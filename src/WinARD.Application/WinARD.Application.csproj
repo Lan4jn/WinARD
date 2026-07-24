@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\WinARD.Domain\WinARD.Domain.csproj" />
+  </ItemGroup>
+</Project>

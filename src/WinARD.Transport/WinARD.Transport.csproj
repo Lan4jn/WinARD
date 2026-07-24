@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\WinARD.Application\WinARD.Application.csproj" />
+    <ProjectReference Include="..\WinARD.Domain\WinARD.Domain.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="SSH.NET" />
+  </ItemGroup>
+</Project>

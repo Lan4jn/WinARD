@@ -1,2 +1,13 @@
+bin/
+obj/
+.vs/
+.idea/
+TestResults/
+artifacts/
 .worktrees/
 .superpowers/
+*.user
+*.suo
+*.pfx
+*.snk
+*.vault

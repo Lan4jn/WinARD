@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\WinARD.Remote.Protocol\WinARD.Remote.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\WinARD.Transport\WinARD.Transport.csproj" />
+  </ItemGroup>
+</Project>
