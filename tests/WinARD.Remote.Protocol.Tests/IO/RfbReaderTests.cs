@@ -154,16 +154,25 @@ public sealed class RfbReaderTests
     [Fact]
     public async Task ReadByte_propagates_asynchronous_cancellation_to_stream()
     {
-        var stream = new BlockingReadStream();
+        await using var stream = new BlockingReadStream();
         var reader = new RfbReader(stream, ProtocolLimits.Default);
         using var cancellation = new CancellationTokenSource();
 
         var readTask = reader.ReadByteAsync(cancellation.Token).AsTask();
-        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
-        cancellation.Cancel();
+        try
+        {
+            await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+            cancellation.Cancel();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => readTask);
-        Assert.Equal(cancellation.Token, stream.ReceivedCancellationToken);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                readTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal(cancellation.Token, stream.ReceivedCancellationToken);
+        }
+        finally
+        {
+            await stream.DisposeAsync();
+            await ObserveCompletionAsync(readTask);
+        }
     }
 
     [Fact]
@@ -172,6 +181,34 @@ public sealed class RfbReaderTests
         using var stream = new ChunkedReadStream([0x01], 1);
         stream.Dispose();
 
+        Assert.False(stream.CanRead);
+        Assert.Throws<ObjectDisposedException>(() => stream.ReadByte());
+    }
+
+    [Fact]
+    public async Task ChunkedReadStream_rejects_operations_after_disposal()
+    {
+        await using var stream = new ChunkedReadStream([0x01], 1);
+        await stream.DisposeAsync();
+
+        Assert.Throws<ObjectDisposedException>(() => { _ = stream.Length; });
+        Assert.Throws<ObjectDisposedException>(() => { _ = stream.Position; });
+        Assert.Throws<ObjectDisposedException>(() => stream.Position = 0);
+        Assert.Throws<ObjectDisposedException>(() => stream.Flush());
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => stream.FlushAsync());
+    }
+
+    [Fact]
+    public async Task BlockingReadStream_disposal_ends_pending_read()
+    {
+        await using var stream = new BlockingReadStream();
+        var readTask = stream.ReadAsync(new byte[1], CancellationToken.None).AsTask();
+        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await stream.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            readTask.WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.False(stream.CanRead);
         Assert.Throws<ObjectDisposedException>(() => stream.ReadByte());
     }
@@ -223,6 +260,20 @@ public sealed class RfbReaderTests
         {
             ReadAttempted = true;
             throw new InvalidOperationException("The stream must not be read.");
+        }
+    }
+
+    private static async Task ObserveCompletionAsync(Task task)
+    {
+        try
+        {
+            await task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
         }
     }
 }

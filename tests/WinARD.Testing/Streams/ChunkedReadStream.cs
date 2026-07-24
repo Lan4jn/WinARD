@@ -22,16 +22,38 @@ public sealed class ChunkedReadStream : Stream
 
     public override bool CanWrite => false;
 
-    public override long Length => _buffer.Length;
+    public override long Length
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return _buffer.Length;
+        }
+    }
 
     public override long Position
     {
-        get => _position;
-        set => throw new NotSupportedException();
+        get
+        {
+            ThrowIfDisposed();
+            return _position;
+        }
+        set
+        {
+            ThrowIfDisposed();
+            throw new NotSupportedException();
+        }
     }
 
     public override void Flush()
     {
+        ThrowIfDisposed();
+    }
+
+    public override Task FlushAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        return Task.CompletedTask;
     }
 
     public override int Read(byte[] buffer, int offset, int count) =>
