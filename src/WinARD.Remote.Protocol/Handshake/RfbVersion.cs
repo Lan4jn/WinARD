@@ -53,6 +53,7 @@ public sealed record RfbVersion
             (3, 3) => V3_3,
             (3, 7) => V3_7,
             (3, 8) => V3_8,
+            (3, 889) => V3_8,
             _ => throw new UnsupportedRfbVersionException(ToSafeBannerText(banner)),
         };
     }

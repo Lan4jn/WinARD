@@ -31,6 +31,21 @@ public sealed class RfbHandshakeTests
         Assert.Equal((byte)0xa5, await new RfbReader(server.ClientStream, ProtocolLimits.Default).ReadByteAsync(CancellationToken.None));
     }
 
+    [Fact]
+    public async Task Negotiates_apple_003_889_alias_as_rfb_38_and_selects_ard()
+    {
+        await using var server = FakeRfbServer.ForVersion(
+            "RFB 003.889\n",
+            (byte)RfbSecurityType.AppleRemoteDesktop);
+
+        var result = await RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None);
+
+        Assert.Equal(RfbVersion.V3_8, result.Version);
+        Assert.Equal(RfbSecurityType.AppleRemoteDesktop, result.SecurityType);
+        Assert.Equal("RFB 003.008\n", server.ReceivedVersion);
+        Assert.Equal((byte)RfbSecurityType.AppleRemoteDesktop, server.ReceivedBytes[12]);
+    }
+
     [Theory]
     [InlineData("RFB 003.007\n", new byte[] { 30, 1, 2 })]
     [InlineData("RFB 003.008\n", new byte[] { 1, 2, 30 })]
@@ -60,7 +75,7 @@ public sealed class RfbHandshakeTests
     [Theory]
     [InlineData("XYZ 003.008\n")]
     [InlineData("RFB 003.008\r\n")]
-    [InlineData("RFB 003.889\n")]
+    [InlineData("RFB 003.009\n")]
     [InlineData("RFB 004.000\n")]
     public async Task Rejects_malformed_or_unsupported_server_banners(string serverBanner)
     {
@@ -93,6 +108,19 @@ public sealed class RfbHandshakeTests
 
         Assert.Equal("Denied\\u000Aplease retry", exception.Reason);
         Assert.Contains("Denied", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Reports_apple_003_889_rejection_reason_using_rfb_38_semantics()
+    {
+        await using var server = FakeRfbServer.ForBytes(BuildRejection("RFB 003.889\n", "Alias denied\nretry"));
+
+        var exception = await Assert.ThrowsAsync<RfbConnectionRejectedException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(RfbVersion.V3_8, exception.Version);
+        Assert.Equal("Alias denied\\u000Aretry", exception.Reason);
+        Assert.Equal("RFB 003.008\n", server.ReceivedVersion);
     }
 
     [Fact]

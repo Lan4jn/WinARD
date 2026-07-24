@@ -5,6 +5,7 @@ using System.Text;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Handshake;
+using WinARD.Remote.Protocol.IO;
 using WinARD.Testing.Rfb;
 using WinARD.Testing.Streams;
 using Xunit;
@@ -15,6 +16,9 @@ namespace WinARD.Remote.Protocol.Tests.Authentication;
 
 public sealed class ArdAuthenticatorTests
 {
+    private const string FixtureModulusHex =
+        "D2652EF10104A3DDC1219700EDFBD1E19F7678B4A4F6D5952634BD8BF1D60326322B5D32366DC25CB4E8E73AF4312A70D2DCAF2747EB89D7E88553EECD6A283D";
+
     [Fact]
     public async Task Authenticates_and_sends_encrypted_credentials_before_fixed_width_client_public_key()
     {
@@ -33,6 +37,35 @@ public sealed class ArdAuthenticatorTests
         Assert.Equal(0, server.GetClientPublicKey()[0]);
         Assert.Equal(server.KeyLength, server.GetSharedSecret().Length);
         Assert.Equal(0, server.GetSharedSecret()[0]);
+    }
+
+    [Fact]
+    public async Task Matches_independent_python_known_answer_vector()
+    {
+        var modulus = Convert.FromHexString(FixtureModulusHex);
+        var serverPublicKey = Convert.FromHexString(
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007D");
+        var challenge = ArdServerFixture.EncodeChallenge(5, 64, modulus, serverPublicKey);
+        var serverBytes = new List<byte>(challenge);
+        serverBytes.AddRange([0, 0, 0, 0]);
+        await using var server = ArdServerFixture.ForServerBytes(serverBytes.ToArray());
+        using var username = SecretMaterial.FromUtf8("user");
+        using var password = SecretMaterial.FromUtf8("password");
+        var random = new KnownAnswerRandomSource();
+
+        await new ArdAuthenticator(random).AuthenticateAsync(
+            server.ClientStream,
+            RfbVersion.V3_8,
+            username,
+            password,
+            CancellationToken.None);
+
+        var expectedCiphertext = Convert.FromHexString(
+            "9AA256017F35EF39E53F21F3ADC120050F1E37C126550C7BB942E4309C7B5A6768C180417D0A5EE5C7B96A1BEFC94836A05C01FA873DEAEF39AEFA78181F424D35DC1F3264BB5EDC9FC85C63466B02763EF1168ECC0CD7F0F39079C2E8577310220D7936D1A4A6A1FE6B3755B09FBCBF94BDD64C681EE61628876756EC241E19");
+        var expectedClientPublicKey = Convert.FromHexString(
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000019");
+        Assert.Equal(expectedCiphertext.Concat(expectedClientPublicKey), server.ReceivedBytes);
+        Assert.Equal(2, random.FillCount);
     }
 
     [Fact]
@@ -187,6 +220,37 @@ public sealed class ArdAuthenticatorTests
         Assert.Empty(server.ReceivedBytes);
     }
 
+    [Fact]
+    public async Task Rejects_nonzero_odd_modulus_with_a_leading_zero_byte()
+    {
+        var modulus = new byte[64];
+        modulus[1] = 0x80;
+        modulus[^1] = 1;
+        var serverPublic = ToFixedWidth(new BigInteger(2), modulus.Length);
+        var challenge = ArdServerFixture.EncodeChallenge(5, 64, modulus, serverPublic);
+        await using var server = ArdServerFixture.ForServerBytes(challenge);
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() => AuthenticateWithEmptyCredentialsAsync(server.ClientStream));
+        Assert.Empty(server.ReceivedBytes);
+    }
+
+    [Fact]
+    public async Task Accepts_key_length_at_512_byte_upper_bound()
+    {
+        var modulus = new byte[512];
+        modulus[0] = 0x80;
+        modulus[^1] = 1;
+        var serverPublic = ToFixedWidth(new BigInteger(2), modulus.Length);
+        var challenge = ArdServerFixture.EncodeChallenge(5, 512, modulus, serverPublic);
+        var serverBytes = new List<byte>(challenge);
+        serverBytes.AddRange([0, 0, 0, 0]);
+        await using var server = ArdServerFixture.ForServerBytes(serverBytes.ToArray(), maxReadChunk: 17);
+
+        await AuthenticateWithEmptyCredentialsAsync(server.ClientStream).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(128 + 512, server.ReceivedBytes.Length);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
@@ -253,6 +317,31 @@ public sealed class ArdAuthenticatorTests
     }
 
     [Fact]
+    public async Task Masks_partial_byte_unused_high_bits_before_private_exponent_sampling()
+    {
+        var modulus = new byte[64];
+        modulus[0] = 0x1f;
+        modulus[^1] = 1;
+        var serverPublic = ToFixedWidth(new BigInteger(2), modulus.Length);
+        var challenge = ArdServerFixture.EncodeChallenge(5, 64, modulus, serverPublic);
+        var serverBytes = new List<byte>(challenge);
+        serverBytes.AddRange([0, 0, 0, 0]);
+        await using var server = ArdServerFixture.ForServerBytes(serverBytes.ToArray());
+        var random = new PartialHighBitsRandomSource();
+        using var username = SecretMaterial.FromUtf8(string.Empty);
+        using var password = SecretMaterial.FromUtf8(string.Empty);
+
+        await new ArdAuthenticator(random).AuthenticateAsync(
+            server.ClientStream,
+            RfbVersion.V3_8,
+            username,
+            password,
+            CancellationToken.None);
+
+        Assert.Equal(2, random.FillCount);
+    }
+
+    [Fact]
     public async Task Accepts_zero_security_result()
     {
         await using var server = ArdServerFixture.Create(securityResult: 0);
@@ -287,6 +376,81 @@ public sealed class ArdAuthenticatorTests
         Assert.DoesNotContain('\n', exception.Message);
         Assert.DoesNotContain('\u001b', exception.Message);
         Assert.DoesNotContain(testPassword, exception.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Redacts_repeated_username_and_password_bytes_before_reason_decode_and_sanitize()
+    {
+        const string testUsername = "echo-user";
+        const string testPassword = "echo-password";
+        var reasonBytes = Encoding.UTF8.GetBytes(
+            $"\u001b[31m {testUsername}/{testPassword} {testUsername}\n{testPassword}");
+        await using var server = ArdServerFixture.Create(securityResult: 7, reasonBytes: reasonBytes);
+        using var username = SecretMaterial.FromUtf8(testUsername);
+        using var password = SecretMaterial.FromUtf8(testPassword);
+
+        var exception = await Assert.ThrowsAsync<ArdAuthenticationRejectedException>(() =>
+            new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                server.ClientStream,
+                RfbVersion.V3_8,
+                username,
+                password,
+                CancellationToken.None));
+
+        const string expected = "\\u001B[31m [REDACTED]/[REDACTED] [REDACTED]\\u000A[REDACTED]";
+        Assert.Equal(expected, exception.Reason);
+        Assert.DoesNotContain(testUsername, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(testPassword, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(testUsername, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(testPassword, exception.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Preserves_result_code_when_rfb_38_reason_length_exceeds_limit()
+    {
+        const string testPassword = "limit-secret-password";
+        var payload = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Repeat(testPassword, 8)));
+        await using var server = ArdServerFixture.Create(securityResult: 7, reasonBytes: payload);
+        using var username = SecretMaterial.FromUtf8("limit-user");
+        using var password = SecretMaterial.FromUtf8(testPassword);
+
+        var exception = await Assert.ThrowsAsync<ArdAuthenticationRejectedException>(() =>
+            new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                server.ClientStream,
+                RfbVersion.V3_8,
+                username,
+                password,
+                new ProtocolLimits(128, 1024),
+                CancellationToken.None));
+
+        Assert.Equal(7u, exception.ResultCode);
+        Assert.IsType<RfbProtocolException>(exception.InnerException);
+        Assert.DoesNotContain(testPassword, exception.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Preserves_result_code_when_rfb_38_reason_payload_ends_early()
+    {
+        const string testUsername = "eof-secret-user";
+        var payload = Encoding.UTF8.GetBytes(testUsername);
+        await using var server = ArdServerFixture.Create(
+            securityResult: 7,
+            reasonBytes: payload,
+            declaredReasonLength: checked((uint)payload.Length + 5));
+        using var username = SecretMaterial.FromUtf8(testUsername);
+        using var password = SecretMaterial.FromUtf8("eof-password");
+
+        var exception = await Assert.ThrowsAsync<ArdAuthenticationRejectedException>(() =>
+            new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                server.ClientStream,
+                RfbVersion.V3_8,
+                username,
+                password,
+                CancellationToken.None));
+
+        Assert.Equal(7u, exception.ResultCode);
+        Assert.IsType<RfbProtocolException>(exception.InnerException);
+        Assert.DoesNotContain(testUsername, exception.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -335,6 +499,63 @@ public sealed class ArdAuthenticatorTests
 
         Assert.Equal(0, server.FlushCount);
         Assert.False(server.IsDisposed);
+    }
+
+    [Fact]
+    public async Task Ard_server_fixture_does_not_release_security_result_before_complete_response()
+    {
+        await using var server = ArdServerFixture.Create();
+        var reader = new RfbReader(server.ClientStream, ProtocolLimits.Default);
+        _ = await reader.ReadBytesAsync(4 + (2 * server.KeyLength), CancellationToken.None);
+
+        var prematureResultRead = reader.ReadUInt32Async(CancellationToken.None).AsTask();
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            prematureResultRead.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Empty(server.ReceivedBytes);
+    }
+
+    [Fact]
+    public async Task Disposing_ard_server_fixture_releases_pending_result_gate_without_faulting_the_gate()
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            var server = ArdServerFixture.Create();
+            var reader = new RfbReader(server.ClientStream, ProtocolLimits.Default);
+            _ = await reader.ReadBytesAsync(4 + (2 * server.KeyLength), CancellationToken.None);
+            var pendingResultRead = reader.ReadUInt32Async(CancellationToken.None).AsTask();
+
+            await server.DisposeAsync();
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+                pendingResultRead.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+    }
+
+    [Fact]
+    public async Task Staged_ard_fixture_reliably_requires_the_full_response_before_result()
+    {
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            await using var server = ArdServerFixture.Create(maxReadChunk: 1);
+
+            await AuthenticateWithEmptyCredentialsAsync(server.ClientStream);
+
+            Assert.Equal(128 + server.KeyLength, server.ReceivedBytes.Length);
+            Assert.Equal(4 + (2 * server.KeyLength) + sizeof(uint), server.ServerBytesRead);
+        }
+    }
+
+    [Fact]
+    public async Task Ard_server_fixture_rejects_a_response_larger_than_the_negotiated_length()
+    {
+        await using var server = ArdServerFixture.Create();
+        var reader = new RfbReader(server.ClientStream, ProtocolLimits.Default);
+        var writer = new RfbWriter(server.ClientStream);
+        _ = await reader.ReadBytesAsync(4 + (2 * server.KeyLength), CancellationToken.None);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await writer.WriteBytesAsync(new byte[129 + server.KeyLength], CancellationToken.None));
     }
 
     [Fact]
@@ -541,6 +762,37 @@ public sealed class ArdAuthenticatorTests
             FillCount++;
             destination.Clear();
             destination[0] = 1;
+        }
+    }
+
+    private sealed class PartialHighBitsRandomSource : IRandomSource
+    {
+        public int FillCount { get; private set; }
+
+        public void Fill(Span<byte> destination)
+        {
+            FillCount++;
+            destination.Clear();
+            destination[0] = 0xe0;
+        }
+    }
+
+    private sealed class KnownAnswerRandomSource : IRandomSource
+    {
+        public int FillCount { get; private set; }
+
+        public void Fill(Span<byte> destination)
+        {
+            if (FillCount++ == 0)
+            {
+                destination.Clear();
+                return;
+            }
+
+            for (var index = 0; index < destination.Length; index++)
+            {
+                destination[index] = checked((byte)index);
+            }
         }
     }
 }

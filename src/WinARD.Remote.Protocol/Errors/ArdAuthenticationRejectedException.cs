@@ -3,7 +3,16 @@ namespace WinARD.Remote.Protocol.Errors;
 public sealed class ArdAuthenticationRejectedException : Exception
 {
     public ArdAuthenticationRejectedException(uint resultCode, string? reason, bool isReasonTruncated)
-        : base(CreateMessage(resultCode, reason, isReasonTruncated))
+        : this(resultCode, reason, isReasonTruncated, null)
+    {
+    }
+
+    public ArdAuthenticationRejectedException(
+        uint resultCode,
+        string? reason,
+        bool isReasonTruncated,
+        Exception? innerException)
+        : base(CreateMessage(resultCode, reason, isReasonTruncated), innerException)
     {
         ResultCode = resultCode;
         Reason = reason;

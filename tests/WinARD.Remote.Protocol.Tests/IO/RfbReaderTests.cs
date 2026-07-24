@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+using System.Text;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.IO;
 using WinARD.Testing.Streams;
@@ -141,6 +143,36 @@ public sealed class RfbReaderTests
     }
 
     [Fact]
+    public async Task ReadBytes_zeroes_partially_filled_buffer_when_failure_reason_ends_early()
+    {
+        var echoedSecret = Encoding.UTF8.GetBytes("echoed-failure-secret");
+        await using var stream = new CapturingPartialReadStream(echoedSecret);
+        var reader = new RfbReader(stream, ProtocolLimits.Default);
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            reader.ReadBytesAsync(echoedSecret.Length + 5, CancellationToken.None).AsTask());
+
+        var capturedBuffer = Assert.IsType<byte[]>(stream.CapturedBuffer);
+        Assert.All(capturedBuffer, value => Assert.Equal(0, value));
+    }
+
+    [Fact]
+    public async Task ReadBytes_zeroes_partially_filled_buffer_before_propagating_cancellation()
+    {
+        var echoedSecret = Encoding.UTF8.GetBytes("cancelled-failure-secret");
+        using var cancellation = new CancellationTokenSource();
+        await using var stream = new CapturingPartialReadStream(echoedSecret, cancellation);
+        var reader = new RfbReader(stream, ProtocolLimits.Default);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            reader.ReadBytesAsync(echoedSecret.Length + 5, cancellation.Token).AsTask());
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        var capturedBuffer = Assert.IsType<byte[]>(stream.CapturedBuffer);
+        Assert.All(capturedBuffer, value => Assert.Equal(0, value));
+    }
+
+    [Fact]
     public async Task ReadByte_propagates_cancellation()
     {
         var reader = new RfbReader(new ThrowOnReadStream(), ProtocolLimits.Default);
@@ -261,6 +293,69 @@ public sealed class RfbReaderTests
             ReadAttempted = true;
             throw new InvalidOperationException("The stream must not be read.");
         }
+    }
+
+    private sealed class CapturingPartialReadStream : Stream
+    {
+        private readonly byte[] _payload;
+        private readonly CancellationTokenSource? _cancelAfterPayload;
+        private bool _payloadReturned;
+
+        public CapturingPartialReadStream(
+            byte[] payload,
+            CancellationTokenSource? cancelAfterPayload = null)
+        {
+            _payload = payload;
+            _cancelAfterPayload = cancelAfterPayload;
+        }
+
+        public byte[]? CapturedBuffer { get; private set; }
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_payloadReturned)
+            {
+                return ValueTask.FromResult(0);
+            }
+
+            _payloadReturned = true;
+            if (!MemoryMarshal.TryGetArray((ReadOnlyMemory<byte>)buffer, out var segment))
+            {
+                throw new InvalidOperationException("The reader did not provide an array-backed buffer.");
+            }
+
+            CapturedBuffer = segment.Array;
+            _payload.CopyTo(buffer.Span);
+            _cancelAfterPayload?.Cancel();
+            return ValueTask.FromResult(_payload.Length);
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private static async Task ObserveCompletionAsync(Task task)

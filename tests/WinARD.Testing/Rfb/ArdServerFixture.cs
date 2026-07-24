@@ -15,9 +15,24 @@ public sealed class ArdServerFixture : IAsyncDisposable
     private readonly byte[] _modulus;
     private readonly ScriptedAuthenticationStream _stream;
 
-    private ArdServerFixture(byte[] serverBytes, byte[] modulus, int maxReadChunk)
+    private ArdServerFixture(
+        byte[] challengeBytes,
+        byte[] resultBytes,
+        byte[] modulus,
+        int expectedResponseLength,
+        int maxReadChunk)
     {
         _modulus = modulus;
+        _stream = new ScriptedAuthenticationStream(
+            challengeBytes,
+            resultBytes,
+            expectedResponseLength,
+            maxReadChunk);
+    }
+
+    private ArdServerFixture(byte[] serverBytes, int maxReadChunk)
+    {
+        _modulus = Array.Empty<byte>();
         _stream = new ScriptedAuthenticationStream(serverBytes, maxReadChunk);
     }
 
@@ -38,6 +53,7 @@ public sealed class ArdServerFixture : IAsyncDisposable
     public static ArdServerFixture Create(
         uint securityResult = 0,
         byte[]? reasonBytes = null,
+        uint? declaredReasonLength = null,
         int maxReadChunk = int.MaxValue)
     {
         var modulus = Convert.FromHexString(ModulusHex);
@@ -45,25 +61,32 @@ public sealed class ArdServerFixture : IAsyncDisposable
         var prime = new BigInteger(modulus, isUnsigned: true, isBigEndian: true);
         var serverPublicKey = ToFixedWidth(BigInteger.ModPow(generator, ServerPrivateExponent, prime), modulus.Length);
 
-        var serverBytes = new List<byte>(4 + (2 * modulus.Length) + sizeof(uint) + (reasonBytes?.Length ?? 0) + sizeof(uint));
-        AddUInt16(serverBytes, 5);
-        AddUInt16(serverBytes, checked((ushort)modulus.Length));
-        serverBytes.AddRange(modulus);
-        serverBytes.AddRange(serverPublicKey);
-        AddUInt32(serverBytes, securityResult);
+        var challengeBytes = new List<byte>(4 + (2 * modulus.Length));
+        AddUInt16(challengeBytes, 5);
+        AddUInt16(challengeBytes, checked((ushort)modulus.Length));
+        challengeBytes.AddRange(modulus);
+        challengeBytes.AddRange(serverPublicKey);
+
+        var resultBytes = new List<byte>(sizeof(uint) + (reasonBytes?.Length ?? 0) + sizeof(uint));
+        AddUInt32(resultBytes, securityResult);
         if (reasonBytes is not null)
         {
-            AddUInt32(serverBytes, checked((uint)reasonBytes.Length));
-            serverBytes.AddRange(reasonBytes);
+            AddUInt32(resultBytes, declaredReasonLength ?? checked((uint)reasonBytes.Length));
+            resultBytes.AddRange(reasonBytes);
         }
 
-        return new ArdServerFixture(serverBytes.ToArray(), modulus, maxReadChunk);
+        return new ArdServerFixture(
+            challengeBytes.ToArray(),
+            resultBytes.ToArray(),
+            modulus,
+            128 + modulus.Length,
+            maxReadChunk);
     }
 
     public static ArdServerFixture ForServerBytes(byte[] serverBytes, int maxReadChunk = int.MaxValue)
     {
         ArgumentNullException.ThrowIfNull(serverBytes);
-        return new ArdServerFixture((byte[])serverBytes.Clone(), Array.Empty<byte>(), maxReadChunk);
+        return new ArdServerFixture((byte[])serverBytes.Clone(), maxReadChunk);
     }
 
     public byte[] GetClientPublicKey()
@@ -182,24 +205,54 @@ public sealed class ArdServerFixture : IAsyncDisposable
 
     private sealed class ScriptedAuthenticationStream : Stream
     {
+        private static readonly TimeSpan StageTimeout = TimeSpan.FromMilliseconds(500);
+
+        private readonly byte[] _challengeBytes;
+        private readonly int _expectedResponseLength;
         private readonly int _maxReadChunk;
-        private readonly byte[] _serverBytes;
+        private readonly TaskCompletionSource _responseAccepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly byte[] _resultBytes;
+        private readonly byte[] _rawServerBytes;
         private readonly MemoryStream _written = new();
-        private int _position;
+        private int _challengePosition;
+        private int _rawPosition;
+        private int _resultPosition;
+        private Phase _phase;
+
+        public ScriptedAuthenticationStream(
+            byte[] challengeBytes,
+            byte[] resultBytes,
+            int expectedResponseLength,
+            int maxReadChunk)
+        {
+            ArgumentNullException.ThrowIfNull(challengeBytes);
+            ArgumentNullException.ThrowIfNull(resultBytes);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(expectedResponseLength);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxReadChunk);
+            _challengeBytes = challengeBytes;
+            _resultBytes = resultBytes;
+            _expectedResponseLength = expectedResponseLength;
+            _maxReadChunk = maxReadChunk;
+            _rawServerBytes = Array.Empty<byte>();
+            _phase = Phase.Challenge;
+        }
 
         public ScriptedAuthenticationStream(byte[] serverBytes, int maxReadChunk)
         {
             ArgumentNullException.ThrowIfNull(serverBytes);
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxReadChunk);
-            _serverBytes = serverBytes;
+            _challengeBytes = Array.Empty<byte>();
+            _resultBytes = Array.Empty<byte>();
+            _rawServerBytes = serverBytes;
             _maxReadChunk = maxReadChunk;
+            _phase = Phase.Raw;
         }
 
         public int FlushCount { get; private set; }
 
         public bool IsDisposed { get; private set; }
 
-        public int BytesRead => _position;
+        public int BytesRead => _challengePosition + _resultPosition + _rawPosition;
 
         public byte[] WrittenBytes => _written.ToArray();
 
@@ -235,22 +288,62 @@ public sealed class ArdServerFixture : IAsyncDisposable
 
         public override int Read(Span<byte> buffer)
         {
+            var copy = new byte[buffer.Length];
+            var count = ReadAsync(copy, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+            if (count != 0)
+            {
+                copy.AsSpan(0, count).CopyTo(buffer);
+            }
+
+            return count;
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
             ThrowIfDisposed();
-            var count = Math.Min(Math.Min(buffer.Length, _maxReadChunk), _serverBytes.Length - _position);
-            if (count == 0)
+            cancellationToken.ThrowIfCancellationRequested();
+            if (buffer.Length == 0)
             {
                 return 0;
             }
 
-            _serverBytes.AsSpan(_position, count).CopyTo(buffer);
-            _position += count;
-            return count;
-        }
+            while (true)
+            {
+                switch (_phase)
+                {
+                    case Phase.Challenge:
+                        return ReadAvailable(
+                            _challengeBytes,
+                            ref _challengePosition,
+                            buffer,
+                            Phase.AwaitResponse);
+                    case Phase.AwaitResponse:
+                        try
+                        {
+                            await _responseAccepted.Task.WaitAsync(StageTimeout, cancellationToken);
+                        }
+                        catch (TimeoutException exception)
+                        {
+                            throw new TimeoutException(
+                                "The client attempted to read the ARD SecurityResult before sending a complete response.",
+                                exception);
+                        }
 
-        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            return ValueTask.FromResult(Read(buffer.Span));
+                        ThrowIfDisposed();
+                        _phase = Phase.Result;
+                        continue;
+                    case Phase.Result:
+                        return ReadAvailable(_resultBytes, ref _resultPosition, buffer, Phase.Finished);
+                    case Phase.Finished:
+                        return 0;
+                    case Phase.Raw:
+                        return ReadAvailable(_rawServerBytes, ref _rawPosition, buffer, Phase.Finished);
+                    default:
+                        throw new InvalidOperationException("The ARD fixture reached an unknown protocol stage.");
+                }
+            }
         }
 
         public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
@@ -258,7 +351,27 @@ public sealed class ArdServerFixture : IAsyncDisposable
         public override void Write(ReadOnlySpan<byte> buffer)
         {
             ThrowIfDisposed();
+            if (_phase == Phase.Raw)
+            {
+                _written.Write(buffer);
+                return;
+            }
+
+            if (_phase != Phase.AwaitResponse)
+            {
+                throw new InvalidOperationException("The client wrote an ARD response before reading the complete challenge.");
+            }
+
+            if (_written.Length + buffer.Length > _expectedResponseLength)
+            {
+                throw new InvalidOperationException("The client ARD response exceeded the negotiated response length.");
+            }
+
             _written.Write(buffer);
+            if (_written.Length == _expectedResponseLength)
+            {
+                _responseAccepted.TrySetResult();
+            }
         }
 
         public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
@@ -277,12 +390,41 @@ public sealed class ArdServerFixture : IAsyncDisposable
             if (!IsDisposed)
             {
                 IsDisposed = true;
+                _responseAccepted.TrySetResult();
                 _written.Dispose();
             }
 
             base.Dispose(disposing);
         }
 
+        private int ReadAvailable(byte[] source, ref int position, Memory<byte> destination, Phase nextPhase)
+        {
+            var count = Math.Min(Math.Min(destination.Length, _maxReadChunk), source.Length - position);
+            if (count == 0)
+            {
+                _phase = nextPhase;
+                return 0;
+            }
+
+            source.AsSpan(position, count).CopyTo(destination.Span);
+            position += count;
+            if (position == source.Length)
+            {
+                _phase = nextPhase;
+            }
+
+            return count;
+        }
+
         private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(IsDisposed, this);
+
+        private enum Phase
+        {
+            Challenge,
+            AwaitResponse,
+            Result,
+            Finished,
+            Raw,
+        }
     }
 }

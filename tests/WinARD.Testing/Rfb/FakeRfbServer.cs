@@ -7,9 +7,19 @@ public sealed class FakeRfbServer : IAsyncDisposable
     private const byte Sentinel = 0xa5;
     private readonly ScriptedDuplexStream _stream;
 
-    private FakeRfbServer(byte[] serverBanner, byte[] securityBytes, bool expectsSecuritySelection, bool exposesSentinel)
+    private FakeRfbServer(
+        byte[] serverBanner,
+        byte[] expectedClientBanner,
+        byte[] securityBytes,
+        bool expectsSecuritySelection,
+        bool exposesSentinel)
     {
-        _stream = new ScriptedDuplexStream(serverBanner, securityBytes, expectsSecuritySelection, exposesSentinel);
+        _stream = new ScriptedDuplexStream(
+            serverBanner,
+            expectedClientBanner,
+            securityBytes,
+            expectsSecuritySelection,
+            exposesSentinel);
     }
 
     private FakeRfbServer(byte[] serverBytes)
@@ -39,6 +49,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
 
         return new FakeRfbServer(
             Encoding.ASCII.GetBytes(banner),
+            Encoding.ASCII.GetBytes(banner),
             [(byte)(securityType >> 24), (byte)(securityType >> 16), (byte)(securityType >> 8), (byte)securityType],
             expectsSecuritySelection: false,
             exposesSentinel: true);
@@ -48,7 +59,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(banner);
         ArgumentNullException.ThrowIfNull(securityTypes);
-        if (banner is not "RFB 003.007\n" and not "RFB 003.008\n")
+        if (banner is not "RFB 003.007\n" and not "RFB 003.008\n" and not "RFB 003.889\n")
         {
             throw new ArgumentException("The byte security type list overload is only valid for RFB 3.7 or 3.8.", nameof(banner));
         }
@@ -63,6 +74,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
         securityTypes.CopyTo(securityBytes, 1);
         return new FakeRfbServer(
             Encoding.ASCII.GetBytes(banner),
+            Encoding.ASCII.GetBytes(banner is "RFB 003.889\n" ? "RFB 003.008\n" : banner),
             securityBytes,
             expectsSecuritySelection: true,
             exposesSentinel: true);
@@ -74,9 +86,14 @@ public sealed class FakeRfbServer : IAsyncDisposable
         if (serverBytes.Length >= 12)
         {
             var banner = Encoding.ASCII.GetString(serverBytes, 0, 12);
-            if (banner is "RFB 003.003\n" or "RFB 003.007\n" or "RFB 003.008\n")
+            if (banner is "RFB 003.003\n" or "RFB 003.007\n" or "RFB 003.008\n" or "RFB 003.889\n")
             {
-                return new FakeRfbServer(serverBytes[..12], serverBytes[12..], expectsSecuritySelection: false, exposesSentinel: false);
+                return new FakeRfbServer(
+                    serverBytes[..12],
+                    Encoding.ASCII.GetBytes(banner is "RFB 003.889\n" ? "RFB 003.008\n" : banner),
+                    serverBytes[12..],
+                    expectsSecuritySelection: false,
+                    exposesSentinel: false);
             }
         }
 
@@ -92,6 +109,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
         private readonly TaskCompletionSource _clientBannerAccepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _securitySelectionAccepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly byte[] _securityBytes;
+        private readonly byte[] _expectedClientBanner;
         private readonly byte[] _serverBanner;
         private readonly byte[] _serverBytes;
         private readonly MemoryStream _written = new();
@@ -104,9 +122,15 @@ public sealed class FakeRfbServer : IAsyncDisposable
         private int _serverPosition;
         private Phase _phase;
 
-        public ScriptedDuplexStream(byte[] serverBanner, byte[] securityBytes, bool expectsSecuritySelection, bool exposesSentinel)
+        public ScriptedDuplexStream(
+            byte[] serverBanner,
+            byte[] expectedClientBanner,
+            byte[] securityBytes,
+            bool expectsSecuritySelection,
+            bool exposesSentinel)
         {
             _serverBanner = serverBanner;
+            _expectedClientBanner = expectedClientBanner;
             _securityBytes = securityBytes;
             _expectsSecuritySelection = expectsSecuritySelection;
             _exposesSentinel = exposesSentinel;
@@ -117,6 +141,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
         public ScriptedDuplexStream(byte[] serverBytes)
         {
             _serverBanner = Array.Empty<byte>();
+            _expectedClientBanner = Array.Empty<byte>();
             _securityBytes = Array.Empty<byte>();
             _serverBytes = serverBytes;
             _phase = Phase.Raw;
@@ -279,7 +304,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
                 if (_serverBanner.Length > 0 && _written.Length < _serverBanner.Length)
                 {
                     var index = (int)_written.Length;
-                    if (value != _serverBanner[index])
+                    if (value != _expectedClientBanner[index])
                     {
                         throw new InvalidOperationException("The client wrote an unexpected RFB version banner.");
                     }

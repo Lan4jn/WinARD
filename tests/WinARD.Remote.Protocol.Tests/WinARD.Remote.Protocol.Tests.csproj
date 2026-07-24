@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\WinARD.Remote.Protocol\WinARD.Remote.Protocol.csproj" />
     <ProjectReference Include="..\WinARD.Testing\WinARD.Testing.csproj" />
+    <ProjectReference Include="..\..\tools\WinARD.ProtocolProbe\WinARD.ProtocolProbe.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />

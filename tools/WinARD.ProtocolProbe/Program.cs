@@ -1,14 +1,11 @@
-using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using WinARD.ProtocolProbe;
 using WinARD.Remote.Protocol.Authentication;
-using WinARD.Remote.Protocol.Errors;
-using WinARD.Remote.Protocol.Handshake;
 
 internal static class Program
 {
     private const int DefaultPort = 5900;
-    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(10);
 
     private static async Task<int> Main()
     {
@@ -37,48 +34,16 @@ internal static class Program
                 return 2;
             }
 
-            using var client = new TcpClient();
-            using (var connectCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token))
-            {
-                connectCancellation.CancelAfter(ConnectTimeout);
-                try
-                {
-                    await client.ConnectAsync(host, port, connectCancellation.Token);
-                }
-                catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
-                {
-                    Console.Error.WriteLine("Connection timed out.");
-                    return 1;
-                }
-            }
+            var result = await new ProbeRunner().RunAsync(host, port, username, password, cancellation.Token);
 
-            await using var stream = client.GetStream();
-            var handshake = await RfbHandshake.NegotiateAsync(stream, cancellation.Token);
-            if (handshake.SecurityType != RfbSecurityType.AppleRemoteDesktop)
-            {
-                throw new RfbProtocolException("The server did not negotiate Apple Remote Desktop security type 30.");
-            }
-
-            await new ArdAuthenticator().AuthenticateAsync(
-                stream,
-                handshake.Version,
-                username,
-                password,
-                cancellation.Token);
-
-            Console.WriteLine($"Version: {handshake.Version.Major}.{handshake.Version.Minor}");
-            Console.WriteLine($"Security: {handshake.SecurityType} ({(byte)handshake.SecurityType})");
+            Console.WriteLine($"Version: {result.Version.Major}.{result.Version.Minor}");
+            Console.WriteLine($"Security: {result.SecurityType} ({(byte)result.SecurityType})");
             Console.WriteLine("Authentication: success");
             return 0;
         }
-        catch (OperationCanceledException)
-        {
-            Console.Error.WriteLine("Cancelled.");
-            return 1;
-        }
         catch (Exception exception)
         {
-            Console.Error.WriteLine($"Probe failed: {exception.Message}");
+            Console.Error.WriteLine(ProbeOutput.FormatFailure(exception));
             return 1;
         }
     }

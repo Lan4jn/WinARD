@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using WinARD.Remote.Protocol.Errors;
 
 namespace WinARD.Remote.Protocol.IO;
@@ -76,9 +77,15 @@ public sealed class RfbReader
         }
         catch (EndOfStreamException exception)
         {
+            CryptographicOperations.ZeroMemory(buffer);
             throw new RfbProtocolException(
                 $"Unexpected end of stream while reading {expectedByteCount} bytes.",
                 exception);
+        }
+        catch
+        {
+            CryptographicOperations.ZeroMemory(buffer);
+            throw;
         }
 
         return buffer;

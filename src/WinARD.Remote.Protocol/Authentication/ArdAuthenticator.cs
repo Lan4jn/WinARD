@@ -67,7 +67,13 @@ public sealed class ArdAuthenticator
 
             await writer.WriteBytesAsync(response.EncryptedCredentialsMemory, cancellationToken);
             await writer.WriteBytesAsync(response.ClientPublicKeyMemory, cancellationToken);
-            await ReadSecurityResultAsync(reader, version, limits, cancellationToken);
+            await ReadSecurityResultAsync(
+                reader,
+                version,
+                limits,
+                usernameBytes,
+                passwordBytes,
+                cancellationToken);
         }
         finally
         {
@@ -100,8 +106,6 @@ public sealed class ArdAuthenticator
         ReadOnlySpan<byte> username,
         ReadOnlySpan<byte> password)
     {
-        var prime = new BigInteger(challenge.ModulusSpan, isUnsigned: true, isBigEndian: true);
-        var serverPublicKey = new BigInteger(challenge.ServerPublicKeySpan, isUnsigned: true, isBigEndian: true);
         var privateExponentBytes = new byte[challenge.KeyLength];
         var sharedSecret = new byte[challenge.KeyLength];
         var aesKey = new byte[16];
@@ -111,11 +115,7 @@ public sealed class ArdAuthenticator
 
         try
         {
-            var privateExponent = GeneratePrivateExponent(prime, privateExponentBytes);
-            WriteFixedWidth(
-                BigInteger.ModPow(new BigInteger(challenge.Generator), privateExponent, prime),
-                clientPublicKey);
-            WriteFixedWidth(BigInteger.ModPow(serverPublicKey, privateExponent, prime), sharedSecret);
+            ComputeDhValues(challenge, privateExponentBytes, clientPublicKey, sharedSecret);
             DeriveAesKey(sharedSecret, aesKey);
             CreatePlaintextCredentials(username, password, plaintextCredentials);
             EncryptCredentials(plaintextCredentials, aesKey, encryptedCredentials);
@@ -130,6 +130,21 @@ public sealed class ArdAuthenticator
             CryptographicOperations.ZeroMemory(encryptedCredentials);
             CryptographicOperations.ZeroMemory(clientPublicKey);
         }
+    }
+
+    private void ComputeDhValues(
+        ArdChallenge challenge,
+        Span<byte> privateExponentBytes,
+        Span<byte> clientPublicKey,
+        Span<byte> sharedSecret)
+    {
+        var prime = new BigInteger(challenge.ModulusSpan, isUnsigned: true, isBigEndian: true);
+        var serverPublicKey = new BigInteger(challenge.ServerPublicKeySpan, isUnsigned: true, isBigEndian: true);
+        var privateExponent = GeneratePrivateExponent(prime, privateExponentBytes);
+        WriteFixedWidth(
+            BigInteger.ModPow(new BigInteger(challenge.Generator), privateExponent, prime),
+            clientPublicKey);
+        WriteFixedWidth(BigInteger.ModPow(serverPublicKey, privateExponent, prime), sharedSecret);
     }
 
     private static void ValidateChallenge(ArdChallenge challenge)
@@ -226,6 +241,8 @@ public sealed class ArdAuthenticator
         RfbReader reader,
         RfbVersion version,
         ProtocolLimits limits,
+        ReadOnlyMemory<byte> username,
+        ReadOnlyMemory<byte> password,
         CancellationToken cancellationToken)
     {
         var resultCode = await reader.ReadUInt32Async(cancellationToken);
@@ -236,8 +253,20 @@ public sealed class ArdAuthenticator
 
         if (version == RfbVersion.V3_8)
         {
-            var failure = await RfbFailureReasonReader.ReadAsync(reader, limits, cancellationToken);
-            throw new ArdAuthenticationRejectedException(resultCode, failure.Reason, failure.IsTruncated);
+            try
+            {
+                var failure = await RfbFailureReasonReader.ReadAsync(
+                    reader,
+                    limits,
+                    username,
+                    password,
+                    cancellationToken);
+                throw new ArdAuthenticationRejectedException(resultCode, failure.Reason, failure.IsTruncated);
+            }
+            catch (RfbProtocolException exception)
+            {
+                throw new ArdAuthenticationRejectedException(resultCode, null, false, exception);
+            }
         }
 
         throw new ArdAuthenticationRejectedException(resultCode, null, false);
