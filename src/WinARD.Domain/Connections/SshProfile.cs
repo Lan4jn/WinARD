@@ -55,6 +55,15 @@ public sealed record SshProfile
         string? pinnedHostKeyAlgorithm,
         string? pinnedHostKeySha256)
     {
+        var normalizedPinnedHostKeyAlgorithm = OptionalTrimmed(pinnedHostKeyAlgorithm);
+        var normalizedPinnedHostKeySha256 = OptionalTrimmed(pinnedHostKeySha256);
+        if ((normalizedPinnedHostKeyAlgorithm is null) != (normalizedPinnedHostKeySha256 is null))
+        {
+            throw new ArgumentException(
+                "Pinned host key algorithm and SHA-256 fingerprint must be specified together.",
+                nameof(pinnedHostKeySha256));
+        }
+
         return new SshProfile(
             RequiredTrimmed(host, nameof(host)),
             ValidPort(port, nameof(port)),
@@ -63,8 +72,8 @@ public sealed record SshProfile
             RequiredTrimmed(targetHost, nameof(targetHost)),
             ValidPort(targetPort, nameof(targetPort)),
             credentialReference,
-            OptionalTrimmed(pinnedHostKeyAlgorithm),
-            OptionalTrimmed(pinnedHostKeySha256));
+            normalizedPinnedHostKeyAlgorithm,
+            normalizedPinnedHostKeySha256);
     }
 
     private static string RequiredTrimmed(string value, string parameterName)

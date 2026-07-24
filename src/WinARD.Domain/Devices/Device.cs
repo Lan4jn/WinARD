@@ -25,12 +25,14 @@ public sealed record Device
             throw new ArgumentException("Device ID cannot be empty.", nameof(id));
         }
 
-        if (updatedUtc < createdUtc)
+        var normalizedCreatedUtc = createdUtc.ToUniversalTime();
+        var normalizedUpdatedUtc = updatedUtc.ToUniversalTime();
+        if (normalizedUpdatedUtc < normalizedCreatedUtc)
         {
             throw new ArgumentException("Updated time cannot be earlier than created time.", nameof(updatedUtc));
         }
 
-        return new Device(id, RequiredTrimmed(displayName, nameof(displayName)), createdUtc, updatedUtc);
+        return new Device(id, RequiredTrimmed(displayName, nameof(displayName)), normalizedCreatedUtc, normalizedUpdatedUtc);
     }
 
     private static string RequiredTrimmed(string value, string parameterName)

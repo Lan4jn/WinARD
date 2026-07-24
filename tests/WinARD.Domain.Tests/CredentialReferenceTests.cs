@@ -28,4 +28,26 @@ public sealed class CredentialReferenceTests
         Assert.DoesNotContain(' ', value);
         Assert.Equal(value, reference.ToString());
     }
+
+    [Theory]
+    [InlineData("windows")]
+    [InlineData("local-store.1")]
+    [InlineData("store-1")]
+    public void Create_accepts_valid_uri_authority_tokens(string store)
+    {
+        var reference = CredentialReference.Create(store, "mac-device-1");
+
+        Assert.True(new Uri(reference.ToString(), UriKind.Absolute).IsAbsoluteUri);
+    }
+
+    [Theory]
+    [InlineData("with space")]
+    [InlineData("store/path")]
+    [InlineData("store%value")]
+    [InlineData("store_日本")]
+    [InlineData("...")]
+    public void Create_rejects_invalid_uri_authority_tokens(string store)
+    {
+        Assert.Throws<ArgumentException>(() => CredentialReference.Create(store, "key"));
+    }
 }

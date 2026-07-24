@@ -19,11 +19,13 @@ public sealed record WinArdError
     public string CorrelationId { get; }
 
     public static WinArdError Create(ConnectionStage stage, string code, string userMessage, string correlationId) =>
-        new(
-            stage,
-            RequiredTrimmed(code, nameof(code)),
-            RequiredTrimmed(userMessage, nameof(userMessage)),
-            RequiredTrimmed(correlationId, nameof(correlationId)));
+        Enum.IsDefined(stage)
+            ? new WinArdError(
+                stage,
+                RequiredTrimmed(code, nameof(code)),
+                RequiredTrimmed(userMessage, nameof(userMessage)),
+                RequiredTrimmed(correlationId, nameof(correlationId)))
+            : throw new ArgumentOutOfRangeException(nameof(stage), "Connection stage must be defined.");
 
     private static string RequiredTrimmed(string value, string parameterName)
     {

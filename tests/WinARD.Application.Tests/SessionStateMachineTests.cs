@@ -94,9 +94,51 @@ public sealed class SessionStateMachineTests
         Assert.Equal(next, machine.Current);
     }
 
+    [Fact]
+    public void MoveTo_all_state_combinations_match_transition_contract()
+    {
+        foreach (var current in Enum.GetValues<SessionState>())
+        {
+            foreach (var next in Enum.GetValues<SessionState>())
+            {
+                var machine = MoveTo(current);
+
+                if (IsAllowed(current, next))
+                {
+                    machine.MoveTo(next);
+                    Assert.Equal(next, machine.Current);
+                }
+                else
+                {
+                    Assert.Throws<InvalidOperationException>(() => machine.MoveTo(next));
+                    Assert.Equal(current, machine.Current);
+                }
+            }
+        }
+    }
+
     private static SessionStateMachine MoveTo(SessionState target)
     {
         var machine = new SessionStateMachine();
+        if (target == SessionState.Idle)
+        {
+            return machine;
+        }
+
+        if (target == SessionState.Disconnecting)
+        {
+            machine.MoveTo(SessionState.Resolving);
+            machine.MoveTo(SessionState.Disconnecting);
+            return machine;
+        }
+
+        if (target == SessionState.Failed)
+        {
+            machine.MoveTo(SessionState.Resolving);
+            machine.MoveTo(SessionState.Failed);
+            return machine;
+        }
+
         var path = new[]
         {
             SessionState.Resolving, SessionState.Connecting, SessionState.Negotiating,
@@ -115,4 +157,19 @@ public sealed class SessionStateMachineTests
 
         throw new ArgumentOutOfRangeException(nameof(target));
     }
+
+    private static bool IsAllowed(SessionState current, SessionState next) => (current, next) switch
+    {
+        (SessionState.Idle, SessionState.Resolving) => true,
+        (SessionState.Resolving, SessionState.Connecting or SessionState.Failed or SessionState.Disconnecting) => true,
+        (SessionState.Connecting, SessionState.Negotiating or SessionState.Failed or SessionState.Disconnecting) => true,
+        (SessionState.Negotiating, SessionState.Authenticating or SessionState.Failed or SessionState.Disconnecting) => true,
+        (SessionState.Authenticating, SessionState.Initializing or SessionState.Failed or SessionState.Disconnecting) => true,
+        (SessionState.Initializing, SessionState.Connected or SessionState.Failed or SessionState.Disconnecting) => true,
+        (SessionState.Connected, SessionState.Reconnecting or SessionState.Disconnecting or SessionState.Failed) => true,
+        (SessionState.Reconnecting, SessionState.Connecting or SessionState.Disconnecting or SessionState.Failed) => true,
+        (SessionState.Disconnecting, SessionState.Idle) => true,
+        (SessionState.Failed, SessionState.Resolving or SessionState.Idle) => true,
+        _ => false,
+    };
 }

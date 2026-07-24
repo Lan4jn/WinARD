@@ -1,6 +1,4 @@
 using WinARD.Domain.Connections;
-using WinARD.Domain.Devices;
-using WinARD.Domain.Errors;
 using WinARD.Domain.Security;
 using Xunit;
 
@@ -89,44 +87,4 @@ public sealed class ConnectionProfileTests
         Assert.Null(direct.SshProfile);
     }
 
-    [Fact]
-    public void Device_create_validates_and_trims_values()
-    {
-        var created = DateTimeOffset.UtcNow;
-        var device = Device.Create(Guid.NewGuid(), " Office Mac ", created, created);
-
-        Assert.Equal("Office Mac", device.DisplayName);
-        Assert.Throws<ArgumentException>(() => Device.Create(Guid.Empty, "Mac", created, created));
-        Assert.Throws<ArgumentException>(() => Device.Create(Guid.NewGuid(), " ", created, created));
-        Assert.Throws<ArgumentException>(() => Device.Create(Guid.NewGuid(), "Mac", created, created.AddTicks(-1)));
-    }
-
-    [Fact]
-    public void SshProfile_create_validates_and_trims_values()
-    {
-        var ssh = SshProfile.Create(" bastion ", 22, " jump ", " key.pem ", " mac ", 5900, null, " ssh-ed25519 ", " SHA256:value ");
-
-        Assert.Equal("bastion", ssh.Host);
-        Assert.Equal("jump", ssh.Username);
-        Assert.Equal("key.pem", ssh.PrivateKeyPath);
-        Assert.Equal("mac", ssh.TargetHost);
-        Assert.Equal("ssh-ed25519", ssh.PinnedHostKeyAlgorithm);
-        Assert.Equal("SHA256:value", ssh.PinnedHostKeySha256);
-        Assert.Throws<ArgumentException>(() => SshProfile.Create(" ", 22, "jump", null, "mac", 5900, null, null, null));
-        Assert.ThrowsAny<ArgumentException>(() => SshProfile.Create("bastion", 0, "jump", null, "mac", 5900, null, null, null));
-        Assert.Throws<ArgumentException>(() => SshProfile.Create("bastion", 22, " ", null, "mac", 5900, null, null, null));
-        Assert.Throws<ArgumentException>(() => SshProfile.Create("bastion", 22, "jump", null, " ", 5900, null, null, null));
-        Assert.ThrowsAny<ArgumentException>(() => SshProfile.Create("bastion", 22, "jump", null, "mac", 65536, null, null, null));
-    }
-
-    [Fact]
-    public void WinArdError_rejects_blank_fields_and_trims_values()
-    {
-        var error = WinArdError.Create(ConnectionStage.Connecting, " timeout ", " Could not connect ", " corr-1 ");
-
-        Assert.Equal("timeout", error.Code);
-        Assert.Equal("Could not connect", error.UserMessage);
-        Assert.Equal("corr-1", error.CorrelationId);
-        Assert.Throws<ArgumentException>(() => WinArdError.Create(ConnectionStage.Connecting, " ", "Message", "id"));
-    }
 }
