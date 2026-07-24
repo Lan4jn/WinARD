@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Numerics;
 using System.Reflection;
 using System.Text;
+using WinARD.ProtocolProbe;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Handshake;
@@ -405,6 +406,42 @@ public sealed class ArdAuthenticatorTests
         Assert.DoesNotContain(testPassword, exception.ToString(), StringComparison.Ordinal);
     }
 
+    [Theory]
+    [MemberData(nameof(CompositeCredentialLeakCases))]
+    public async Task Discards_remote_reason_when_redaction_recomposes_a_complete_credential(
+        string testUsername,
+        string testPassword,
+        string remoteReason)
+    {
+        await using var server = ArdServerFixture.Create(
+            securityResult: 7,
+            reasonBytes: Encoding.UTF8.GetBytes(remoteReason));
+        using var username = SecretMaterial.FromUtf8(testUsername);
+        using var password = SecretMaterial.FromUtf8(testPassword);
+
+        var exception = await Assert.ThrowsAsync<ArdAuthenticationRejectedException>(() =>
+            new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                server.ClientStream,
+                RfbVersion.V3_8,
+                username,
+                password,
+                CancellationToken.None));
+        var probeOutput = ProbeOutput.FormatFailure(exception);
+        var compositeCredential = testUsername.Contains("[REDACTED]", StringComparison.Ordinal)
+            ? testUsername
+            : testPassword;
+
+        Assert.Equal(7u, exception.ResultCode);
+        Assert.True(string.IsNullOrEmpty(exception.Reason));
+        Assert.False(exception.IsReasonTruncated);
+        Assert.DoesNotContain(compositeCredential, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(remoteReason, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(compositeCredential, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(remoteReason, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(compositeCredential, probeOutput, StringComparison.Ordinal);
+        Assert.DoesNotContain(remoteReason, probeOutput, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task Preserves_result_code_when_rfb_38_reason_length_exceeds_limit()
     {
@@ -694,6 +731,14 @@ public sealed class ArdAuthenticatorTests
         {
             RfbVersion.V3_3,
             RfbVersion.V3_7,
+        };
+
+    public static TheoryData<string, string, string> CompositeCredentialLeakCases =>
+        new()
+        {
+            { "X", "abc[REDACTED]def", "abcXdef" },
+            { "abc[REDACTED]def", "X", "abcXdef" },
+            { "aa", "[REDACTED][REDACTED]a", "aaaaa" },
         };
 
     private static async Task AuthenticateWithEmptyCredentialsAsync(

@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.IO;
@@ -38,9 +39,12 @@ internal static class RfbFailureReasonReader
         try
         {
             redacted = Redact(reasonBytes, firstSecret.Span, secondSecret.Span);
-            return CreateSafeDisplayedReason(
+            var safeReason = CreateSafeDisplayedReason(
                 Encoding.UTF8.GetString(redacted.Bytes.AsSpan(0, redacted.Length)),
                 redacted.IsTruncated);
+            return ContainsSecretText(safeReason.Reason, firstSecret.Span, secondSecret.Span)
+                ? new RfbFailureReason(string.Empty, false)
+                : safeReason;
         }
         finally
         {
@@ -99,6 +103,31 @@ internal static class RfbFailureReasonReader
         }
 
         return matchLength;
+    }
+
+    private static bool ContainsSecretText(
+        string reason,
+        ReadOnlySpan<byte> firstSecret,
+        ReadOnlySpan<byte> secondSecret) =>
+        ContainsSecretText(reason, firstSecret) || ContainsSecretText(reason, secondSecret);
+
+    private static bool ContainsSecretText(string reason, ReadOnlySpan<byte> secret)
+    {
+        if (secret.IsEmpty)
+        {
+            return false;
+        }
+
+        var characters = new char[Encoding.UTF8.GetCharCount(secret)];
+        try
+        {
+            _ = Encoding.UTF8.GetChars(secret, characters);
+            return reason.AsSpan().IndexOf(characters, StringComparison.Ordinal) >= 0;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(characters.AsSpan()));
+        }
     }
 
     private static RfbFailureReason CreateSafeDisplayedReason(string decodedReason, bool isInputTruncated)
