@@ -19,19 +19,19 @@ public sealed class RfbReader
 
     public async ValueTask<byte> ReadByteAsync(CancellationToken cancellationToken)
     {
-        var bytes = await ReadBytesExactlyAsync(1, cancellationToken);
+        var bytes = await ReadBytesAsync(1, cancellationToken);
         return bytes[0];
     }
 
     public async ValueTask<ushort> ReadUInt16Async(CancellationToken cancellationToken)
     {
-        var bytes = await ReadBytesExactlyAsync(sizeof(ushort), cancellationToken);
+        var bytes = await ReadBytesAsync(sizeof(ushort), cancellationToken);
         return BinaryPrimitives.ReadUInt16BigEndian(bytes);
     }
 
     public async ValueTask<uint> ReadUInt32Async(CancellationToken cancellationToken)
     {
-        var bytes = await ReadBytesExactlyAsync(sizeof(uint), cancellationToken);
+        var bytes = await ReadBytesAsync(sizeof(uint), cancellationToken);
         return BinaryPrimitives.ReadUInt32BigEndian(bytes);
     }
 

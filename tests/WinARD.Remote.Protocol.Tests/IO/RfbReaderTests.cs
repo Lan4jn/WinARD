@@ -29,6 +29,52 @@ public sealed class RfbReaderTests
     }
 
     [Fact]
+    public async Task ReadUInt16_rejects_width_above_message_limit_without_reading()
+    {
+        var stream = new ThrowOnReadStream();
+        var reader = new RfbReader(stream, new ProtocolLimits(1, 1024));
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            reader.ReadUInt16Async(CancellationToken.None).AsTask());
+
+        Assert.Contains("2", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("1", exception.Message, StringComparison.Ordinal);
+        Assert.False(stream.ReadAttempted);
+    }
+
+    [Fact]
+    public async Task ReadUInt32_rejects_width_above_message_limit_without_reading()
+    {
+        var stream = new ThrowOnReadStream();
+        var reader = new RfbReader(stream, new ProtocolLimits(1, 1024));
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            reader.ReadUInt32Async(CancellationToken.None).AsTask());
+
+        Assert.Contains("4", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("1", exception.Message, StringComparison.Ordinal);
+        Assert.False(stream.ReadAttempted);
+    }
+
+    [Fact]
+    public async Task ReadUInt16_accepts_width_equal_to_message_limit()
+    {
+        await using var stream = new ChunkedReadStream([0x12, 0x34], 1);
+        var reader = new RfbReader(stream, new ProtocolLimits(2, 1024));
+
+        Assert.Equal((ushort)0x1234, await reader.ReadUInt16Async(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ReadUInt32_accepts_width_equal_to_message_limit()
+    {
+        await using var stream = new ChunkedReadStream([0x01, 0x02, 0x03, 0x04], 1);
+        var reader = new RfbReader(stream, new ProtocolLimits(4, 1024));
+
+        Assert.Equal(0x01020304u, await reader.ReadUInt32Async(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task ReadByte_reads_value()
     {
         await using var stream = new ChunkedReadStream([0xA5], 1);
@@ -71,6 +117,15 @@ public sealed class RfbReaderTests
     }
 
     [Fact]
+    public async Task ReadBytes_accepts_count_equal_to_message_limit()
+    {
+        await using var stream = new ChunkedReadStream([0xA5], 1);
+        var reader = new RfbReader(stream, new ProtocolLimits(1, 1024));
+
+        Assert.Equal([0xA5], await reader.ReadBytesAsync(1, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task ReadBytes_wraps_premature_end_of_stream()
     {
         await using var stream = new ChunkedReadStream([0x01], 1);
@@ -80,7 +135,9 @@ public sealed class RfbReaderTests
             reader.ReadBytesAsync(2, CancellationToken.None).AsTask());
 
         Assert.Contains("2", exception.Message, StringComparison.Ordinal);
-        Assert.IsType<EndOfStreamException>(exception.InnerException);
+        var innerException = Assert.IsType<EndOfStreamException>(exception.InnerException);
+        Assert.Contains("Expected 2 bytes", innerException.Message, StringComparison.Ordinal);
+        Assert.Contains("after 1 bytes", innerException.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -92,6 +149,31 @@ public sealed class RfbReaderTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             reader.ReadByteAsync(cancellation.Token).AsTask());
+    }
+
+    [Fact]
+    public async Task ReadByte_propagates_asynchronous_cancellation_to_stream()
+    {
+        var stream = new BlockingReadStream();
+        var reader = new RfbReader(stream, ProtocolLimits.Default);
+        using var cancellation = new CancellationTokenSource();
+
+        var readTask = reader.ReadByteAsync(cancellation.Token).AsTask();
+        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => readTask);
+        Assert.Equal(cancellation.Token, stream.ReceivedCancellationToken);
+    }
+
+    [Fact]
+    public void ChunkedReadStream_rejects_reads_after_disposal()
+    {
+        using var stream = new ChunkedReadStream([0x01], 1);
+        stream.Dispose();
+
+        Assert.False(stream.CanRead);
+        Assert.Throws<ObjectDisposedException>(() => stream.ReadByte());
     }
 
     [Fact]
