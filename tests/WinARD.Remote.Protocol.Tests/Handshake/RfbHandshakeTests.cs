@@ -19,13 +19,16 @@ public sealed class RfbHandshakeTests
     [InlineData("RFB 003.008\n")]
     public async Task Negotiates_supported_versions(string serverBanner)
     {
-        await using var server = FakeRfbServer.ForVersion(serverBanner, (byte)RfbSecurityType.AppleRemoteDesktop);
+        await using var server = serverBanner is "RFB 003.003\n"
+            ? FakeRfbServer.ForVersion(serverBanner, (uint)RfbSecurityType.AppleRemoteDesktop)
+            : FakeRfbServer.ForVersion(serverBanner, (byte)RfbSecurityType.AppleRemoteDesktop);
 
         var result = await RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None);
 
         Assert.Equal(serverBanner, server.ReceivedVersion);
         Assert.Equal(RfbSecurityType.AppleRemoteDesktop, result.SecurityType);
         Assert.Equal(serverBanner, result.Version.Banner);
+        Assert.Equal((byte)0xa5, await new RfbReader(server.ClientStream, ProtocolLimits.Default).ReadByteAsync(CancellationToken.None));
     }
 
     [Theory]
@@ -45,12 +48,13 @@ public sealed class RfbHandshakeTests
     [Fact]
     public async Task Negotiates_33_without_writing_a_security_selection()
     {
-        await using var server = FakeRfbServer.ForVersion("RFB 003.003\n", (byte)RfbSecurityType.AppleRemoteDesktop);
+        await using var server = FakeRfbServer.ForVersion("RFB 003.003\n", (uint)RfbSecurityType.AppleRemoteDesktop);
 
         var result = await RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None);
 
         Assert.Equal(RfbSecurityType.AppleRemoteDesktop, result.SecurityType);
         Assert.Equal(12, server.ReceivedBytes.Length);
+        Assert.Equal((byte)0xa5, await new RfbReader(server.ClientStream, ProtocolLimits.Default).ReadByteAsync(CancellationToken.None));
     }
 
     [Theory]
@@ -87,7 +91,7 @@ public sealed class RfbHandshakeTests
         var exception = await Assert.ThrowsAsync<RfbConnectionRejectedException>(() =>
             RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
 
-        Assert.Equal("Denied\nplease retry", exception.Reason);
+        Assert.Equal("Denied\\u000Aplease retry", exception.Reason);
         Assert.Contains("Denied", exception.Message, StringComparison.Ordinal);
     }
 
@@ -100,6 +104,68 @@ public sealed class RfbHandshakeTests
             RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
 
         Assert.Equal("No access", exception.Reason);
+    }
+
+    [Fact]
+    public async Task Escapes_control_characters_in_rejection_reason_and_message()
+    {
+        const string reason = "carriage\rline\nescape\u001bc0\u0001c1\u0085line\u2028paragraph\u2029bidi\u202Atail";
+        await using var server = FakeRfbServer.ForBytes(BuildRejection("RFB 003.008\n", reason));
+
+        var exception = await Assert.ThrowsAsync<RfbConnectionRejectedException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        const string expected = "carriage\\u000Dline\\u000Aescape\\u001Bc0\\u0001c1\\u0085line\\u2028paragraph\\u2029bidi\\u202Atail";
+        Assert.Equal(expected, exception.Reason);
+        Assert.Equal($"The server rejected the connection: {expected}", exception.Message);
+        Assert.DoesNotContain('\r', exception.Message);
+        Assert.DoesNotContain('\n', exception.Message);
+        Assert.DoesNotContain('\u001b', exception.Message);
+        Assert.DoesNotContain('\u0001', exception.Message);
+        Assert.DoesNotContain('\u0085', exception.Message);
+        Assert.DoesNotContain('\u2028', exception.Message);
+        Assert.DoesNotContain('\u2029', exception.Message);
+        Assert.DoesNotContain('\u202a', exception.Message);
+    }
+
+    [Fact]
+    public async Task Uses_replacement_character_for_invalid_utf8_rejection_reason()
+    {
+        await using var server = FakeRfbServer.ForBytes(BuildRejection("RFB 003.008\n", [0xc3, 0x28]));
+
+        var exception = await Assert.ThrowsAsync<RfbConnectionRejectedException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal("\ufffd(", exception.Reason);
+    }
+
+    [Fact]
+    public async Task Truncates_rejection_reason_at_a_rune_boundary_after_reading_all_payload()
+    {
+        var sourceReason = string.Concat(Enumerable.Repeat("😀", 4097));
+        var sourceBytes = Encoding.UTF8.GetBytes(sourceReason);
+        await using var server = FakeRfbServer.ForBytes(BuildRejection("RFB 003.008\n", sourceReason));
+
+        var exception = await Assert.ThrowsAsync<RfbConnectionRejectedException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.True(exception.IsReasonTruncated);
+        Assert.Equal(4096, exception.Reason.EnumerateRunes().Count());
+        Assert.Equal(string.Concat(Enumerable.Repeat("😀", 4096)), exception.Reason);
+        Assert.Contains("truncated", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(17 + sourceBytes.Length, server.ServerBytesRead);
+    }
+
+    [Fact]
+    public async Task Reports_an_empty_rejection_reason()
+    {
+        await using var server = FakeRfbServer.ForBytes(BuildRejection("RFB 003.008\n", string.Empty));
+
+        var exception = await Assert.ThrowsAsync<RfbConnectionRejectedException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(string.Empty, exception.Reason);
+        Assert.Equal("The server rejected the connection.", exception.Message);
     }
 
     [Theory]
@@ -117,6 +183,83 @@ public sealed class RfbHandshakeTests
         Assert.Throws<NotSupportedException>(() => offered[0] = 255);
         Assert.Equal(securityTypes.Select(value => (uint)value), exception.OfferedTypes);
         Assert.Equal(Encoding.ASCII.GetBytes(serverBanner), server.ReceivedBytes);
+    }
+
+    [Fact]
+    public async Task Reads_a_255_entry_security_list_and_selects_ard()
+    {
+        var securityTypes = Enumerable.Repeat((byte)1, 254).Append((byte)RfbSecurityType.AppleRemoteDesktop).ToArray();
+        await using var server = FakeRfbServer.ForVersion("RFB 003.008\n", securityTypes);
+
+        await RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None);
+
+        Assert.Equal((byte)0xa5, await new RfbReader(server.ClientStream, ProtocolLimits.Default).ReadByteAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public void Fake_server_rejects_a_256_entry_security_list()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            FakeRfbServer.ForVersion("RFB 003.008\n", new byte[256]));
+    }
+
+    [Fact]
+    public void Fake_server_requires_a_uint_security_type_for_rfb_33()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            FakeRfbServer.ForVersion("RFB 003.003\n", new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop }));
+    }
+
+    [Fact]
+    public async Task Fake_server_does_not_release_security_data_before_client_banner_is_verified()
+    {
+        await using var server = FakeRfbServer.ForVersion("RFB 003.008\n", (byte)RfbSecurityType.AppleRemoteDesktop);
+        var banner = new byte[12];
+        Assert.Equal(12, await server.ClientStream.ReadAsync(banner));
+
+        var security = new byte[1];
+        var pendingRead = server.ClientStream.ReadAsync(security).AsTask();
+        Assert.False(pendingRead.IsCompleted);
+
+        await server.ClientStream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+        Assert.Equal(1, await pendingRead.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(1, security[0]);
+    }
+
+    [Fact]
+    public async Task Fake_server_requires_37_selection_before_releasing_sentinel()
+    {
+        await using var server = FakeRfbServer.ForVersion("RFB 003.007\n", (byte)RfbSecurityType.AppleRemoteDesktop);
+        var banner = new byte[12];
+        await server.ClientStream.ReadExactlyAsync(banner);
+        await server.ClientStream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.007\n"));
+        var security = new byte[2];
+        await server.ClientStream.ReadExactlyAsync(security);
+
+        var sentinel = new byte[1];
+        var pendingRead = server.ClientStream.ReadAsync(sentinel).AsTask();
+        Assert.False(pendingRead.IsCompleted);
+
+        await server.ClientStream.WriteAsync(new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop });
+        Assert.Equal(1, await pendingRead.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal((byte)0xa5, sentinel[0]);
+    }
+
+    [Fact]
+    public async Task Fake_server_releases_33_sentinel_without_a_selection()
+    {
+        await using var server = FakeRfbServer.ForVersion("RFB 003.003\n", (uint)RfbSecurityType.AppleRemoteDesktop);
+        var banner = new byte[12];
+        await server.ClientStream.ReadExactlyAsync(banner);
+        await server.ClientStream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.003\n"));
+        var security = new byte[4];
+        await server.ClientStream.ReadExactlyAsync(security);
+
+        var sentinel = new byte[1];
+        Assert.Equal(1, await server.ClientStream.ReadAsync(sentinel));
+        Assert.Equal((byte)0xa5, sentinel[0]);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            server.ClientStream.WriteAsync(new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop }).AsTask());
     }
 
     [Theory]
@@ -157,12 +300,38 @@ public sealed class RfbHandshakeTests
     }
 
     [Fact]
+    public async Task Rejects_uint_max_rejection_reason_length_before_reading_payload()
+    {
+        var bytes = new List<byte>(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+        bytes.Add(0);
+        bytes.AddRange([0xff, 0xff, 0xff, 0xff]);
+        await using var server = FakeRfbServer.ForBytes(bytes.ToArray());
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(17, server.ServerBytesRead);
+    }
+
+    [Fact]
     public async Task Wraps_premature_end_of_stream_while_reading_reason()
     {
         var bytes = new List<byte>(Encoding.ASCII.GetBytes("RFB 003.008\n"));
         bytes.Add(0);
         bytes.AddRange([0, 0, 0, 3]);
         bytes.Add((byte)'x');
+        await using var server = FakeRfbServer.ForBytes(bytes.ToArray());
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Wraps_premature_end_of_stream_while_reading_security_type_list()
+    {
+        var bytes = new List<byte>(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+        bytes.Add(2);
+        bytes.Add(1);
         await using var server = FakeRfbServer.ForBytes(bytes.ToArray());
 
         await Assert.ThrowsAsync<RfbProtocolException>(() =>
@@ -219,10 +388,25 @@ public sealed class RfbHandshakeTests
         Assert.False(server.IsDisposed);
     }
 
-    private static byte[] BuildRejection(string versionBanner, string reason)
+    [Fact]
+    public async Task Staged_handshake_sequencing_is_reliable_across_repeated_runs()
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            await using var server = FakeRfbServer.ForVersion("RFB 003.008\n", (byte)RfbSecurityType.AppleRemoteDesktop);
+
+            await RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None);
+
+            Assert.Equal((byte)0xa5, await new RfbReader(server.ClientStream, ProtocolLimits.Default).ReadByteAsync(CancellationToken.None));
+        }
+    }
+
+    private static byte[] BuildRejection(string versionBanner, string reason) =>
+        BuildRejection(versionBanner, Encoding.UTF8.GetBytes(reason));
+
+    private static byte[] BuildRejection(string versionBanner, byte[] reasonBytes)
     {
         var bytes = new List<byte>(Encoding.ASCII.GetBytes(versionBanner));
-        var reasonBytes = Encoding.UTF8.GetBytes(reason);
         if (versionBanner is "RFB 003.003\n")
         {
             bytes.AddRange([0, 0, 0, 0]);

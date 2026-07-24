@@ -9,9 +9,17 @@ public static class RfbHandshake
     private const int VersionBannerLength = 12;
     private const int MaximumDisplayedReasonLength = 4096;
 
+    /// <summary>
+    /// Negotiates the RFB version and Apple Remote Desktop security type over a write-through transport stream.
+    /// This method never flushes or disposes <paramref name="stream" />.
+    /// </summary>
     public static Task<RfbHandshakeResult> NegotiateAsync(Stream stream, CancellationToken cancellationToken) =>
         NegotiateAsync(stream, ProtocolLimits.Default, cancellationToken);
 
+    /// <summary>
+    /// Negotiates the RFB version and Apple Remote Desktop security type over a write-through transport stream.
+    /// This method never flushes or disposes <paramref name="stream" />.
+    /// </summary>
     public static async Task<RfbHandshakeResult> NegotiateAsync(
         Stream stream,
         ProtocolLimits limits,
@@ -88,13 +96,42 @@ public static class RfbHandshake
         }
 
         var reasonBytes = await reader.ReadBytesAsync((int)reasonLength, cancellationToken);
-        var reason = Encoding.UTF8.GetString(reasonBytes);
-        var isReasonTruncated = reason.Length > MaximumDisplayedReasonLength;
-        if (isReasonTruncated)
-        {
-            reason = reason[..MaximumDisplayedReasonLength];
-        }
+        var (reason, isReasonTruncated) = CreateSafeDisplayedReason(Encoding.UTF8.GetString(reasonBytes));
 
         return new RfbConnectionRejectedException(version, reason, isReasonTruncated);
     }
+
+    private static (string Reason, bool IsTruncated) CreateSafeDisplayedReason(string decodedReason)
+    {
+        var builder = new StringBuilder(Math.Min(decodedReason.Length, MaximumDisplayedReasonLength));
+        var runeCount = 0;
+        foreach (var rune in decodedReason.EnumerateRunes())
+        {
+            if (runeCount == MaximumDisplayedReasonLength)
+            {
+                return (builder.ToString(), true);
+            }
+
+            if (IsUnsafeDisplayRune(rune))
+            {
+                builder.Append("\\u");
+                builder.Append(rune.Value.ToString("X4", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                builder.Append(rune.ToString());
+            }
+
+            runeCount++;
+        }
+
+        return (builder.ToString(), false);
+    }
+
+    private static bool IsUnsafeDisplayRune(Rune rune) =>
+        Rune.GetUnicodeCategory(rune) is
+            System.Globalization.UnicodeCategory.Control or
+            System.Globalization.UnicodeCategory.Format or
+            System.Globalization.UnicodeCategory.LineSeparator or
+            System.Globalization.UnicodeCategory.ParagraphSeparator;
 }
