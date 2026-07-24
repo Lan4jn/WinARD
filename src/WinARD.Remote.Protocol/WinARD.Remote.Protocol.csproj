@@ -1,2 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <InternalsVisibleTo Include="WinARD.Remote.Protocol.Tests" />
+  </ItemGroup>
 </Project>

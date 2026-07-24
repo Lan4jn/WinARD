@@ -16,6 +16,36 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 public sealed class ProtocolProbeTests
 {
     [Fact]
+    public void Hidden_password_ctrl_c_throws_and_restores_console_state()
+    {
+        var console = new FakePasswordConsole(
+            treatControlCAsInput: false,
+            new ConsoleKeyInfo('\u0003', ConsoleKey.C, shift: false, alt: false, control: true));
+
+        Assert.Throws<OperationCanceledException>(() => HiddenPasswordReader.Read(console, CancellationToken.None));
+
+        Assert.False(console.TreatControlCAsInput);
+        Assert.Equal([true, false], console.TreatControlCAsInputAssignments);
+    }
+
+    [Fact]
+    public void Hidden_password_reads_normally_and_restores_existing_console_state()
+    {
+        var console = new FakePasswordConsole(
+            treatControlCAsInput: true,
+            new ConsoleKeyInfo('p', ConsoleKey.P, shift: false, alt: false, control: false),
+            new ConsoleKeyInfo('\r', ConsoleKey.Enter, shift: false, alt: false, control: false));
+
+        using var password = HiddenPasswordReader.Read(console, CancellationToken.None);
+        var copy = new byte[password!.Length];
+        password.CopyTo(copy);
+
+        Assert.Equal("p", Encoding.UTF8.GetString(copy));
+        Assert.True(console.TreatControlCAsInput);
+        Assert.Equal([true, true], console.TreatControlCAsInputAssignments);
+    }
+
+    [Fact]
     public async Task Overall_timeout_bounds_banner_challenge_and_result_silence_across_repeated_runs()
     {
         for (var attempt = 0; attempt < 10; attempt++)
@@ -198,5 +228,37 @@ public sealed class ProtocolProbeTests
         Banner,
         Challenge,
         Result,
+    }
+
+    private sealed class FakePasswordConsole(
+        bool treatControlCAsInput,
+        params ConsoleKeyInfo[] keys) : IPasswordConsole
+    {
+        private readonly Queue<ConsoleKeyInfo> _keys = new(keys);
+        private bool _treatControlCAsInput = treatControlCAsInput;
+
+        public List<bool> TreatControlCAsInputAssignments { get; } = [];
+
+        public bool IsInputRedirected => false;
+
+        public bool TreatControlCAsInput
+        {
+            get => _treatControlCAsInput;
+            set
+            {
+                TreatControlCAsInputAssignments.Add(value);
+                _treatControlCAsInput = value;
+            }
+        }
+
+        public ConsoleKeyInfo ReadKey(bool intercept) => _keys.Dequeue();
+
+        public void Write(string value)
+        {
+        }
+
+        public void WriteLine()
+        {
+        }
     }
 }

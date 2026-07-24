@@ -1,5 +1,3 @@
-using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using WinARD.ProtocolProbe;
 using WinARD.Remote.Protocol.Authentication;
 
@@ -27,7 +25,7 @@ internal static class Program
             }
 
             using var username = SecretMaterial.FromUtf8(usernameText);
-            using var password = ReadHiddenPassword(cancellation.Token);
+            using var password = HiddenPasswordReader.Read(new SystemPasswordConsole(), cancellation.Token);
             if (password is null)
             {
                 PrintUsage();
@@ -82,60 +80,6 @@ internal static class Program
         }
 
         return int.TryParse(value, out port) && port is >= 1 and <= ushort.MaxValue;
-    }
-
-    private static SecretMaterial? ReadHiddenPassword(CancellationToken cancellationToken)
-    {
-        if (Console.IsInputRedirected)
-        {
-            return null;
-        }
-
-        var characters = new char[256];
-        var length = 0;
-        Console.Write("Password: ");
-        try
-        {
-            while (true)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var key = Console.ReadKey(intercept: true);
-                if (key.Key == ConsoleKey.Enter)
-                {
-                    Console.WriteLine();
-                    return SecretMaterial.FromUtf8(characters.AsSpan(0, length));
-                }
-
-                if (key.Key == ConsoleKey.Backspace)
-                {
-                    if (length > 0)
-                    {
-                        characters[--length] = '\0';
-                    }
-
-                    continue;
-                }
-
-                if (key.Key == ConsoleKey.C && key.Modifiers.HasFlag(ConsoleModifiers.Control))
-                {
-                    throw new OperationCanceledException(cancellationToken);
-                }
-
-                if (!char.IsControl(key.KeyChar))
-                {
-                    if (length == characters.Length)
-                    {
-                        throw new ArgumentException("Password input is too long.");
-                    }
-
-                    characters[length++] = key.KeyChar;
-                }
-            }
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(characters.AsSpan()));
-        }
     }
 
     private static void PrintUsage() =>

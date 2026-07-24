@@ -442,6 +442,96 @@ public sealed class ArdAuthenticatorTests
         Assert.DoesNotContain(remoteReason, probeOutput, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [MemberData(nameof(NonAsciiCredentialReasonCases))]
+    public async Task Discards_remote_reason_without_decoding_when_either_credential_is_non_ascii(
+        string testUsername,
+        string testPassword,
+        string remoteReason)
+    {
+        var reasonBytes = Encoding.UTF8.GetBytes(remoteReason);
+        await using var server = ArdServerFixture.Create(securityResult: 23, reasonBytes: reasonBytes);
+        using var username = SecretMaterial.FromUtf8(testUsername);
+        using var password = SecretMaterial.FromUtf8(testPassword);
+
+        var exception = await Assert.ThrowsAsync<ArdAuthenticationRejectedException>(() =>
+            new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                server.ClientStream,
+                RfbVersion.V3_8,
+                username,
+                password,
+                CancellationToken.None));
+        var probeOutput = ProbeOutput.FormatFailure(exception);
+        var nonAsciiSecret = testUsername.Any(character => character > 0x7f)
+            ? testUsername
+            : testPassword;
+
+        Assert.Equal(23u, exception.ResultCode);
+        Assert.Equal(string.Empty, exception.Reason);
+        Assert.False(exception.IsReasonTruncated);
+        Assert.Equal(
+            4 + (2 * server.KeyLength) + sizeof(uint) + sizeof(uint) + reasonBytes.Length,
+            server.ServerBytesRead);
+        Assert.DoesNotContain(remoteReason, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(remoteReason, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(remoteReason, probeOutput, StringComparison.Ordinal);
+        Assert.DoesNotContain(nonAsciiSecret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(nonAsciiSecret, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(nonAsciiSecret, probeOutput, StringComparison.Ordinal);
+        Assert.Equal("Apple Remote Desktop authentication was rejected (result 23).", exception.Message);
+    }
+
+    [Fact]
+    public async Task Discards_remote_reason_when_invalid_utf8_replacement_recomposes_a_credential()
+    {
+        await using var server = ArdServerFixture.Create(
+            securityResult: 7,
+            reasonBytes: [0xc3, (byte)'X', (byte)'(']);
+        using var username = SecretMaterial.FromUtf8("X");
+        using var password = SecretMaterial.FromUtf8("�[REDACTED](");
+
+        var exception = await Assert.ThrowsAsync<ArdAuthenticationRejectedException>(() =>
+            new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                server.ClientStream,
+                RfbVersion.V3_8,
+                username,
+                password,
+                CancellationToken.None));
+
+        Assert.Equal(string.Empty, exception.Reason);
+        Assert.Equal("Apple Remote Desktop authentication was rejected (result 7).", exception.Message);
+    }
+
+    [Fact]
+    public async Task Composite_fail_closed_path_does_not_materialize_a_reason_string()
+    {
+        await using var server = ArdServerFixture.Create(
+            securityResult: 7,
+            reasonBytes: Encoding.UTF8.GetBytes("abcXdef"));
+        using var username = SecretMaterial.FromUtf8("X");
+        using var password = SecretMaterial.FromUtf8("abc[REDACTED]def");
+        var materializationCount = 0;
+        RfbFailureReasonReader.MaterializationObserver = () => materializationCount++;
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<ArdAuthenticationRejectedException>(() =>
+                new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                    server.ClientStream,
+                    RfbVersion.V3_8,
+                    username,
+                    password,
+                    CancellationToken.None));
+
+            Assert.Equal(string.Empty, exception.Reason);
+            Assert.Equal(0, materializationCount);
+        }
+        finally
+        {
+            RfbFailureReasonReader.MaterializationObserver = null;
+        }
+    }
+
     [Fact]
     public async Task Preserves_result_code_when_rfb_38_reason_length_exceeds_limit()
     {
@@ -501,7 +591,8 @@ public sealed class ArdAuthenticatorTests
             AuthenticateWithEmptyCredentialsAsync(server.ClientStream));
 
         Assert.True(exception.IsReasonTruncated);
-        Assert.Equal(4096, exception.Reason!.EnumerateRunes().Count());
+        Assert.Equal(4096, exception.Reason!.Length);
+        Assert.Equal(2048, exception.Reason.EnumerateRunes().Count());
         Assert.Equal(4 + (2 * server.KeyLength) + sizeof(uint) + sizeof(uint) + reasonBytes.Length, server.ServerBytesRead);
     }
 
@@ -739,6 +830,17 @@ public sealed class ArdAuthenticatorTests
             { "X", "abc[REDACTED]def", "abcXdef" },
             { "abc[REDACTED]def", "X", "abcXdef" },
             { "aa", "[REDACTED][REDACTED]a", "aaaaa" },
+            { "X", "a[REDACTED]b", "aXb" },
+            { "X", "\\u001B[REDACTED]", "\u001bX" },
+        };
+
+    public static TheoryData<string, string, string> NonAsciiCredentialReasonCases =>
+        new()
+        {
+            { "user", "é", "Denied e\u0301" },
+            { "user", "e\u0301", "Denied é" },
+            { "user", "a\u0301\u0327", "Denied á\u0327" },
+            { "usér", "password", "Denied use\u0301r" },
         };
 
     private static async Task AuthenticateWithEmptyCredentialsAsync(

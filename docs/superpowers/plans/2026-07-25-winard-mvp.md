@@ -492,17 +492,18 @@ public interface ISecretMaterial : IDisposable
 
 - [ ] **步骤 4：用 ProtocolProbe 验证真实 Mac**
 
-`ProtocolProbe` 从环境变量读取地址与用户名，从隐藏控制台输入读取密码，成功时只输出协商版本、安全类型和桌面尺寸。
+`ProtocolProbe` 从 `WINARD_HOST`、可选的 `WINARD_PORT` 和 `WINARD_USERNAME` 读取连接信息，未设置时在交互式控制台提示输入。密码始终通过隐藏的交互式控制台输入读取。任务 5 只验证 RFB 协商与 ARD 认证，不读取 `ServerInit` 或桌面尺寸。
 
 运行：
 
 ```powershell
-$env:WINARD_TEST_MAC_HOST=Read-Host 'Mac host or IP'
-$env:WINARD_TEST_MAC_USER=Read-Host 'macOS username'
+$env:WINARD_HOST=Read-Host 'Mac host or IP'
+$env:WINARD_USERNAME=Read-Host 'macOS username'
+# Optional: $env:WINARD_PORT=5900
 dotnet run --project tools/WinARD.ProtocolProbe
 ```
 
-预期：输出包含 `Security: AppleRemoteDesktop (30)`、`Authentication: success` 和非零桌面尺寸；输出中不出现密码。
+预期：输出包含 `Security: AppleRemoteDesktop (30)` 和 `Authentication: success`；输出中不出现密码。任务 5 不读取 `ServerInit`，因此不输出桌面尺寸。
 
 - [ ] **步骤 5：提交认证实现与协议记录**
 

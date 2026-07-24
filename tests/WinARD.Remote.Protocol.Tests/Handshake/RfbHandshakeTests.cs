@@ -178,8 +178,9 @@ public sealed class RfbHandshakeTests
             RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
 
         Assert.True(exception.IsReasonTruncated);
-        Assert.Equal(4096, exception.Reason.EnumerateRunes().Count());
-        Assert.Equal(string.Concat(Enumerable.Repeat("😀", 4096)), exception.Reason);
+        Assert.Equal(4096, exception.Reason.Length);
+        Assert.Equal(2048, exception.Reason.EnumerateRunes().Count());
+        Assert.Equal(string.Concat(Enumerable.Repeat("😀", 2048)), exception.Reason);
         Assert.Contains("truncated", exception.Message, StringComparison.Ordinal);
         Assert.Equal(17 + sourceBytes.Length, server.ServerBytesRead);
     }
