@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using WinARD.Remote.Protocol.Authentication;
@@ -19,6 +20,14 @@ internal interface IPasswordConsole
 
 internal static class HiddenPasswordReader
 {
+    private static readonly AsyncLocal<Action<char[], SecretMaterial?>?> CleanupObserverStorage = new();
+
+    internal static Action<char[], SecretMaterial?>? CleanupObserver
+    {
+        get => CleanupObserverStorage.Value;
+        set => CleanupObserverStorage.Value = value;
+    }
+
     public static SecretMaterial? Read(IPasswordConsole console, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(console);
@@ -30,6 +39,8 @@ internal static class HiddenPasswordReader
         var previousTreatControlCAsInput = console.TreatControlCAsInput;
         var characters = new char[256];
         var length = 0;
+        SecretMaterial? result = null;
+        ExceptionDispatchInfo? pendingException = null;
         console.Write("Password: ");
         try
         {
@@ -41,7 +52,8 @@ internal static class HiddenPasswordReader
                 if (key.Key == ConsoleKey.Enter)
                 {
                     console.WriteLine();
-                    return SecretMaterial.FromUtf8(characters.AsSpan(0, length));
+                    result = SecretMaterial.FromUtf8(characters.AsSpan(0, length));
+                    break;
                 }
 
                 if (key.Key == ConsoleKey.Backspace)
@@ -70,11 +82,28 @@ internal static class HiddenPasswordReader
                 }
             }
         }
+        catch (Exception exception)
+        {
+            pendingException = ExceptionDispatchInfo.Capture(exception);
+        }
         finally
         {
-            console.TreatControlCAsInput = previousTreatControlCAsInput;
             CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(characters.AsSpan()));
+            try
+            {
+                console.TreatControlCAsInput = previousTreatControlCAsInput;
+            }
+            catch (Exception exception)
+            {
+                result?.Dispose();
+                pendingException = ExceptionDispatchInfo.Capture(exception);
+            }
+
+            CleanupObserver?.Invoke(characters, result);
         }
+
+        pendingException?.Throw();
+        return result;
     }
 }
 

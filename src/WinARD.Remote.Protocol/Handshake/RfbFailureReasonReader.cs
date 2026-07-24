@@ -82,7 +82,7 @@ internal static class RfbFailureReasonReader
             safeCharacters = ArrayPool<char>.Shared.Rent(MaximumDisplayedReasonLength);
             var safeLength = Sanitize(
                 decodedCharacters.AsSpan(0, decodedLength),
-                safeCharacters,
+                safeCharacters.AsSpan(0, MaximumDisplayedReasonLength),
                 out var isDisplayTruncated);
             var safeSpan = safeCharacters.AsSpan(0, safeLength);
             if (ContainsSecretCharacters(safeSpan, firstSecret.Span, secondSecret.Span))

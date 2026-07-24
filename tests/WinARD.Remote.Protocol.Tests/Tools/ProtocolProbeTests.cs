@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using WinARD.ProtocolProbe;
 using WinARD.Remote.Protocol.Authentication;
@@ -21,11 +22,22 @@ public sealed class ProtocolProbeTests
         var console = new FakePasswordConsole(
             treatControlCAsInput: false,
             new ConsoleKeyInfo('\u0003', ConsoleKey.C, shift: false, alt: false, control: true));
+        char[]? characterStorage = null;
+        HiddenPasswordReader.CleanupObserver = (characters, _) => characterStorage = characters;
 
-        Assert.Throws<OperationCanceledException>(() => HiddenPasswordReader.Read(console, CancellationToken.None));
+        try
+        {
+            Assert.Throws<OperationCanceledException>(() => HiddenPasswordReader.Read(console, CancellationToken.None));
 
-        Assert.False(console.TreatControlCAsInput);
-        Assert.Equal([true, false], console.TreatControlCAsInputAssignments);
+            Assert.NotNull(characterStorage);
+            Assert.All(characterStorage, character => Assert.Equal('\0', character));
+            Assert.False(console.TreatControlCAsInput);
+            Assert.Equal([true, false], console.TreatControlCAsInputAssignments);
+        }
+        finally
+        {
+            HiddenPasswordReader.CleanupObserver = null;
+        }
     }
 
     [Fact]
@@ -35,14 +47,114 @@ public sealed class ProtocolProbeTests
             treatControlCAsInput: true,
             new ConsoleKeyInfo('p', ConsoleKey.P, shift: false, alt: false, control: false),
             new ConsoleKeyInfo('\r', ConsoleKey.Enter, shift: false, alt: false, control: false));
+        char[]? characterStorage = null;
+        HiddenPasswordReader.CleanupObserver = (characters, _) => characterStorage = characters;
 
-        using var password = HiddenPasswordReader.Read(console, CancellationToken.None);
-        var copy = new byte[password!.Length];
-        password.CopyTo(copy);
+        try
+        {
+            using var password = HiddenPasswordReader.Read(console, CancellationToken.None);
+            var copy = new byte[password!.Length];
+            password.CopyTo(copy);
 
-        Assert.Equal("p", Encoding.UTF8.GetString(copy));
-        Assert.True(console.TreatControlCAsInput);
-        Assert.Equal([true, true], console.TreatControlCAsInputAssignments);
+            Assert.Equal("p", Encoding.UTF8.GetString(copy));
+            Assert.NotNull(characterStorage);
+            Assert.All(characterStorage, character => Assert.Equal('\0', character));
+            Assert.True(console.TreatControlCAsInput);
+            Assert.Equal([true, true], console.TreatControlCAsInputAssignments);
+        }
+        finally
+        {
+            HiddenPasswordReader.CleanupObserver = null;
+        }
+    }
+
+    [Fact]
+    public void Hidden_password_zeroes_input_and_disposes_result_when_console_restore_throws()
+    {
+        var console = new FakePasswordConsole(
+            treatControlCAsInput: false,
+            new ConsoleKeyInfo('p', ConsoleKey.P, shift: false, alt: false, control: false),
+            new ConsoleKeyInfo('\r', ConsoleKey.Enter, shift: false, alt: false, control: false))
+        {
+            TreatControlCAsInputExceptionAssignment = 2,
+        };
+        char[]? characterStorage = null;
+        SecretMaterial? createdResult = null;
+        HiddenPasswordReader.CleanupObserver = (characters, result) =>
+        {
+            characterStorage = characters;
+            createdResult = result;
+        };
+
+        try
+        {
+            Assert.Throws<IOException>(() => HiddenPasswordReader.Read(console, CancellationToken.None));
+
+            Assert.NotNull(characterStorage);
+            Assert.All(characterStorage, character => Assert.Equal('\0', character));
+            Assert.NotNull(createdResult);
+            var field = typeof(SecretMaterial).GetField("_bytes", BindingFlags.Instance | BindingFlags.NonPublic);
+            var secretStorage = Assert.IsType<byte[]>(field!.GetValue(createdResult));
+            Assert.All(secretStorage, value => Assert.Equal(0, value));
+            Assert.Throws<ObjectDisposedException>(() => _ = createdResult.Length);
+            Assert.Equal([true, false], console.TreatControlCAsInputAssignments);
+        }
+        finally
+        {
+            HiddenPasswordReader.CleanupObserver = null;
+        }
+    }
+
+    [Fact]
+    public void Hidden_password_zeroes_input_and_restores_console_when_read_key_throws()
+    {
+        var console = new FakePasswordConsole(
+            treatControlCAsInput: false,
+            new ConsoleKeyInfo('p', ConsoleKey.P, shift: false, alt: false, control: false))
+        {
+            ReadKeyExceptionAfter = 1,
+        };
+        char[]? characterStorage = null;
+        HiddenPasswordReader.CleanupObserver = (characters, _) => characterStorage = characters;
+
+        try
+        {
+            Assert.Throws<IOException>(() => HiddenPasswordReader.Read(console, CancellationToken.None));
+
+            Assert.NotNull(characterStorage);
+            Assert.All(characterStorage, character => Assert.Equal('\0', character));
+            Assert.False(console.TreatControlCAsInput);
+            Assert.Equal([true, false], console.TreatControlCAsInputAssignments);
+        }
+        finally
+        {
+            HiddenPasswordReader.CleanupObserver = null;
+        }
+    }
+
+    [Fact]
+    public void Hidden_password_zeroes_input_and_restores_console_when_initial_state_change_throws()
+    {
+        var console = new FakePasswordConsole(treatControlCAsInput: false)
+        {
+            TreatControlCAsInputExceptionAssignment = 1,
+        };
+        char[]? characterStorage = null;
+        HiddenPasswordReader.CleanupObserver = (characters, _) => characterStorage = characters;
+
+        try
+        {
+            Assert.Throws<IOException>(() => HiddenPasswordReader.Read(console, CancellationToken.None));
+
+            Assert.NotNull(characterStorage);
+            Assert.All(characterStorage, character => Assert.Equal('\0', character));
+            Assert.False(console.TreatControlCAsInput);
+            Assert.Equal([true, false], console.TreatControlCAsInputAssignments);
+        }
+        finally
+        {
+            HiddenPasswordReader.CleanupObserver = null;
+        }
     }
 
     [Fact]
@@ -236,8 +348,13 @@ public sealed class ProtocolProbeTests
     {
         private readonly Queue<ConsoleKeyInfo> _keys = new(keys);
         private bool _treatControlCAsInput = treatControlCAsInput;
+        private int _readKeyCount;
 
         public List<bool> TreatControlCAsInputAssignments { get; } = [];
+
+        public int? TreatControlCAsInputExceptionAssignment { get; init; }
+
+        public int? ReadKeyExceptionAfter { get; init; }
 
         public bool IsInputRedirected => false;
 
@@ -247,11 +364,24 @@ public sealed class ProtocolProbeTests
             set
             {
                 TreatControlCAsInputAssignments.Add(value);
+                if (TreatControlCAsInputAssignments.Count == TreatControlCAsInputExceptionAssignment)
+                {
+                    throw new IOException("Simulated console state failure.");
+                }
+
                 _treatControlCAsInput = value;
             }
         }
 
-        public ConsoleKeyInfo ReadKey(bool intercept) => _keys.Dequeue();
+        public ConsoleKeyInfo ReadKey(bool intercept)
+        {
+            if (_readKeyCount++ == ReadKeyExceptionAfter)
+            {
+                throw new IOException("Simulated console read failure.");
+            }
+
+            return _keys.Dequeue();
+        }
 
         public void Write(string value)
         {
