@@ -7,8 +7,6 @@ namespace WinARD.Remote.Protocol.Handshake;
 public static class RfbHandshake
 {
     private const int VersionBannerLength = 12;
-    private const int MaximumDisplayedReasonLength = 4096;
-
     /// <summary>
     /// Negotiates the RFB version and Apple Remote Desktop security type over a write-through transport stream.
     /// This method never flushes or disposes <paramref name="stream" />.
@@ -88,50 +86,7 @@ public static class RfbHandshake
         ProtocolLimits limits,
         CancellationToken cancellationToken)
     {
-        var reasonLength = await reader.ReadUInt32Async(cancellationToken);
-        if (reasonLength > (uint)limits.MaxMessageBytes)
-        {
-            throw new RfbProtocolException(
-                $"Server rejection reason length {reasonLength} exceeds the configured limit of {limits.MaxMessageBytes} bytes.");
-        }
-
-        var reasonBytes = await reader.ReadBytesAsync((int)reasonLength, cancellationToken);
-        var (reason, isReasonTruncated) = CreateSafeDisplayedReason(Encoding.UTF8.GetString(reasonBytes));
-
-        return new RfbConnectionRejectedException(version, reason, isReasonTruncated);
+        var failure = await RfbFailureReasonReader.ReadAsync(reader, limits, cancellationToken);
+        return new RfbConnectionRejectedException(version, failure.Reason, failure.IsTruncated);
     }
-
-    private static (string Reason, bool IsTruncated) CreateSafeDisplayedReason(string decodedReason)
-    {
-        var builder = new StringBuilder(Math.Min(decodedReason.Length, MaximumDisplayedReasonLength));
-        var runeCount = 0;
-        foreach (var rune in decodedReason.EnumerateRunes())
-        {
-            if (runeCount == MaximumDisplayedReasonLength)
-            {
-                return (builder.ToString(), true);
-            }
-
-            if (IsUnsafeDisplayRune(rune))
-            {
-                builder.Append("\\u");
-                builder.Append(rune.Value.ToString("X4", System.Globalization.CultureInfo.InvariantCulture));
-            }
-            else
-            {
-                builder.Append(rune.ToString());
-            }
-
-            runeCount++;
-        }
-
-        return (builder.ToString(), false);
-    }
-
-    private static bool IsUnsafeDisplayRune(Rune rune) =>
-        Rune.GetUnicodeCategory(rune) is
-            System.Globalization.UnicodeCategory.Control or
-            System.Globalization.UnicodeCategory.Format or
-            System.Globalization.UnicodeCategory.LineSeparator or
-            System.Globalization.UnicodeCategory.ParagraphSeparator;
 }
