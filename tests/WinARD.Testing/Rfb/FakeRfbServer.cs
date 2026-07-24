@@ -172,6 +172,10 @@ public sealed class FakeRfbServer : IAsyncDisposable
         {
             ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
+            if (buffer.Length == 0)
+            {
+                return 0;
+            }
 
             while (true)
             {
@@ -181,6 +185,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
                         return ReadAvailable(_serverBanner, ref _bannerPosition, buffer, Phase.AwaitClientBanner);
                     case Phase.AwaitClientBanner:
                         await _clientBannerAccepted.Task.WaitAsync(StageTimeout, cancellationToken);
+                        ThrowIfDisposed();
                         _phase = Phase.Security;
                         continue;
                     case Phase.Security:
@@ -191,6 +196,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
                             _expectsSecuritySelection ? Phase.AwaitSecuritySelection : _exposesSentinel ? Phase.Sentinel : Phase.Finished);
                     case Phase.AwaitSecuritySelection:
                         await _securitySelectionAccepted.Task.WaitAsync(StageTimeout, cancellationToken);
+                        ThrowIfDisposed();
                         _phase = Phase.Sentinel;
                         continue;
                     case Phase.Sentinel:
@@ -233,9 +239,8 @@ public sealed class FakeRfbServer : IAsyncDisposable
             if (!IsDisposed)
             {
                 IsDisposed = true;
-                var exception = new ObjectDisposedException(nameof(ScriptedDuplexStream));
-                _clientBannerAccepted.TrySetException(exception);
-                _securitySelectionAccepted.TrySetException(exception);
+                _clientBannerAccepted.TrySetResult();
+                _securitySelectionAccepted.TrySetResult();
                 _written.Dispose();
             }
 

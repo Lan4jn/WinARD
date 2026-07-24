@@ -246,6 +246,60 @@ public sealed class RfbHandshakeTests
     }
 
     [Fact]
+    public async Task Fake_server_disposal_ends_a_read_waiting_for_client_banner()
+    {
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            await using var server = FakeRfbServer.ForVersion("RFB 003.008\n", (byte)RfbSecurityType.AppleRemoteDesktop);
+            await server.ClientStream.ReadExactlyAsync(new byte[12]);
+            var pendingRead = server.ClientStream.ReadAsync(new byte[1]).AsTask();
+
+            await server.DisposeAsync();
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => pendingRead.WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+    }
+
+    [Fact]
+    public async Task Fake_server_disposal_ends_a_read_waiting_for_security_selection()
+    {
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            await using var server = FakeRfbServer.ForVersion("RFB 003.008\n", (byte)RfbSecurityType.AppleRemoteDesktop);
+            await server.ClientStream.ReadExactlyAsync(new byte[12]);
+            await server.ClientStream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+            await server.ClientStream.ReadExactlyAsync(new byte[2]);
+            var pendingRead = server.ClientStream.ReadAsync(new byte[1]).AsTask();
+
+            await server.DisposeAsync();
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => pendingRead.WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+    }
+
+    [Fact]
+    public async Task Fake_server_returns_zero_for_an_empty_read_while_waiting_for_client_banner()
+    {
+        await using var server = FakeRfbServer.ForVersion("RFB 003.008\n", (byte)RfbSecurityType.AppleRemoteDesktop);
+        await server.ClientStream.ReadExactlyAsync(new byte[12]);
+
+        Assert.Equal(0, await server.ClientStream.ReadAsync(Memory<byte>.Empty).AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task Fake_server_returns_zero_for_an_empty_read_before_sentinel()
+    {
+        await using var server = FakeRfbServer.ForVersion("RFB 003.008\n", (byte)RfbSecurityType.AppleRemoteDesktop);
+        await server.ClientStream.ReadExactlyAsync(new byte[12]);
+        await server.ClientStream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+        await server.ClientStream.ReadExactlyAsync(new byte[2]);
+        await server.ClientStream.WriteAsync(new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop });
+
+        Assert.Equal(0, await server.ClientStream.ReadAsync(Memory<byte>.Empty).AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal((byte)0xa5, await new RfbReader(server.ClientStream, ProtocolLimits.Default).ReadByteAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Fake_server_releases_33_sentinel_without_a_selection()
     {
         await using var server = FakeRfbServer.ForVersion("RFB 003.003\n", (uint)RfbSecurityType.AppleRemoteDesktop);
@@ -391,7 +445,7 @@ public sealed class RfbHandshakeTests
     [Fact]
     public async Task Staged_handshake_sequencing_is_reliable_across_repeated_runs()
     {
-        for (var attempt = 0; attempt < 10; attempt++)
+        for (var attempt = 0; attempt < 20; attempt++)
         {
             await using var server = FakeRfbServer.ForVersion("RFB 003.008\n", (byte)RfbSecurityType.AppleRemoteDesktop);
 
