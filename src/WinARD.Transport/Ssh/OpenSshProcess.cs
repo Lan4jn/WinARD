@@ -311,21 +311,37 @@ public sealed class SystemOpenSshKeyScanLauncher : IOpenSshKeyScanLauncher
             stderr,
             waitForExit);
         var cleanupTimedOut = false;
-        if (!process.HasExited)
-        {
-            try
-            {
-                process.Kill(entireProcessTree: true);
-            }
-            catch (Exception exception)
-            {
-                AddFlattened(exceptions, exception);
-            }
-        }
-
         using var cleanupCancellation = new CancellationTokenSource(
             _limits.CleanupTimeout,
             _timeProvider);
+        var kill = Task.Run(
+            () => KillIfRunning(process),
+            CancellationToken.None);
+        try
+        {
+            if (kill.IsCompleted)
+            {
+                await kill.ConfigureAwait(false);
+            }
+            else
+            {
+                await kill
+                    .WaitAsync(cleanupCancellation.Token)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cleanupCancellation.IsCancellationRequested)
+        {
+            cleanupTimedOut = true;
+            ObserveFault(kill);
+            exceptions.Add(
+                new OpenSshProcessCleanupTimeoutException(_limits.CleanupTimeout));
+        }
+        catch (Exception exception)
+        {
+            AddFlattened(exceptions, exception);
+        }
+
         try
         {
             await process
@@ -381,6 +397,44 @@ public sealed class SystemOpenSshKeyScanLauncher : IOpenSshKeyScanLauncher
         }
 
         throw new AggregateException(exceptions);
+    }
+
+    private static void KillIfRunning(IOpenSshProcess process)
+    {
+        if (process.HasExited)
+        {
+            return;
+        }
+
+        try
+        {
+            process.Kill(entireProcessTree: true);
+        }
+        catch (Exception) when (HasExitedWithoutThrowing(process))
+        {
+        }
+    }
+
+    private static bool HasExitedWithoutThrowing(IOpenSshProcess process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ObserveFault(Task operation)
+    {
+        _ = operation.ContinueWith(
+            completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted |
+                TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private static async Task ObserveOperationTasksAsync(params Task[] operations)

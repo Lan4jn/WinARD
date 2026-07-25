@@ -130,6 +130,66 @@ public sealed class OpenSshProcessTests
     }
 
     [Fact]
+    public async Task Blocking_keyscan_kill_is_bounded_and_later_cleanup_still_runs()
+    {
+        using var killGate = new ManualResetEventSlim();
+        var process = new FakeProcess
+        {
+            StandardOutputSource = new MemoryStream(new byte[33]),
+            KillGate = killGate,
+        };
+        var launcher = new SystemOpenSshKeyScanLauncher(
+            new FakeLauncher(process),
+            new OpenSshKeyScanLimits(
+                maximumStandardOutputBytes: 32,
+                maximumStandardErrorBytes: 32,
+                cleanupTimeout: TimeSpan.FromMilliseconds(100)),
+            TimeProvider.System);
+
+        try
+        {
+            var scanTask = Task.Run(
+                () => launcher.ScanAsync(Start(), CancellationToken.None).AsTask(),
+                CancellationToken.None);
+            await process.KillStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            var aggregate = await Assert.ThrowsAsync<AggregateException>(
+                () => scanTask.WaitAsync(TimeSpan.FromSeconds(1)));
+
+            Assert.IsType<OpenSshOutputLimitExceededException>(
+                aggregate.InnerExceptions[0]);
+            Assert.Contains(
+                aggregate.InnerExceptions,
+                exception => exception is OpenSshProcessCleanupTimeoutException);
+            Assert.Equal(1, process.KillCount);
+            Assert.Equal(2, process.WaitCount);
+            Assert.Equal(1, process.DisposeCount);
+        }
+        finally
+        {
+            killGate.Set();
+        }
+    }
+
+    [Fact]
+    public async Task Keyscan_cleanup_ignores_the_has_exited_kill_race()
+    {
+        var process = new FakeProcess
+        {
+            StandardOutputSource = new MemoryStream(new byte[33]),
+            ExitBeforeKillException = true,
+            KillException = new InvalidOperationException("already exited"),
+        };
+        var launcher = CreateLauncher(process, maximumBytes: 32);
+
+        await Assert.ThrowsAsync<OpenSshOutputLimitExceededException>(
+            () => launcher.ScanAsync(Start(), CancellationToken.None).AsTask());
+
+        Assert.Equal(1, process.KillCount);
+        Assert.Equal(2, process.WaitCount);
+        Assert.Equal(1, process.DisposeCount);
+    }
+
+    [Fact]
     public async Task Nonzero_keyscan_exit_is_rejected_with_bounded_redacted_stderr()
     {
         var process = new FakeProcess
@@ -200,6 +260,13 @@ public sealed class OpenSshProcessTests
 
         public Exception? KillException { get; set; }
 
+        public ManualResetEventSlim? KillGate { get; set; }
+
+        public TaskCompletionSource KillStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool ExitBeforeKillException { get; set; }
+
         public Exception? CleanupWaitException { get; set; }
 
         public Exception? DisposeException { get; set; }
@@ -224,6 +291,13 @@ public sealed class OpenSshProcessTests
         public void Kill(bool entireProcessTree)
         {
             KillCount++;
+            KillStarted.TrySetResult();
+            KillGate?.Wait();
+            if (ExitBeforeKillException)
+            {
+                _exit.TrySetResult(-1);
+            }
+
             if (KillException is not null)
             {
                 throw KillException;
