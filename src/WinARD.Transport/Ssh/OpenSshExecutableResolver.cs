@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace WinARD.Transport.Ssh;
 
 public sealed record OpenSshExecutablePaths(
@@ -18,7 +20,7 @@ public enum OpenSshExecutableKind
 public sealed class WindowsOpenSshExecutableResolver
     : IOpenSshExecutableResolver
 {
-    private readonly string _windowsDirectory;
+    private readonly IWindowsSystemDirectoryProvider _systemDirectoryProvider;
     private readonly string? _configuredSshPath;
     private readonly string? _configuredKeyScanPath;
     private readonly Func<string, bool> _fileExists;
@@ -27,8 +29,7 @@ public sealed class WindowsOpenSshExecutableResolver
         string? configuredSshPath = null,
         string? configuredKeyScanPath = null)
         : this(
-            Environment.GetEnvironmentVariable("WINDIR") ??
-                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            new WindowsSystemDirectoryProvider(),
             configuredSshPath,
             configuredKeyScanPath,
             File.Exists)
@@ -36,19 +37,13 @@ public sealed class WindowsOpenSshExecutableResolver
     }
 
     internal WindowsOpenSshExecutableResolver(
-        string windowsDirectory,
+        IWindowsSystemDirectoryProvider systemDirectoryProvider,
         string? configuredSshPath,
         string? configuredKeyScanPath,
         Func<string, bool> fileExists)
     {
-        if (string.IsNullOrWhiteSpace(windowsDirectory))
-        {
-            throw new ArgumentException(
-                "The Windows directory cannot be blank.",
-                nameof(windowsDirectory));
-        }
-
-        _windowsDirectory = Path.GetFullPath(windowsDirectory);
+        _systemDirectoryProvider = systemDirectoryProvider ??
+            throw new ArgumentNullException(nameof(systemDirectoryProvider));
         _configuredSshPath = configuredSshPath;
         _configuredKeyScanPath = configuredKeyScanPath;
         _fileExists = fileExists ?? throw new ArgumentNullException(nameof(fileExists));
@@ -56,31 +51,41 @@ public sealed class WindowsOpenSshExecutableResolver
 
     public OpenSshExecutablePaths Resolve()
     {
-        var openSshDirectory = Path.Combine(
-            _windowsDirectory,
-            "System32",
-            "OpenSSH");
+        var needsSystemDirectory =
+            _configuredSshPath is null ||
+            _configuredKeyScanPath is null;
+        var openSshDirectory = needsSystemDirectory
+            ? Path.Combine(
+                _systemDirectoryProvider.GetSystemDirectory(),
+                "OpenSSH")
+            : null;
         return new OpenSshExecutablePaths(
             ResolveExecutable(
                 OpenSshExecutableKind.Ssh,
                 _configuredSshPath,
-                Path.Combine(openSshDirectory, "ssh.exe"),
+                openSshDirectory is null
+                    ? null
+                    : Path.Combine(openSshDirectory, "ssh.exe"),
                 "ssh.exe"),
             ResolveExecutable(
                 OpenSshExecutableKind.KeyScan,
                 _configuredKeyScanPath,
-                Path.Combine(openSshDirectory, "ssh-keyscan.exe"),
+                openSshDirectory is null
+                    ? null
+                    : Path.Combine(openSshDirectory, "ssh-keyscan.exe"),
                 "ssh-keyscan.exe"));
     }
 
     private string ResolveExecutable(
         OpenSshExecutableKind kind,
         string? configuredPath,
-        string defaultPath,
+        string? defaultPath,
         string expectedFileName)
     {
         var candidate = configuredPath is null
-            ? defaultPath
+            ? defaultPath ??
+                throw new InvalidOperationException(
+                    "A native OpenSSH system path was required but not resolved.")
             : ValidateConfiguredPath(configuredPath, expectedFileName);
         var fullPath = Path.GetFullPath(candidate);
         if (!_fileExists(fullPath))
@@ -114,6 +119,161 @@ public sealed class WindowsOpenSshExecutableResolver
         }
 
         return fullPath;
+    }
+}
+
+public interface IWindowsSystemDirectoryProvider
+{
+    string GetSystemDirectory();
+}
+
+internal interface IWindowsSystemDirectoryNativeApi
+{
+    bool IsWindows { get; }
+
+    uint GetSystemDirectory(char[] buffer, uint capacity);
+
+    int GetLastError();
+}
+
+public sealed class WindowsSystemDirectoryProvider
+    : IWindowsSystemDirectoryProvider
+{
+    private const int DefaultInitialBufferCapacity = 260;
+    private const int DefaultMaximumBufferCapacity = 32768;
+    private readonly IWindowsSystemDirectoryNativeApi _nativeApi;
+    private readonly int _initialBufferCapacity;
+    private readonly int _maximumBufferCapacity;
+
+    public WindowsSystemDirectoryProvider()
+        : this(
+            new WindowsSystemDirectoryNativeApi(),
+            DefaultInitialBufferCapacity,
+            DefaultMaximumBufferCapacity)
+    {
+    }
+
+    internal WindowsSystemDirectoryProvider(
+        IWindowsSystemDirectoryNativeApi nativeApi,
+        int initialBufferCapacity,
+        int maximumBufferCapacity)
+    {
+        _nativeApi = nativeApi ?? throw new ArgumentNullException(nameof(nativeApi));
+        if (initialBufferCapacity <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(initialBufferCapacity),
+                "Initial buffer capacity must be positive.");
+        }
+
+        if (maximumBufferCapacity < initialBufferCapacity)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumBufferCapacity),
+                "Maximum buffer capacity must not be smaller than the initial capacity.");
+        }
+
+        _initialBufferCapacity = initialBufferCapacity;
+        _maximumBufferCapacity = maximumBufferCapacity;
+    }
+
+    public string GetSystemDirectory()
+    {
+        if (!_nativeApi.IsWindows)
+        {
+            throw new OpenSshPlatformNotSupportedException();
+        }
+
+        var capacity = _initialBufferCapacity;
+        while (true)
+        {
+            var buffer = new char[capacity];
+            var result = _nativeApi.GetSystemDirectory(
+                buffer,
+                checked((uint)capacity));
+            if (result == 0)
+            {
+                throw new OpenSshSystemDirectoryException(
+                    _nativeApi.GetLastError());
+            }
+
+            if (result < capacity)
+            {
+                var path = new string(buffer, 0, checked((int)result));
+                if (string.IsNullOrWhiteSpace(path) ||
+                    !Path.IsPathFullyQualified(path) ||
+                    path.Any(char.IsControl))
+                {
+                    throw new OpenSshSystemDirectoryException(
+                        "GetSystemDirectoryW returned an invalid system directory.");
+                }
+
+                return Path.GetFullPath(path);
+            }
+
+            var requiredCapacity = result > int.MaxValue
+                ? int.MaxValue
+                : checked((int)result);
+            if (requiredCapacity <= capacity)
+            {
+                requiredCapacity = checked(capacity * 2);
+            }
+
+            if (requiredCapacity > _maximumBufferCapacity)
+            {
+                throw new OpenSshSystemDirectoryException(
+                    "GetSystemDirectoryW required a path buffer larger than the configured safety limit.");
+            }
+
+            capacity = requiredCapacity;
+        }
+    }
+}
+
+internal sealed class WindowsSystemDirectoryNativeApi
+    : IWindowsSystemDirectoryNativeApi
+{
+    public bool IsWindows => OperatingSystem.IsWindows();
+
+    public uint GetSystemDirectory(char[] buffer, uint capacity) =>
+        GetSystemDirectoryW(buffer, capacity);
+
+    public int GetLastError() => Marshal.GetLastWin32Error();
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "GetSystemDirectoryW",
+        ExactSpelling = true,
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern uint GetSystemDirectoryW(
+        [Out] char[] buffer,
+        uint capacity);
+}
+
+public sealed class OpenSshSystemDirectoryException : Exception
+{
+    public OpenSshSystemDirectoryException(int nativeErrorCode)
+        : base(
+            $"GetSystemDirectoryW failed with Win32 error {nativeErrorCode}.")
+    {
+        NativeErrorCode = nativeErrorCode;
+    }
+
+    public OpenSshSystemDirectoryException(string message)
+        : base(message)
+    {
+    }
+
+    public int NativeErrorCode { get; }
+}
+
+public sealed class OpenSshPlatformNotSupportedException
+    : PlatformNotSupportedException
+{
+    public OpenSshPlatformNotSupportedException()
+        : base("System OpenSSH discovery is supported only on Windows.")
+    {
     }
 }
 

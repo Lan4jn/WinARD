@@ -10,26 +10,27 @@ public sealed class OpenSshExecutableResolverTests
     [Fact]
     public void Default_resolver_uses_verified_absolute_System32_paths_not_current_directory_names()
     {
-        var windowsDirectory = Path.GetFullPath(@"C:\Trusted Windows");
+        var systemDirectory = Path.GetFullPath(@"C:\Trusted Windows\System32");
         var expectedSsh = Path.Combine(
-            windowsDirectory,
-            "System32",
+            systemDirectory,
             "OpenSSH",
             "ssh.exe");
         var expectedKeyScan = Path.Combine(
-            windowsDirectory,
-            "System32",
+            systemDirectory,
             "OpenSSH",
             "ssh-keyscan.exe");
         var maliciousCurrentDirectorySsh = Path.GetFullPath("ssh.exe");
+        var pollutedWindirSsh = Path.GetFullPath(
+            @"C:\Attacker Controlled\System32\OpenSSH\ssh.exe");
         var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             expectedSsh,
             expectedKeyScan,
             maliciousCurrentDirectorySsh,
+            pollutedWindirSsh,
         };
         var resolver = new WindowsOpenSshExecutableResolver(
-            windowsDirectory,
+            new FakeSystemDirectoryProvider(systemDirectory),
             configuredSshPath: null,
             configuredKeyScanPath: null,
             existing.Contains);
@@ -47,7 +48,8 @@ public sealed class OpenSshExecutableResolverTests
     public void Missing_system_executable_throws_a_stable_resolution_exception()
     {
         var resolver = new WindowsOpenSshExecutableResolver(
-            Path.GetFullPath(@"C:\Missing Windows"),
+            new FakeSystemDirectoryProvider(
+                Path.GetFullPath(@"C:\Missing Windows\System32")),
             configuredSshPath: null,
             configuredKeyScanPath: null,
             _ => false);
@@ -69,7 +71,8 @@ public sealed class OpenSshExecutableResolverTests
         string? configuredKeyScanPath)
     {
         var resolver = new WindowsOpenSshExecutableResolver(
-            Path.GetFullPath(@"C:\Windows"),
+            new FakeSystemDirectoryProvider(
+                Path.GetFullPath(@"C:\Windows\System32")),
             configuredSshPath,
             configuredKeyScanPath,
             _ => true);
@@ -91,5 +94,128 @@ public sealed class OpenSshExecutableResolverTests
 
         Assert.Equal(paths.KeyScanPath, start.FileName);
         Assert.Equal(["-T", "7", "-p", "2222", "jump.example"], start.Arguments);
+    }
+
+    [Fact]
+    public void Complete_administrator_overrides_do_not_require_the_native_system_directory()
+    {
+        var sshPath = Path.GetFullPath(@"C:\Managed OpenSSH\ssh.exe");
+        var keyScanPath = Path.GetFullPath(
+            @"C:\Managed OpenSSH\ssh-keyscan.exe");
+        var resolver = new WindowsOpenSshExecutableResolver(
+            new ThrowingSystemDirectoryProvider(),
+            sshPath,
+            keyScanPath,
+            _ => true);
+
+        var resolved = resolver.Resolve();
+
+        Assert.Equal(new OpenSshExecutablePaths(sshPath, keyScanPath), resolved);
+    }
+
+    [Fact]
+    public void Native_provider_resizes_the_buffer_using_GetSystemDirectoryW_result()
+    {
+        var native = new FakeNativeSystemDirectoryApi
+        {
+            SystemDirectory = Path.GetFullPath(
+                @"C:\A Windows Directory With A Long Name\System32"),
+        };
+        var provider = new WindowsSystemDirectoryProvider(
+            native,
+            initialBufferCapacity: 4,
+            maximumBufferCapacity: 1024);
+
+        var result = provider.GetSystemDirectory();
+
+        Assert.Equal(native.SystemDirectory, result);
+        Assert.Equal(2, native.CallCount);
+        Assert.True(native.RequestedCapacities[1] > native.RequestedCapacities[0]);
+    }
+
+    [Fact]
+    public void Native_provider_maps_GetSystemDirectoryW_failure_to_a_stable_exception()
+    {
+        var native = new FakeNativeSystemDirectoryApi
+        {
+            ReturnFailure = true,
+            LastError = 5,
+        };
+        var provider = new WindowsSystemDirectoryProvider(
+            native,
+            initialBufferCapacity: 16,
+            maximumBufferCapacity: 1024);
+
+        var exception = Assert.Throws<OpenSshSystemDirectoryException>(
+            provider.GetSystemDirectory);
+
+        Assert.Equal(5, exception.NativeErrorCode);
+    }
+
+    [Fact]
+    public void Native_provider_rejects_non_Windows_with_a_stable_exception()
+    {
+        var native = new FakeNativeSystemDirectoryApi
+        {
+            IsWindows = false,
+        };
+        var provider = new WindowsSystemDirectoryProvider(
+            native,
+            initialBufferCapacity: 16,
+            maximumBufferCapacity: 1024);
+
+        Assert.Throws<OpenSshPlatformNotSupportedException>(
+            provider.GetSystemDirectory);
+        Assert.Equal(0, native.CallCount);
+    }
+
+    private sealed class FakeSystemDirectoryProvider(string systemDirectory)
+        : IWindowsSystemDirectoryProvider
+    {
+        public string GetSystemDirectory() => systemDirectory;
+    }
+
+    private sealed class ThrowingSystemDirectoryProvider
+        : IWindowsSystemDirectoryProvider
+    {
+        public string GetSystemDirectory() =>
+            throw new InvalidOperationException("native provider should not be called");
+    }
+
+    private sealed class FakeNativeSystemDirectoryApi
+        : IWindowsSystemDirectoryNativeApi
+    {
+        public bool IsWindows { get; set; } = true;
+
+        public string SystemDirectory { get; set; } =
+            Path.GetFullPath(@"C:\Windows\System32");
+
+        public bool ReturnFailure { get; set; }
+
+        public int LastError { get; set; }
+
+        public int CallCount { get; private set; }
+
+        public List<uint> RequestedCapacities { get; } = [];
+
+        public uint GetSystemDirectory(char[] buffer, uint capacity)
+        {
+            CallCount++;
+            RequestedCapacities.Add(capacity);
+            if (ReturnFailure)
+            {
+                return 0;
+            }
+
+            if (SystemDirectory.Length >= capacity)
+            {
+                return checked((uint)SystemDirectory.Length + 1);
+            }
+
+            SystemDirectory.AsSpan().CopyTo(buffer);
+            return checked((uint)SystemDirectory.Length);
+        }
+
+        public int GetLastError() => LastError;
     }
 }

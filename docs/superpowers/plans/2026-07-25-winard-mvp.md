@@ -717,7 +717,7 @@ public interface IRemoteTransportFactory
 
 TCP 使用 `TcpClient.ConnectAsync(host, port, cancellationToken)`。SSH 使用受控的系统 OpenSSH 进程，通过 `ssh.exe -T -W <rfbHost>:<rfbPort>` 的 stdin/stdout 暴露双向流，不创建本地 TCP 监听端口。所有参数必须通过 `ProcessStartInfo.ArgumentList` 传入，并关闭 shell 执行。
 
-生产环境只从 `%WINDIR%\System32\OpenSSH` 解析 `ssh.exe` 与 `ssh-keyscan.exe`，或使用管理员显式配置且已验证存在、文件名匹配的绝对路径；不得从当前目录或 `PATH` 搜索同名程序。Authenticode 签名验证不在 Task 8 范围内，作为发布前供应链门禁记录。
+生产环境必须通过 Windows `GetSystemDirectoryW` 获取不受进程环境变量覆盖的原生 System32，再从其 `OpenSSH` 子目录解析 `ssh.exe` 与 `ssh-keyscan.exe`；也可使用管理员显式配置且已验证存在、文件名匹配的绝对路径。不得信任 `%WINDIR%`、当前目录或 `PATH` 搜索同名程序。Authenticode 签名验证不在 Task 8 范围内，作为发布前供应链门禁记录。
 
 连接前运行有界的 `ssh-keyscan.exe`，独立解析原始公钥并计算 SHA-256 指纹；首次未知返回“需要用户确认”，已变化返回“阻断”。只有端点、算法和原始公钥均与固定值匹配，才为本次连接创建端点专用的临时 `known_hosts`，并使用 `StrictHostKeyChecking=yes`，禁止读取或更新全局及用户 known_hosts。
 
