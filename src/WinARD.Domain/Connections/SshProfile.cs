@@ -13,7 +13,8 @@ public sealed record SshProfile
         int targetPort,
         CredentialReference? credentialReference,
         string? pinnedHostKeyAlgorithm,
-        string? pinnedHostKeySha256)
+        string? pinnedHostKeySha256,
+        SshHostKeyPin? hostKeyPin)
     {
         Host = host;
         Port = port;
@@ -24,6 +25,7 @@ public sealed record SshProfile
         CredentialReference = credentialReference;
         PinnedHostKeyAlgorithm = pinnedHostKeyAlgorithm;
         PinnedHostKeySha256 = pinnedHostKeySha256;
+        HostKeyPin = hostKeyPin;
     }
 
     public string Host { get; }
@@ -43,6 +45,8 @@ public sealed record SshProfile
     public string? PinnedHostKeyAlgorithm { get; }
 
     public string? PinnedHostKeySha256 { get; }
+
+    public SshHostKeyPin? HostKeyPin { get; }
 
     public static SshProfile Create(
         string host,
@@ -73,8 +77,38 @@ public sealed record SshProfile
             ValidPort(targetPort, nameof(targetPort)),
             credentialReference,
             normalizedPinnedHostKeyAlgorithm,
-            normalizedPinnedHostKeySha256);
+            normalizedPinnedHostKeySha256,
+            hostKeyPin: null);
     }
+
+    public SshProfile WithHostKeyPin(SshHostKeyPin pin)
+    {
+        ArgumentNullException.ThrowIfNull(pin);
+        return new SshProfile(
+            Host,
+            Port,
+            Username,
+            PrivateKeyPath,
+            TargetHost,
+            TargetPort,
+            CredentialReference,
+            pin.Algorithm,
+            pin.Fingerprint,
+            pin);
+    }
+
+    public SshProfile WithEndpoint(string host, int port) =>
+        new(
+            RequiredTrimmed(host, nameof(host)),
+            ValidPort(port, nameof(port)),
+            Username,
+            PrivateKeyPath,
+            TargetHost,
+            TargetPort,
+            CredentialReference,
+            PinnedHostKeyAlgorithm,
+            PinnedHostKeySha256,
+            HostKeyPin);
 
     private static string RequiredTrimmed(string value, string parameterName)
     {

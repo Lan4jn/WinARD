@@ -6,7 +6,7 @@
 
 **架构：** 采用 C#、.NET 8 和 WinUI 3。RFB/ARD 协议、传输、安全、持久化和 UI 通过小型接口隔离；先用模拟服务端和真实 Mac 验证协议，再接入设备库、Direct3D 渲染与发布打包。
 
-**技术栈：** C# 12、.NET 8、WinUI 3 / Windows App SDK 1.6、Direct3D 11、Microsoft.Data.Sqlite、SSH.NET、CommunityToolkit.Mvvm、xUnit、GitHub Actions。
+**技术栈：** C# 12、.NET 8、WinUI 3 / Windows App SDK 1.6、Direct3D 11、Microsoft.Data.Sqlite、Windows OpenSSH、CommunityToolkit.Mvvm、xUnit、GitHub Actions。
 
 ---
 
@@ -114,7 +114,6 @@ artifacts/
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
     <PackageVersion Include="Microsoft.Extensions.Logging" Version="8.0.1" />
     <PackageVersion Include="Microsoft.WindowsAppSDK" Version="1.6.250205002" />
-    <PackageVersion Include="SSH.NET" Version="2024.2.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.13.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.0.2" />
@@ -162,7 +161,6 @@ dotnet add tests/WinARD.Transport.Tests reference src/WinARD.Transport tests/Win
 dotnet add tests/WinARD.Security.Tests reference src/WinARD.Security tests/WinARD.Testing
 dotnet add tests/WinARD.Infrastructure.Tests reference src/WinARD.Infrastructure tests/WinARD.Testing
 dotnet add tests/WinARD.Desktop.Tests reference src/WinARD.Application tests/WinARD.Testing
-dotnet add src/WinARD.Transport package SSH.NET
 dotnet add src/WinARD.Security package Konscious.Security.Cryptography.Argon2
 dotnet add src/WinARD.Infrastructure package Microsoft.Data.Sqlite
 dotnet add src/WinARD.Infrastructure package Microsoft.Extensions.Logging
@@ -668,6 +666,9 @@ git commit -m "feat: add compressed frames input and clipboard"
 - 创建：`src/WinARD.Transport/Tcp/TcpRemoteTransport.cs`
 - 创建：`src/WinARD.Transport/Ssh/SshRemoteTransport.cs`
 - 创建：`src/WinARD.Transport/Ssh/SshHostKeyVerifier.cs`
+- 创建：`src/WinARD.Transport/Ssh/OpenSshCommand.cs`
+- 创建：`src/WinARD.Transport/Ssh/OpenSshKnownHosts.cs`
+- 创建：`src/WinARD.Transport/Ssh/OpenSshProcess.cs`
 - 创建：`src/WinARD.Transport/TransportTimeouts.cs`
 - 测试：`tests/WinARD.Transport.Tests/TcpRemoteTransportTests.cs`
 - 测试：`tests/WinARD.Transport.Tests/SshHostKeyVerifierTests.cs`
@@ -714,7 +715,13 @@ public interface IRemoteTransportFactory
 }
 ```
 
-TCP 使用 `TcpClient.ConnectAsync(host, port, cancellationToken)`。SSH.NET 连接事件必须校验算法与 SHA-256 指纹；首次未知返回“需要用户确认”，已变化返回“阻断”，只有已固定匹配才继续创建 direct-tcpip channel。
+TCP 使用 `TcpClient.ConnectAsync(host, port, cancellationToken)`。SSH 使用受控的系统 OpenSSH 进程，通过 `ssh.exe -T -W <rfbHost>:<rfbPort>` 的 stdin/stdout 暴露双向流，不创建本地 TCP 监听端口。所有参数必须通过 `ProcessStartInfo.ArgumentList` 传入，并关闭 shell 执行。
+
+连接前运行有界的 `ssh-keyscan.exe`，独立解析原始公钥并计算 SHA-256 指纹；首次未知返回“需要用户确认”，已变化返回“阻断”。只有端点、算法和原始公钥均与固定值匹配，才为本次连接创建端点专用的临时 `known_hosts`，并使用 `StrictHostKeyChecking=yes`，禁止读取或更新全局及用户 known_hosts。
+
+隧道就绪以 RFB 服务端会立即发送 banner 为前提：在同一个总连接截止时间内读取至少一个 stdout 字节，并通过前缀流把该字节回放给协议层。stderr 必须异步排空、脱敏并限制诊断摘要长度；取消、超时、远端拒绝和并发释放均须终止进程树并删除临时 known_hosts。
+
+密码及加密私钥口令不得进入命令行、环境变量、stdin、日志或异常。Task 8 只定义 askpass broker 边界并在存在凭据引用时明确报“不支持”；安全 askpass 集成和真实 OpenSSH 互操作验证作为 Task 9 的外部门槛。
 
 - [ ] **步骤 4：运行传输测试**
 
@@ -727,6 +734,17 @@ TCP 使用 `TcpClient.ConnectAsync(host, port, cancellationToken)`。SSH.NET 连
 ```powershell
 git add src/WinARD.Application src/WinARD.Transport tests/WinARD.Transport.Tests
 git commit -m "feat: add TCP and verified SSH transports"
+```
+
+- [ ] **步骤 6：将 SSH 传输重构为 OpenSSH stdio forwarding**
+
+运行：`dotnet test tests/WinARD.Transport.Tests`
+
+预期：OpenSSH 参数、host-key pin、首字节回放、共享截止时间、诊断脱敏和幂等清理测试全部 PASS，生产程序集不再引用 `Renci.SshNet`。
+
+```powershell
+git add Directory.Packages.props src/WinARD.Domain src/WinARD.Transport tests/WinARD.Transport.Tests docs/superpowers/plans/2026-07-25-winard-mvp.md
+git commit -m "refactor: use OpenSSH stdio forwarding for SSH transport"
 ```
 
 ## 任务 9：实现两种凭据后端

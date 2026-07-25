@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using WinARD.Domain.Connections;
 using WinARD.Transport.Ssh;
 using Xunit;
 
@@ -74,5 +75,92 @@ public sealed class SshHostKeyVerifierTests
         var result = SshHostKeyVerifier.Verify(unbracketed, "ssh-ed25519", hostKey, pin);
 
         Assert.Equal(SshHostKeyStatus.Trusted, result.Status);
+    }
+
+    [Fact]
+    public void Same_public_key_at_a_different_host_requires_confirmation()
+    {
+        var originalEndpoint = new SshHostKeyEndpoint("old.example", 22);
+        var editedEndpoint = new SshHostKeyEndpoint("new.example", 22);
+        var pin = SshHostKeyVerifier.CreateCandidate(
+            originalEndpoint,
+            "ssh-ed25519",
+            Convert.ToBase64String([1, 2, 3])).ToPin();
+        var candidate = SshHostKeyVerifier.CreateCandidate(
+            editedEndpoint,
+            "ssh-ed25519",
+            Convert.ToBase64String([1, 2, 3]));
+
+        var result = SshHostKeyVerifier.Verify(candidate, pin);
+
+        Assert.Equal(SshHostKeyStatus.Unknown, result.Status);
+    }
+
+    [Fact]
+    public void Same_public_key_at_a_different_port_requires_confirmation()
+    {
+        var originalEndpoint = new SshHostKeyEndpoint("mac.example", 22);
+        var editedEndpoint = new SshHostKeyEndpoint("mac.example", 2222);
+        var pin = SshHostKeyVerifier.CreateCandidate(
+            originalEndpoint,
+            "ssh-ed25519",
+            Convert.ToBase64String([1, 2, 3])).ToPin();
+        var candidate = SshHostKeyVerifier.CreateCandidate(
+            editedEndpoint,
+            "ssh-ed25519",
+            Convert.ToBase64String([1, 2, 3]));
+
+        var result = SshHostKeyVerifier.Verify(candidate, pin);
+
+        Assert.Equal(SshHostKeyStatus.Unknown, result.Status);
+    }
+
+    [Fact]
+    public void Editing_profile_endpoint_preserves_but_does_not_rebind_the_old_pin()
+    {
+        var originalEndpoint = new SshHostKeyEndpoint("old.example", 22);
+        var pin = SshHostKeyVerifier.CreateCandidate(
+            originalEndpoint,
+            "ssh-ed25519",
+            Convert.ToBase64String([1, 2, 3])).ToPin();
+        var profile = SshProfile.Create(
+                "old.example",
+                22,
+                "operator",
+                privateKeyPath: null,
+                targetHost: "127.0.0.1",
+                targetPort: 5900,
+                credentialReference: null,
+                pinnedHostKeyAlgorithm: null,
+                pinnedHostKeySha256: null)
+            .WithHostKeyPin(pin)
+            .WithEndpoint("new.example", 2222);
+
+        Assert.Equal(originalEndpoint, profile.HostKeyPin!.Endpoint);
+        Assert.NotEqual(new SshHostKeyEndpoint(profile.Host, profile.Port), profile.HostKeyPin.Endpoint);
+    }
+
+    [Fact]
+    public async Task Concurrent_confirmation_uses_insert_if_absent_CAS_and_never_overwrites()
+    {
+        var store = new InMemorySshHostKeyPinStore();
+        var endpoint = new SshHostKeyEndpoint("mac.example", 22);
+        var first = SshHostKeyVerifier.CreateCandidate(
+            endpoint,
+            "ssh-ed25519",
+            Convert.ToBase64String([1, 2, 3])).ToPin();
+        var second = SshHostKeyVerifier.CreateCandidate(
+            endpoint,
+            "ssh-ed25519",
+            Convert.ToBase64String([3, 2, 1])).ToPin();
+
+        var results = await Task.WhenAll(
+            store.ConfirmUnknownAsync(first, CancellationToken.None).AsTask(),
+            store.ConfirmUnknownAsync(second, CancellationToken.None).AsTask());
+        var stored = await store.FindAsync(endpoint, CancellationToken.None);
+
+        Assert.Single(results, result => result == SshHostKeyPinConfirmation.Stored);
+        Assert.Single(results, result => result == SshHostKeyPinConfirmation.Conflict);
+        Assert.True(stored == first || stored == second);
     }
 }

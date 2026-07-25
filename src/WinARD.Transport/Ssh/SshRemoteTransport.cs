@@ -1,6 +1,7 @@
-using System.Net;
-using System.Net.Sockets;
-using Renci.SshNet;
+using System.Globalization;
+using System.Runtime.ExceptionServices;
+using System.Text;
+using System.Text.RegularExpressions;
 using WinARD.Application.Ports;
 using WinARD.Domain.Connections;
 
@@ -8,32 +9,47 @@ namespace WinARD.Transport.Ssh;
 
 public sealed class SshRemoteTransport : IRemoteTransportFactory
 {
-    private readonly ISshSessionConnector _connector;
+    private readonly IOpenSshProcessLauncher _processLauncher;
+    private readonly IOpenSshKeyScanLauncher _keyScanLauncher;
+    private readonly ISshHostKeyPinStore _pinStore;
+    private readonly IOpenSshAskPassBroker _askPassBroker;
+    private readonly IOpenSshKnownHostsFileFactory _knownHostsFactory;
     private readonly TransportTimeouts _timeouts;
     private readonly TimeProvider _timeProvider;
 
     public SshRemoteTransport(
-        ISshAuthenticationMethodProvider authenticationMethodProvider,
+        ISshHostKeyPinStore pinStore,
         TransportTimeouts? timeouts = null,
         TimeProvider? timeProvider = null)
         : this(
-            new SshNetSessionConnector(authenticationMethodProvider),
+            new SystemOpenSshProcessLauncher(),
+            new SystemOpenSshKeyScanLauncher(),
+            pinStore,
+            new UnsupportedOpenSshAskPassBroker(),
+            new TemporaryOpenSshKnownHostsFileFactory(),
             timeouts ?? TransportTimeouts.Default,
             timeProvider ?? TimeProvider.System)
     {
     }
 
-    internal SshRemoteTransport(ISshSessionConnector connector)
-        : this(connector, TransportTimeouts.Default, TimeProvider.System)
-    {
-    }
-
-    internal SshRemoteTransport(
-        ISshSessionConnector connector,
+    public SshRemoteTransport(
+        IOpenSshProcessLauncher processLauncher,
+        IOpenSshKeyScanLauncher keyScanLauncher,
+        ISshHostKeyPinStore pinStore,
+        IOpenSshAskPassBroker askPassBroker,
+        IOpenSshKnownHostsFileFactory knownHostsFactory,
         TransportTimeouts timeouts,
         TimeProvider timeProvider)
     {
-        _connector = connector ?? throw new ArgumentNullException(nameof(connector));
+        _processLauncher = processLauncher ??
+            throw new ArgumentNullException(nameof(processLauncher));
+        _keyScanLauncher = keyScanLauncher ??
+            throw new ArgumentNullException(nameof(keyScanLauncher));
+        _pinStore = pinStore ?? throw new ArgumentNullException(nameof(pinStore));
+        _askPassBroker = askPassBroker ??
+            throw new ArgumentNullException(nameof(askPassBroker));
+        _knownHostsFactory = knownHostsFactory ??
+            throw new ArgumentNullException(nameof(knownHostsFactory));
         _timeouts = timeouts ?? throw new ArgumentNullException(nameof(timeouts));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
     }
@@ -45,91 +61,18 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
         ArgumentNullException.ThrowIfNull(profile);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var sshProfile = profile.SshProfile ??
-            throw new ArgumentException("An SSH transport requires an SSH profile.", nameof(profile));
-        var sshEndpoint = new SshHostKeyEndpoint(sshProfile.Host, sshProfile.Port);
-        var pin = CreatePin(sshProfile, sshEndpoint);
-        SshHostKeyVerification? verification = null;
-
-        bool ValidateHostKey(SshPresentedHostKey presented)
-        {
-            verification = SshHostKeyVerifier.Verify(
-                sshEndpoint,
-                presented.Algorithm,
-                presented.KeyBytes.Span,
-                pin);
-            return verification.Status == SshHostKeyStatus.Trusted;
-        }
-
-        ISshTunnelSession session;
-        try
-        {
-            session = await WithConnectionDeadlineAsync(
-                token => _connector.ConnectAsync(sshProfile, ValidateHostKey, token),
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception exception) when (
-            exception is not OperationCanceledException and not TransportTimeoutException &&
-            verification?.Status == SshHostKeyStatus.Unknown)
-        {
-            throw new SshHostKeyUnknownException(verification, exception);
-        }
-        catch (Exception exception) when (
-            exception is not OperationCanceledException and not TransportTimeoutException &&
-            verification?.Status == SshHostKeyStatus.Changed)
-        {
-            throw new SshHostKeyChangedException(sshEndpoint, exception);
-        }
-
-        if (verification?.Status != SshHostKeyStatus.Trusted)
-        {
-            Exception trustFailure = verification?.Status switch
-            {
-                SshHostKeyStatus.Unknown => new SshHostKeyUnknownException(verification),
-                SshHostKeyStatus.Changed => new SshHostKeyChangedException(sshEndpoint),
-                _ => new SshHostKeyNotVerifiedException(sshEndpoint),
-            };
-
-            var cleanup = new CleanupCollector(trustFailure);
-            await cleanup.TryAsync(session.DisposeAsync).ConfigureAwait(false);
-            cleanup.ThrowIfAny();
-        }
-
-        try
-        {
-            var stream = await WithConnectionDeadlineAsync(
-                token => session.OpenDirectTcpipAsync(
-                    sshProfile.TargetHost,
-                    sshProfile.TargetPort,
-                    token),
-                cancellationToken).ConfigureAwait(false);
-            return new TransportConnection(
-                stream,
-                new EndPointDescription(sshProfile.TargetHost, sshProfile.TargetPort),
-                session);
-        }
-        catch (Exception exception)
-        {
-            var cleanup = new CleanupCollector(exception);
-            await cleanup.TryAsync(session.DisposeAsync).ConfigureAwait(false);
-            cleanup.ThrowIfAny();
-            throw new InvalidOperationException("Unreachable.");
-        }
-    }
-
-    private async Task<T> WithConnectionDeadlineAsync<T>(
-        Func<CancellationToken, Task<T>> operation,
-        CancellationToken callerToken)
-    {
         using var deadline = new CancellationTokenSource(_timeouts.Connection, _timeProvider);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(callerToken, deadline.Token);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            deadline.Token);
+
         try
         {
-            return await operation(linked.Token).ConfigureAwait(false);
+            return await ConnectCoreAsync(profile, linked.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (callerToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            throw new OperationCanceledException(callerToken);
+            throw new OperationCanceledException(cancellationToken);
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
         {
@@ -137,407 +80,265 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
         }
     }
 
-    private static SshHostKeyPin? CreatePin(
+    private async Task<TransportConnection> ConnectCoreAsync(
+        ConnectionProfile profile,
+        CancellationToken cancellationToken)
+    {
+        var sshProfile = profile.SshProfile ??
+            throw new ArgumentException("An SSH transport requires an SSH profile.", nameof(profile));
+        var endpoint = new SshHostKeyEndpoint(sshProfile.Host, sshProfile.Port);
+
+        await _askPassBroker
+            .EnsureSupportedAsync(sshProfile, cancellationToken)
+            .ConfigureAwait(false);
+
+        var scanStart = OpenSshCommandBuilder.BuildKeyScan(endpoint, _timeouts.Connection);
+        var scan = await _keyScanLauncher
+            .ScanAsync(scanStart, cancellationToken)
+            .ConfigureAwait(false);
+        var candidates = OpenSshKeyScanParser.Parse(scan.StandardOutput, endpoint);
+        var pin = await _pinStore.FindAsync(endpoint, cancellationToken).ConfigureAwait(false) ??
+            EndpointPin(sshProfile, endpoint);
+        var trustedCandidate = VerifyHostKey(endpoint, candidates, pin);
+
+        var knownHosts = await _knownHostsFactory
+            .CreateAsync(trustedCandidate.ToPin(), cancellationToken)
+            .ConfigureAwait(false);
+        IOpenSshProcess? process = null;
+        try
+        {
+            var processStart = OpenSshCommandBuilder.BuildTunnel(sshProfile, knownHosts.Path);
+            process = await _processLauncher
+                .LaunchAsync(processStart, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            List<Exception>? cleanupFailures = null;
+            if (process is not null)
+            {
+                try
+                {
+                    await process.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception cleanupException)
+                {
+                    (cleanupFailures ??= []).Add(cleanupException);
+                }
+            }
+
+            try
+            {
+                await knownHosts.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanupException)
+            {
+                (cleanupFailures ??= []).Add(cleanupException);
+            }
+
+            RethrowWithCleanupFailures(exception, cleanupFailures);
+            throw new InvalidOperationException("Unreachable.");
+        }
+
+        var diagnostics = OpenSshDiagnostics.DrainAsync(
+            process.StandardError,
+            cancellationToken);
+        var lifetime = new OpenSshTunnelLifetime(process, knownHosts, diagnostics);
+        try
+        {
+            var firstByte = new byte[1];
+            var read = await process.StandardOutput
+                .ReadAsync(firstByte, cancellationToken)
+                .ConfigureAwait(false);
+            if (read == 1)
+            {
+                var stream = new PrefixDuplexStream(
+                    firstByte[0],
+                    process.StandardOutput,
+                    process.StandardInput);
+                return new TransportConnection(
+                    stream,
+                    new EndPointDescription(sshProfile.TargetHost, sshProfile.TargetPort),
+                    lifetime);
+            }
+
+            if (!process.HasExited)
+            {
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            var summary = await diagnostics.ConfigureAwait(false);
+            throw new OpenSshTunnelException(
+                process.ExitCode,
+                summary);
+        }
+        catch (Exception exception)
+        {
+            try
+            {
+                await lifetime.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanupException)
+            {
+                throw new AggregateException(exception, cleanupException);
+            }
+
+            ExceptionDispatchInfo.Capture(exception).Throw();
+            throw new InvalidOperationException("Unreachable.");
+        }
+    }
+
+    private static SshHostKeyCandidate VerifyHostKey(
+        SshHostKeyEndpoint endpoint,
+        IReadOnlyList<SshHostKeyCandidate> candidates,
+        SshHostKeyPin? pin)
+    {
+        if (pin is null)
+        {
+            var verification = SshHostKeyVerifier.Verify(candidates[0], pin: null);
+            throw new SshHostKeyUnknownException(verification);
+        }
+
+        foreach (var candidate in candidates)
+        {
+            if (SshHostKeyVerifier.Verify(candidate, pin).Status == SshHostKeyStatus.Trusted)
+            {
+                return candidate;
+            }
+        }
+
+        throw new SshHostKeyChangedException(endpoint);
+    }
+
+    private static SshHostKeyPin? EndpointPin(
         SshProfile profile,
         SshHostKeyEndpoint endpoint) =>
-        profile.PinnedHostKeyAlgorithm is null
-            ? null
-            : new SshHostKeyPin(
-                endpoint,
-                profile.PinnedHostKeyAlgorithm,
-                profile.PinnedHostKeySha256!);
+        profile.HostKeyPin?.Endpoint == endpoint
+            ? profile.HostKeyPin
+            : null;
+
+    private static void RethrowWithCleanupFailures(
+        Exception primaryException,
+        List<Exception>? cleanupFailures)
+    {
+        if (cleanupFailures is null)
+        {
+            ExceptionDispatchInfo.Capture(primaryException).Throw();
+        }
+
+        throw new AggregateException([primaryException, .. cleanupFailures]);
+    }
 }
 
-public interface ISshAuthenticationMethodProvider
+public interface IOpenSshAskPassBroker
 {
-    ValueTask<IReadOnlyList<AuthenticationMethod>> GetAuthenticationMethodsAsync(
+    ValueTask EnsureSupportedAsync(
         SshProfile profile,
         CancellationToken cancellationToken);
 }
 
-internal readonly record struct SshPresentedHostKey(
-    string Algorithm,
-    ReadOnlyMemory<byte> KeyBytes);
-
-internal interface ISshSessionConnector
+public sealed class UnsupportedOpenSshAskPassBroker : IOpenSshAskPassBroker
 {
-    Task<ISshTunnelSession> ConnectAsync(
+    public ValueTask EnsureSupportedAsync(
         SshProfile profile,
-        Func<SshPresentedHostKey, bool> hostKeyValidator,
-        CancellationToken cancellationToken);
-}
-
-internal interface ISshTunnelSession : IAsyncDisposable
-{
-    Task<Stream> OpenDirectTcpipAsync(
-        string targetHost,
-        int targetPort,
-        CancellationToken cancellationToken);
-}
-
-internal sealed class SshNetSessionConnector(
-    ISshAuthenticationMethodProvider authenticationMethodProvider) : ISshSessionConnector
-{
-    public async Task<ISshTunnelSession> ConnectAsync(
-        SshProfile profile,
-        Func<SshPresentedHostKey, bool> hostKeyValidator,
         CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(authenticationMethodProvider);
-        AuthenticationMethod[] ownedAuthenticationMethods = [];
-        SshClient? client = null;
-        try
+        ArgumentNullException.ThrowIfNull(profile);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (profile.CredentialReference is not null)
         {
-            var authenticationMethods = await authenticationMethodProvider
-                .GetAuthenticationMethodsAsync(profile, cancellationToken)
-                .ConfigureAwait(false);
-            if (authenticationMethods.Count == 0)
-            {
-                throw new InvalidOperationException("At least one SSH authentication method is required.");
-            }
-
-            ownedAuthenticationMethods = authenticationMethods.ToArray();
-            var connectionInfo = new ConnectionInfo(
-                profile.Host,
-                profile.Port,
-                profile.Username,
-                ownedAuthenticationMethods);
-            client = new SshClient(connectionInfo);
-            client.HostKeyReceived += (_, eventArgs) =>
-            {
-                eventArgs.CanTrust = hostKeyValidator(
-                    new SshPresentedHostKey(eventArgs.HostKeyName, eventArgs.HostKey));
-            };
-
-            await client.ConnectAsync(cancellationToken).ConfigureAwait(false);
-            return new SshNetTunnelSession(
-                new SshClientResource(client),
-                ownedAuthenticationMethods,
-                new SshTunnelResourceFactory());
-        }
-        catch (Exception exception)
-        {
-            var cleanup = new CleanupCollector(exception);
-            if (client is not null)
-            {
-                cleanup.Try(() =>
-                {
-                    if (client.IsConnected)
-                    {
-                        client.Disconnect();
-                    }
-                });
-                cleanup.Try(client.Dispose);
-            }
-
-            AddAuthenticationMethodCleanup(cleanup, ownedAuthenticationMethods);
-            cleanup.ThrowIfAny();
-            throw new InvalidOperationException("Unreachable.");
-        }
-    }
-
-    internal static void AddAuthenticationMethodCleanup(
-        CleanupCollector cleanup,
-        IEnumerable<AuthenticationMethod> authenticationMethods)
-    {
-        var disposed = new HashSet<object>(ReferenceEqualityComparer.Instance);
-        foreach (var method in authenticationMethods)
-        {
-            if (method is IDisposable disposable && disposed.Add(method))
-            {
-                cleanup.Try(disposable.Dispose);
-            }
-        }
-    }
-}
-
-internal sealed class SshNetTunnelSession(
-    ISshClientResource client,
-    IReadOnlyList<AuthenticationMethod> authenticationMethods,
-    ISshTunnelResourceFactory resourceFactory,
-    ISshForwardedPortResource? forwardedPort = null,
-    ILocalTcpClientResource? localClient = null) : ISshTunnelSession
-{
-    private readonly object _sync = new();
-    private ISshForwardedPortResource? _forwardedPort = forwardedPort;
-    private ILocalTcpClientResource? _localClient = localClient;
-    private int _disposed;
-
-    public async Task<Stream> OpenDirectTcpipAsync(
-        string targetHost,
-        int targetPort,
-        CancellationToken cancellationToken)
-    {
-        ObjectDisposedException.ThrowIf(
-            Volatile.Read(ref _disposed) != 0,
-            this);
-
-        ISshForwardedPortResource? newForwardedPort = null;
-        ILocalTcpClientResource? newLocalClient = null;
-        try
-        {
-            newForwardedPort = resourceFactory.CreateForwardedPort(targetHost, targetPort);
-            newLocalClient = resourceFactory.CreateLocalClient();
-            client.AddForwardedPort(newForwardedPort);
-            newForwardedPort.Start();
-            await newLocalClient
-                .ConnectAsync(
-                    IPAddress.Loopback.ToString(),
-                    newForwardedPort.BoundPort,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            var stream = newLocalClient.GetStream();
-            lock (_sync)
-            {
-                _forwardedPort = newForwardedPort;
-                _localClient = newLocalClient;
-            }
-
-            return stream;
-        }
-        catch (Exception exception)
-        {
-            var cleanup = new CleanupCollector(exception);
-            if (newLocalClient is not null)
-            {
-                cleanup.Try(newLocalClient.Dispose);
-            }
-
-            if (newForwardedPort is not null)
-            {
-                cleanup.Try(() =>
-                {
-                    if (newForwardedPort.IsStarted)
-                    {
-                        newForwardedPort.Stop();
-                    }
-                });
-                cleanup.Try(newForwardedPort.Dispose);
-            }
-
-            cleanup.ThrowIfAny();
-            throw new InvalidOperationException("Unreachable.");
-        }
-    }
-
-    public ValueTask DisposeAsync()
-    {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
-        {
-            return ValueTask.CompletedTask;
+            throw new OpenSshAuthenticationUnsupportedException();
         }
 
-        ISshForwardedPortResource? ownedForwardedPort;
-        ILocalTcpClientResource? ownedLocalClient;
-        lock (_sync)
-        {
-            ownedForwardedPort = _forwardedPort;
-            ownedLocalClient = _localClient;
-            _forwardedPort = null;
-            _localClient = null;
-        }
-
-        var cleanup = new CleanupCollector();
-        if (ownedLocalClient is not null)
-        {
-            cleanup.Try(ownedLocalClient.Dispose);
-        }
-
-        if (ownedForwardedPort is not null)
-        {
-            cleanup.Try(() =>
-            {
-                if (ownedForwardedPort.IsStarted)
-                {
-                    ownedForwardedPort.Stop();
-                }
-            });
-            cleanup.Try(ownedForwardedPort.Dispose);
-        }
-
-        cleanup.Try(client.Disconnect);
-        cleanup.Try(client.Dispose);
-        SshNetSessionConnector.AddAuthenticationMethodCleanup(cleanup, authenticationMethods);
-        cleanup.ThrowIfAny();
         return ValueTask.CompletedTask;
     }
 }
 
-internal interface ISshClientResource : IDisposable
+public static partial class OpenSshDiagnostics
 {
-    void AddForwardedPort(ISshForwardedPortResource forwardedPort);
+    public const int MaximumSummaryLength = 4096;
 
-    void Disconnect();
-}
-
-internal interface ISshForwardedPortResource : IDisposable
-{
-    bool IsStarted { get; }
-
-    int BoundPort { get; }
-
-    void Start();
-
-    void Stop();
-}
-
-internal interface ILocalTcpClientResource : IDisposable
-{
-    Task ConnectAsync(string host, int port, CancellationToken cancellationToken);
-
-    Stream GetStream();
-}
-
-internal interface ISshTunnelResourceFactory
-{
-    ISshForwardedPortResource CreateForwardedPort(string targetHost, int targetPort);
-
-    ILocalTcpClientResource CreateLocalClient();
-}
-
-internal sealed class SshClientResource(SshClient client) : ISshClientResource
-{
-    public void AddForwardedPort(ISshForwardedPortResource forwardedPort)
+    internal static async Task<string> DrainAsync(
+        Stream standardError,
+        CancellationToken cancellationToken)
     {
-        if (forwardedPort is not SshForwardedPortResource sshForwardedPort)
+        using var reader = new StreamReader(
+            standardError,
+            Encoding.UTF8,
+            detectEncodingFromByteOrderMarks: true,
+            bufferSize: 4096,
+            leaveOpen: true);
+        var retained = new StringBuilder(MaximumSummaryLength + 512);
+        var buffer = new char[4096];
+        while (true)
         {
-            throw new ArgumentException("Unsupported SSH forwarded port resource.", nameof(forwardedPort));
+            var read = await reader
+                .ReadAsync(buffer, cancellationToken)
+                .ConfigureAwait(false);
+            if (read == 0)
+            {
+                break;
+            }
+
+            var available = retained.Capacity - retained.Length;
+            if (available > 0)
+            {
+                retained.Append(buffer, 0, Math.Min(read, available));
+            }
         }
 
-        client.AddForwardedPort(sshForwardedPort.ForwardedPort);
+        var sanitized = SensitiveAssignment().Replace(
+            retained.ToString(),
+            "$1=[REDACTED]");
+        return sanitized.Length <= MaximumSummaryLength
+            ? sanitized
+            : sanitized[..MaximumSummaryLength];
     }
 
-    public void Disconnect()
-    {
-        if (client.IsConnected)
-        {
-            client.Disconnect();
-        }
-    }
-
-    public void Dispose() => client.Dispose();
+    [GeneratedRegex(
+        @"(?i)(password|passphrase|token|secret)\s*=\s*([^\s]+)",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex SensitiveAssignment();
 }
 
-internal sealed class SshForwardedPortResource(ForwardedPortLocal forwardedPort)
-    : ISshForwardedPortResource
+public sealed class OpenSshTunnelException : Exception
 {
-    internal ForwardedPortLocal ForwardedPort => forwardedPort;
+    public OpenSshTunnelException(int? exitCode, string diagnosticSummary)
+        : base(CreateMessage(exitCode, diagnosticSummary))
+    {
+        ExitCode = exitCode;
+        DiagnosticSummary = diagnosticSummary ?? string.Empty;
+    }
 
-    public bool IsStarted => forwardedPort.IsStarted;
+    public int? ExitCode { get; }
 
-    public int BoundPort => checked((int)forwardedPort.BoundPort);
+    public string DiagnosticSummary { get; }
 
-    public void Start() => forwardedPort.Start();
-
-    public void Stop() => forwardedPort.Stop();
-
-    public void Dispose() => forwardedPort.Dispose();
+    private static string CreateMessage(int? exitCode, string? diagnosticSummary)
+    {
+        var code = exitCode is null
+            ? "unknown"
+            : exitCode.Value.ToString(CultureInfo.InvariantCulture);
+        return string.IsNullOrWhiteSpace(diagnosticSummary)
+            ? $"OpenSSH failed to establish the remote tunnel (exit code {code})."
+            : $"OpenSSH failed to establish the remote tunnel (exit code {code}): {diagnosticSummary}";
+    }
 }
 
-internal sealed class LocalTcpClientResource(TcpClient client) : ILocalTcpClientResource
+public sealed class OpenSshAuthenticationUnsupportedException : Exception
 {
-    public async Task ConnectAsync(
-        string host,
-        int port,
-        CancellationToken cancellationToken) =>
-        await client.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
-
-    public Stream GetStream() => client.GetStream();
-
-    public void Dispose() => client.Dispose();
-}
-
-internal sealed class SshTunnelResourceFactory : ISshTunnelResourceFactory
-{
-    public ISshForwardedPortResource CreateForwardedPort(string targetHost, int targetPort) =>
-        new SshForwardedPortResource(
-            new ForwardedPortLocal(
-                IPAddress.Loopback.ToString(),
-                0,
-                targetHost,
-                checked((uint)targetPort)));
-
-    public ILocalTcpClientResource CreateLocalClient() =>
-        new LocalTcpClientResource(new TcpClient(AddressFamily.InterNetwork));
-}
-
-internal sealed class CleanupCollector
-{
-    private readonly List<Exception> _exceptions = [];
-
-    public CleanupCollector(Exception? primaryException = null)
+    public OpenSshAuthenticationUnsupportedException()
+        : base(
+            "Credential-backed OpenSSH password or passphrase authentication is not supported yet.")
     {
-        if (primaryException is not null)
-        {
-            Add(primaryException);
-        }
-    }
-
-    public void Try(Action cleanup)
-    {
-        try
-        {
-            cleanup();
-        }
-        catch (Exception exception)
-        {
-            Add(exception);
-        }
-    }
-
-    public async ValueTask TryAsync(Func<ValueTask> cleanup)
-    {
-        try
-        {
-            await cleanup().ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            Add(exception);
-        }
-    }
-
-    private void Add(Exception exception)
-    {
-        if (exception is AggregateException aggregateException)
-        {
-            _exceptions.AddRange(aggregateException.Flatten().InnerExceptions);
-        }
-        else
-        {
-            _exceptions.Add(exception);
-        }
-    }
-
-    public void ThrowIfAny()
-    {
-        if (_exceptions.Count == 1)
-        {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo
-                .Capture(_exceptions[0])
-                .Throw();
-        }
-
-        if (_exceptions.Count > 1)
-        {
-            throw new AggregateException(_exceptions);
-        }
     }
 }
 
 public sealed class SshHostKeyUnknownException : Exception
 {
     public SshHostKeyUnknownException(SshHostKeyVerification verification)
-        : this(verification, innerException: null)
-    {
-    }
-
-    public SshHostKeyUnknownException(
-        SshHostKeyVerification verification,
-        Exception? innerException)
         : base(
-            $"The SSH host key for {verification.Endpoint.Host}:{verification.Endpoint.Port} is not pinned.",
-            innerException)
+            $"The SSH host key for {verification.Endpoint.Host}:{verification.Endpoint.Port} is not pinned.")
     {
         Verification = verification ?? throw new ArgumentNullException(nameof(verification));
     }
@@ -545,13 +346,192 @@ public sealed class SshHostKeyUnknownException : Exception
     public SshHostKeyVerification Verification { get; }
 }
 
-public sealed class SshHostKeyNotVerifiedException : Exception
+internal sealed class PrefixDuplexStream(
+    byte prefix,
+    Stream standardOutput,
+    Stream standardInput) : Stream
 {
-    public SshHostKeyNotVerifiedException(SshHostKeyEndpoint endpoint)
-        : base($"The SSH host key for {endpoint.Host}:{endpoint.Port} was not verified.")
+    private int _prefixAvailable = 1;
+
+    public override bool CanRead => standardOutput.CanRead;
+
+    public override bool CanSeek => false;
+
+    public override bool CanWrite => standardInput.CanWrite;
+
+    public override long Length => throw new NotSupportedException();
+
+    public override long Position
     {
-        Endpoint = endpoint;
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
     }
 
-    public SshHostKeyEndpoint Endpoint { get; }
+    public override void Flush() => standardInput.Flush();
+
+    public override Task FlushAsync(CancellationToken cancellationToken) =>
+        standardInput.FlushAsync(cancellationToken);
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        ValidateBuffer(buffer, offset, count);
+        if (count > 0 && Interlocked.Exchange(ref _prefixAvailable, 0) == 1)
+        {
+            buffer[offset] = prefix;
+            return 1;
+        }
+
+        return standardOutput.Read(buffer, offset, count);
+    }
+
+    public override int Read(Span<byte> buffer)
+    {
+        if (!buffer.IsEmpty && Interlocked.Exchange(ref _prefixAvailable, 0) == 1)
+        {
+            buffer[0] = prefix;
+            return 1;
+        }
+
+        return standardOutput.Read(buffer);
+    }
+
+    public override ValueTask<int> ReadAsync(
+        Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        if (!buffer.IsEmpty && Interlocked.Exchange(ref _prefixAvailable, 0) == 1)
+        {
+            buffer.Span[0] = prefix;
+            return ValueTask.FromResult(1);
+        }
+
+        return standardOutput.ReadAsync(buffer, cancellationToken);
+    }
+
+    public override void Write(byte[] buffer, int offset, int count) =>
+        standardInput.Write(buffer, offset, count);
+
+    public override void Write(ReadOnlySpan<byte> buffer) =>
+        standardInput.Write(buffer);
+
+    public override ValueTask WriteAsync(
+        ReadOnlyMemory<byte> buffer,
+        CancellationToken cancellationToken = default) =>
+        standardInput.WriteAsync(buffer, cancellationToken);
+
+    public override long Seek(long offset, SeekOrigin origin) =>
+        throw new NotSupportedException();
+
+    public override void SetLength(long value) =>
+        throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+    }
+
+    public override ValueTask DisposeAsync() => base.DisposeAsync();
+
+    private static void ValidateBuffer(byte[] buffer, int offset, int count)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (buffer.Length - offset < count)
+        {
+            throw new ArgumentException("Offset and count exceed the buffer length.");
+        }
+    }
+}
+
+internal sealed class OpenSshTunnelLifetime(
+    IOpenSshProcess process,
+    IOpenSshKnownHostsFile knownHosts,
+    Task<string> diagnostics) : IAsyncDisposable
+{
+    private readonly object _sync = new();
+    private Task? _disposeTask;
+
+    public ValueTask DisposeAsync()
+    {
+        Task disposeTask;
+        lock (_sync)
+        {
+            _disposeTask ??= DisposeCoreAsync();
+            disposeTask = _disposeTask;
+        }
+
+        return new ValueTask(disposeTask);
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        List<Exception>? failures = null;
+        Try(process.StandardInput.Dispose, ref failures);
+        if (!process.HasExited)
+        {
+            Try(() => process.Kill(entireProcessTree: true), ref failures);
+        }
+
+        try
+        {
+            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            (failures ??= []).Add(exception);
+        }
+
+        try
+        {
+            await diagnostics.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception)
+        {
+            (failures ??= []).Add(exception);
+        }
+
+        try
+        {
+            await process.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            (failures ??= []).Add(exception);
+        }
+
+        try
+        {
+            await knownHosts.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            (failures ??= []).Add(exception);
+        }
+
+        if (failures is { Count: 1 })
+        {
+            ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        }
+
+        if (failures is { Count: > 1 })
+        {
+            throw new AggregateException(failures);
+        }
+    }
+
+    private static void Try(Action action, ref List<Exception>? failures)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            (failures ??= []).Add(exception);
+        }
+    }
 }

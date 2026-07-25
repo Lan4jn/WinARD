@@ -1,7 +1,8 @@
 using System.Net;
-using System.Net.Sockets;
-using Renci.SshNet;
+using System.Text;
 using WinARD.Domain.Connections;
+using WinARD.Domain.Security;
+using WinARD.Transport;
 using WinARD.Transport.Ssh;
 using Xunit;
 
@@ -12,379 +13,415 @@ namespace WinARD.Transport.Tests;
 public sealed class SshRemoteTransportTests
 {
     [Fact]
-    public async Task Unknown_host_key_is_returned_for_confirmation_before_a_tunnel_is_opened()
+    public async Task Unknown_keyscan_result_requires_confirmation_without_launching_ssh()
     {
-        var connector = new FakeSshSessionConnector("ssh-ed25519", [1, 2, 3]);
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(pinnedAlgorithm: null, pinnedFingerprint: null);
+        var fixture = new OpenSshFixture();
 
         var exception = await Assert.ThrowsAsync<SshHostKeyUnknownException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
+            () => fixture.Transport.ConnectAsync(fixture.Profile, CancellationToken.None));
 
         Assert.Equal(SshHostKeyStatus.Unknown, exception.Verification.Status);
-        Assert.Equal(0, connector.OpenCount);
+        Assert.Equal(0, fixture.Launcher.LaunchCount);
+        Assert.Equal(0, fixture.KnownHosts.CreateCount);
     }
 
     [Fact]
-    public async Task Changed_host_key_is_blocked_before_a_tunnel_is_opened()
+    public async Task Changed_key_is_blocked_without_overwriting_pin_or_launching_ssh()
     {
-        var connector = new FakeSshSessionConnector("ssh-ed25519", [9, 9, 9]);
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(
-            "ssh-ed25519",
-            SshHostKeyVerifier.ComputeFingerprint([1, 2, 3]));
+        var fixture = new OpenSshFixture();
+        var originalPin = fixture.Candidate.ToPin();
+        await fixture.Store.ConfirmUnknownAsync(originalPin, CancellationToken.None);
+        fixture.KeyScan.Output = fixture.KeyScanLine([9, 9, 9]);
 
         await Assert.ThrowsAsync<SshHostKeyChangedException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
+            () => fixture.Transport.ConnectAsync(fixture.Profile, CancellationToken.None));
 
-        Assert.Equal(0, connector.OpenCount);
+        Assert.Equal(originalPin, await fixture.Store.FindAsync(fixture.Endpoint, CancellationToken.None));
+        Assert.Equal(0, fixture.Launcher.LaunchCount);
     }
 
     [Fact]
-    public async Task Unknown_host_key_preserves_connector_cleanup_failures_as_inner_exception()
+    public async Task Trusted_key_launches_strict_stdio_forward_and_preserves_ready_byte()
     {
-        var connectFailure = new IOException("SSH connection rejected.");
-        var cleanupFailure = new IOException("SSH connector cleanup failed.");
-        var connectorFailure = new AggregateException(connectFailure, cleanupFailure);
-        var connector = new FakeSshSessionConnector("ssh-ed25519", [1, 2, 3])
-        {
-            HostKeyRejectionFailure = connectorFailure,
-        };
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(pinnedAlgorithm: null, pinnedFingerprint: null);
+        var fixture = new OpenSshFixture();
+        await fixture.ConfirmAsync();
+        fixture.Process.StandardOutputSource = new MemoryStream("RFB 003.889\n"u8.ToArray());
 
-        var exception = await Assert.ThrowsAsync<SshHostKeyUnknownException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
+        await using var connection = await fixture.Transport.ConnectAsync(
+            fixture.Profile,
+            CancellationToken.None);
+        var banner = new byte[12];
+        await connection.Stream.ReadExactlyAsync(banner);
 
-        Assert.Same(connectorFailure, exception.InnerException);
-        Assert.Collection(
-            connectorFailure.InnerExceptions,
-            item => Assert.Same(connectFailure, item),
-            item => Assert.Same(cleanupFailure, item));
+        Assert.Equal("RFB 003.889\n", Encoding.ASCII.GetString(banner));
+        Assert.Contains("-W", fixture.Launcher.LastStart!.Arguments);
+        Assert.DoesNotContain(
+            typeof(SshRemoteTransport).Assembly.GetReferencedAssemblies(),
+            assembly => string.Equals(assembly.Name, "Renci.SshNet", StringComparison.Ordinal));
+        Assert.Equal(OpenSshKnownHosts.Format(fixture.Candidate.ToPin()), fixture.KnownHosts.Content);
     }
 
     [Fact]
-    public async Task Changed_host_key_preserves_connector_cleanup_failures_as_inner_exception()
+    public async Task Remote_tunnel_rejection_fails_before_returning_a_stream_and_cleans_resources()
     {
-        var connectFailure = new IOException("SSH connection rejected.");
-        var cleanupFailure = new IOException("SSH connector cleanup failed.");
-        var connectorFailure = new AggregateException(connectFailure, cleanupFailure);
-        var connector = new FakeSshSessionConnector("ssh-ed25519", [9, 9, 9])
-        {
-            HostKeyRejectionFailure = connectorFailure,
-        };
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(
-            "ssh-ed25519",
-            SshHostKeyVerifier.ComputeFingerprint([1, 2, 3]));
+        var fixture = new OpenSshFixture();
+        await fixture.ConfirmAsync();
+        fixture.Process.StandardOutputSource = Stream.Null;
+        fixture.Process.StandardErrorSource = new MemoryStream(
+            "channel 0: open failed: connect failed: Connection refused"u8.ToArray());
+        fixture.Process.Exit(255);
 
-        var exception = await Assert.ThrowsAsync<SshHostKeyChangedException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
+        var exception = await Assert.ThrowsAsync<OpenSshTunnelException>(
+            () => fixture.Transport.ConnectAsync(fixture.Profile, CancellationToken.None));
 
-        Assert.Same(connectorFailure, exception.InnerException);
-        Assert.Collection(
-            connectorFailure.InnerExceptions,
-            item => Assert.Same(connectFailure, item),
-            item => Assert.Same(cleanupFailure, item));
+        Assert.Contains("Connection refused", exception.DiagnosticSummary, StringComparison.Ordinal);
+        Assert.Equal(1, fixture.Process.DisposeCount);
+        Assert.Equal(1, fixture.KnownHosts.DisposeCount);
     }
 
     [Fact]
-    public async Task Connector_that_skips_host_key_validation_is_disposed_before_tunnel_creation()
+    public async Task Total_deadline_covers_keyscan_and_remote_ready_probe()
     {
-        var connector = new FakeSshSessionConnector("ssh-ed25519", [1, 2, 3])
-        {
-            SkipHostKeyValidator = true,
-        };
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(pinnedAlgorithm: null, pinnedFingerprint: null);
+        var timeProvider = new ManualTimeProvider();
+        var fixture = new OpenSshFixture(
+            timeProvider,
+            new TransportTimeouts(TimeSpan.FromSeconds(30)));
+        await fixture.ConfirmAsync();
+        fixture.KeyScan.OnScan = () => timeProvider.Advance(TimeSpan.FromSeconds(25));
+        fixture.Process.StandardOutputSource = new BlockingReadStream();
 
-        await Assert.ThrowsAsync<SshHostKeyNotVerifiedException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
+        var connectTask = fixture.Transport.ConnectAsync(fixture.Profile, CancellationToken.None);
+        await fixture.Process.ReadStarted.Task;
+        timeProvider.Advance(TimeSpan.FromSeconds(5));
 
-        Assert.Equal(0, connector.OpenCount);
-        Assert.Equal(1, connector.SessionDisposeCount);
+        var exception = await Assert.ThrowsAsync<TransportTimeoutException>(() => connectTask);
+        Assert.Equal(TransportTimeoutStage.Connection, exception.Stage);
+        Assert.Equal(1, fixture.Process.KillCount);
+        Assert.Equal(1, fixture.KnownHosts.DisposeCount);
+        Assert.Equal(0, timeProvider.ActiveTimerCount);
     }
 
     [Fact]
-    public async Task Connector_that_ignores_unknown_key_rejection_is_disposed_before_tunnel_creation()
+    public async Task Caller_cancellation_kills_process_and_is_not_mapped_to_timeout()
     {
-        var connector = new FakeSshSessionConnector("ssh-ed25519", [1, 2, 3])
-        {
-            IgnoreHostKeyRejection = true,
-        };
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(pinnedAlgorithm: null, pinnedFingerprint: null);
+        var fixture = new OpenSshFixture();
+        await fixture.ConfirmAsync();
+        fixture.Process.StandardOutputSource = new BlockingReadStream();
+        using var cancellation = new CancellationTokenSource();
 
-        var exception = await Assert.ThrowsAsync<SshHostKeyUnknownException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
+        var connectTask = fixture.Transport.ConnectAsync(fixture.Profile, cancellation.Token);
+        await fixture.Process.ReadStarted.Task;
+        cancellation.Cancel();
 
-        Assert.Equal(SshHostKeyStatus.Unknown, exception.Verification.Status);
-        Assert.Equal(0, connector.OpenCount);
-        Assert.Equal(1, connector.SessionDisposeCount);
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => connectTask);
+        Assert.IsNotType<TransportTimeoutException>(exception);
+        Assert.Equal(1, fixture.Process.KillCount);
+        Assert.Equal(1, fixture.KnownHosts.DisposeCount);
     }
 
     [Fact]
-    public async Task Connector_that_ignores_changed_key_rejection_is_disposed_before_tunnel_creation()
+    public async Task Large_stderr_is_drained_without_deadlock_and_sensitive_assignments_are_redacted()
     {
-        var connector = new FakeSshSessionConnector("ssh-ed25519", [9, 9, 9])
-        {
-            IgnoreHostKeyRejection = true,
-        };
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(
-            "ssh-ed25519",
-            SshHostKeyVerifier.ComputeFingerprint([1, 2, 3]));
+        var fixture = new OpenSshFixture();
+        await fixture.ConfirmAsync();
+        fixture.Process.StandardOutputSource = Stream.Null;
+        var stderr = string.Concat(
+            Enumerable.Repeat("password=topsecret " + new string('x', 1024), 128));
+        fixture.Process.StandardErrorSource = new MemoryStream(Encoding.UTF8.GetBytes(stderr));
+        fixture.Process.Exit(255);
 
-        await Assert.ThrowsAsync<SshHostKeyChangedException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
+        var exception = await Assert.ThrowsAsync<OpenSshTunnelException>(
+            () => fixture.Transport.ConnectAsync(fixture.Profile, CancellationToken.None));
 
-        Assert.Equal(0, connector.OpenCount);
-        Assert.Equal(1, connector.SessionDisposeCount);
+        Assert.DoesNotContain("topsecret", exception.DiagnosticSummary, StringComparison.Ordinal);
+        Assert.True(exception.DiagnosticSummary.Length <= OpenSshDiagnostics.MaximumSummaryLength);
     }
 
     [Fact]
-    public async Task Matching_pin_opens_the_remote_Rfb_target_and_disposes_all_session_resources_once()
+    public async Task Concurrent_stream_disposal_kills_and_cleans_process_once()
     {
-        byte[] hostKey = [4, 5, 6];
-        var connector = new FakeSshSessionConnector("SSH-ED25519", hostKey);
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(
-            "ssh-ed25519",
-            SshHostKeyVerifier.ComputeFingerprint(hostKey));
+        var fixture = new OpenSshFixture();
+        await fixture.ConfirmAsync();
+        fixture.Process.StandardOutputSource = new MemoryStream([42]);
+        var connection = await fixture.Transport.ConnectAsync(
+            fixture.Profile,
+            CancellationToken.None);
 
-        var connection = await transport.ConnectAsync(profile, CancellationToken.None);
+        await Task.WhenAll(
+            connection.DisposeAsync().AsTask(),
+            connection.DisposeAsync().AsTask());
 
-        Assert.Equal("127.0.0.1", connector.TargetHost);
-        Assert.Equal(5900, connector.TargetPort);
-        Assert.Equal("127.0.0.1", connection.EndPoint.Host);
-        Assert.Equal(5900, connection.EndPoint.Port);
-
-        await connection.DisposeAsync();
-        await connection.DisposeAsync();
-
-        Assert.Equal(1, connector.Stream.DisposeCount);
-        Assert.Equal(1, connector.SessionDisposeCount);
+        Assert.Equal(1, fixture.Process.KillCount);
+        Assert.Equal(1, fixture.Process.DisposeCount);
+        Assert.Equal(1, fixture.KnownHosts.DisposeCount);
     }
 
     [Fact]
-    public async Task Tunnel_failure_disposes_the_connected_Ssh_session()
+    public async Task Credential_reference_is_rejected_by_unsupported_askpass_before_process_launch()
     {
-        byte[] hostKey = [7, 8, 9];
-        var connector = new FakeSshSessionConnector("ssh-ed25519", hostKey)
-        {
-            TunnelFailure = new IOException("Tunnel failed."),
-        };
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(
-            "ssh-ed25519",
-            SshHostKeyVerifier.ComputeFingerprint(hostKey));
-
-        await Assert.ThrowsAsync<IOException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
-
-        Assert.Equal(1, connector.SessionDisposeCount);
-    }
-
-    [Fact]
-    public async Task Tunnel_and_session_cleanup_failures_are_both_preserved()
-    {
-        byte[] hostKey = [7, 8, 9];
-        var tunnelFailure = new IOException("Tunnel failed.");
-        var cleanupFailure = new IOException("Session cleanup failed.");
-        var connector = new FakeSshSessionConnector("ssh-ed25519", hostKey)
-        {
-            TunnelFailure = tunnelFailure,
-            SessionDisposeFailure = cleanupFailure,
-        };
-        var transport = new SshRemoteTransport(connector);
-        var profile = CreateProfile(
-            "ssh-ed25519",
-            SshHostKeyVerifier.ComputeFingerprint(hostKey));
-
-        var exception = await Assert.ThrowsAsync<AggregateException>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
-
-        Assert.Collection(
-            exception.InnerExceptions,
-            item => Assert.Same(tunnelFailure, item),
-            item => Assert.Same(cleanupFailure, item));
-        Assert.Equal(1, connector.SessionDisposeCount);
-    }
-
-    [Fact]
-    public async Task Failed_SshNet_connection_disposes_authentication_material()
-    {
-        using var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        var serverTask = Task.Run(async () =>
-        {
-            using var accepted = await listener.AcceptTcpClientAsync();
-            await accepted.GetStream().WriteAsync("NOT-SSH\r\n"u8.ToArray());
-            accepted.Client.Shutdown(SocketShutdown.Both);
-        });
-        var method = new TrackingAuthenticationMethod();
-        var transport = new SshRemoteTransport(new FixedAuthenticationMethodProvider(method));
+        var fixture = new OpenSshFixture();
+        await fixture.ConfirmAsync();
+        var current = fixture.Profile.SshProfile!;
         var ssh = SshProfile.Create(
-            "127.0.0.1",
-            port,
-            "ssh-user",
-            privateKeyPath: null,
-            targetHost: "127.0.0.1",
-            targetPort: 5900,
-            credentialReference: null,
+            current.Host,
+            current.Port,
+            current.Username,
+            current.PrivateKeyPath,
+            current.TargetHost,
+            current.TargetPort,
+            CredentialReference.Create("windows", "ssh-secret"),
             pinnedHostKeyAlgorithm: null,
             pinnedHostKeySha256: null);
         var profile = ConnectionProfile
             .Create(Guid.NewGuid(), "Mac", "ignored.example", 5999, "operator")
             .WithSsh(ssh);
 
-        await Assert.ThrowsAnyAsync<Exception>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
-        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.Equal(1, method.DisposeCount);
+        await Assert.ThrowsAsync<OpenSshAuthenticationUnsupportedException>(
+            () => fixture.Transport.ConnectAsync(profile, CancellationToken.None));
+
+        Assert.Equal(0, fixture.Launcher.LaunchCount);
     }
 
-    [Fact]
-    public async Task ConnectionInfo_construction_failure_disposes_all_obtained_authentication_material()
+    private sealed class OpenSshFixture
     {
-        var first = new TrackingAuthenticationMethod();
-        var second = new TrackingAuthenticationMethod();
-        var provider = new FixedAuthenticationMethodProvider([first, null!, second]);
-        var transport = new SshRemoteTransport(provider);
-        var profile = CreateProfile(pinnedAlgorithm: null, pinnedFingerprint: null);
-
-        await Assert.ThrowsAnyAsync<Exception>(
-            () => transport.ConnectAsync(profile, CancellationToken.None));
-
-        Assert.Equal(1, first.DisposeCount);
-        Assert.Equal(1, second.DisposeCount);
-    }
-
-    [Fact]
-    public async Task Session_disposal_attempts_every_resource_and_preserves_all_failures()
-    {
-        var localFailure = new IOException("Local client cleanup failed.");
-        var stopFailure = new IOException("Forward stop failed.");
-        var forwardDisposeFailure = new IOException("Forward dispose failed.");
-        var disconnectFailure = new IOException("SSH disconnect failed.");
-        var clientDisposeFailure = new IOException("SSH dispose failed.");
-        var authenticationFailure = new IOException("Authentication cleanup failed.");
-        var local = new ThrowingLocalClientResource(localFailure);
-        var forward = new ThrowingForwardedPortResource(stopFailure, forwardDisposeFailure);
-        var client = new ThrowingSshClientResource(disconnectFailure, clientDisposeFailure);
-        var authentication = new TrackingAuthenticationMethod(authenticationFailure);
-        var session = new SshNetTunnelSession(
-            client,
-            [authentication],
-            new UnusedTunnelResourceFactory(),
-            forward,
-            local);
-
-        var exception = await Assert.ThrowsAsync<AggregateException>(
-            () => session.DisposeAsync().AsTask());
-
-        Assert.Collection(
-            exception.InnerExceptions,
-            item => Assert.Same(localFailure, item),
-            item => Assert.Same(stopFailure, item),
-            item => Assert.Same(forwardDisposeFailure, item),
-            item => Assert.Same(disconnectFailure, item),
-            item => Assert.Same(clientDisposeFailure, item),
-            item => Assert.Same(authenticationFailure, item));
-        Assert.Equal(1, local.DisposeCount);
-        Assert.Equal(1, forward.StopCount);
-        Assert.Equal(1, forward.DisposeCount);
-        Assert.Equal(1, client.DisconnectCount);
-        Assert.Equal(1, client.DisposeCount);
-        Assert.Equal(1, authentication.DisposeCount);
-    }
-
-    private static ConnectionProfile CreateProfile(
-        string? pinnedAlgorithm,
-        string? pinnedFingerprint)
-    {
-        var ssh = SshProfile.Create(
-            "jump.example",
-            2222,
-            "ssh-user",
-            privateKeyPath: null,
-            targetHost: "127.0.0.1",
-            targetPort: 5900,
-            credentialReference: null,
-            pinnedAlgorithm,
-            pinnedFingerprint);
-
-        return ConnectionProfile
-            .Create(Guid.NewGuid(), "Mac", "ignored.example", 5999, "operator")
-            .WithSsh(ssh);
-    }
-
-    private sealed class FakeSshSessionConnector(
-        string algorithm,
-        byte[] hostKey) : ISshSessionConnector
-    {
-        public int OpenCount { get; private set; }
-
-        public int SessionDisposeCount { get; private set; }
-
-        public string? TargetHost { get; private set; }
-
-        public int TargetPort { get; private set; }
-
-        public CountingStream Stream { get; } = new();
-
-        public Exception? TunnelFailure { get; init; }
-
-        public Exception? SessionDisposeFailure { get; init; }
-
-        public Exception? HostKeyRejectionFailure { get; init; }
-
-        public bool SkipHostKeyValidator { get; init; }
-
-        public bool IgnoreHostKeyRejection { get; init; }
-
-        public Task<ISshTunnelSession> ConnectAsync(
-            SshProfile profile,
-            Func<SshPresentedHostKey, bool> hostKeyValidator,
-            CancellationToken cancellationToken)
+        public OpenSshFixture(
+            TimeProvider? timeProvider = null,
+            TransportTimeouts? timeouts = null)
         {
-            var trusted = SkipHostKeyValidator ||
-                hostKeyValidator(new SshPresentedHostKey(algorithm, hostKey));
-            if (!trusted && !IgnoreHostKeyRejection)
+            Endpoint = new SshHostKeyEndpoint("jump.example", 2222);
+            Candidate = SshHostKeyVerifier.CreateCandidate(
+                Endpoint,
+                "ssh-ed25519",
+                Convert.ToBase64String([1, 2, 3, 4]));
+            KeyScan = new FakeKeyScanLauncher
             {
-                throw HostKeyRejectionFailure ?? new IOException("SSH host key was rejected.");
-            }
-
-            return Task.FromResult<ISshTunnelSession>(new FakeSession(this));
+                Output = KeyScanLine([1, 2, 3, 4]),
+            };
+            Process = new FakeOpenSshProcess();
+            Launcher = new FakeProcessLauncher(Process);
+            Store = new InMemorySshHostKeyPinStore();
+            KnownHosts = new FakeKnownHostsFactory();
+            var ssh = SshProfile.Create(
+                Endpoint.Host,
+                Endpoint.Port,
+                "ssh-user",
+                privateKeyPath: null,
+                targetHost: "127.0.0.1",
+                targetPort: 5900,
+                credentialReference: null,
+                pinnedHostKeyAlgorithm: null,
+                pinnedHostKeySha256: null);
+            Profile = ConnectionProfile
+                .Create(Guid.NewGuid(), "Mac", "ignored.example", 5999, "operator")
+                .WithSsh(ssh);
+            Transport = new SshRemoteTransport(
+                Launcher,
+                KeyScan,
+                Store,
+                new UnsupportedOpenSshAskPassBroker(),
+                KnownHosts,
+                timeouts ?? TransportTimeouts.Default,
+                timeProvider ?? TimeProvider.System);
         }
 
-        private sealed class FakeSession(FakeSshSessionConnector owner) : ISshTunnelSession
+        public SshHostKeyEndpoint Endpoint { get; }
+
+        public SshHostKeyCandidate Candidate { get; }
+
+        public FakeKeyScanLauncher KeyScan { get; }
+
+        public FakeOpenSshProcess Process { get; }
+
+        public FakeProcessLauncher Launcher { get; }
+
+        public InMemorySshHostKeyPinStore Store { get; }
+
+        public FakeKnownHostsFactory KnownHosts { get; }
+
+        public ConnectionProfile Profile { get; }
+
+        public SshRemoteTransport Transport { get; }
+
+        public Task<SshHostKeyPinConfirmation> ConfirmAsync() =>
+            Store.ConfirmUnknownAsync(Candidate.ToPin(), CancellationToken.None).AsTask();
+
+        public string KeyScanLine(byte[] key) =>
+            $"[{Endpoint.Host}]:{Endpoint.Port} ssh-ed25519 {Convert.ToBase64String(key)}";
+    }
+
+    private sealed class FakeKeyScanLauncher : IOpenSshKeyScanLauncher
+    {
+        public string Output { get; set; } = string.Empty;
+
+        public Action? OnScan { get; set; }
+
+        public ValueTask<OpenSshKeyScanResult> ScanAsync(
+            OpenSshProcessStart start,
+            CancellationToken cancellationToken)
+        {
+            OnScan?.Invoke();
+            cancellationToken.ThrowIfCancellationRequested();
+            return ValueTask.FromResult(new OpenSshKeyScanResult(Output, string.Empty, 0));
+        }
+    }
+
+    private sealed class FakeProcessLauncher(FakeOpenSshProcess process)
+        : IOpenSshProcessLauncher
+    {
+        public int LaunchCount { get; private set; }
+
+        public OpenSshProcessStart? LastStart { get; private set; }
+
+        public ValueTask<IOpenSshProcess> LaunchAsync(
+            OpenSshProcessStart start,
+            CancellationToken cancellationToken)
+        {
+            LaunchCount++;
+            LastStart = start;
+            return ValueTask.FromResult<IOpenSshProcess>(process);
+        }
+    }
+
+    private sealed class FakeOpenSshProcess : IOpenSshProcess
+    {
+        private readonly TaskCompletionSource<int> _exit =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _disposed;
+        private int _killed;
+
+        public Stream StandardInput { get; } = new MemoryStream();
+
+        public Stream StandardOutput => new ReadNotifyingStream(StandardOutputSource, ReadStarted);
+
+        public Stream StandardError => StandardErrorSource;
+
+        public Stream StandardOutputSource { get; set; } = new MemoryStream([1]);
+
+        public Stream StandardErrorSource { get; set; } = Stream.Null;
+
+        public TaskCompletionSource ReadStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool HasExited => _exit.Task.IsCompleted;
+
+        public int? ExitCode => HasExited ? _exit.Task.Result : null;
+
+        public int KillCount => _killed;
+
+        public int DisposeCount => _disposed;
+
+        public void Exit(int exitCode) => _exit.TrySetResult(exitCode);
+
+        public void Kill(bool entireProcessTree)
+        {
+            if (Interlocked.Increment(ref _killed) == 1)
+            {
+                _exit.TrySetResult(-1);
+            }
+        }
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken) =>
+            _exit.Task.WaitAsync(cancellationToken);
+
+        public ValueTask DisposeAsync()
+        {
+            Interlocked.Increment(ref _disposed);
+            StandardInput.Dispose();
+            StandardOutputSource.Dispose();
+            StandardErrorSource.Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class ReadNotifyingStream(
+        Stream inner,
+        TaskCompletionSource readStarted) : Stream
+    {
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            inner.Read(buffer, offset, count);
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            readStarted.TrySetResult();
+            return inner.ReadAsync(buffer, cancellationToken);
+        }
+
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class BlockingReadStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return 0;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class FakeKnownHostsFactory : IOpenSshKnownHostsFileFactory
+    {
+        public int CreateCount { get; private set; }
+
+        public int DisposeCount { get; private set; }
+
+        public string? Content { get; private set; }
+
+        public ValueTask<IOpenSshKnownHostsFile> CreateAsync(
+            SshHostKeyPin pin,
+            CancellationToken cancellationToken)
+        {
+            CreateCount++;
+            Content = OpenSshKnownHosts.Format(pin);
+            return ValueTask.FromResult<IOpenSshKnownHostsFile>(
+                new FakeKnownHostsFile(this));
+        }
+
+        private sealed class FakeKnownHostsFile(FakeKnownHostsFactory owner)
+            : IOpenSshKnownHostsFile
         {
             private int _disposed;
 
-            public Task<Stream> OpenDirectTcpipAsync(
-                string targetHost,
-                int targetPort,
-                CancellationToken cancellationToken)
-            {
-                owner.OpenCount++;
-                owner.TargetHost = targetHost;
-                owner.TargetPort = targetPort;
-                return owner.TunnelFailure is null
-                    ? Task.FromResult<Stream>(owner.Stream)
-                    : Task.FromException<Stream>(owner.TunnelFailure);
-            }
+            public string Path => @"C:\Temp\strict known_hosts";
 
             public ValueTask DisposeAsync()
             {
                 if (Interlocked.Exchange(ref _disposed, 1) == 0)
                 {
-                    owner.SessionDisposeCount++;
-                    if (owner.SessionDisposeFailure is not null)
-                    {
-                        return ValueTask.FromException(owner.SessionDisposeFailure);
-                    }
+                    owner.DisposeCount++;
                 }
 
                 return ValueTask.CompletedTask;
@@ -392,138 +429,112 @@ public sealed class SshRemoteTransportTests
         }
     }
 
-    private sealed class CountingStream : MemoryStream
+    private sealed class ManualTimeProvider : TimeProvider
     {
-        public int DisposeCount { get; private set; }
+        private readonly object _sync = new();
+        private readonly List<ManualTimer> _timers = [];
+        private DateTimeOffset _utcNow = DateTimeOffset.UnixEpoch;
 
-        protected override void Dispose(bool disposing)
+        public int ActiveTimerCount
         {
-            if (disposing && DisposeCount == 0)
+            get
             {
-                DisposeCount++;
-            }
-
-            base.Dispose(disposing);
-        }
-    }
-
-    private sealed class FixedAuthenticationMethodProvider : ISshAuthenticationMethodProvider
-    {
-        private readonly IReadOnlyList<AuthenticationMethod> _methods;
-
-        public FixedAuthenticationMethodProvider(AuthenticationMethod method)
-            : this([method])
-        {
-        }
-
-        public FixedAuthenticationMethodProvider(IReadOnlyList<AuthenticationMethod> methods)
-        {
-            _methods = methods;
-        }
-
-        public ValueTask<IReadOnlyList<AuthenticationMethod>> GetAuthenticationMethodsAsync(
-            SshProfile profile,
-            CancellationToken cancellationToken) =>
-            ValueTask.FromResult(_methods);
-    }
-
-    private sealed class TrackingAuthenticationMethod(Exception? disposeFailure = null)
-        : AuthenticationMethod("ssh-user"), IDisposable
-    {
-        public int DisposeCount { get; private set; }
-
-        public override string Name => "tracking";
-
-        public override AuthenticationResult Authenticate(Session session) =>
-            AuthenticationResult.Failure;
-
-        public void Dispose()
-        {
-            DisposeCount++;
-            if (disposeFailure is not null)
-            {
-                throw disposeFailure;
+                lock (_sync)
+                {
+                    return _timers.Count;
+                }
             }
         }
-    }
 
-    private sealed class ThrowingLocalClientResource(Exception failure) : ILocalTcpClientResource
-    {
-        public int DisposeCount { get; private set; }
+        public override DateTimeOffset GetUtcNow() => _utcNow;
 
-        public Task ConnectAsync(string host, int port, CancellationToken cancellationToken) =>
-            Task.CompletedTask;
-
-        public Stream GetStream() => Stream.Null;
-
-        public void Dispose()
+        public override ITimer CreateTimer(
+            TimerCallback callback,
+            object? state,
+            TimeSpan dueTime,
+            TimeSpan period)
         {
-            DisposeCount++;
-            throw failure;
+            var timer = new ManualTimer(this, callback, state, _utcNow + dueTime, period);
+            lock (_sync)
+            {
+                _timers.Add(timer);
+            }
+
+            return timer;
+        }
+
+        public void Advance(TimeSpan amount)
+        {
+            _utcNow += amount;
+            ManualTimer[] due;
+            lock (_sync)
+            {
+                due = _timers.Where(timer => timer.IsDue(_utcNow)).ToArray();
+            }
+
+            foreach (var timer in due)
+            {
+                timer.Fire(_utcNow);
+            }
+        }
+
+        private void Remove(ManualTimer timer)
+        {
+            lock (_sync)
+            {
+                _timers.Remove(timer);
+            }
+        }
+
+        private sealed class ManualTimer(
+            ManualTimeProvider owner,
+            TimerCallback callback,
+            object? state,
+            DateTimeOffset dueAt,
+            TimeSpan period) : ITimer
+        {
+            private bool _disposed;
+            private DateTimeOffset _dueAt = dueAt;
+            private TimeSpan _period = period;
+
+            public bool IsDue(DateTimeOffset now) => !_disposed && now >= _dueAt;
+
+            public void Fire(DateTimeOffset now)
+            {
+                callback(state);
+                if (_period == Timeout.InfiniteTimeSpan)
+                {
+                    Dispose();
+                }
+                else
+                {
+                    _dueAt = now + _period;
+                }
+            }
+
+            public bool Change(TimeSpan dueTime, TimeSpan newPeriod)
+            {
+                _dueAt = owner.GetUtcNow() + dueTime;
+                _period = newPeriod;
+                return !_disposed;
+            }
+
+            public void Dispose()
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+                owner.Remove(this);
+            }
+
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
         }
     }
-
-    private sealed class ThrowingForwardedPortResource(
-        Exception stopFailure,
-        Exception disposeFailure) : ISshForwardedPortResource
-    {
-        public int StopCount { get; private set; }
-
-        public int DisposeCount { get; private set; }
-
-        public bool IsStarted => true;
-
-        public int BoundPort => 12345;
-
-        public void Start()
-        {
-        }
-
-        public void Stop()
-        {
-            StopCount++;
-            throw stopFailure;
-        }
-
-        public void Dispose()
-        {
-            DisposeCount++;
-            throw disposeFailure;
-        }
-    }
-
-    private sealed class ThrowingSshClientResource(
-        Exception disconnectFailure,
-        Exception disposeFailure) : ISshClientResource
-    {
-        public int DisconnectCount { get; private set; }
-
-        public int DisposeCount { get; private set; }
-
-        public void AddForwardedPort(ISshForwardedPortResource forwardedPort)
-        {
-        }
-
-        public void Disconnect()
-        {
-            DisconnectCount++;
-            throw disconnectFailure;
-        }
-
-        public void Dispose()
-        {
-            DisposeCount++;
-            throw disposeFailure;
-        }
-    }
-
-    private sealed class UnusedTunnelResourceFactory : ISshTunnelResourceFactory
-    {
-        public ISshForwardedPortResource CreateForwardedPort(string targetHost, int targetPort) =>
-            throw new InvalidOperationException("Not used.");
-
-        public ILocalTcpClientResource CreateLocalClient() =>
-            throw new InvalidOperationException("Not used.");
-    }
-
 }
