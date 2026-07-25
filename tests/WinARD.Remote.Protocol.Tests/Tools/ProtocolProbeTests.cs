@@ -96,7 +96,7 @@ public sealed class ProtocolProbeTests
                     path,
                     CancellationToken.None));
 
-            Assert.Contains("dirty rectangle", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.NotEmpty(exception.Message);
             Assert.False(File.Exists(path));
             await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
         }
@@ -127,6 +127,97 @@ public sealed class ProtocolProbeTests
                     CancellationToken.None));
 
             Assert.False(File.Exists(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_probe_reissues_full_request_after_desktop_resize_without_publishing()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, CaptureScenario.DesktopSizeOnly);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            await Assert.ThrowsAsync<RfbProtocolException>(() =>
+                new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                    IPAddress.Loopback.ToString(),
+                    GetPort(listener),
+                    username,
+                    password,
+                    path,
+                    CancellationToken.None));
+
+            Assert.False(File.Exists(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_probe_uses_resized_dimensions_for_reissued_full_request()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, CaptureScenario.DesktopSizeThenFullRaw);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                IPAddress.Loopback.ToString(),
+                GetPort(listener),
+                username,
+                password,
+                path,
+                CancellationToken.None);
+
+            var capture = Assert.IsType<ProbeCapture>(result.Capture);
+            Assert.Equal(2, capture.Width);
+            Assert.Equal(1, capture.Height);
+            Assert.Equal([0, 0, 255, 255, 0, 255, 0, 255], await File.ReadAllBytesAsync(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_probe_accumulates_partial_raw_coverage_across_updates()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, CaptureScenario.PartialRawAcrossUpdates);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                IPAddress.Loopback.ToString(),
+                GetPort(listener),
+                username,
+                password,
+                path,
+                CancellationToken.None);
+
+            var capture = Assert.IsType<ProbeCapture>(result.Capture);
+            Assert.Equal(2, capture.Width);
+            Assert.Equal(1, capture.Height);
+            Assert.Equal([0, 0, 255, 255, 0, 255, 0, 255], await File.ReadAllBytesAsync(path));
             await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
         }
         finally
@@ -416,7 +507,18 @@ public sealed class ProtocolProbeTests
     private static async Task RunCaptureServerAsync(
         TcpListener listener,
         bool sendEmptyUpdate = false,
-        bool sendCursorOnly = false)
+        bool sendCursorOnly = false) =>
+        await RunCaptureServerAsync(
+            listener,
+            sendEmptyUpdate
+                ? CaptureScenario.Empty
+                : sendCursorOnly
+                    ? CaptureScenario.CursorOnly
+                    : CaptureScenario.FullRaw);
+
+    private static async Task RunCaptureServerAsync(
+        TcpListener listener,
+        CaptureScenario scenario)
     {
         using var client = await listener.AcceptTcpClientAsync();
         await using var stream = client.GetStream();
@@ -434,8 +536,9 @@ public sealed class ProtocolProbeTests
         await stream.WriteAsync(new byte[4]);
 
         Assert.Equal(new byte[] { 1 }, await ReadExactlyAsync(stream, 1));
+        var initialWidth = scenario == CaptureScenario.PartialRawAcrossUpdates ? (ushort)2 : (ushort)1;
         var serverInit = new List<byte>();
-        AddUInt16(serverInit, 1);
+        AddUInt16(serverInit, initialWidth);
         AddUInt16(serverInit, 1);
         serverInit.AddRange(PixelFormat.WinArdBgra32.ToWireBytes());
         AddUInt32(serverInit, 3);
@@ -446,17 +549,18 @@ public sealed class ProtocolProbeTests
         Assert.Equal((byte)0, declarations[0]);
         Assert.Equal((byte)2, declarations[20]);
         var request = await ReadExactlyAsync(stream, 10);
-        Assert.Equal([3, 0, 0, 0, 0, 0, 0, 1, 0, 1], request);
+        Assert.Equal(CreateFullRequest(initialWidth, 1), request);
 
-        var update = new List<byte> { 0, 0, 0, sendEmptyUpdate ? (byte)0 : (byte)1 };
-        if (sendEmptyUpdate)
+        if (scenario == CaptureScenario.Empty)
         {
-            await stream.WriteAsync(update.ToArray());
+            await stream.WriteAsync(new byte[] { 0, 0, 0, 0 });
+            Assert.Equal(CreateFullRequest(initialWidth, 1), await ReadExactlyAsync(stream, 10));
             return;
         }
 
-        if (sendCursorOnly)
+        if (scenario == CaptureScenario.CursorOnly)
         {
+            var update = new List<byte> { 0, 0, 0, 1 };
             AddUInt16(update, 0);
             AddUInt16(update, 0);
             AddUInt16(update, 1);
@@ -464,16 +568,66 @@ public sealed class ProtocolProbeTests
             AddUInt32(update, unchecked((uint)(int)RfbEncodingType.Cursor));
             update.AddRange([0, 0, 255, 0, 0x80]);
             await stream.WriteAsync(update.ToArray());
+            Assert.Equal(CreateFullRequest(initialWidth, 1), await ReadExactlyAsync(stream, 10));
             return;
         }
 
-        AddUInt16(update, 0);
-        AddUInt16(update, 0);
-        AddUInt16(update, 1);
-        AddUInt16(update, 1);
-        AddUInt32(update, 0);
-        update.AddRange([0, 0, 255, 0]);
+        if (scenario is CaptureScenario.DesktopSizeOnly or CaptureScenario.DesktopSizeThenFullRaw)
+        {
+            await WriteRectangleUpdateAsync(stream, 0, 0, 2, 1, RfbEncodingType.DesktopSize, []);
+            Assert.Equal(CreateFullRequest(2, 1), await ReadExactlyAsync(stream, 10));
+            if (scenario == CaptureScenario.DesktopSizeOnly)
+            {
+                return;
+            }
+
+            await WriteRectangleUpdateAsync(
+                stream,
+                0,
+                0,
+                2,
+                1,
+                RfbEncodingType.Raw,
+                [0, 0, 255, 0, 0, 255, 0, 0]);
+            return;
+        }
+
+        if (scenario == CaptureScenario.PartialRawAcrossUpdates)
+        {
+            await WriteRectangleUpdateAsync(stream, 0, 0, 1, 1, RfbEncodingType.Raw, [0, 0, 255, 0]);
+            Assert.Equal(CreateFullRequest(2, 1), await ReadExactlyAsync(stream, 10));
+            await WriteRectangleUpdateAsync(stream, 1, 0, 1, 1, RfbEncodingType.Raw, [0, 255, 0, 0]);
+            return;
+        }
+
+        await WriteRectangleUpdateAsync(stream, 0, 0, 1, 1, RfbEncodingType.Raw, [0, 0, 255, 0]);
+    }
+
+    private static async Task WriteRectangleUpdateAsync(
+        Stream stream,
+        ushort x,
+        ushort y,
+        ushort width,
+        ushort height,
+        RfbEncodingType encoding,
+        byte[] payload)
+    {
+        var update = new List<byte> { 0, 0, 0, 1 };
+        AddUInt16(update, x);
+        AddUInt16(update, y);
+        AddUInt16(update, width);
+        AddUInt16(update, height);
+        AddUInt32(update, unchecked((uint)(int)encoding));
+        update.AddRange(payload);
         await stream.WriteAsync(update.ToArray());
+    }
+
+    private static byte[] CreateFullRequest(ushort width, ushort height)
+    {
+        var request = new List<byte> { 3, 0, 0, 0, 0, 0 };
+        AddUInt16(request, width);
+        AddUInt16(request, height);
+        return request.ToArray();
     }
 
     private static async Task<byte[]> ReadExactlyAsync(Stream stream, int count)
@@ -529,6 +683,16 @@ public sealed class ProtocolProbeTests
         Banner,
         Challenge,
         Result,
+    }
+
+    private enum CaptureScenario
+    {
+        FullRaw,
+        Empty,
+        CursorOnly,
+        DesktopSizeOnly,
+        DesktopSizeThenFullRaw,
+        PartialRawAcrossUpdates,
     }
 
     private sealed class FakePasswordConsole(

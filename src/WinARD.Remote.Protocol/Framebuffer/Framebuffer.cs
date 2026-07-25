@@ -10,6 +10,9 @@ public sealed class Framebuffer : IDisposable
     private readonly ProtocolLimits _limits;
     private byte[] _pixels;
     private bool _disposed;
+    private long _pixelContentVersion;
+    private FramebufferRect _lastPixelContentRect;
+    private RemoteCursor? _cursor;
 
     public Framebuffer(int width, int height, ProtocolLimits limits)
     {
@@ -34,8 +37,8 @@ public sealed class Framebuffer : IDisposable
     }
 
     internal ProtocolLimits Limits => _limits;
-
-    private RemoteCursor? _cursor;
+    internal long PixelContentVersion => _pixelContentVersion;
+    internal FramebufferRect LastPixelContentRect => _lastPixelContentRect;
 
     public byte[] GetPixelsBgra32()
     {
@@ -82,6 +85,9 @@ public sealed class Framebuffer : IDisposable
                 destination[alphaIndex] = 255;
             }
         }
+
+        _lastPixelContentRect = rectangle;
+        _pixelContentVersion = unchecked(_pixelContentVersion + 1);
     }
 
     internal void CopyRect(FramebufferRect destination, int sourceX, int sourceY)

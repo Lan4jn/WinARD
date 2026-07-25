@@ -13,8 +13,8 @@ internal static class PixelConverter
             width,
             height,
             format.BytesPerPixel,
-            limits.MaxMessageBytes,
-            "message");
+            limits.MaxFramebufferUpdateBytes,
+            "framebuffer update");
     }
 
     public static int CheckedBgraLength(int width, int height, ProtocolLimits limits)

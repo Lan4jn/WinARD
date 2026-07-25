@@ -8,6 +8,7 @@ public sealed class RfbReader
 {
     private readonly Stream _stream;
     private readonly ProtocolLimits _limits;
+    private int _framebufferUpdateBytes;
 
     public RfbReader(Stream stream, ProtocolLimits limits)
     {
@@ -52,6 +53,34 @@ public sealed class RfbReader
                 $"Requested message length {count} exceeds the configured limit of {_limits.MaxMessageBytes} bytes.");
         }
 
+        if (count == 0)
+        {
+            return Array.Empty<byte>();
+        }
+
+        return await ReadBytesExactlyAsync(count, cancellationToken);
+    }
+
+    internal void ReserveFramebufferUpdateBytes(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+
+        var total = checked((long)_framebufferUpdateBytes + count);
+        if (total > _limits.MaxFramebufferUpdateBytes)
+        {
+            throw new RfbProtocolException(
+                $"Framebuffer update payload length {total} exceeds the configured limit of " +
+                $"{_limits.MaxFramebufferUpdateBytes} bytes.");
+        }
+
+        _framebufferUpdateBytes = checked((int)total);
+    }
+
+    internal async ValueTask<byte[]> ReadFramebufferPayloadBytesAsync(
+        int count,
+        CancellationToken cancellationToken)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
         if (count == 0)
         {
             return Array.Empty<byte>();

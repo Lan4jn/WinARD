@@ -61,17 +61,24 @@ public sealed class CursorEncoding : IRfbEncodingDecoder
             throw new RfbProtocolException("Cursor mask length overflowed.", exception);
         }
 
-        if ((long)pixelLength + maskLength > framebuffer.Limits.MaxMessageBytes)
+        int payloadLength;
+        try
         {
-            throw new RfbProtocolException("Cursor pixel and mask payload exceeds the configured message limit.");
+            payloadLength = checked(pixelLength + maskLength);
+        }
+        catch (OverflowException exception)
+        {
+            throw new RfbProtocolException("Cursor payload length overflowed.", exception);
         }
 
-        var wirePixels = await reader.ReadBytesAsync(pixelLength, cancellationToken);
+        reader.ReserveFramebufferUpdateBytes(payloadLength);
+
+        var wirePixels = await reader.ReadFramebufferPayloadBytesAsync(pixelLength, cancellationToken);
         byte[]? mask = null;
         byte[]? bgraPixels = null;
         try
         {
-            mask = await reader.ReadBytesAsync(maskLength, cancellationToken);
+            mask = await reader.ReadFramebufferPayloadBytesAsync(maskLength, cancellationToken);
             bgraPixels = PixelConverter.ToBgra32(wirePixels, width, height, _pixelFormat, framebuffer.Limits);
             ApplyMask(bgraPixels, mask, width, height, maskStride);
             framebuffer.SetCursor(new RemoteCursor(x, y, width, height, bgraPixels));

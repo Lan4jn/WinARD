@@ -54,6 +54,7 @@ public static class FramebufferUpdateReader
         }
 
         var dirtyRects = new List<FramebufferRect>(rectangleCount);
+        var pixelContentRects = new List<FramebufferRect>(rectangleCount);
         RemoteCursor? cursor = null;
         var desktopResized = false;
         for (var index = 0; index < rectangleCount; index++)
@@ -77,10 +78,21 @@ public static class FramebufferUpdateReader
             var previousWidth = framebuffer.Width;
             var previousHeight = framebuffer.Height;
             var previousCursor = framebuffer.Cursor;
+            var previousPixelContentVersion = framebuffer.PixelContentVersion;
             var rectangle = encoding == RfbEncodingType.Cursor
                 ? FramebufferRect.CreateCursorRectangle(x, y, width, height)
                 : new FramebufferRect(x, y, width, height);
             dirtyRects.AddRange(await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken));
+            if (previousWidth != framebuffer.Width || previousHeight != framebuffer.Height)
+            {
+                pixelContentRects.Clear();
+            }
+
+            if (previousPixelContentVersion != framebuffer.PixelContentVersion)
+            {
+                pixelContentRects.Add(framebuffer.LastPixelContentRect);
+            }
+
             if (!ReferenceEquals(previousCursor, framebuffer.Cursor))
             {
                 cursor = framebuffer.Cursor;
@@ -89,7 +101,7 @@ public static class FramebufferUpdateReader
             desktopResized |= previousWidth != framebuffer.Width || previousHeight != framebuffer.Height;
         }
 
-        return new FramebufferUpdateResult(dirtyRects, cursor, desktopResized);
+        return new FramebufferUpdateResult(dirtyRects, pixelContentRects, cursor, desktopResized);
     }
 
     private static Dictionary<int, IRfbEncodingDecoder> CreateDecoders(PixelFormat pixelFormat) =>

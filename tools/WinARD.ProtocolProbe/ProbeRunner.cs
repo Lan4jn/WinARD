@@ -11,6 +11,7 @@ namespace WinARD.ProtocolProbe;
 public sealed class ProbeRunner
 {
     private static readonly TimeSpan DefaultOperationTimeout = TimeSpan.FromSeconds(30);
+    private const int MaximumInitialFramebufferUpdates = 64;
 
     private readonly TimeSpan _operationTimeout;
 
@@ -81,22 +82,37 @@ public sealed class ProbeRunner
                 ProtocolLimits.Default,
                 operationCancellation.Token);
             using var framebuffer = new Framebuffer(server.Width, server.Height, ProtocolLimits.Default);
-            await RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
-                stream,
-                incremental: false,
-                0,
-                0,
-                checked((ushort)server.Width),
-                checked((ushort)server.Height),
-                operationCancellation.Token);
-            var update = await FramebufferUpdateReader.ApplyAsync(
-                stream,
-                framebuffer,
-                PixelFormat.WinArdBgra32,
-                operationCancellation.Token);
-            if (update.DirtyRects.Count == 0)
+            var coverage = new PixelCoverage(server.Width, server.Height);
+            var dirtyRects = new List<FramebufferRect>();
+            for (var updateCount = 0; updateCount < MaximumInitialFramebufferUpdates; updateCount++)
             {
-                throw new RfbProtocolException("The first framebuffer update did not contain a dirty rectangle.");
+                await WriteFullFramebufferUpdateRequestAsync(stream, framebuffer, operationCancellation.Token);
+                var update = await FramebufferUpdateReader.ApplyAsync(
+                    stream,
+                    framebuffer,
+                    PixelFormat.WinArdBgra32,
+                    operationCancellation.Token);
+                dirtyRects.AddRange(update.DirtyRects);
+                if (update.DesktopResized)
+                {
+                    coverage.Reset(framebuffer.Width, framebuffer.Height);
+                }
+
+                foreach (var rectangle in update.PixelContentRects)
+                {
+                    coverage.Add(rectangle);
+                }
+
+                if (coverage.IsComplete)
+                {
+                    break;
+                }
+            }
+
+            if (!coverage.IsComplete)
+            {
+                throw new RfbProtocolException(
+                    $"The initial framebuffer did not become complete within {MaximumInitialFramebufferUpdates} updates.");
             }
 
             var fullPath = Path.GetFullPath(captureFirstFramePath);
@@ -104,12 +120,79 @@ public sealed class ProbeRunner
             return new ProbeResult(
                 handshake.Version,
                 handshake.SecurityType,
-                new ProbeCapture(fullPath, framebuffer.Width, framebuffer.Height, update.DirtyRects));
+                new ProbeCapture(fullPath, framebuffer.Width, framebuffer.Height, dirtyRects));
         }
         catch (OperationCanceledException exception)
             when (!cancellationToken.IsCancellationRequested && operationCancellation.IsCancellationRequested)
         {
             throw new ProbeTimeoutException(exception);
+        }
+    }
+
+    private static async Task WriteFullFramebufferUpdateRequestAsync(
+        Stream stream,
+        Framebuffer framebuffer,
+        CancellationToken cancellationToken) =>
+        await RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
+            stream,
+            incremental: false,
+            0,
+            0,
+            checked((ushort)framebuffer.Width),
+            checked((ushort)framebuffer.Height),
+            cancellationToken);
+
+    private sealed class PixelCoverage
+    {
+        private List<(int Start, int End)>[] _rows = [];
+        private long _coveredPixels;
+        private long _totalPixels;
+
+        public PixelCoverage(int width, int height)
+        {
+            Reset(width, height);
+        }
+
+        public bool IsComplete => _coveredPixels == _totalPixels;
+
+        public void Reset(int width, int height)
+        {
+            _rows = Enumerable.Range(0, height)
+                .Select(_ => new List<(int Start, int End)>())
+                .ToArray();
+            _coveredPixels = 0;
+            _totalPixels = checked((long)width * height);
+        }
+
+        public void Add(FramebufferRect rectangle)
+        {
+            var endX = checked(rectangle.X + rectangle.Width);
+            var endY = checked(rectangle.Y + rectangle.Height);
+            for (var y = rectangle.Y; y < endY; y++)
+            {
+                AddInterval(_rows[y], rectangle.X, endX);
+            }
+        }
+
+        private void AddInterval(List<(int Start, int End)> intervals, int start, int end)
+        {
+            var insertionIndex = 0;
+            while (insertionIndex < intervals.Count && intervals[insertionIndex].End < start)
+            {
+                insertionIndex++;
+            }
+
+            while (insertionIndex < intervals.Count && intervals[insertionIndex].Start <= end)
+            {
+                var existing = intervals[insertionIndex];
+                start = Math.Min(start, existing.Start);
+                end = Math.Max(end, existing.End);
+                _coveredPixels -= existing.End - existing.Start;
+                intervals.RemoveAt(insertionIndex);
+            }
+
+            intervals.Insert(insertionIndex, (start, end));
+            _coveredPixels += end - start;
         }
     }
 }

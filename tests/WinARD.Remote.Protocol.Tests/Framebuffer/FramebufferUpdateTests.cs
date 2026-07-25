@@ -104,6 +104,7 @@ public sealed class FramebufferUpdateTests
             new MemoryStream(message), framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None);
 
         Assert.Equal(new FramebufferRect(1, 1, 2, 2), Assert.Single(result.DirtyRects));
+        Assert.Equal(new FramebufferRect(1, 1, 2, 2), Assert.Single(result.PixelContentRects));
         Assert.Equal(0xFFFF0000u, framebuffer.GetBgra32(1, 1));
         Assert.Equal(0xFF00FF00u, framebuffer.GetBgra32(2, 1));
         Assert.Equal(0xFF0000FFu, framebuffer.GetBgra32(1, 2));
@@ -165,29 +166,87 @@ public sealed class FramebufferUpdateTests
     public async Task Out_of_bounds_raw_rectangle_is_rejected_before_payload_read()
     {
         using var framebuffer = new FramebufferModel(2, 2, ProtocolLimits.Default);
-        var message = Update(Header(1, 1, 2, 2, RfbEncodingType.Raw));
+        var before = framebuffer.GetPixelsBgra32();
+        var message = Update([.. Header(1, 1, 2, 2, RfbEncodingType.Raw), 0xDE, 0xAD]);
         await using var stream = new MemoryStream(message);
 
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             FramebufferUpdateReader.ApplyAsync(stream, framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None));
 
-        Assert.Equal(message.Length, stream.Position);
-        Assert.All(framebuffer.GetPixelsBgra32().Where((_, index) => index % 4 != 3), value => Assert.Equal(0, value));
+        Assert.Contains("exceeds", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(16, stream.Position);
+        Assert.Equal(before, framebuffer.GetPixelsBgra32());
     }
 
     [Fact]
-    public async Task Raw_length_above_message_limit_is_rejected_without_mutation()
+    public async Task Raw_length_above_update_budget_is_rejected_without_consuming_payload()
     {
-        var limits = new ProtocolLimits(15, 64);
+        var limits = new ProtocolLimits(15, 64, 15);
         using var framebuffer = new FramebufferModel(2, 2, limits);
         var before = framebuffer.GetPixelsBgra32();
-        var message = Update(Header(0, 0, 2, 2, RfbEncodingType.Raw));
+        var message = Update([.. Header(0, 0, 2, 2, RfbEncodingType.Raw), 0xDE, 0xAD]);
+        await using var stream = new MemoryStream(message);
 
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             FramebufferUpdateReader.ApplyAsync(
-                new MemoryStream(message), framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None));
+                stream, framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None));
 
+        Assert.Contains("16", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(16, stream.Position);
         Assert.Equal(before, framebuffer.GetPixelsBgra32());
+    }
+
+    [Fact]
+    public async Task Raw_payload_budget_is_cumulative_and_rejects_before_second_payload()
+    {
+        var limits = new ProtocolLimits(16, 8, 7);
+        using var framebuffer = new FramebufferModel(2, 1, limits);
+        var message = Update(
+            Raw(0, 0, 1, 1, [1, 0, 0, 0]),
+            Raw(1, 0, 1, 1, [0xDE, 0xAD, 0xBE, 0xEF]));
+        await using var stream = new MemoryStream(message);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(stream, framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None));
+
+        Assert.Contains("8", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(32, stream.Position);
+        Assert.Equal(1u, framebuffer.GetBgra32(0, 0) & 0xFF);
+        Assert.Equal(0u, framebuffer.GetBgra32(1, 0) & 0xFF);
+    }
+
+    [Fact]
+    public async Task Raw_payload_can_exceed_message_limit_when_within_update_budget()
+    {
+        const int width = 3840;
+        const int height = 2160;
+        const int payloadLength = width * height * 4;
+        var limits = new ProtocolLimits(16 * 1024 * 1024, payloadLength, payloadLength);
+        using var framebuffer = new FramebufferModel(width, height, limits);
+        var payload = new byte[payloadLength];
+
+        var result = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(Update(Raw(0, 0, width, height, payload))),
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            CancellationToken.None);
+
+        Assert.Equal(new FramebufferRect(0, 0, width, height), Assert.Single(result.PixelContentRects));
+    }
+
+    [Fact]
+    public async Task Framebuffer_update_payload_budget_resets_for_each_update()
+    {
+        var limits = new ProtocolLimits(4, 4, 4);
+        using var framebuffer = new FramebufferModel(1, 1, limits);
+        var update = Update(Raw(0, 0, 1, 1, [1, 0, 0, 0]));
+
+        _ = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(update), framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None);
+        _ = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(update), framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None);
+
+        Assert.Equal(1u, framebuffer.GetBgra32(0, 0) & 0xFF);
     }
 
     [Fact]
@@ -201,6 +260,7 @@ public sealed class FramebufferUpdateTests
             new MemoryStream(message), framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None);
 
         Assert.Equal(new FramebufferRect(1, 0, 1, 1), Assert.Single(result.DirtyRects));
+        Assert.Empty(result.PixelContentRects);
         Assert.Equal(7u, framebuffer.GetBgra32(1, 0) & 0xFF);
     }
 
@@ -222,6 +282,26 @@ public sealed class FramebufferUpdateTests
     }
 
     [Fact]
+    public async Task CopyRect_payload_budget_is_cumulative_and_rejects_before_second_payload()
+    {
+        var limits = new ProtocolLimits(16, 8, 7);
+        using var framebuffer = new FramebufferModel(2, 1, limits);
+        framebuffer.ApplyRaw(new FramebufferRect(0, 0, 2, 1), [1, 0, 0, 255, 2, 0, 0, 255]);
+        var message = Update(
+            CopyRect(0, 0, 1, 1, 1, 0),
+            [.. Header(1, 0, 1, 1, RfbEncodingType.CopyRect), 0xDE, 0xAD, 0xBE, 0xEF]);
+        await using var stream = new MemoryStream(message);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(stream, framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None));
+
+        Assert.Contains("8", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(32, stream.Position);
+        Assert.Equal(2u, framebuffer.GetBgra32(0, 0) & 0xFF);
+        Assert.Equal(2u, framebuffer.GetBgra32(1, 0) & 0xFF);
+    }
+
+    [Fact]
     public async Task DesktopSize_resizes_atomically_and_marks_full_screen_dirty()
     {
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
@@ -233,6 +313,7 @@ public sealed class FramebufferUpdateTests
             CancellationToken.None);
 
         Assert.True(result.DesktopResized);
+        Assert.Empty(result.PixelContentRects);
         Assert.Equal(3, framebuffer.Width);
         Assert.Equal(2, framebuffer.Height);
         Assert.Equal(new FramebufferRect(0, 0, 3, 2), Assert.Single(result.DirtyRects));
@@ -312,6 +393,24 @@ public sealed class FramebufferUpdateTests
         pixels[0] = 99;
 
         Assert.Equal(1, cursor.GetPixelsBgra32()[0]);
+    }
+
+    [Fact]
+    public async Task Cursor_payload_budget_is_cumulative_and_rejects_before_second_payload()
+    {
+        var limits = new ProtocolLimits(16, 16, 9);
+        using var framebuffer = new FramebufferModel(1, 1, limits);
+        var message = Update(
+            Cursor(0, 0, 1, 1, [1, 2, 3, 0], [0x80]),
+            Cursor(0, 0, 1, 1, [0xDE, 0xAD, 0xBE, 0xEF], [0x80]));
+        await using var stream = new MemoryStream(message);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(stream, framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None));
+
+        Assert.Contains("10", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(33, stream.Position);
+        Assert.Equal([1, 2, 3, 255], Assert.IsType<RemoteCursor>(framebuffer.Cursor).GetPixelsBgra32());
     }
 
     [Fact]

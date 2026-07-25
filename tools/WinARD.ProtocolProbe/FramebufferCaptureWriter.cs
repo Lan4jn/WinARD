@@ -7,55 +7,64 @@ namespace WinARD.ProtocolProbe;
 public static class FramebufferCaptureWriter
 {
     private const int BitmapHeaderLength = 54;
+    private static readonly ICaptureFileOperations FileOperations = new CaptureFileOperations();
 
     public static Task WriteAsync(
         string path,
         Framebuffer framebuffer,
+        CancellationToken cancellationToken) =>
+        WriteAsync(path, framebuffer, FileOperations, cancellationToken);
+
+    internal static Task WriteAsync(
+        string path,
+        Framebuffer framebuffer,
+        ICaptureFileOperations fileOperations,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentNullException.ThrowIfNull(fileOperations);
         return Path.GetExtension(path).ToUpperInvariant() switch
         {
-            ".BGRA" => WriteBgraAsync(path, framebuffer, cancellationToken),
-            ".BMP" => WriteBmpAsync(path, framebuffer, cancellationToken),
+            ".BGRA" => WriteBgraAsync(path, framebuffer, fileOperations, cancellationToken),
+            ".BMP" => WriteBmpAsync(path, framebuffer, fileOperations, cancellationToken),
             _ => throw new ArgumentException("Capture path must use the .bgra or .bmp extension.", nameof(path)),
         };
     }
 
-    public static async Task WriteBmpAsync(
+    public static Task WriteBmpAsync(
         string path,
         Framebuffer framebuffer,
+        CancellationToken cancellationToken) =>
+        WriteBmpAsync(path, framebuffer, FileOperations, cancellationToken);
+
+    private static async Task WriteBmpAsync(
+        string path,
+        Framebuffer framebuffer,
+        ICaptureFileOperations fileOperations,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         ArgumentNullException.ThrowIfNull(framebuffer);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var fullPath = Path.GetFullPath(path);
-        CreateParentDirectory(fullPath);
         var pixels = framebuffer.GetPixelsBgra32();
         var header = CreateHeader(framebuffer.Width, framebuffer.Height, pixels.Length);
-        var created = false;
         try
         {
-            await using var output = new FileStream(
-                fullPath,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                4096,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
-            created = true;
-            await output.WriteAsync(header, cancellationToken);
-            for (var y = framebuffer.Height - 1; y >= 0; y--)
-            {
-                await output.WriteAsync(pixels.AsMemory(y * framebuffer.Stride, framebuffer.Stride), cancellationToken);
-            }
-        }
-        catch
-        {
-            DeletePartialCapture(fullPath, created);
-            throw;
+            await WriteAtomicallyAsync(
+                path,
+                async output =>
+                {
+                    await output.WriteAsync(header, cancellationToken);
+                    for (var y = framebuffer.Height - 1; y >= 0; y--)
+                    {
+                        await output.WriteAsync(
+                            pixels.AsMemory(y * framebuffer.Stride, framebuffer.Stride),
+                            cancellationToken);
+                    }
+                },
+                fileOperations,
+                cancellationToken);
         }
         finally
         {
@@ -66,31 +75,20 @@ public static class FramebufferCaptureWriter
     private static async Task WriteBgraAsync(
         string path,
         Framebuffer framebuffer,
+        ICaptureFileOperations fileOperations,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(framebuffer);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var fullPath = Path.GetFullPath(path);
-        CreateParentDirectory(fullPath);
         var pixels = framebuffer.GetPixelsBgra32();
-        var created = false;
         try
         {
-            await using var output = new FileStream(
-                fullPath,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                4096,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
-            created = true;
-            await output.WriteAsync(pixels, cancellationToken);
-        }
-        catch
-        {
-            DeletePartialCapture(fullPath, created);
-            throw;
+            await WriteAtomicallyAsync(
+                path,
+                output => output.WriteAsync(pixels, cancellationToken).AsTask(),
+                fileOperations,
+                cancellationToken);
         }
         finally
         {
@@ -98,32 +96,51 @@ public static class FramebufferCaptureWriter
         }
     }
 
-    private static void CreateParentDirectory(string fullPath)
+    private static async Task WriteAtomicallyAsync(
+        string path,
+        Func<Stream, Task> write,
+        ICaptureFileOperations fileOperations,
+        CancellationToken cancellationToken)
     {
+        var fullPath = Path.GetFullPath(path);
         var directory = Path.GetDirectoryName(fullPath);
         if (!string.IsNullOrEmpty(directory))
         {
-            _ = Directory.CreateDirectory(directory);
+            fileOperations.CreateDirectory(directory);
+        }
+
+        var temporaryPath = CreateTemporaryPath(fullPath);
+        try
+        {
+            await using (var output = fileOperations.CreateNew(temporaryPath))
+            {
+                await write(output);
+                await output.FlushAsync(cancellationToken);
+            }
+
+            fileOperations.MoveNew(temporaryPath, fullPath);
+        }
+        catch (Exception exception)
+        {
+            try
+            {
+                fileOperations.Delete(temporaryPath);
+            }
+            catch (Exception cleanupException)
+                when (cleanupException is IOException or UnauthorizedAccessException)
+            {
+                exception.Data["CaptureTemporaryFileCleanupException"] = cleanupException;
+            }
+
+            throw;
         }
     }
 
-    private static void DeletePartialCapture(string fullPath, bool created)
+    private static string CreateTemporaryPath(string fullPath)
     {
-        if (!created)
-        {
-            return;
-        }
-
-        try
-        {
-            File.Delete(fullPath);
-        }
-        catch (IOException)
-        {
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
+        var directory = Path.GetDirectoryName(fullPath) ?? string.Empty;
+        var fileName = Path.GetFileName(fullPath);
+        return Path.Combine(directory, $".{fileName}.{Guid.NewGuid():N}.tmp");
     }
 
     private static byte[] CreateHeader(int width, int height, int pixelByteLength)
@@ -142,4 +159,31 @@ public static class FramebufferCaptureWriter
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(34), pixelByteLength);
         return header;
     }
+}
+
+internal interface ICaptureFileOperations
+{
+    void CreateDirectory(string path);
+    Stream CreateNew(string path);
+    void MoveNew(string source, string destination);
+    void Delete(string path);
+}
+
+internal sealed class CaptureFileOperations : ICaptureFileOperations
+{
+    public void CreateDirectory(string path) => _ = Directory.CreateDirectory(path);
+
+    public Stream CreateNew(string path) =>
+        new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            4096,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+    public void MoveNew(string source, string destination) =>
+        File.Move(source, destination, overwrite: false);
+
+    public void Delete(string path) => File.Delete(path);
 }

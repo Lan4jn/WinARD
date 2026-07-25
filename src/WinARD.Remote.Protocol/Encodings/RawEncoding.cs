@@ -33,7 +33,8 @@ public sealed class RawEncoding : IRfbEncodingDecoder
             rectangle.Height,
             _pixelFormat,
             framebuffer.Limits);
-        var wirePixels = await reader.ReadBytesAsync(wireLength, cancellationToken);
+        reader.ReserveFramebufferUpdateBytes(wireLength);
+        var wirePixels = await reader.ReadFramebufferPayloadBytesAsync(wireLength, cancellationToken);
         byte[]? bgraPixels = null;
         try
         {

@@ -14,6 +14,7 @@ public sealed class CopyRectEncoding : IRfbEncodingDecoder
         CancellationToken cancellationToken)
     {
         rectangle.ValidateWithin(framebuffer.Width, framebuffer.Height);
+        reader.ReserveFramebufferUpdateBytes(sizeof(ushort) * 2);
         var sourceX = await reader.ReadUInt16Async(cancellationToken);
         var sourceY = await reader.ReadUInt16Async(cancellationToken);
         framebuffer.CopyRect(rectangle, sourceX, sourceY);
