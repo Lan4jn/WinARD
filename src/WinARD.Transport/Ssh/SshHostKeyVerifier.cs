@@ -168,7 +168,16 @@ public sealed class SshHostKeyVerifier
 public sealed class SshHostKeyChangedException : Exception
 {
     public SshHostKeyChangedException(SshHostKeyEndpoint endpoint)
-        : base($"The SSH host key for {endpoint.Host}:{endpoint.Port} has changed.")
+        : this(endpoint, innerException: null)
+    {
+    }
+
+    public SshHostKeyChangedException(
+        SshHostKeyEndpoint endpoint,
+        Exception? innerException)
+        : base(
+            $"The SSH host key for {endpoint.Host}:{endpoint.Port} has changed.",
+            innerException)
     {
         Endpoint = endpoint;
     }

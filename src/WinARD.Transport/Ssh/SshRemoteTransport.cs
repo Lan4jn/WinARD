@@ -72,13 +72,13 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             exception is not OperationCanceledException and not TransportTimeoutException &&
             verification?.Status == SshHostKeyStatus.Unknown)
         {
-            throw new SshHostKeyUnknownException(verification);
+            throw new SshHostKeyUnknownException(verification, exception);
         }
         catch (Exception exception) when (
             exception is not OperationCanceledException and not TransportTimeoutException &&
             verification?.Status == SshHostKeyStatus.Changed)
         {
-            throw new SshHostKeyChangedException(sshEndpoint);
+            throw new SshHostKeyChangedException(sshEndpoint, exception);
         }
 
         if (verification?.Status != SshHostKeyStatus.Trusted)
@@ -528,7 +528,16 @@ internal sealed class CleanupCollector
 public sealed class SshHostKeyUnknownException : Exception
 {
     public SshHostKeyUnknownException(SshHostKeyVerification verification)
-        : base($"The SSH host key for {verification.Endpoint.Host}:{verification.Endpoint.Port} is not pinned.")
+        : this(verification, innerException: null)
+    {
+    }
+
+    public SshHostKeyUnknownException(
+        SshHostKeyVerification verification,
+        Exception? innerException)
+        : base(
+            $"The SSH host key for {verification.Endpoint.Host}:{verification.Endpoint.Port} is not pinned.",
+            innerException)
     {
         Verification = verification ?? throw new ArgumentNullException(nameof(verification));
     }

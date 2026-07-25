@@ -41,6 +41,54 @@ public sealed class SshRemoteTransportTests
     }
 
     [Fact]
+    public async Task Unknown_host_key_preserves_connector_cleanup_failures_as_inner_exception()
+    {
+        var connectFailure = new IOException("SSH connection rejected.");
+        var cleanupFailure = new IOException("SSH connector cleanup failed.");
+        var connectorFailure = new AggregateException(connectFailure, cleanupFailure);
+        var connector = new FakeSshSessionConnector("ssh-ed25519", [1, 2, 3])
+        {
+            HostKeyRejectionFailure = connectorFailure,
+        };
+        var transport = new SshRemoteTransport(connector);
+        var profile = CreateProfile(pinnedAlgorithm: null, pinnedFingerprint: null);
+
+        var exception = await Assert.ThrowsAsync<SshHostKeyUnknownException>(
+            () => transport.ConnectAsync(profile, CancellationToken.None));
+
+        Assert.Same(connectorFailure, exception.InnerException);
+        Assert.Collection(
+            connectorFailure.InnerExceptions,
+            item => Assert.Same(connectFailure, item),
+            item => Assert.Same(cleanupFailure, item));
+    }
+
+    [Fact]
+    public async Task Changed_host_key_preserves_connector_cleanup_failures_as_inner_exception()
+    {
+        var connectFailure = new IOException("SSH connection rejected.");
+        var cleanupFailure = new IOException("SSH connector cleanup failed.");
+        var connectorFailure = new AggregateException(connectFailure, cleanupFailure);
+        var connector = new FakeSshSessionConnector("ssh-ed25519", [9, 9, 9])
+        {
+            HostKeyRejectionFailure = connectorFailure,
+        };
+        var transport = new SshRemoteTransport(connector);
+        var profile = CreateProfile(
+            "ssh-ed25519",
+            SshHostKeyVerifier.ComputeFingerprint([1, 2, 3]));
+
+        var exception = await Assert.ThrowsAsync<SshHostKeyChangedException>(
+            () => transport.ConnectAsync(profile, CancellationToken.None));
+
+        Assert.Same(connectorFailure, exception.InnerException);
+        Assert.Collection(
+            connectorFailure.InnerExceptions,
+            item => Assert.Same(connectFailure, item),
+            item => Assert.Same(cleanupFailure, item));
+    }
+
+    [Fact]
     public async Task Connector_that_skips_host_key_validation_is_disposed_before_tunnel_creation()
     {
         var connector = new FakeSshSessionConnector("ssh-ed25519", [1, 2, 3])
@@ -290,6 +338,8 @@ public sealed class SshRemoteTransportTests
 
         public Exception? SessionDisposeFailure { get; init; }
 
+        public Exception? HostKeyRejectionFailure { get; init; }
+
         public bool SkipHostKeyValidator { get; init; }
 
         public bool IgnoreHostKeyRejection { get; init; }
@@ -303,7 +353,7 @@ public sealed class SshRemoteTransportTests
                 hostKeyValidator(new SshPresentedHostKey(algorithm, hostKey));
             if (!trusted && !IgnoreHostKeyRejection)
             {
-                throw new IOException("SSH host key was rejected.");
+                throw HostKeyRejectionFailure ?? new IOException("SSH host key was rejected.");
             }
 
             return Task.FromResult<ISshTunnelSession>(new FakeSession(this));
