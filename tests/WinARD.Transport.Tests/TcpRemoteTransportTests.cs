@@ -38,17 +38,16 @@ public sealed class TcpRemoteTransportTests
     [Fact]
     public async Task Caller_cancellation_is_not_reported_as_a_transport_timeout()
     {
-        var resolver = new BlockingResolver();
+        var connector = new BlockingConnector();
         var transport = new TcpRemoteTransport(
             new TransportTimeouts(TimeSpan.FromMinutes(1)),
             TimeProvider.System,
-            resolver,
-            new SystemTcpClientConnector());
+            connector);
         var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.invalid", 5900, "operator");
         using var cancellation = new CancellationTokenSource();
 
         var connectTask = transport.ConnectAsync(profile, cancellation.Token);
-        await resolver.Started.Task;
+        await connector.Started.Task;
         cancellation.Cancel();
 
         var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => connectTask);
@@ -56,34 +55,13 @@ public sealed class TcpRemoteTransportTests
     }
 
     [Fact]
-    public async Task Dns_deadline_is_reported_as_a_stable_transport_timeout()
-    {
-        var timeProvider = new ManualTimeProvider();
-        var resolver = new BlockingResolver();
-        var transport = new TcpRemoteTransport(
-            new TransportTimeouts(TimeSpan.FromSeconds(30)),
-            timeProvider,
-            resolver,
-            new SystemTcpClientConnector());
-        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.invalid", 5900, "operator");
-
-        var connectTask = transport.ConnectAsync(profile, CancellationToken.None);
-        await resolver.Started.Task;
-        timeProvider.Advance(TimeSpan.FromSeconds(30));
-
-        var exception = await Assert.ThrowsAsync<TransportTimeoutException>(() => connectTask);
-        Assert.Equal(TransportTimeoutStage.DnsResolution, exception.Stage);
-    }
-
-    [Fact]
-    public async Task Connect_deadline_is_reported_as_a_stable_transport_timeout()
+    public async Task Host_connect_deadline_is_reported_as_a_stable_transport_timeout()
     {
         var timeProvider = new ManualTimeProvider();
         var connector = new BlockingConnector();
         var transport = new TcpRemoteTransport(
             new TransportTimeouts(TimeSpan.FromSeconds(30)),
             timeProvider,
-            new FixedResolver(IPAddress.Loopback),
             connector);
         var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.invalid", 5900, "operator");
 
@@ -95,23 +73,47 @@ public sealed class TcpRemoteTransportTests
         Assert.Equal(TransportTimeoutStage.Connection, exception.Stage);
     }
 
-    private sealed class BlockingResolver : IHostAddressResolver
+    [Theory]
+    [InlineData("münchen.example.", "xn--mnchen-3ya.example")]
+    [InlineData("[2001:0db8:0:0:0:0:0:1]", "2001:db8::1")]
+    public async Task Host_is_normalized_before_the_host_level_connector(
+        string configuredHost,
+        string expectedHost)
     {
-        public TaskCompletionSource Started { get; } =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var connector = new RecordingFailingConnector();
+        var transport = new TcpRemoteTransport(
+            TransportTimeouts.Default,
+            TimeProvider.System,
+            connector);
+        var profile = ConnectionProfile.Create(
+            Guid.NewGuid(),
+            "Mac",
+            configuredHost,
+            5900,
+            "operator");
 
-        public async Task<IPAddress[]> ResolveAsync(string host, CancellationToken cancellationToken)
-        {
-            Started.TrySetResult();
-            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
-            return [];
-        }
+        await Assert.ThrowsAsync<SocketException>(
+            () => transport.ConnectAsync(profile, CancellationToken.None));
+
+        Assert.Equal(expectedHost, connector.Host);
     }
 
-    private sealed class FixedResolver(params IPAddress[] addresses) : IHostAddressResolver
+    [Fact]
+    public async Task System_connector_connects_using_a_host_name()
     {
-        public Task<IPAddress[]> ResolveAsync(string host, CancellationToken cancellationToken) =>
-            Task.FromResult(addresses);
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var acceptTask = listener.AcceptTcpClientAsync();
+        var connector = new SystemTcpClientConnector();
+
+        using var client = await connector.ConnectAsync(
+            "localhost",
+            port,
+            CancellationToken.None);
+        using var accepted = await acceptTask;
+
+        Assert.True(client.Connected);
     }
 
     private sealed class BlockingConnector : ITcpClientConnector
@@ -120,13 +122,28 @@ public sealed class TcpRemoteTransportTests
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task<TcpClient> ConnectAsync(
-            IPAddress address,
+            string host,
             int port,
             CancellationToken cancellationToken)
         {
             Started.TrySetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             throw new InvalidOperationException("Unreachable.");
+        }
+    }
+
+    private sealed class RecordingFailingConnector : ITcpClientConnector
+    {
+        public string? Host { get; private set; }
+
+        public Task<TcpClient> ConnectAsync(
+            string host,
+            int port,
+            CancellationToken cancellationToken)
+        {
+            Host = host;
+            return Task.FromException<TcpClient>(
+                new SocketException((int)SocketError.ConnectionRefused));
         }
     }
 

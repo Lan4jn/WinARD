@@ -81,6 +81,20 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             throw new SshHostKeyChangedException(sshEndpoint);
         }
 
+        if (verification?.Status != SshHostKeyStatus.Trusted)
+        {
+            Exception trustFailure = verification?.Status switch
+            {
+                SshHostKeyStatus.Unknown => new SshHostKeyUnknownException(verification),
+                SshHostKeyStatus.Changed => new SshHostKeyChangedException(sshEndpoint),
+                _ => new SshHostKeyNotVerifiedException(sshEndpoint),
+            };
+
+            var cleanup = new CleanupCollector(trustFailure);
+            await cleanup.TryAsync(session.DisposeAsync).ConfigureAwait(false);
+            cleanup.ThrowIfAny();
+        }
+
         try
         {
             var stream = await WithConnectionDeadlineAsync(
@@ -94,10 +108,12 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
                 new EndPointDescription(sshProfile.TargetHost, sshProfile.TargetPort),
                 session);
         }
-        catch
+        catch (Exception exception)
         {
-            await session.DisposeAsync().ConfigureAwait(false);
-            throw;
+            var cleanup = new CleanupCollector(exception);
+            await cleanup.TryAsync(session.DisposeAsync).ConfigureAwait(false);
+            cleanup.ThrowIfAny();
+            throw new InvalidOperationException("Unreachable.");
         }
     }
 
@@ -168,48 +184,60 @@ internal sealed class SshNetSessionConnector(
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(authenticationMethodProvider);
-        var authenticationMethods = await authenticationMethodProvider
-            .GetAuthenticationMethodsAsync(profile, cancellationToken)
-            .ConfigureAwait(false);
-        if (authenticationMethods.Count == 0)
-        {
-            throw new InvalidOperationException("At least one SSH authentication method is required.");
-        }
-
-        var ownedAuthenticationMethods = authenticationMethods.ToArray();
-        var connectionInfo = new ConnectionInfo(
-            profile.Host,
-            profile.Port,
-            profile.Username,
-            ownedAuthenticationMethods);
-        var client = new SshClient(connectionInfo);
-        client.HostKeyReceived += (_, eventArgs) =>
-        {
-            eventArgs.CanTrust = hostKeyValidator(
-                new SshPresentedHostKey(eventArgs.HostKeyName, eventArgs.HostKey));
-        };
-
+        AuthenticationMethod[] ownedAuthenticationMethods = [];
+        SshClient? client = null;
         try
         {
-            await client.ConnectAsync(cancellationToken).ConfigureAwait(false);
-            return new SshNetTunnelSession(client, ownedAuthenticationMethods);
-        }
-        catch
-        {
-            try
+            var authenticationMethods = await authenticationMethodProvider
+                .GetAuthenticationMethodsAsync(profile, cancellationToken)
+                .ConfigureAwait(false);
+            if (authenticationMethods.Count == 0)
             {
-                client.Dispose();
-            }
-            finally
-            {
-                DisposeAuthenticationMethods(ownedAuthenticationMethods);
+                throw new InvalidOperationException("At least one SSH authentication method is required.");
             }
 
-            throw;
+            ownedAuthenticationMethods = authenticationMethods.ToArray();
+            var connectionInfo = new ConnectionInfo(
+                profile.Host,
+                profile.Port,
+                profile.Username,
+                ownedAuthenticationMethods);
+            client = new SshClient(connectionInfo);
+            client.HostKeyReceived += (_, eventArgs) =>
+            {
+                eventArgs.CanTrust = hostKeyValidator(
+                    new SshPresentedHostKey(eventArgs.HostKeyName, eventArgs.HostKey));
+            };
+
+            await client.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            return new SshNetTunnelSession(
+                new SshClientResource(client),
+                ownedAuthenticationMethods,
+                new SshTunnelResourceFactory());
+        }
+        catch (Exception exception)
+        {
+            var cleanup = new CleanupCollector(exception);
+            if (client is not null)
+            {
+                cleanup.Try(() =>
+                {
+                    if (client.IsConnected)
+                    {
+                        client.Disconnect();
+                    }
+                });
+                cleanup.Try(client.Dispose);
+            }
+
+            AddAuthenticationMethodCleanup(cleanup, ownedAuthenticationMethods);
+            cleanup.ThrowIfAny();
+            throw new InvalidOperationException("Unreachable.");
         }
     }
 
-    internal static void DisposeAuthenticationMethods(
+    internal static void AddAuthenticationMethodCleanup(
+        CleanupCollector cleanup,
         IEnumerable<AuthenticationMethod> authenticationMethods)
     {
         var disposed = new HashSet<object>(ReferenceEqualityComparer.Instance);
@@ -217,19 +245,22 @@ internal sealed class SshNetSessionConnector(
         {
             if (method is IDisposable disposable && disposed.Add(method))
             {
-                disposable.Dispose();
+                cleanup.Try(disposable.Dispose);
             }
         }
     }
 }
 
 internal sealed class SshNetTunnelSession(
-    SshClient client,
-    IReadOnlyList<AuthenticationMethod> authenticationMethods) : ISshTunnelSession
+    ISshClientResource client,
+    IReadOnlyList<AuthenticationMethod> authenticationMethods,
+    ISshTunnelResourceFactory resourceFactory,
+    ISshForwardedPortResource? forwardedPort = null,
+    ILocalTcpClientResource? localClient = null) : ISshTunnelSession
 {
     private readonly object _sync = new();
-    private ForwardedPortLocal? _forwardedPort;
-    private TcpClient? _localClient;
+    private ISshForwardedPortResource? _forwardedPort = forwardedPort;
+    private ILocalTcpClientResource? _localClient = localClient;
     private int _disposed;
 
     public async Task<Stream> OpenDirectTcpipAsync(
@@ -241,37 +272,51 @@ internal sealed class SshNetTunnelSession(
             Volatile.Read(ref _disposed) != 0,
             this);
 
-        var forwardedPort = new ForwardedPortLocal(
-            IPAddress.Loopback.ToString(),
-            0,
-            targetHost,
-            checked((uint)targetPort));
-        var localClient = new TcpClient(AddressFamily.InterNetwork);
+        ISshForwardedPortResource? newForwardedPort = null;
+        ILocalTcpClientResource? newLocalClient = null;
         try
         {
-            client.AddForwardedPort(forwardedPort);
-            forwardedPort.Start();
-            await localClient
-                .ConnectAsync(IPAddress.Loopback, checked((int)forwardedPort.BoundPort), cancellationToken)
+            newForwardedPort = resourceFactory.CreateForwardedPort(targetHost, targetPort);
+            newLocalClient = resourceFactory.CreateLocalClient();
+            client.AddForwardedPort(newForwardedPort);
+            newForwardedPort.Start();
+            await newLocalClient
+                .ConnectAsync(
+                    IPAddress.Loopback.ToString(),
+                    newForwardedPort.BoundPort,
+                    cancellationToken)
                 .ConfigureAwait(false);
+            var stream = newLocalClient.GetStream();
             lock (_sync)
             {
-                _forwardedPort = forwardedPort;
-                _localClient = localClient;
+                _forwardedPort = newForwardedPort;
+                _localClient = newLocalClient;
             }
 
-            return localClient.GetStream();
+            return stream;
         }
-        catch
+        catch (Exception exception)
         {
-            localClient.Dispose();
-            if (forwardedPort.IsStarted)
+            var cleanup = new CleanupCollector(exception);
+            if (newLocalClient is not null)
             {
-                forwardedPort.Stop();
+                cleanup.Try(newLocalClient.Dispose);
             }
 
-            forwardedPort.Dispose();
-            throw;
+            if (newForwardedPort is not null)
+            {
+                cleanup.Try(() =>
+                {
+                    if (newForwardedPort.IsStarted)
+                    {
+                        newForwardedPort.Stop();
+                    }
+                });
+                cleanup.Try(newForwardedPort.Dispose);
+            }
+
+            cleanup.ThrowIfAny();
+            throw new InvalidOperationException("Unreachable.");
         }
     }
 
@@ -282,33 +327,201 @@ internal sealed class SshNetTunnelSession(
             return ValueTask.CompletedTask;
         }
 
-        ForwardedPortLocal? forwardedPort;
-        TcpClient? localClient;
+        ISshForwardedPortResource? ownedForwardedPort;
+        ILocalTcpClientResource? ownedLocalClient;
         lock (_sync)
         {
-            forwardedPort = _forwardedPort;
-            localClient = _localClient;
+            ownedForwardedPort = _forwardedPort;
+            ownedLocalClient = _localClient;
             _forwardedPort = null;
             _localClient = null;
         }
 
-        localClient?.Dispose();
-        if (forwardedPort?.IsStarted == true)
+        var cleanup = new CleanupCollector();
+        if (ownedLocalClient is not null)
         {
-            forwardedPort.Stop();
+            cleanup.Try(ownedLocalClient.Dispose);
         }
 
-        forwardedPort?.Dispose();
+        if (ownedForwardedPort is not null)
+        {
+            cleanup.Try(() =>
+            {
+                if (ownedForwardedPort.IsStarted)
+                {
+                    ownedForwardedPort.Stop();
+                }
+            });
+            cleanup.Try(ownedForwardedPort.Dispose);
+        }
+
+        cleanup.Try(client.Disconnect);
+        cleanup.Try(client.Dispose);
+        SshNetSessionConnector.AddAuthenticationMethodCleanup(cleanup, authenticationMethods);
+        cleanup.ThrowIfAny();
+        return ValueTask.CompletedTask;
+    }
+}
+
+internal interface ISshClientResource : IDisposable
+{
+    void AddForwardedPort(ISshForwardedPortResource forwardedPort);
+
+    void Disconnect();
+}
+
+internal interface ISshForwardedPortResource : IDisposable
+{
+    bool IsStarted { get; }
+
+    int BoundPort { get; }
+
+    void Start();
+
+    void Stop();
+}
+
+internal interface ILocalTcpClientResource : IDisposable
+{
+    Task ConnectAsync(string host, int port, CancellationToken cancellationToken);
+
+    Stream GetStream();
+}
+
+internal interface ISshTunnelResourceFactory
+{
+    ISshForwardedPortResource CreateForwardedPort(string targetHost, int targetPort);
+
+    ILocalTcpClientResource CreateLocalClient();
+}
+
+internal sealed class SshClientResource(SshClient client) : ISshClientResource
+{
+    public void AddForwardedPort(ISshForwardedPortResource forwardedPort)
+    {
+        if (forwardedPort is not SshForwardedPortResource sshForwardedPort)
+        {
+            throw new ArgumentException("Unsupported SSH forwarded port resource.", nameof(forwardedPort));
+        }
+
+        client.AddForwardedPort(sshForwardedPort.ForwardedPort);
+    }
+
+    public void Disconnect()
+    {
+        if (client.IsConnected)
+        {
+            client.Disconnect();
+        }
+    }
+
+    public void Dispose() => client.Dispose();
+}
+
+internal sealed class SshForwardedPortResource(ForwardedPortLocal forwardedPort)
+    : ISshForwardedPortResource
+{
+    internal ForwardedPortLocal ForwardedPort => forwardedPort;
+
+    public bool IsStarted => forwardedPort.IsStarted;
+
+    public int BoundPort => checked((int)forwardedPort.BoundPort);
+
+    public void Start() => forwardedPort.Start();
+
+    public void Stop() => forwardedPort.Stop();
+
+    public void Dispose() => forwardedPort.Dispose();
+}
+
+internal sealed class LocalTcpClientResource(TcpClient client) : ILocalTcpClientResource
+{
+    public async Task ConnectAsync(
+        string host,
+        int port,
+        CancellationToken cancellationToken) =>
+        await client.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
+
+    public Stream GetStream() => client.GetStream();
+
+    public void Dispose() => client.Dispose();
+}
+
+internal sealed class SshTunnelResourceFactory : ISshTunnelResourceFactory
+{
+    public ISshForwardedPortResource CreateForwardedPort(string targetHost, int targetPort) =>
+        new SshForwardedPortResource(
+            new ForwardedPortLocal(
+                IPAddress.Loopback.ToString(),
+                0,
+                targetHost,
+                checked((uint)targetPort)));
+
+    public ILocalTcpClientResource CreateLocalClient() =>
+        new LocalTcpClientResource(new TcpClient(AddressFamily.InterNetwork));
+}
+
+internal sealed class CleanupCollector
+{
+    private readonly List<Exception> _exceptions = [];
+
+    public CleanupCollector(Exception? primaryException = null)
+    {
+        if (primaryException is not null)
+        {
+            Add(primaryException);
+        }
+    }
+
+    public void Try(Action cleanup)
+    {
         try
         {
-            client.Dispose();
+            cleanup();
         }
-        finally
+        catch (Exception exception)
         {
-            SshNetSessionConnector.DisposeAuthenticationMethods(authenticationMethods);
+            Add(exception);
+        }
+    }
+
+    public async ValueTask TryAsync(Func<ValueTask> cleanup)
+    {
+        try
+        {
+            await cleanup().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            Add(exception);
+        }
+    }
+
+    private void Add(Exception exception)
+    {
+        if (exception is AggregateException aggregateException)
+        {
+            _exceptions.AddRange(aggregateException.Flatten().InnerExceptions);
+        }
+        else
+        {
+            _exceptions.Add(exception);
+        }
+    }
+
+    public void ThrowIfAny()
+    {
+        if (_exceptions.Count == 1)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                .Capture(_exceptions[0])
+                .Throw();
         }
 
-        return ValueTask.CompletedTask;
+        if (_exceptions.Count > 1)
+        {
+            throw new AggregateException(_exceptions);
+        }
     }
 }
 
@@ -321,4 +534,15 @@ public sealed class SshHostKeyUnknownException : Exception
     }
 
     public SshHostKeyVerification Verification { get; }
+}
+
+public sealed class SshHostKeyNotVerifiedException : Exception
+{
+    public SshHostKeyNotVerifiedException(SshHostKeyEndpoint endpoint)
+        : base($"The SSH host key for {endpoint.Host}:{endpoint.Port} was not verified.")
+    {
+        Endpoint = endpoint;
+    }
+
+    public SshHostKeyEndpoint Endpoint { get; }
 }

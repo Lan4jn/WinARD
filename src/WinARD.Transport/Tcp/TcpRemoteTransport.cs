@@ -10,14 +10,12 @@ public sealed class TcpRemoteTransport : IRemoteTransportFactory
 {
     private readonly TransportTimeouts _timeouts;
     private readonly TimeProvider _timeProvider;
-    private readonly IHostAddressResolver _resolver;
     private readonly ITcpClientConnector _connector;
 
     public TcpRemoteTransport()
         : this(
             TransportTimeouts.Default,
             TimeProvider.System,
-            new SystemHostAddressResolver(),
             new SystemTcpClientConnector())
     {
     }
@@ -25,12 +23,10 @@ public sealed class TcpRemoteTransport : IRemoteTransportFactory
     internal TcpRemoteTransport(
         TransportTimeouts timeouts,
         TimeProvider timeProvider,
-        IHostAddressResolver resolver,
         ITcpClientConnector connector)
     {
         _timeouts = timeouts ?? throw new ArgumentNullException(nameof(timeouts));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
-        _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _connector = connector ?? throw new ArgumentNullException(nameof(connector));
     }
 
@@ -42,16 +38,7 @@ public sealed class TcpRemoteTransport : IRemoteTransportFactory
         cancellationToken.ThrowIfCancellationRequested();
 
         var host = NormalizeHost(profile.Host);
-        var addresses = IPAddress.TryParse(host, out var literalAddress)
-            ? [literalAddress]
-            : await ResolveAsync(host, cancellationToken).ConfigureAwait(false);
-
-        if (addresses.Length == 0)
-        {
-            throw new SocketException((int)SocketError.HostNotFound);
-        }
-
-        var client = await ConnectAnyAsync(addresses, profile.Port, cancellationToken).ConfigureAwait(false);
+        var client = await ConnectAsync(host, profile.Port, cancellationToken).ConfigureAwait(false);
         try
         {
             return new TransportConnection(
@@ -66,13 +53,16 @@ public sealed class TcpRemoteTransport : IRemoteTransportFactory
         }
     }
 
-    private async Task<IPAddress[]> ResolveAsync(string host, CancellationToken callerToken)
+    private async Task<TcpClient> ConnectAsync(
+        string host,
+        int port,
+        CancellationToken callerToken)
     {
-        using var deadline = new CancellationTokenSource(_timeouts.DnsResolution, _timeProvider);
+        using var deadline = new CancellationTokenSource(_timeouts.Connection, _timeProvider);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(callerToken, deadline.Token);
         try
         {
-            return await _resolver.ResolveAsync(host, linked.Token).ConfigureAwait(false);
+            return await _connector.ConnectAsync(host, port, linked.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (callerToken.IsCancellationRequested)
         {
@@ -80,40 +70,8 @@ public sealed class TcpRemoteTransport : IRemoteTransportFactory
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
         {
-            throw new TransportTimeoutException(TransportTimeoutStage.DnsResolution);
+            throw new TransportTimeoutException(TransportTimeoutStage.Connection);
         }
-    }
-
-    private async Task<TcpClient> ConnectAnyAsync(
-        IReadOnlyList<IPAddress> addresses,
-        int port,
-        CancellationToken callerToken)
-    {
-        using var deadline = new CancellationTokenSource(_timeouts.Connection, _timeProvider);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(callerToken, deadline.Token);
-        Exception? lastFailure = null;
-
-        foreach (var address in addresses)
-        {
-            try
-            {
-                return await _connector.ConnectAsync(address, port, linked.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (callerToken.IsCancellationRequested)
-            {
-                throw new OperationCanceledException(callerToken);
-            }
-            catch (OperationCanceledException) when (deadline.IsCancellationRequested)
-            {
-                throw new TransportTimeoutException(TransportTimeoutStage.Connection);
-            }
-            catch (Exception exception) when (exception is SocketException or IOException)
-            {
-                lastFailure = exception;
-            }
-        }
-
-        throw lastFailure ?? new SocketException((int)SocketError.NotConnected);
     }
 
     private static string NormalizeHost(string host)
@@ -124,9 +82,9 @@ public sealed class TcpRemoteTransport : IRemoteTransportFactory
             trimmed = trimmed[1..^1];
         }
 
-        if (IPAddress.TryParse(trimmed, out _))
+        if (IPAddress.TryParse(trimmed, out var address))
         {
-            return trimmed;
+            return address.ToString();
         }
 
         var asciiHost = new IdnMapping().GetAscii(trimmed.TrimEnd('.'));
@@ -139,33 +97,22 @@ public sealed class TcpRemoteTransport : IRemoteTransportFactory
     }
 }
 
-internal interface IHostAddressResolver
-{
-    Task<IPAddress[]> ResolveAsync(string host, CancellationToken cancellationToken);
-}
-
-internal sealed class SystemHostAddressResolver : IHostAddressResolver
-{
-    public Task<IPAddress[]> ResolveAsync(string host, CancellationToken cancellationToken) =>
-        Dns.GetHostAddressesAsync(host, cancellationToken);
-}
-
 internal interface ITcpClientConnector
 {
-    Task<TcpClient> ConnectAsync(IPAddress address, int port, CancellationToken cancellationToken);
+    Task<TcpClient> ConnectAsync(string host, int port, CancellationToken cancellationToken);
 }
 
 internal sealed class SystemTcpClientConnector : ITcpClientConnector
 {
     public async Task<TcpClient> ConnectAsync(
-        IPAddress address,
+        string host,
         int port,
         CancellationToken cancellationToken)
     {
-        var client = new TcpClient(address.AddressFamily);
+        var client = new TcpClient();
         try
         {
-            await client.ConnectAsync(address, port, cancellationToken).ConfigureAwait(false);
+            await client.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
             return client;
         }
         catch

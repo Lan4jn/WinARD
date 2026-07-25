@@ -3,20 +3,12 @@ namespace WinARD.Transport;
 public sealed record TransportTimeouts
 {
     public static TransportTimeouts Default { get; } =
-        new(TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(30));
+        new(TimeSpan.FromSeconds(30));
 
     public TransportTimeouts(TimeSpan timeout)
-        : this(timeout, timeout)
     {
+        Connection = ValidTimeout(timeout, nameof(timeout));
     }
-
-    public TransportTimeouts(TimeSpan dnsResolution, TimeSpan connection)
-    {
-        DnsResolution = ValidTimeout(dnsResolution, nameof(dnsResolution));
-        Connection = ValidTimeout(connection, nameof(connection));
-    }
-
-    public TimeSpan DnsResolution { get; }
 
     public TimeSpan Connection { get; }
 
@@ -33,16 +25,13 @@ public sealed record TransportTimeouts
 
 public enum TransportTimeoutStage
 {
-    DnsResolution,
     Connection,
 }
 
 public sealed class TransportTimeoutException : TimeoutException
 {
     public TransportTimeoutException(TransportTimeoutStage stage)
-        : base(stage == TransportTimeoutStage.DnsResolution
-            ? "Remote host name resolution timed out."
-            : "Remote transport connection timed out.")
+        : base("Remote transport connection timed out.")
     {
         Stage = stage;
     }
