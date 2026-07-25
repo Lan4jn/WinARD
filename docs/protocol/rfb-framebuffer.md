@@ -44,14 +44,19 @@ component8 = (component * 255 + maximum / 2) / maximum
 
 `FramebufferUpdateReader.ApplyAsync` consumes a complete server-to-client message, including message type `0`. Rectangle counts above 4096 are rejected before the rectangle loop. Unknown encoding IDs are fatal because their payload length cannot be inferred safely.
 
+The one-shot `ApplyAsync` convenience API supports stateless encodings only. It rejects a ZRLE rectangle immediately after its 12-byte rectangle header, before consuming the compressed-length field, and directs callers to `CreateSession`. A connection that negotiates ZRLE must create exactly one `FramebufferUpdateSession` and reuse it for every update on that connection so the connection-level zlib dictionary is preserved.
+
 Supported encodings:
 
 - Raw: validates the destination and payload size, reads and converts into temporary buffers, then commits the rectangle. A failed Raw rectangle does not alter its destination.
 - CopyRect: validates source and destination before copying. Overlap is handled with memmove-equivalent row ordering and overlapping row copies.
 - DesktopSize: requires origin `(0,0)`, validates and allocates atomically, and reports the resized full framebuffer as dirty.
 - Cursor: keeps cursor pixels separate from the desktop. Cursor mask bits are most-significant-bit first, with each mask row padded to a whole byte. A set bit makes the BGRA pixel opaque; a clear bit makes it transparent. A `0x0` cursor has no payload and represents an empty cursor.
+- ZRLE: uses one persistent zlib inflater per framebuffer-update session. Every rectangle must end at a `Z_SYNC_FLUSH` boundary; a completed zlib stream, truncated boundary, or any compressed trailing bytes are fatal. Decompression, tile expansion, and framebuffer commit are cancellation-aware and bounded by the configured compressed, decompressed, and work limits.
 
 Updates use rectangle-level commit semantics: rectangles completed before a later rectangle fails remain applied. The failing rectangle itself is not partially committed. Dirty rectangles preserve successful wire order.
+
+Any exception or cancellation after a `FramebufferUpdateSession` starts consuming a message permanently faults that session. Later calls fail without reading their stream. The caller must close the connection and discard both the session and framebuffer because successful earlier rectangles in the failed message may already have committed without a returned dirty-region result.
 
 Each `FramebufferUpdate` has two independent budgets. `MaxFramebufferUpdateBytes` limits bytes consumed from decoder payloads. `MaxFramebufferUpdateWorkBytes` limits estimated decoding work before reads, allocations, or copies: Raw charges wire bytes plus conversion and framebuffer writes, CopyRect charges copied BGRA bytes, DesktopSize charges replacement framebuffer initialization, and Cursor charges wire/mask bytes plus conversion and the defensive cursor copy. The budgets reset for every message. DesktopSize is additionally limited to four rectangles per update, and decoded cursor BGRA storage is bounded by `MaxCursorBytes`.
 
@@ -78,3 +83,5 @@ On 2026-07-25, the user confirmed a successful first-frame capture against a rea
 - the reported dirty rectangle covered the full framebuffer: `(0,0) 3360x2100`.
 
 The generated BMP decoded successfully during visual inspection. Its orientation and color channels were correct, and the captured content covered the complete screen. The Mac host, username, password, capture path, and screenshot contents were not recorded. The specific macOS major version was not provided, so this result is not attributed to a particular macOS release.
+
+This capture did not record the selected framebuffer encoding and therefore is not evidence that a real Mac selected or transmitted ZRLE. Real-Mac ZRLE interoperability remains unverified.

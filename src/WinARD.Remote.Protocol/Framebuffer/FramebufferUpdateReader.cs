@@ -20,8 +20,11 @@ public static class FramebufferUpdateReader
         ArgumentNullException.ThrowIfNull(pixelFormat);
         cancellationToken.ThrowIfCancellationRequested();
 
-        using var session = CreateSession(framebuffer, pixelFormat);
-        return await session.ApplyAsync(stream, cancellationToken);
+        return await ApplyAsync(
+            stream,
+            framebuffer,
+            CreateOneShotDecoders(pixelFormat),
+            cancellationToken).ConfigureAwait(false);
     }
 
     public static FramebufferUpdateSession CreateSession(
@@ -87,7 +90,8 @@ public static class FramebufferUpdateReader
             var rectangle = encoding == RfbEncodingType.Cursor
                 ? FramebufferRect.CreateCursorRectangle(x, y, width, height)
                 : new FramebufferRect(x, y, width, height);
-            var decodeResult = await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken);
+            var decodeResult = await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken)
+                .ConfigureAwait(false);
             dirtyRects.AddRange(decodeResult.DirtyRects);
             if (previousWidth != framebuffer.Width || previousHeight != framebuffer.Height)
             {
@@ -118,4 +122,28 @@ public static class FramebufferUpdateReader
             new DesktopSizeEncoding(),
             new CursorEncoding(pixelFormat),
         }.ToDictionary(decoder => decoder.EncodingId);
+
+    private static Dictionary<int, IRfbEncodingDecoder> CreateOneShotDecoders(PixelFormat pixelFormat) =>
+        new IRfbEncodingDecoder[]
+        {
+            new RawEncoding(pixelFormat),
+            new CopyRectEncoding(),
+            new SessionRequiredZrleEncoding(),
+            new DesktopSizeEncoding(),
+            new CursorEncoding(pixelFormat),
+        }.ToDictionary(decoder => decoder.EncodingId);
+
+    private sealed class SessionRequiredZrleEncoding : IRfbEncodingDecoder
+    {
+        public int EncodingId => (int)RfbEncodingType.Zrle;
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            Framebuffer framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromException<EncodingDecodeResult>(
+                new RfbProtocolException(
+                    "ZRLE requires a persistent per-connection session; use FramebufferUpdateReader.CreateSession."));
+    }
 }

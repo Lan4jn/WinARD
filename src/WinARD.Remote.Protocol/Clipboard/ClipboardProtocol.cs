@@ -29,10 +29,11 @@ public sealed class ClipboardProtocol
         string text,
         CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var message = EncodeClientCutText(text, _maxUtf8Bytes);
         try
         {
-            await _writer.WriteBytesAsync(message, cancellationToken);
+            await _writer.WriteBytesAsync(message, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -46,10 +47,10 @@ public sealed class ClipboardProtocol
     {
         ArgumentNullException.ThrowIfNull(text);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxUtf8Bytes);
-        var normalized = NormalizeLineEndings(text);
-        var byteCount = StrictUtf8.GetByteCount(normalized);
-        ValidateLength(checked((uint)byteCount), maxUtf8Bytes);
-        return StrictUtf8.GetBytes(normalized);
+        var byteCount = GetNormalizedUtf8Length(text, maxUtf8Bytes);
+        var payload = new byte[byteCount];
+        EncodeNormalizedUtf8(text, payload);
+        return payload;
     }
 
     public static byte[] EncodeClientCutText(
@@ -176,4 +177,96 @@ public sealed class ClipboardProtocol
 
     private static string NormalizeLineEndings(string text) =>
         text.Replace("\r\n", "\n", StringComparison.Ordinal);
+
+    private static int GetNormalizedUtf8Length(string text, int maxUtf8Bytes)
+    {
+        var byteCount = 0;
+        for (var index = 0; index < text.Length; index++)
+        {
+            var value = text[index];
+            if (value == '\r' && index + 1 < text.Length && text[index + 1] == '\n')
+            {
+                value = '\n';
+                index++;
+            }
+
+            int encodedLength;
+            if (value <= 0x7F)
+            {
+                encodedLength = 1;
+            }
+            else if (value <= 0x7FF)
+            {
+                encodedLength = 2;
+            }
+            else if (char.IsHighSurrogate(value))
+            {
+                if (index + 1 >= text.Length || !char.IsLowSurrogate(text[index + 1]))
+                {
+                    throw InvalidUtf16();
+                }
+
+                encodedLength = 4;
+                index++;
+            }
+            else if (char.IsLowSurrogate(value))
+            {
+                throw InvalidUtf16();
+            }
+            else
+            {
+                encodedLength = 3;
+            }
+
+            byteCount = checked(byteCount + encodedLength);
+            if (byteCount > maxUtf8Bytes)
+            {
+                throw new RfbProtocolException(
+                    $"Clipboard UTF-8 length exceeds the configured limit of {maxUtf8Bytes} bytes.");
+            }
+        }
+
+        return byteCount;
+    }
+
+    private static void EncodeNormalizedUtf8(string text, Span<byte> destination)
+    {
+        var offset = 0;
+        for (var index = 0; index < text.Length; index++)
+        {
+            var value = text[index];
+            if (value == '\r' && index + 1 < text.Length && text[index + 1] == '\n')
+            {
+                value = '\n';
+                index++;
+            }
+
+            if (value <= 0x7F)
+            {
+                destination[offset++] = checked((byte)value);
+            }
+            else if (value <= 0x7FF)
+            {
+                destination[offset++] = checked((byte)(0xC0 | (value >> 6)));
+                destination[offset++] = checked((byte)(0x80 | (value & 0x3F)));
+            }
+            else if (char.IsHighSurrogate(value))
+            {
+                var codePoint = char.ConvertToUtf32(value, text[++index]);
+                destination[offset++] = checked((byte)(0xF0 | (codePoint >> 18)));
+                destination[offset++] = checked((byte)(0x80 | ((codePoint >> 12) & 0x3F)));
+                destination[offset++] = checked((byte)(0x80 | ((codePoint >> 6) & 0x3F)));
+                destination[offset++] = checked((byte)(0x80 | (codePoint & 0x3F)));
+            }
+            else
+            {
+                destination[offset++] = checked((byte)(0xE0 | (value >> 12)));
+                destination[offset++] = checked((byte)(0x80 | ((value >> 6) & 0x3F)));
+                destination[offset++] = checked((byte)(0x80 | (value & 0x3F)));
+            }
+        }
+    }
+
+    private static RfbProtocolException InvalidUtf16() =>
+        new("Clipboard text contains an invalid UTF-16 surrogate sequence.");
 }

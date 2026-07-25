@@ -1,13 +1,15 @@
 using WinARD.Remote.Protocol.Encodings;
+using WinARD.Remote.Protocol.Errors;
 
 namespace WinARD.Remote.Protocol.Framebuffer;
 
-public sealed class FramebufferUpdateSession : IDisposable
+public sealed class FramebufferUpdateSession : IAsyncDisposable
 {
     private readonly Framebuffer _framebuffer;
     private readonly IReadOnlyDictionary<int, IRfbEncodingDecoder> _decoders;
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private bool _disposed;
+    private readonly object _stateLock = new();
+    private SessionState _state = SessionState.Active;
 
     internal FramebufferUpdateSession(
         Framebuffer framebuffer,
@@ -24,15 +26,31 @@ public sealed class FramebufferUpdateSession : IDisposable
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        await _gate.WaitAsync(cancellationToken);
+        ThrowIfUnavailable();
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            return await FramebufferUpdateReader.ApplyAsync(
-                stream,
-                _framebuffer,
-                _decoders,
-                cancellationToken);
+            ThrowIfUnavailable();
+            try
+            {
+                return await FramebufferUpdateReader.ApplyAsync(
+                    stream,
+                    _framebuffer,
+                    _decoders,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                lock (_stateLock)
+                {
+                    if (_state == SessionState.Active)
+                    {
+                        _state = SessionState.Faulted;
+                    }
+                }
+
+                throw;
+            }
         }
         finally
         {
@@ -40,32 +58,69 @@ public sealed class FramebufferUpdateSession : IDisposable
         }
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        lock (_stateLock)
         {
-            return;
-        }
-
-        _gate.Wait();
-        try
-        {
-            if (_disposed)
+            if (_state is SessionState.Disposing or SessionState.Disposed)
             {
                 return;
             }
 
-            foreach (var decoder in _decoders.Values.OfType<IDisposable>())
+            _state = SessionState.Disposing;
+        }
+
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            foreach (var decoder in _decoders.Values)
             {
-                decoder.Dispose();
+                if (decoder is IAsyncDisposable asyncDisposable)
+                {
+                    await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+                }
+                else if (decoder is IDisposable disposable)
+                {
+                    disposable.Dispose();
+                }
             }
 
-            _disposed = true;
+            lock (_stateLock)
+            {
+                _state = SessionState.Disposed;
+            }
         }
         finally
         {
             _gate.Release();
-            _gate.Dispose();
         }
+    }
+
+    private void ThrowIfUnavailable()
+    {
+        lock (_stateLock)
+        {
+            switch (_state)
+            {
+                case SessionState.Active:
+                    return;
+                case SessionState.Faulted:
+                    throw new RfbProtocolException(
+                        "The framebuffer update session is faulted; discard it and the connection.");
+                case SessionState.Disposing:
+                case SessionState.Disposed:
+                    throw new ObjectDisposedException(nameof(FramebufferUpdateSession));
+                default:
+                    throw new InvalidOperationException("Unknown framebuffer update session state.");
+            }
+        }
+    }
+
+    private enum SessionState
+    {
+        Active,
+        Faulted,
+        Disposing,
+        Disposed,
     }
 }

@@ -28,6 +28,7 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal("Studio Mac", server.Name);
         Assert.Equal(PixelFormat.WinArdBgra32, server.PixelFormat);
         Assert.Equal(ExpectedClientInitialization(), stream.WrittenBytes);
+        Assert.Equal([1, 20, 24], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
     }
@@ -47,6 +48,7 @@ public sealed class RfbSessionInitializerTests
             CancellationToken.None);
 
         Assert.Equal([3, 0, 0, 1, 0, 2, 0x12, 0x34, 0x56, 0x78], stream.WrittenBytes);
+        Assert.Equal([10], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
     }
@@ -251,6 +253,7 @@ public sealed class RfbSessionInitializerTests
         private readonly MemoryStream _output = new();
 
         public byte[] WrittenBytes => _output.ToArray();
+        public List<int> WriteLengths { get; } = [];
         public long ReadPosition => _input.Position;
         public int FlushCount { get; private set; }
         public bool WasDisposed { get; private set; }
@@ -264,7 +267,13 @@ public sealed class RfbSessionInitializerTests
         public override int Read(byte[] buffer, int offset, int count) => _input.Read(buffer, offset, count);
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) => _input.ReadAsync(buffer, cancellationToken);
         public override void Write(byte[] buffer, int offset, int count) => _output.Write(buffer, offset, count);
-        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) => _output.WriteAsync(buffer, cancellationToken);
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            WriteLengths.Add(buffer.Length);
+            return _output.WriteAsync(buffer, cancellationToken);
+        }
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
 

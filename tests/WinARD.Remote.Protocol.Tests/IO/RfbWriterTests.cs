@@ -1,4 +1,5 @@
 using WinARD.Remote.Protocol.IO;
+using WinARD.Remote.Protocol.Errors;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -71,6 +72,41 @@ public sealed class RfbWriterTests
         Assert.Throws<ArgumentNullException>(() => new RfbWriter(null!));
     }
 
+    [Fact]
+    public async Task Writers_over_the_same_stream_serialize_complete_messages()
+    {
+        await using var stream = new ConcurrencyDetectingWriteStream();
+        var first = new RfbWriter(stream);
+        var second = new RfbWriter(stream);
+
+        await Task.WhenAll(
+            first.WriteBytesAsync(new byte[] { 1, 1, 1 }, CancellationToken.None).AsTask(),
+            second.WriteBytesAsync(new byte[] { 2, 2, 2 }, CancellationToken.None).AsTask());
+
+        Assert.Equal(1, stream.MaximumConcurrentWrites);
+        Assert.True(
+            stream.Bytes.SequenceEqual(new byte[] { 1, 1, 1, 2, 2, 2 }) ||
+            stream.Bytes.SequenceEqual(new byte[] { 2, 2, 2, 1, 1, 1 }));
+    }
+
+    [Fact]
+    public async Task Partial_write_failure_permanently_poisons_all_writers_for_stream()
+    {
+        await using var stream = new PartialFailureWriteStream();
+        var first = new RfbWriter(stream);
+        var second = new RfbWriter(stream);
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            first.WriteBytesAsync(new byte[] { 1, 2, 3, 4 }, CancellationToken.None).AsTask());
+        var lengthAfterFailure = stream.Bytes.Count;
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            second.WriteBytesAsync(new byte[] { 5, 6 }, CancellationToken.None).AsTask());
+
+        Assert.Contains("faulted", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(lengthAfterFailure, stream.Bytes.Count);
+    }
+
     private sealed class FlushCountingStream : MemoryStream
     {
         public int FlushCount { get; private set; }
@@ -104,6 +140,65 @@ public sealed class RfbWriterTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class ConcurrencyDetectingWriteStream : Stream
+    {
+        private int _activeWrites;
+
+        public List<byte> Bytes { get; } = [];
+        public int MaximumConcurrentWrites { get; private set; }
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => Bytes.Count;
+        public override long Position { get => Bytes.Count; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            var active = Interlocked.Increment(ref _activeWrites);
+            MaximumConcurrentWrites = Math.Max(MaximumConcurrentWrites, active);
+            try
+            {
+                await Task.Delay(20, cancellationToken);
+                Bytes.AddRange(buffer.ToArray());
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeWrites);
+            }
+        }
+    }
+
+    private sealed class PartialFailureWriteStream : Stream
+    {
+        public List<byte> Bytes { get; } = [];
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => Bytes.Count;
+        public override long Position { get => Bytes.Count; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Bytes.AddRange(buffer.Span[..Math.Min(2, buffer.Length)].ToArray());
+            throw new IOException("Injected partial write failure.");
         }
     }
 }

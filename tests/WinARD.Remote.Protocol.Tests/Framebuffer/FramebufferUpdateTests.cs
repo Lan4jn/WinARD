@@ -691,6 +691,41 @@ public sealed class FramebufferUpdateTests
         Assert.Equal(cancellation.Token, stream.ReceivedCancellationToken);
     }
 
+    [Fact]
+    public async Task One_shot_reader_rejects_zrle_before_consuming_compressed_length()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        await using var stream = new MemoryStream(
+            Update([.. Header(0, 0, 1, 1, RfbEncodingType.Zrle), 0, 0, 0, 4, 0, 0, 0xFF, 0xFF]));
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(
+                stream,
+                framebuffer,
+                PixelFormat.WinArdBgra32,
+                CancellationToken.None));
+
+        Assert.Contains("CreateSession", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(16, stream.Position);
+    }
+
+    [Fact]
+    public async Task Session_faults_permanently_after_message_consumption_failure()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32);
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            session.ApplyAsync(new MemoryStream([0, 0, 0, 1]), CancellationToken.None));
+
+        await using var retry = new MemoryStream(Update(Raw(0, 0, 1, 1, [1, 2, 3, 4])));
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            session.ApplyAsync(retry, CancellationToken.None));
+
+        Assert.Contains("faulted", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, retry.Position);
+    }
+
     private static byte[] Update(params byte[][] rectangles)
     {
         var bytes = new List<byte> { 0, 0 };

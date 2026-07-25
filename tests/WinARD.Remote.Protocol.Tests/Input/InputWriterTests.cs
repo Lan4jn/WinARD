@@ -1,5 +1,6 @@
 using WinARD.Remote.Protocol.Input;
 using WinARD.Remote.Protocol.IO;
+using WinARD.Remote.Protocol.Errors;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -53,7 +54,7 @@ public sealed class InputWriterTests
     }
 
     [Fact]
-    public async Task Writers_propagate_cancellation_without_writing()
+    public async Task Cancellation_poisons_shared_writer_without_writing()
     {
         await using var stream = new MemoryStream();
         var pointer = new PointerEventWriter(new RfbWriter(stream));
@@ -63,7 +64,7 @@ public sealed class InputWriterTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             pointer.WriteAsync(0, 0, 0, cancellation.Token).AsTask());
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
             key.WriteAsync(true, 1, cancellation.Token).AsTask());
 
         Assert.Empty(stream.ToArray());
@@ -120,7 +121,7 @@ public sealed class InputWriterTests
     }
 
     [Fact]
-    public async Task Failed_keyup_keeps_key_pressed_for_retry()
+    public async Task Failed_keyup_faults_adapter_and_discards_inferred_state()
     {
         await using var stream = new ControlledFailureWriteStream { FailOnWriteNumber = 2 };
         var keyboard = new KeyboardInputAdapter(new KeyEventWriter(new RfbWriter(stream)));
@@ -129,7 +130,9 @@ public sealed class InputWriterTests
         await Assert.ThrowsAsync<IOException>(() =>
             keyboard.KeyUpAsync((uint)'A', CancellationToken.None).AsTask());
 
-        Assert.Equal([(uint)'A'], keyboard.PressedKeysyms);
+        Assert.Empty(keyboard.PressedKeysyms);
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            keyboard.KeyUpAsync((uint)'B', CancellationToken.None).AsTask());
     }
 
     [Fact]
@@ -151,7 +154,7 @@ public sealed class InputWriterTests
     }
 
     [Fact]
-    public async Task Disconnect_release_can_retry_after_partial_failure()
+    public async Task Disconnect_release_failure_faults_adapter_without_retry()
     {
         await using var stream = new ControlledFailureWriteStream { FailOnWriteNumber = 5 };
         var keyboard = new KeyboardInputAdapter(new KeyEventWriter(new RfbWriter(stream)));
@@ -162,13 +165,14 @@ public sealed class InputWriterTests
         await Assert.ThrowsAsync<IOException>(() =>
             keyboard.OnDisconnectedAsync(CancellationToken.None).AsTask());
 
-        Assert.Equal([1u, 2u], keyboard.PressedKeysyms);
+        Assert.Empty(keyboard.PressedKeysyms);
         stream.FailOnWriteNumber = null;
 
-        await keyboard.OnDisconnectedAsync(CancellationToken.None);
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            keyboard.OnDisconnectedAsync(CancellationToken.None).AsTask());
 
         Assert.Empty(keyboard.PressedKeysyms);
-        Assert.Equal([3u, 2u, 1u], WrittenKeysyms(stream.Bytes.ToArray().AsSpan(24)));
+        Assert.Equal([3u], WrittenKeysyms(stream.Bytes.ToArray().AsSpan(24)));
     }
 
     private static uint[] WrittenKeysyms(ReadOnlySpan<byte> bytes)

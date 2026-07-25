@@ -54,6 +54,37 @@ public sealed class ClipboardProtocolTests
     }
 
     [Fact]
+    public void Encode_rejects_invalid_utf16_with_stable_protocol_exception()
+    {
+        foreach (var text in new[]
+        {
+            new string((char)0xD800, 1),
+            new string((char)0xDC00, 1),
+            string.Concat("a", new string((char)0xD800, 1), "b"),
+        })
+        {
+            var exception = Assert.Throws<RfbProtocolException>(() =>
+                ClipboardProtocol.EncodeText(text));
+
+            Assert.Contains("UTF-16", exception.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task Precancelled_write_does_not_scan_or_allocate_clipboard_payload()
+    {
+        await using var stream = new MemoryStream();
+        var protocol = new ClipboardProtocol(new RfbWriter(stream));
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            protocol.WriteClientCutTextAsync("\uD800", cancellation.Token).AsTask());
+
+        Assert.Empty(stream.ToArray());
+    }
+
+    [Fact]
     public void Default_utf8_limit_is_one_mebibyte()
     {
         Assert.Equal(1_048_576, ClipboardProtocol.DefaultMaxUtf8Bytes);

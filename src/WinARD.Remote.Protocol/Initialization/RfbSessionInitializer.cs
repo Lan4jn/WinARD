@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text;
 using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
@@ -33,7 +34,7 @@ public static class RfbSessionInitializer
 
         var reader = new RfbReader(stream, limits);
         var writer = new RfbWriter(stream);
-        await writer.WriteByteAsync(1, cancellationToken);
+        await writer.WriteByteAsync(1, cancellationToken).ConfigureAwait(false);
 
         var width = await reader.ReadUInt16Async(cancellationToken);
         var height = await reader.ReadUInt16Async(cancellationToken);
@@ -53,8 +54,8 @@ public static class RfbSessionInitializer
         var nameBytes = await reader.ReadBytesAsync(checked((int)nameLength), cancellationToken);
         var (name, isTruncated) = CreateDisplayName(nameBytes);
 
-        await WriteSetPixelFormatAsync(writer, cancellationToken);
-        await WriteSetEncodingsAsync(writer, cancellationToken);
+        await WriteSetPixelFormatAsync(writer, cancellationToken).ConfigureAwait(false);
+        await WriteSetEncodingsAsync(writer, cancellationToken).ConfigureAwait(false);
         return new RfbServerInit(width, height, serverPixelFormat, name, isTruncated);
     }
 
@@ -74,29 +75,38 @@ public static class RfbSessionInitializer
             throw new ArgumentOutOfRangeException(nameof(width), "Framebuffer update request dimensions must be non-zero.");
         }
 
-        var writer = new RfbWriter(stream);
-        await writer.WriteByteAsync(3, cancellationToken);
-        await writer.WriteByteAsync(incremental ? (byte)1 : (byte)0, cancellationToken);
-        await writer.WriteUInt16Async(x, cancellationToken);
-        await writer.WriteUInt16Async(y, cancellationToken);
-        await writer.WriteUInt16Async(width, cancellationToken);
-        await writer.WriteUInt16Async(height, cancellationToken);
+        var message = new byte[10];
+        message[0] = 3;
+        message[1] = incremental ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(2), x);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(4), y);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(6), width);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(8), height);
+        await new RfbWriter(stream).WriteBytesAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task WriteSetPixelFormatAsync(RfbWriter writer, CancellationToken cancellationToken)
     {
-        await writer.WriteBytesAsync(new byte[] { 0, 0, 0, 0 }, cancellationToken);
-        await writer.WriteBytesAsync(PixelFormat.WinArdBgra32.ToWireBytes(), cancellationToken);
+        var message = new byte[20];
+        PixelFormat.WinArdBgra32.ToWireBytes().CopyTo(message, 4);
+        await writer.WriteBytesAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task WriteSetEncodingsAsync(RfbWriter writer, CancellationToken cancellationToken)
     {
-        await writer.WriteBytesAsync(new byte[] { 2, 0 }, cancellationToken);
-        await writer.WriteUInt16Async(checked((ushort)RequestedEncodings.Length), cancellationToken);
-        foreach (var encoding in RequestedEncodings)
+        var message = new byte[4 + (RequestedEncodings.Length * sizeof(int))];
+        message[0] = 2;
+        BinaryPrimitives.WriteUInt16BigEndian(
+            message.AsSpan(2),
+            checked((ushort)RequestedEncodings.Length));
+        for (var index = 0; index < RequestedEncodings.Length; index++)
         {
-            await writer.WriteInt32Async(encoding, cancellationToken);
+            BinaryPrimitives.WriteInt32BigEndian(
+                message.AsSpan(4 + (index * sizeof(int))),
+                RequestedEncodings[index]);
         }
+
+        await writer.WriteBytesAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
     private static (string Name, bool IsTruncated) CreateDisplayName(ReadOnlySpan<byte> bytes)

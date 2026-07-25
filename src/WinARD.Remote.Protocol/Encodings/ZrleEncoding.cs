@@ -7,19 +7,17 @@ using WinARD.Remote.Protocol.IO;
 
 namespace WinARD.Remote.Protocol.Encodings;
 
-public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
+public sealed class ZrleEncoding : IRfbEncodingDecoder, IAsyncDisposable
 {
     private const int TileSize = 64;
     private readonly PixelFormat _pixelFormat;
     private readonly int _encodedPixelLength;
     private readonly int _wirePixelOffset;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly object _stateLock = new();
     private SegmentedReadStream? _compressedInput;
     private ZLibStream? _zlib;
-    private uint _adlerA;
-    private uint _adlerB;
-    private bool _faulted;
-    private bool _disposed;
+    private DecoderState _state = DecoderState.Active;
 
     public ZrleEncoding()
         : this(PixelFormat.WinArdBgra32)
@@ -44,7 +42,8 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(framebuffer);
-        await _gate.WaitAsync(cancellationToken);
+        ThrowIfUnavailable();
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfUnavailable();
@@ -52,7 +51,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
             rectangle.ValidateWithin(framebuffer.Width, framebuffer.Height);
 
             reader.ReserveFramebufferUpdateBytes(sizeof(uint));
-            var compressedLengthValue = await reader.ReadUInt32Async(cancellationToken);
+            var compressedLengthValue = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
             if (compressedLengthValue > int.MaxValue ||
                 compressedLengthValue > framebuffer.Limits.MaxZrleCompressedBytes)
             {
@@ -63,26 +62,35 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
 
             var compressedLength = checked((int)compressedLengthValue);
             reader.ReserveFramebufferUpdateBytes(compressedLength);
+            reader.ReserveFramebufferUpdateWorkBytes(compressedLength);
             var bgraLength = PixelConverter.CheckedBgraLength(
                 rectangle.Width,
                 rectangle.Height,
                 framebuffer.Limits);
             reader.ReserveFramebufferUpdateWorkBytes(checked((long)bgraLength * 2));
 
-            var compressed = await reader.ReadFramebufferPayloadBytesAsync(compressedLength, cancellationToken);
-            byte[]? decompressed = null;
+            var compressed = await reader.ReadFramebufferPayloadBytesAsync(compressedLength, cancellationToken)
+                .ConfigureAwait(false);
+            DecompressedChunk decompressed = default;
             byte[]? bgra = null;
             var contextTouched = false;
             try
             {
                 contextTouched = true;
+                ValidateSyncFlushBoundary(compressed);
                 decompressed = await DecompressChunkAsync(
                     compressed,
                     reader,
+                    rectangle.Width,
+                    rectangle.Height,
                     framebuffer.Limits.MaxZrleDecompressedBytes,
+                    cancellationToken).ConfigureAwait(false);
+                bgra = DecodeTiles(
+                    decompressed.Buffer.AsSpan(0, decompressed.Length),
+                    rectangle.Width,
+                    rectangle.Height,
                     cancellationToken);
-                ValidateChunkBoundary(compressed, decompressed);
-                bgra = DecodeTiles(decompressed, rectangle.Width, rectangle.Height);
+                cancellationToken.ThrowIfCancellationRequested();
                 framebuffer.ApplyRaw(rectangle, bgra);
                 return new EncodingDecodeResult([rectangle], [rectangle]);
             }
@@ -98,9 +106,9 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
             finally
             {
                 CryptographicOperations.ZeroMemory(compressed);
-                if (decompressed is not null)
+                if (decompressed.Buffer is not null)
                 {
-                    CryptographicOperations.ZeroMemory(decompressed);
+                    CryptographicOperations.ZeroMemory(decompressed.Buffer);
                 }
 
                 if (bgra is not null)
@@ -115,15 +123,20 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         }
     }
 
-    public void Reset()
+    /// <summary>Resets the inflater for a new connection. It cannot resynchronize a damaged connection.</summary>
+    public async ValueTask ResetAsync(CancellationToken cancellationToken = default)
     {
-        _gate.Wait();
+        ThrowIfDisposed();
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowIfDisposed();
             DisposeContext();
             InitializeContext();
-            _faulted = false;
+            lock (_stateLock)
+            {
+                _state = DecoderState.Active;
+            }
         }
         finally
         {
@@ -131,28 +144,30 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         }
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        lock (_stateLock)
         {
-            return;
-        }
-
-        _gate.Wait();
-        try
-        {
-            if (_disposed)
+            if (_state is DecoderState.Disposing or DecoderState.Disposed)
             {
                 return;
             }
 
+            _state = DecoderState.Disposing;
+        }
+
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
             DisposeContext();
-            _disposed = true;
+            lock (_stateLock)
+            {
+                _state = DecoderState.Disposed;
+            }
         }
         finally
         {
             _gate.Release();
-            _gate.Dispose();
         }
     }
 
@@ -160,8 +175,6 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
     {
         _compressedInput = new SegmentedReadStream();
         _zlib = new ZLibStream(_compressedInput, CompressionMode.Decompress, leaveOpen: true);
-        _adlerA = 1;
-        _adlerB = 0;
     }
 
     private void DisposeContext()
@@ -175,97 +188,122 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
     private void FaultContext()
     {
         DisposeContext();
-        _faulted = true;
+        lock (_stateLock)
+        {
+            if (_state == DecoderState.Active)
+            {
+                _state = DecoderState.Faulted;
+            }
+        }
     }
 
     private void ThrowIfUnavailable()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_faulted)
+        lock (_stateLock)
         {
-            throw new RfbProtocolException(
-                "The ZRLE decompression context is faulted and must be reset before reuse.");
+            switch (_state)
+            {
+                case DecoderState.Active:
+                    return;
+                case DecoderState.Faulted:
+                    throw new RfbProtocolException(
+                        "The ZRLE decompression context is faulted and must be reset for a new connection.");
+                case DecoderState.Disposing:
+                case DecoderState.Disposed:
+                    ObjectDisposedException.ThrowIf(true, this);
+                    return;
+                default:
+                    throw new InvalidOperationException("Unknown ZRLE decoder state.");
+            }
         }
     }
 
-    private void ValidateChunkBoundary(ReadOnlySpan<byte> compressed, ReadOnlySpan<byte> decompressed)
+    private void ThrowIfDisposed()
     {
-        const uint adlerModulus = 65521;
-        ulong nextA = _adlerA;
-        ulong nextB = _adlerB;
-        var offset = 0;
-        while (offset < decompressed.Length)
+        lock (_stateLock)
         {
-            var blockLength = Math.Min(5552, decompressed.Length - offset);
-            var block = decompressed.Slice(offset, blockLength);
-            foreach (var value in block)
-            {
-                nextA += value;
-                nextB += nextA;
-            }
-
-            nextA %= adlerModulus;
-            nextB %= adlerModulus;
-            offset += blockLength;
+            ObjectDisposedException.ThrowIf(
+                _state is DecoderState.Disposing or DecoderState.Disposed,
+                this);
         }
+    }
 
+    private static void ValidateSyncFlushBoundary(ReadOnlySpan<byte> compressed)
+    {
         var hasSyncFlushBoundary =
             compressed.Length >= 4 &&
             compressed[^4] == 0 &&
             compressed[^3] == 0 &&
             compressed[^2] == byte.MaxValue &&
             compressed[^1] == byte.MaxValue;
-        var expectedAdler = checked((uint)((nextB << 16) | nextA));
-        var hasCompleteStreamBoundary =
-            compressed.Length >= 4 &&
-            BinaryPrimitives.ReadUInt32BigEndian(compressed[^4..]) == expectedAdler;
-        if (!hasSyncFlushBoundary && !hasCompleteStreamBoundary)
+        if (!hasSyncFlushBoundary)
         {
             throw new RfbProtocolException(
-                "ZRLE compressed data ended without a complete zlib stream or Z_SYNC_FLUSH boundary.");
+                "ZRLE compressed data must end at a Z_SYNC_FLUSH boundary.");
         }
-
-        _adlerA = checked((uint)nextA);
-        _adlerB = checked((uint)nextB);
     }
 
-    private async Task<byte[]> DecompressChunkAsync(
+    private async Task<DecompressedChunk> DecompressChunkAsync(
         byte[] compressed,
         RfbReader reader,
+        int rectangleWidth,
+        int rectangleHeight,
         int decompressedLimit,
         CancellationToken cancellationToken)
     {
         try
         {
             _compressedInput!.SetSegment(compressed);
-            using var output = new MemoryStream();
-            var buffer = new byte[Math.Min(8192, decompressedLimit)];
+            var tileCount = checked(
+                ((rectangleWidth + TileSize - 1) / TileSize) *
+                ((rectangleHeight + TileSize - 1) / TileSize));
+            var maximumValidLength = checked(
+                ((long)rectangleWidth * rectangleHeight * (_encodedPixelLength + 1)) + tileCount);
+            var capacity = checked((int)Math.Min(decompressedLimit, maximumValidLength));
+            reader.ReserveFramebufferUpdateWorkBytes(capacity);
+            var output = new byte[capacity];
+            var length = 0;
             try
             {
                 while (true)
                 {
-                    var read = await _zlib!.ReadAsync(buffer, cancellationToken);
+                    if (length == output.Length)
+                    {
+                        var overflow = new byte[1];
+                        var overflowRead = await _zlib!.ReadAsync(overflow, cancellationToken)
+                            .ConfigureAwait(false);
+                        CryptographicOperations.ZeroMemory(overflow);
+                        if (overflowRead != 0)
+                        {
+                            throw new RfbProtocolException(
+                                $"ZRLE decompressed length exceeds the configured limit of {decompressedLimit} bytes.");
+                        }
+
+                        break;
+                    }
+
+                    var read = await _zlib!.ReadAsync(output.AsMemory(length), cancellationToken)
+                        .ConfigureAwait(false);
                     if (read == 0)
                     {
                         break;
                     }
 
-                    var total = checked(output.Length + read);
-                    if (total > decompressedLimit)
-                    {
-                        throw new RfbProtocolException(
-                            $"ZRLE decompressed length exceeds the configured limit of {decompressedLimit} bytes.");
-                    }
-
-                    reader.ReserveFramebufferUpdateWorkBytes(checked((long)read * 2));
-                    output.Write(buffer, 0, read);
+                    length = checked(length + read);
                 }
 
-                return output.ToArray();
+                if (_compressedInput.Position != compressed.Length)
+                {
+                    throw new RfbProtocolException(
+                        "ZRLE compressed data contains a completed zlib stream or trailing bytes before its Z_SYNC_FLUSH boundary.");
+                }
+
+                return new DecompressedChunk(output, length);
             }
-            finally
+            catch
             {
-                CryptographicOperations.ZeroMemory(buffer);
+                CryptographicOperations.ZeroMemory(output);
+                throw;
             }
         }
         catch (InvalidDataException exception)
@@ -274,17 +312,42 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         }
     }
 
-    private byte[] DecodeTiles(ReadOnlySpan<byte> data, int rectangleWidth, int rectangleHeight)
+    private enum DecoderState
+    {
+        Active,
+        Faulted,
+        Disposing,
+        Disposed,
+    }
+
+    private readonly record struct DecompressedChunk(byte[] Buffer, int Length);
+
+    private byte[] DecodeTiles(
+        ReadOnlySpan<byte> data,
+        int rectangleWidth,
+        int rectangleHeight,
+        CancellationToken cancellationToken)
     {
         var bgra = new byte[checked(rectangleWidth * rectangleHeight * 4)];
         var offset = 0;
         for (var tileY = 0; tileY < rectangleHeight; tileY += TileSize)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var tileHeight = Math.Min(TileSize, rectangleHeight - tileY);
             for (var tileX = 0; tileX < rectangleWidth; tileX += TileSize)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var tileWidth = Math.Min(TileSize, rectangleWidth - tileX);
-                DecodeTile(data, ref offset, bgra, rectangleWidth, tileX, tileY, tileWidth, tileHeight);
+                DecodeTile(
+                    data,
+                    ref offset,
+                    bgra,
+                    rectangleWidth,
+                    tileX,
+                    tileY,
+                    tileWidth,
+                    tileHeight,
+                    cancellationToken);
             }
         }
 
@@ -305,17 +368,35 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         int tileX,
         int tileY,
         int tileWidth,
-        int tileHeight)
+        int tileHeight,
+        CancellationToken cancellationToken)
     {
         var subencoding = ReadByte(data, ref offset);
         switch (subencoding)
         {
             case 0:
-                DecodeRawTile(data, ref offset, destination, destinationWidth, tileX, tileY, tileWidth, tileHeight);
+                DecodeRawTile(
+                    data,
+                    ref offset,
+                    destination,
+                    destinationWidth,
+                    tileX,
+                    tileY,
+                    tileWidth,
+                    tileHeight,
+                    cancellationToken);
                 return;
             case 1:
                 var solid = ReadPixel(data, ref offset);
-                FillTile(destination, destinationWidth, tileX, tileY, tileWidth, tileHeight, solid);
+                FillTile(
+                    destination,
+                    destinationWidth,
+                    tileX,
+                    tileY,
+                    tileWidth,
+                    tileHeight,
+                    solid,
+                    cancellationToken);
                 return;
             case >= 2 and <= 16:
                 DecodePackedPaletteTile(
@@ -327,7 +408,8 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
                     tileY,
                     tileWidth,
                     tileHeight,
-                    subencoding);
+                    subencoding,
+                    cancellationToken);
                 return;
             case 128:
                 DecodePlainRleTile(
@@ -338,7 +420,8 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
                     tileX,
                     tileY,
                     tileWidth,
-                    tileHeight);
+                    tileHeight,
+                    cancellationToken);
                 return;
             default:
                 throw new RfbProtocolException($"Unsupported ZRLE subencoding {subencoding}.");
@@ -353,10 +436,12 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         int tileX,
         int tileY,
         int tileWidth,
-        int tileHeight)
+        int tileHeight,
+        CancellationToken cancellationToken)
     {
         for (var y = 0; y < tileHeight; y++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             for (var x = 0; x < tileWidth; x++)
             {
                 WritePixel(
@@ -378,7 +463,8 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         int tileY,
         int tileWidth,
         int tileHeight,
-        int paletteSize)
+        int paletteSize,
+        CancellationToken cancellationToken)
     {
         var palette = new uint[paletteSize];
         for (var index = 0; index < paletteSize; index++)
@@ -390,6 +476,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         var rowBytes = checked((tileWidth * bitsPerIndex + 7) / 8);
         for (var y = 0; y < tileHeight; y++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var row = ReadBytes(data, ref offset, rowBytes);
             for (var x = 0; x < tileWidth; x++)
             {
@@ -422,12 +509,14 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         int tileX,
         int tileY,
         int tileWidth,
-        int tileHeight)
+        int tileHeight,
+        CancellationToken cancellationToken)
     {
         var tilePixelCount = checked(tileWidth * tileHeight);
         var decodedPixels = 0;
         while (decodedPixels < tilePixelCount)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var pixel = ReadPixel(data, ref offset);
             var runLength = 1;
             byte extension;
@@ -444,6 +533,11 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
 
             for (var runIndex = 0; runIndex < runLength; runIndex++)
             {
+                if ((runIndex & 0xFF) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 var tilePixelIndex = decodedPixels + runIndex;
                 WritePixel(
                     destination,
@@ -523,10 +617,12 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         int tileY,
         int tileWidth,
         int tileHeight,
-        uint pixel)
+        uint pixel,
+        CancellationToken cancellationToken)
     {
         for (var y = 0; y < tileHeight; y++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             for (var x = 0; x < tileWidth; x++)
             {
                 WritePixel(destination, destinationWidth, tileX + x, tileY + y, pixel);
@@ -582,7 +678,11 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
                 return 0;
             }
 
-            var count = Math.Min(buffer.Length, _segment.Length - _position);
+            var prefixLength = _segment.Length - 4;
+            var remainingInPortion = _position < prefixLength
+                ? prefixLength - _position
+                : _segment.Length - _position;
+            var count = Math.Min(buffer.Length, remainingInPortion);
             _segment.AsSpan(_position, count).CopyTo(buffer);
             _position += count;
             return count;

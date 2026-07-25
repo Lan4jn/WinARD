@@ -241,6 +241,26 @@ public sealed class ZrleEncodingTests
         Assert.Equal(before, framebuffer.GetPixelsBgra32());
     }
 
+    [Fact]
+    public async Task Work_budget_includes_compressed_backing_before_payload_read()
+    {
+        var limits = new ProtocolLimits(1024, 1024, 1024, 13, 1024, 1024, 5);
+        using var framebuffer = new FramebufferModel(16, 16, limits);
+        var payload = Compress([1, 1, 2, 3]);
+        await using var stream = new MemoryStream(WithLength(payload));
+        var reader = new RfbReader(stream, limits);
+        await using var decoder = new ZrleEncoding();
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            decoder.DecodeAsync(
+                reader,
+                framebuffer,
+                new FramebufferRect(0, 0, 1, 1),
+                CancellationToken.None).AsTask());
+
+        Assert.Equal(4, stream.Position);
+    }
+
     [Theory]
     [MemberData(nameof(PixelReaderFixtures))]
     public async Task Raw_and_solid_tiles_use_legal_pixel_or_cpixel_layout(
@@ -321,7 +341,7 @@ public sealed class ZrleEncodingTests
         var secondTile = RawTile(2);
         var (firstChunk, secondChunk) = CreateSharedZlibChunks(firstTile, secondTile);
         using var framebuffer = new FramebufferModel(64, 64, ProtocolLimits.Default);
-        using var decoder = new ZrleEncoding();
+        await using var decoder = new ZrleEncoding();
         var rectangle = new FramebufferRect(0, 0, 64, 64);
 
         _ = await DecodeChunkAsync(decoder, framebuffer, rectangle, firstChunk, CancellationToken.None);
@@ -339,7 +359,7 @@ public sealed class ZrleEncodingTests
     {
         var (firstChunk, secondChunk) = CreateSharedZlibChunks(RawTile(1), RawTile(2));
         using var framebuffer = new FramebufferModel(64, 64, ProtocolLimits.Default);
-        using var session = FramebufferUpdateReader.CreateSession(
+        await using var session = FramebufferUpdateReader.CreateSession(
             framebuffer,
             PixelFormat.WinArdBgra32);
 
@@ -354,11 +374,49 @@ public sealed class ZrleEncodingTests
     }
 
     [Fact]
+    public async Task Complete_zlib_stream_is_rejected()
+    {
+        using var framebuffer = SeededFramebuffer();
+        await using var decoder = new ZrleEncoding();
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            DecodeChunkAsync(
+                decoder,
+                framebuffer,
+                new FramebufferRect(0, 0, 1, 1),
+                CompressComplete([1, 1, 2, 3]),
+                CancellationToken.None));
+
+        Assert.Contains("Z_SYNC_FLUSH", exception.Message, StringComparison.Ordinal);
+        Assert.Equal([9u, 6u], BlueValues(framebuffer));
+    }
+
+    [Fact]
+    public async Task Complete_zlib_with_trailing_sync_marker_is_rejected_atomically()
+    {
+        using var framebuffer = SeededFramebuffer();
+        await using var decoder = new ZrleEncoding();
+        var compressed = CompressComplete([1, 1, 2, 3])
+            .Concat(new byte[] { 0xDE, 0xAD, 0, 0, 0xFF, 0xFF })
+            .ToArray();
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            DecodeChunkAsync(
+                decoder,
+                framebuffer,
+                new FramebufferRect(0, 0, 1, 1),
+                compressed,
+                CancellationToken.None));
+
+        Assert.Equal([9u, 6u], BlueValues(framebuffer));
+    }
+
+    [Fact]
     public async Task Truncated_sync_flush_chunk_faults_context_until_reset()
     {
         var (firstChunk, secondChunk) = CreateSharedZlibChunks(RawTile(1), RawTile(2));
         using var framebuffer = new FramebufferModel(64, 64, ProtocolLimits.Default);
-        using var decoder = new ZrleEncoding();
+        await using var decoder = new ZrleEncoding();
         var rectangle = new FramebufferRect(0, 0, 64, 64);
         _ = await DecodeChunkAsync(decoder, framebuffer, rectangle, firstChunk, CancellationToken.None);
 
@@ -372,7 +430,7 @@ public sealed class ZrleEncodingTests
         await Assert.ThrowsAsync<RfbProtocolException>(() =>
             DecodeChunkAsync(decoder, framebuffer, rectangle, secondChunk, CancellationToken.None));
 
-        decoder.Reset();
+        await decoder.ResetAsync();
         _ = await DecodeChunkAsync(
             decoder,
             framebuffer,
@@ -391,7 +449,7 @@ public sealed class ZrleEncodingTests
         await using var stream = new CancelAfterReadStream(WithLength(payload), cancellation);
         var reader = new RfbReader(stream, ProtocolLimits.Default);
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
-        using var decoder = new ZrleEncoding();
+        await using var decoder = new ZrleEncoding();
         var rectangle = new FramebufferRect(0, 0, 1, 1);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
@@ -399,7 +457,7 @@ public sealed class ZrleEncodingTests
         await Assert.ThrowsAsync<RfbProtocolException>(() =>
             DecodeChunkAsync(decoder, framebuffer, rectangle, payload, CancellationToken.None));
 
-        decoder.Reset();
+        await decoder.ResetAsync();
         _ = await DecodeChunkAsync(decoder, framebuffer, rectangle, payload, CancellationToken.None);
         Assert.Equal(0xFF030201u, framebuffer.GetBgra32(0, 0));
     }
@@ -408,7 +466,7 @@ public sealed class ZrleEncodingTests
     public async Task Disposed_decoder_rejects_further_rectangles()
     {
         var decoder = new ZrleEncoding();
-        decoder.Dispose();
+        await decoder.DisposeAsync();
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
 
         await Assert.ThrowsAsync<ObjectDisposedException>(() =>
@@ -454,6 +512,15 @@ public sealed class ZrleEncodingTests
     }
 
     private static byte[] Compress(byte[] uncompressed)
+    {
+        using var output = new MemoryStream();
+        using var zlib = new ZLibStream(output, CompressionLevel.SmallestSize, leaveOpen: true);
+        zlib.Write(uncompressed);
+        zlib.Flush();
+        return output.ToArray();
+    }
+
+    private static byte[] CompressComplete(byte[] uncompressed)
     {
         using var output = new MemoryStream();
         using (var zlib = new ZLibStream(output, CompressionLevel.SmallestSize, leaveOpen: true))
