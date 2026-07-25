@@ -5,9 +5,27 @@ namespace WinARD.Remote.Protocol.Encodings;
 
 public sealed class CopyRectEncoding : IRfbEncodingDecoder
 {
-    public RfbEncodingType EncodingType => RfbEncodingType.CopyRect;
+    public int EncodingId => (int)RfbEncodingType.CopyRect;
 
-    public async ValueTask<EncodingDecodeResult> DecodeAsync(
+    public async ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+        RfbReader reader,
+        Framebuffer.Framebuffer framebuffer,
+        FramebufferRect rectangle,
+        CancellationToken cancellationToken)
+    {
+        var result = await DecodeWithContextAsync(
+            reader,
+            framebuffer,
+            checked((ushort)rectangle.X),
+            checked((ushort)rectangle.Y),
+            checked((ushort)rectangle.Width),
+            checked((ushort)rectangle.Height),
+            PixelFormat.WinArdBgra32,
+            cancellationToken);
+        return result.DirtyRect is { } dirtyRect ? new[] { dirtyRect } : Array.Empty<FramebufferRect>();
+    }
+
+    internal static async ValueTask<EncodingDecodeResult> DecodeWithContextAsync(
         RfbReader reader,
         Framebuffer.Framebuffer framebuffer,
         ushort x,

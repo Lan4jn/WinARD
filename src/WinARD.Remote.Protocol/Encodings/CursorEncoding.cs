@@ -7,9 +7,27 @@ namespace WinARD.Remote.Protocol.Encodings;
 
 public sealed class CursorEncoding : IRfbEncodingDecoder
 {
-    public RfbEncodingType EncodingType => RfbEncodingType.Cursor;
+    public int EncodingId => (int)RfbEncodingType.Cursor;
 
-    public async ValueTask<EncodingDecodeResult> DecodeAsync(
+    public async ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+        RfbReader reader,
+        Framebuffer.Framebuffer framebuffer,
+        FramebufferRect rectangle,
+        CancellationToken cancellationToken)
+    {
+        _ = await DecodeWithContextAsync(
+            reader,
+            framebuffer,
+            checked((ushort)rectangle.X),
+            checked((ushort)rectangle.Y),
+            checked((ushort)rectangle.Width),
+            checked((ushort)rectangle.Height),
+            PixelFormat.WinArdBgra32,
+            cancellationToken);
+        return Array.Empty<FramebufferRect>();
+    }
+
+    internal static async ValueTask<EncodingDecodeResult> DecodeWithContextAsync(
         RfbReader reader,
         Framebuffer.Framebuffer framebuffer,
         ushort x,

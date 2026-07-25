@@ -1,20 +1,17 @@
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.IO;
+using FramebufferModel = WinARD.Remote.Protocol.Framebuffer.Framebuffer;
 
 namespace WinARD.Remote.Protocol.Encodings;
 
 public interface IRfbEncodingDecoder
 {
-    RfbEncodingType EncodingType { get; }
+    int EncodingId { get; }
 
-    ValueTask<EncodingDecodeResult> DecodeAsync(
+    ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
         RfbReader reader,
-        Framebuffer.Framebuffer framebuffer,
-        ushort x,
-        ushort y,
-        ushort width,
-        ushort height,
-        PixelFormat pixelFormat,
+        FramebufferModel framebuffer,
+        FramebufferRect rectangle,
         CancellationToken cancellationToken);
 }
 

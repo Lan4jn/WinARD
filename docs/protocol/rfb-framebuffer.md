@@ -58,7 +58,7 @@ Updates use rectangle-level commit semantics: rectangles completed before a late
 The probe still exits immediately after successful authentication by default. It only initializes the session and requests a framebuffer when the user supplies an explicit path:
 
 ```powershell
-dotnet run --project tools/WinARD.ProtocolProbe -- --capture-first-frame C:\Temp\winard-first-frame.bmp
+dotnet run --project tools/WinARD.ProtocolProbe -- --capture-first-frame artifacts\first-frame.bgra
 ```
 
-The capture is an uncompressed 32-bit BMP containing dimensions and BGRA pixels. Existing files are not overwritten. The probe reports the captured dimensions and path, and never prints the server name.
+The output format is selected by extension. `.bgra` writes exactly `width * height * 4` bytes in the framebuffer's top-down BGRA memory order with no header; `.bmp` remains available as an uncompressed 32-bit BMP. Missing parent directories are created and existing files are not overwritten. Capture succeeds only when the first update contains at least one dirty rectangle. The probe reports the dimensions, path, and dirty rectangles, and never prints the server name.

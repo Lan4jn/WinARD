@@ -8,6 +8,20 @@ public static class FramebufferCaptureWriter
 {
     private const int BitmapHeaderLength = 54;
 
+    public static Task WriteAsync(
+        string path,
+        Framebuffer framebuffer,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        return Path.GetExtension(path).ToUpperInvariant() switch
+        {
+            ".BGRA" => WriteBgraAsync(path, framebuffer, cancellationToken),
+            ".BMP" => WriteBmpAsync(path, framebuffer, cancellationToken),
+            _ => throw new ArgumentException("Capture path must use the .bgra or .bmp extension.", nameof(path)),
+        };
+    }
+
     public static async Task WriteBmpAsync(
         string path,
         Framebuffer framebuffer,
@@ -18,6 +32,7 @@ public static class FramebufferCaptureWriter
         cancellationToken.ThrowIfCancellationRequested();
 
         var fullPath = Path.GetFullPath(path);
+        CreateParentDirectory(fullPath);
         var pixels = framebuffer.GetPixelsBgra32();
         var header = CreateHeader(framebuffer.Width, framebuffer.Height, pixels.Length);
         var created = false;
@@ -39,25 +54,75 @@ public static class FramebufferCaptureWriter
         }
         catch
         {
-            if (created)
-            {
-                try
-                {
-                    File.Delete(fullPath);
-                }
-                catch (IOException)
-                {
-                }
-                catch (UnauthorizedAccessException)
-                {
-                }
-            }
-
+            DeletePartialCapture(fullPath, created);
             throw;
         }
         finally
         {
             CryptographicOperations.ZeroMemory(pixels);
+        }
+    }
+
+    private static async Task WriteBgraAsync(
+        string path,
+        Framebuffer framebuffer,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(framebuffer);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var fullPath = Path.GetFullPath(path);
+        CreateParentDirectory(fullPath);
+        var pixels = framebuffer.GetPixelsBgra32();
+        var created = false;
+        try
+        {
+            await using var output = new FileStream(
+                fullPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                4096,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            created = true;
+            await output.WriteAsync(pixels, cancellationToken);
+        }
+        catch
+        {
+            DeletePartialCapture(fullPath, created);
+            throw;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(pixels);
+        }
+    }
+
+    private static void CreateParentDirectory(string fullPath)
+    {
+        var directory = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            _ = Directory.CreateDirectory(directory);
+        }
+    }
+
+    private static void DeletePartialCapture(string fullPath, bool created)
+    {
+        if (!created)
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(fullPath);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
         }
     }
 

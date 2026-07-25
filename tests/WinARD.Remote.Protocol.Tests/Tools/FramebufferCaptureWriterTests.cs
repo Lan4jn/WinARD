@@ -12,6 +12,49 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 public sealed class FramebufferCaptureWriterTests
 {
     [Fact]
+    public async Task WriteBgra_writes_top_down_framebuffer_bytes_without_header()
+    {
+        using var framebuffer = new FramebufferModel(1, 2, ProtocolLimits.Default);
+        framebuffer.ApplyRaw(
+            new FramebufferRect(0, 0, 1, 2),
+            [1, 2, 3, 255, 4, 5, 6, 255]);
+        var path = Path.Combine(Path.GetTempPath(), $"winard-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            await FramebufferCaptureWriter.WriteAsync(path, framebuffer, CancellationToken.None);
+
+            var bytes = await File.ReadAllBytesAsync(path);
+            Assert.Equal(framebuffer.Width * framebuffer.Height * 4, bytes.Length);
+            Assert.Equal([1, 2, 3, 255, 4, 5, 6, 255], bytes);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Write_creates_missing_parent_directory()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-{Guid.NewGuid():N}", "artifacts");
+        var path = Path.Combine(directory, "first-frame.bgra");
+        try
+        {
+            await FramebufferCaptureWriter.WriteAsync(path, framebuffer, CancellationToken.None);
+
+            Assert.True(File.Exists(path));
+        }
+        finally
+        {
+            if (Directory.Exists(Path.GetDirectoryName(directory)))
+            {
+                Directory.Delete(Path.GetDirectoryName(directory)!, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
     public async Task WriteBmp_includes_dimensions_and_bottom_up_bgra_pixels()
     {
         using var framebuffer = new FramebufferModel(1, 2, ProtocolLimits.Default);

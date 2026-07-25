@@ -7,12 +7,33 @@ using WinARD.Testing.Streams;
 using Xunit;
 using FramebufferModel = WinARD.Remote.Protocol.Framebuffer.Framebuffer;
 
-#pragma warning disable CA1707
+#pragma warning disable CA1707, CA1859
 
 namespace WinARD.Remote.Protocol.Tests.Framebuffer;
 
 public sealed class FramebufferUpdateTests
 {
+    [Fact]
+    public async Task Public_encoding_decoder_contract_decodes_canonical_raw_rectangle()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var reader = new RfbReader(
+            new MemoryStream([0, 0, 255, 0]),
+            ProtocolLimits.Default);
+        var decoder = CreateRawDecoder();
+        var rectangle = new FramebufferRect(0, 0, 1, 1);
+
+        var dirtyRects = await decoder.DecodeAsync(
+            reader,
+            framebuffer,
+            rectangle,
+            CancellationToken.None);
+
+        Assert.Equal(0, decoder.EncodingId);
+        Assert.Equal(rectangle, Assert.Single(dirtyRects));
+        Assert.Equal(0xFFFF0000u, framebuffer.GetBgra32(0, 0));
+    }
+
     [Fact]
     public async Task Raw_rectangle_updates_only_declared_region()
     {
@@ -350,6 +371,8 @@ public sealed class FramebufferUpdateTests
 
         return bytes.ToArray();
     }
+
+    private static IRfbEncodingDecoder CreateRawDecoder() => new RawEncoding();
 
     private static byte[] Raw(ushort x, ushort y, ushort width, ushort height, byte[] pixels) =>
         [.. Header(x, y, width, height, RfbEncodingType.Raw), .. pixels];

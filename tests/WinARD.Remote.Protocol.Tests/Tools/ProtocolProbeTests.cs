@@ -42,14 +42,14 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
-    public async Task Capture_probe_initializes_requests_full_frame_and_writes_bmp()
+    public async Task Capture_probe_initializes_requests_full_frame_and_writes_requested_format()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var serverTask = RunCaptureServerAsync(listener);
         using var username = SecretMaterial.FromUtf8("capture-user");
         using var password = SecretMaterial.FromUtf8("capture-password");
-        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bmp");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
         try
         {
             var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
@@ -64,8 +64,39 @@ public sealed class ProtocolProbeTests
             Assert.Equal(1, capture.Width);
             Assert.Equal(1, capture.Height);
             Assert.Equal(Path.GetFullPath(path), capture.Path);
-            var bmp = await File.ReadAllBytesAsync(path);
-            Assert.Equal([0, 0, 255, 255], bmp[54..]);
+            Assert.Equal(new FramebufferRect(0, 0, 1, 1), Assert.Single(capture.DirtyRects));
+            Assert.Contains("Dirty: (0,0) 1x1", ProbeOutput.FormatCapture(capture), StringComparison.Ordinal);
+            Assert.Equal([0, 0, 255, 255], await File.ReadAllBytesAsync(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_probe_rejects_update_without_dirty_rectangles()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, sendEmptyUpdate: true);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+                new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                    IPAddress.Loopback.ToString(),
+                    GetPort(listener),
+                    username,
+                    password,
+                    path,
+                    CancellationToken.None));
+
+            Assert.Contains("dirty rectangle", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False(File.Exists(path));
             await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
         }
         finally
@@ -352,7 +383,7 @@ public sealed class ProtocolProbeTests
         stageReached.TrySetResult();
     }
 
-    private static async Task RunCaptureServerAsync(TcpListener listener)
+    private static async Task RunCaptureServerAsync(TcpListener listener, bool sendEmptyUpdate = false)
     {
         using var client = await listener.AcceptTcpClientAsync();
         await using var stream = client.GetStream();
@@ -384,7 +415,13 @@ public sealed class ProtocolProbeTests
         var request = await ReadExactlyAsync(stream, 10);
         Assert.Equal([3, 0, 0, 0, 0, 0, 0, 1, 0, 1], request);
 
-        var update = new List<byte> { 0, 0, 0, 1 };
+        var update = new List<byte> { 0, 0, 0, sendEmptyUpdate ? (byte)0 : (byte)1 };
+        if (sendEmptyUpdate)
+        {
+            await stream.WriteAsync(update.ToArray());
+            return;
+        }
+
         AddUInt16(update, 0);
         AddUInt16(update, 0);
         AddUInt16(update, 1);

@@ -89,17 +89,22 @@ public sealed class ProbeRunner
                 checked((ushort)server.Width),
                 checked((ushort)server.Height),
                 operationCancellation.Token);
-            _ = await FramebufferUpdateReader.ApplyAsync(
+            var update = await FramebufferUpdateReader.ApplyAsync(
                 stream,
                 framebuffer,
                 PixelFormat.WinArdBgra32,
                 operationCancellation.Token);
+            if (update.DirtyRects.Count == 0)
+            {
+                throw new RfbProtocolException("The first framebuffer update did not contain a dirty rectangle.");
+            }
+
             var fullPath = Path.GetFullPath(captureFirstFramePath);
-            await FramebufferCaptureWriter.WriteBmpAsync(fullPath, framebuffer, operationCancellation.Token);
+            await FramebufferCaptureWriter.WriteAsync(fullPath, framebuffer, operationCancellation.Token);
             return new ProbeResult(
                 handshake.Version,
                 handshake.SecurityType,
-                new ProbeCapture(fullPath, framebuffer.Width, framebuffer.Height));
+                new ProbeCapture(fullPath, framebuffer.Width, framebuffer.Height, update.DirtyRects));
         }
         catch (OperationCanceledException exception)
             when (!cancellationToken.IsCancellationRequested && operationCancellation.IsCancellationRequested)

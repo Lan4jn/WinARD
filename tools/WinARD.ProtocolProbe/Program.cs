@@ -51,7 +51,7 @@ internal static class Program
             Console.WriteLine("Authentication: success");
             if (result.Capture is { } capture)
             {
-                Console.WriteLine($"Captured: {capture.Width}x{capture.Height} -> {capture.Path}");
+                Console.WriteLine(ProbeOutput.FormatCapture(capture));
             }
 
             return 0;
@@ -123,5 +123,5 @@ internal static class Program
 
     private static void PrintUsage() =>
         Console.Error.WriteLine(
-            "Usage: WinARD.ProtocolProbe [--capture-first-frame <path.bmp>]. Set WINARD_HOST and WINARD_USERNAME (optional WINARD_PORT, default 5900), then run from an interactive console so the password can be read without echo.");
+            "Usage: WinARD.ProtocolProbe [--capture-first-frame <path.bgra|path.bmp>]. Set WINARD_HOST and WINARD_USERNAME (optional WINARD_PORT, default 5900), then run from an interactive console so the password can be read without echo.");
 }
