@@ -14,6 +14,7 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
     private readonly ISshHostKeyPinStore _pinStore;
     private readonly IOpenSshAskPassBroker _askPassBroker;
     private readonly IOpenSshKnownHostsFileFactory _knownHostsFactory;
+    private readonly OpenSshExecutablePaths _executables;
     private readonly TransportTimeouts _timeouts;
     private readonly TimeProvider _timeProvider;
 
@@ -27,6 +28,7 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             pinStore,
             new UnsupportedOpenSshAskPassBroker(),
             new TemporaryOpenSshKnownHostsFileFactory(),
+            new WindowsOpenSshExecutableResolver(),
             timeouts ?? TransportTimeouts.Default,
             timeProvider ?? TimeProvider.System)
     {
@@ -38,6 +40,7 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
         ISshHostKeyPinStore pinStore,
         IOpenSshAskPassBroker askPassBroker,
         IOpenSshKnownHostsFileFactory knownHostsFactory,
+        IOpenSshExecutableResolver executableResolver,
         TransportTimeouts timeouts,
         TimeProvider timeProvider)
     {
@@ -50,6 +53,8 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             throw new ArgumentNullException(nameof(askPassBroker));
         _knownHostsFactory = knownHostsFactory ??
             throw new ArgumentNullException(nameof(knownHostsFactory));
+        ArgumentNullException.ThrowIfNull(executableResolver);
+        _executables = executableResolver.Resolve();
         _timeouts = timeouts ?? throw new ArgumentNullException(nameof(timeouts));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
     }
@@ -92,7 +97,10 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             .EnsureSupportedAsync(sshProfile, cancellationToken)
             .ConfigureAwait(false);
 
-        var scanStart = OpenSshCommandBuilder.BuildKeyScan(endpoint, _timeouts.Connection);
+        var scanStart = OpenSshCommandBuilder.BuildKeyScan(
+            _executables.KeyScanPath,
+            endpoint,
+            _timeouts.Connection);
         var scan = await _keyScanLauncher
             .ScanAsync(scanStart, cancellationToken)
             .ConfigureAwait(false);
@@ -107,7 +115,10 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
         IOpenSshProcess? process = null;
         try
         {
-            var processStart = OpenSshCommandBuilder.BuildTunnel(sshProfile, knownHosts.Path);
+            var processStart = OpenSshCommandBuilder.BuildTunnel(
+                _executables.SshPath,
+                sshProfile,
+                knownHosts.Path);
             process = await _processLauncher
                 .LaunchAsync(processStart, cancellationToken)
                 .ConfigureAwait(false);
@@ -123,7 +134,9 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
                 }
                 catch (Exception cleanupException)
                 {
-                    (cleanupFailures ??= []).Add(cleanupException);
+                    TemporaryOpenSshKnownHostsFile.AddException(
+                        ref cleanupFailures,
+                        cleanupException);
                 }
             }
 
@@ -133,7 +146,9 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             }
             catch (Exception cleanupException)
             {
-                (cleanupFailures ??= []).Add(cleanupException);
+                TemporaryOpenSshKnownHostsFile.AddException(
+                    ref cleanupFailures,
+                    cleanupException);
             }
 
             RethrowWithCleanupFailures(exception, cleanupFailures);
@@ -287,12 +302,17 @@ public static partial class OpenSshDiagnostics
             }
         }
 
-        var sanitized = SensitiveAssignment().Replace(
-            retained.ToString(),
-            "$1=[REDACTED]");
-        return sanitized.Length <= MaximumSummaryLength
+        return Sanitize(retained.ToString(), MaximumSummaryLength);
+    }
+
+    internal static string Sanitize(string text, int maximumLength)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumLength);
+        var sanitized = SensitiveAssignment().Replace(text, "$1=[REDACTED]");
+        return sanitized.Length <= maximumLength
             ? sanitized
-            : sanitized[..MaximumSummaryLength];
+            : sanitized[..maximumLength];
     }
 
     [GeneratedRegex(
@@ -479,7 +499,7 @@ internal sealed class OpenSshTunnelLifetime(
         }
         catch (Exception exception)
         {
-            (failures ??= []).Add(exception);
+            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
         }
 
         try
@@ -491,7 +511,7 @@ internal sealed class OpenSshTunnelLifetime(
         }
         catch (Exception exception)
         {
-            (failures ??= []).Add(exception);
+            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
         }
 
         try
@@ -500,7 +520,7 @@ internal sealed class OpenSshTunnelLifetime(
         }
         catch (Exception exception)
         {
-            (failures ??= []).Add(exception);
+            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
         }
 
         try
@@ -509,18 +529,10 @@ internal sealed class OpenSshTunnelLifetime(
         }
         catch (Exception exception)
         {
-            (failures ??= []).Add(exception);
+            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
         }
 
-        if (failures is { Count: 1 })
-        {
-            ExceptionDispatchInfo.Capture(failures[0]).Throw();
-        }
-
-        if (failures is { Count: > 1 })
-        {
-            throw new AggregateException(failures);
-        }
+        TemporaryOpenSshKnownHostsFile.ThrowIfAny(failures);
     }
 
     private static void Try(Action action, ref List<Exception>? failures)
@@ -531,7 +543,7 @@ internal sealed class OpenSshTunnelLifetime(
         }
         catch (Exception exception)
         {
-            (failures ??= []).Add(exception);
+            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
         }
     }
 }

@@ -11,9 +11,11 @@ public sealed record OpenSshProcessStart(
 internal static class OpenSshCommandBuilder
 {
     public static OpenSshProcessStart BuildTunnel(
+        string sshPath,
         SshProfile profile,
         string knownHostsPath)
     {
+        ValidateExecutablePath(sshPath, "ssh.exe", nameof(sshPath));
         ArgumentNullException.ThrowIfNull(profile);
         ValidatePath(knownHostsPath, nameof(knownHostsPath));
         ValidateUsername(profile.Username);
@@ -66,13 +68,18 @@ internal static class OpenSshCommandBuilder
         }
 
         arguments.Add($"{profile.Username}@{sshEndpoint.Host}");
-        return new OpenSshProcessStart("ssh.exe", arguments);
+        return new OpenSshProcessStart(sshPath, arguments);
     }
 
     public static OpenSshProcessStart BuildKeyScan(
+        string keyScanPath,
         SshHostKeyEndpoint endpoint,
         TimeSpan timeout)
     {
+        ValidateExecutablePath(
+            keyScanPath,
+            "ssh-keyscan.exe",
+            nameof(keyScanPath));
         if (timeout <= TimeSpan.Zero || timeout == Timeout.InfiniteTimeSpan)
         {
             throw new ArgumentOutOfRangeException(nameof(timeout), "Keyscan timeout must be finite and positive.");
@@ -80,7 +87,7 @@ internal static class OpenSshCommandBuilder
 
         var wholeSeconds = Math.Max(1, (int)Math.Ceiling(timeout.TotalSeconds));
         return new OpenSshProcessStart(
-            "ssh-keyscan.exe",
+            keyScanPath,
             [
                 "-T",
                 wholeSeconds.ToString(CultureInfo.InvariantCulture),
@@ -116,6 +123,24 @@ internal static class OpenSshCommandBuilder
         if (string.IsNullOrWhiteSpace(path) || path.Any(char.IsControl))
         {
             throw new ArgumentException("Path cannot be blank or contain control characters.", parameterName);
+        }
+    }
+
+    private static void ValidateExecutablePath(
+        string path,
+        string expectedFileName,
+        string parameterName)
+    {
+        ValidatePath(path, parameterName);
+        if (!Path.IsPathFullyQualified(path) ||
+            !string.Equals(
+                Path.GetFileName(path),
+                expectedFileName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException(
+                $"OpenSSH executable must be an absolute path named '{expectedFileName}'.",
+                parameterName);
         }
     }
 }

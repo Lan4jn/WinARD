@@ -23,10 +23,13 @@ public sealed class OpenSshCommandTests
             pinnedHostKeySha256: null);
 
         var start = OpenSshCommandBuilder.BuildTunnel(
+            Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh.exe"),
             profile,
             @"C:\Users\A User\AppData\Local\Temp\known hosts");
 
-        Assert.Equal("ssh.exe", start.FileName);
+        Assert.Equal(
+            Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh.exe"),
+            start.FileName);
         Assert.Equal(
             [
                 "-T",
@@ -52,7 +55,10 @@ public sealed class OpenSshCommandTests
     {
         var profile = CreateProfile("jump.example", "ssh-user");
 
-        var start = OpenSshCommandBuilder.BuildTunnel(profile, @"C:\Temp\known_hosts");
+        var start = OpenSshCommandBuilder.BuildTunnel(
+            Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh.exe"),
+            profile,
+            @"C:\Temp\known_hosts");
 
         Assert.DoesNotContain("-i", start.Arguments);
         Assert.Contains("IdentitiesOnly=no", start.Arguments);
@@ -70,7 +76,10 @@ public sealed class OpenSshCommandTests
         var profile = CreateProfile(host, username);
 
         Assert.Throws<ArgumentException>(
-            () => OpenSshCommandBuilder.BuildTunnel(profile, @"C:\Temp\known_hosts"));
+            () => OpenSshCommandBuilder.BuildTunnel(
+                Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh.exe"),
+                profile,
+                @"C:\Temp\known_hosts"));
     }
 
     [Fact]
@@ -78,9 +87,14 @@ public sealed class OpenSshCommandTests
     {
         var endpoint = new SshHostKeyEndpoint("jump.example", 2222);
 
-        var start = OpenSshCommandBuilder.BuildKeyScan(endpoint, TimeSpan.FromSeconds(7));
+        var start = OpenSshCommandBuilder.BuildKeyScan(
+            Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh-keyscan.exe"),
+            endpoint,
+            TimeSpan.FromSeconds(7));
 
-        Assert.Equal("ssh-keyscan.exe", start.FileName);
+        Assert.Equal(
+            Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh-keyscan.exe"),
+            start.FileName);
         Assert.Equal(["-T", "7", "-p", "2222", "jump.example"], start.Arguments);
     }
 

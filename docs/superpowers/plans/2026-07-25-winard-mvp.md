@@ -717,7 +717,11 @@ public interface IRemoteTransportFactory
 
 TCP 使用 `TcpClient.ConnectAsync(host, port, cancellationToken)`。SSH 使用受控的系统 OpenSSH 进程，通过 `ssh.exe -T -W <rfbHost>:<rfbPort>` 的 stdin/stdout 暴露双向流，不创建本地 TCP 监听端口。所有参数必须通过 `ProcessStartInfo.ArgumentList` 传入，并关闭 shell 执行。
 
+生产环境只从 `%WINDIR%\System32\OpenSSH` 解析 `ssh.exe` 与 `ssh-keyscan.exe`，或使用管理员显式配置且已验证存在、文件名匹配的绝对路径；不得从当前目录或 `PATH` 搜索同名程序。Authenticode 签名验证不在 Task 8 范围内，作为发布前供应链门禁记录。
+
 连接前运行有界的 `ssh-keyscan.exe`，独立解析原始公钥并计算 SHA-256 指纹；首次未知返回“需要用户确认”，已变化返回“阻断”。只有端点、算法和原始公钥均与固定值匹配，才为本次连接创建端点专用的临时 `known_hosts`，并使用 `StrictHostKeyChecking=yes`，禁止读取或更新全局及用户 known_hosts。
+
+`ssh-keyscan` 的 stdout/stderr 必须分别按字节数限制并并发排空。超限、取消、读取失败或非零退出都要保留主异常，再使用独立短超时 best-effort 执行进程树终止、等待退出和释放；任何 cleanup 异常不得覆盖主异常。临时 `known_hosts` 的流关闭和显式删除必须分别尝试，`DeleteOnClose` 仅作为附加防线。
 
 隧道就绪以 RFB 服务端会立即发送 banner 为前提：在同一个总连接截止时间内读取至少一个 stdout 字节，并通过前缀流把该字节回放给协议层。stderr 必须异步排空、脱敏并限制诊断摘要长度；取消、超时、远端拒绝和并发释放均须终止进程树并删除临时 known_hosts。
 

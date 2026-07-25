@@ -182,6 +182,29 @@ public sealed class SshRemoteTransportTests
         Assert.Equal(0, fixture.Launcher.LaunchCount);
     }
 
+    [Fact]
+    public async Task Launch_failure_preserves_primary_and_all_known_hosts_cleanup_failures()
+    {
+        var fixture = new OpenSshFixture();
+        await fixture.ConfirmAsync();
+        var primary = new IOException("launch failed");
+        var streamCleanup = new IOException("stream dispose failed");
+        var deleteCleanup = new UnauthorizedAccessException("delete failed");
+        fixture.Launcher.LaunchException = primary;
+        fixture.KnownHosts.DisposeException =
+            new AggregateException(streamCleanup, deleteCleanup);
+
+        var aggregate = await Assert.ThrowsAsync<AggregateException>(
+            () => fixture.Transport.ConnectAsync(
+                fixture.Profile,
+                CancellationToken.None));
+
+        Assert.Equal(3, aggregate.InnerExceptions.Count);
+        Assert.Same(primary, aggregate.InnerExceptions[0]);
+        Assert.Same(streamCleanup, aggregate.InnerExceptions[1]);
+        Assert.Same(deleteCleanup, aggregate.InnerExceptions[2]);
+    }
+
     private sealed class OpenSshFixture
     {
         public OpenSshFixture(
@@ -220,6 +243,7 @@ public sealed class SshRemoteTransportTests
                 Store,
                 new UnsupportedOpenSshAskPassBroker(),
                 KnownHosts,
+                new FakeExecutableResolver(),
                 timeouts ?? TransportTimeouts.Default,
                 timeProvider ?? TimeProvider.System);
         }
@@ -249,6 +273,14 @@ public sealed class SshRemoteTransportTests
             $"[{Endpoint.Host}]:{Endpoint.Port} ssh-ed25519 {Convert.ToBase64String(key)}";
     }
 
+    private sealed class FakeExecutableResolver : IOpenSshExecutableResolver
+    {
+        public OpenSshExecutablePaths Resolve() =>
+            new(
+                Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh.exe"),
+                Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh-keyscan.exe"));
+    }
+
     private sealed class FakeKeyScanLauncher : IOpenSshKeyScanLauncher
     {
         public string Output { get; set; } = string.Empty;
@@ -272,12 +304,19 @@ public sealed class SshRemoteTransportTests
 
         public OpenSshProcessStart? LastStart { get; private set; }
 
+        public Exception? LaunchException { get; set; }
+
         public ValueTask<IOpenSshProcess> LaunchAsync(
             OpenSshProcessStart start,
             CancellationToken cancellationToken)
         {
             LaunchCount++;
             LastStart = start;
+            if (LaunchException is not null)
+            {
+                return ValueTask.FromException<IOpenSshProcess>(LaunchException);
+            }
+
             return ValueTask.FromResult<IOpenSshProcess>(process);
         }
     }
@@ -400,6 +439,8 @@ public sealed class SshRemoteTransportTests
 
         public string? Content { get; private set; }
 
+        public Exception? DisposeException { get; set; }
+
         public ValueTask<IOpenSshKnownHostsFile> CreateAsync(
             SshHostKeyPin pin,
             CancellationToken cancellationToken)
@@ -422,6 +463,10 @@ public sealed class SshRemoteTransportTests
                 if (Interlocked.Exchange(ref _disposed, 1) == 0)
                 {
                     owner.DisposeCount++;
+                    if (owner.DisposeException is not null)
+                    {
+                        return ValueTask.FromException(owner.DisposeException);
+                    }
                 }
 
                 return ValueTask.CompletedTask;
