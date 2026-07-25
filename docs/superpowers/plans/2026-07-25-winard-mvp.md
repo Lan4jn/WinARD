@@ -633,6 +633,8 @@ public void Clipboard_rejects_text_above_one_megabyte()
 
 ZRLE 解码必须限制压缩与解压长度，逐 64×64 tile 处理 raw、solid、packed palette 和 plain RLE 子编码。键盘适配器维护已按下 keysym 集合，窗口失焦或断开时按相反顺序发送 key-up，避免远端修饰键卡住。
 
+同时将 encoding decoder 的返回值扩展为结构化结果，直接携带 dirty rectangles 与 pixel-content rectangles，替换 Task 6 中 `PixelContentVersion` / `LastPixelContentRect` 的单矩形旁路状态，以支持 ZRLE 等单次解码产生多个像素内容矩形。
+
 ```csharp
 public sealed class ClipboardProtocol(int maxUtf8Bytes)
 {

@@ -100,7 +100,7 @@ public sealed class ProbeRunner
 
                 foreach (var rectangle in update.PixelContentRects)
                 {
-                    coverage.Add(rectangle);
+                    coverage.Add(rectangle, operationCancellation.Token);
                 }
 
                 if (coverage.IsComplete)
@@ -142,57 +142,4 @@ public sealed class ProbeRunner
             checked((ushort)framebuffer.Height),
             cancellationToken);
 
-    private sealed class PixelCoverage
-    {
-        private List<(int Start, int End)>[] _rows = [];
-        private long _coveredPixels;
-        private long _totalPixels;
-
-        public PixelCoverage(int width, int height)
-        {
-            Reset(width, height);
-        }
-
-        public bool IsComplete => _coveredPixels == _totalPixels;
-
-        public void Reset(int width, int height)
-        {
-            _rows = Enumerable.Range(0, height)
-                .Select(_ => new List<(int Start, int End)>())
-                .ToArray();
-            _coveredPixels = 0;
-            _totalPixels = checked((long)width * height);
-        }
-
-        public void Add(FramebufferRect rectangle)
-        {
-            var endX = checked(rectangle.X + rectangle.Width);
-            var endY = checked(rectangle.Y + rectangle.Height);
-            for (var y = rectangle.Y; y < endY; y++)
-            {
-                AddInterval(_rows[y], rectangle.X, endX);
-            }
-        }
-
-        private void AddInterval(List<(int Start, int End)> intervals, int start, int end)
-        {
-            var insertionIndex = 0;
-            while (insertionIndex < intervals.Count && intervals[insertionIndex].End < start)
-            {
-                insertionIndex++;
-            }
-
-            while (insertionIndex < intervals.Count && intervals[insertionIndex].Start <= end)
-            {
-                var existing = intervals[insertionIndex];
-                start = Math.Min(start, existing.Start);
-                end = Math.Max(end, existing.End);
-                _coveredPixels -= existing.End - existing.Start;
-                intervals.RemoveAt(insertionIndex);
-            }
-
-            intervals.Insert(insertionIndex, (start, end));
-            _coveredPixels += end - start;
-        }
-    }
 }

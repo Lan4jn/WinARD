@@ -227,6 +227,81 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
+    public async Task Capture_probe_accepts_complete_frame_on_sixty_fourth_update()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, CaptureScenario.CompleteOnSixtyFourthUpdate);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                IPAddress.Loopback.ToString(),
+                GetPort(listener),
+                username,
+                password,
+                path,
+                CancellationToken.None);
+
+            Assert.NotNull(result.Capture);
+            Assert.Equal([0, 0, 255, 255], await File.ReadAllBytesAsync(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_probe_rejects_incomplete_sixty_fourth_update_without_requesting_sixty_fifth()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, CaptureScenario.IncompleteAfterSixtyFourUpdates);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+                new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                    IPAddress.Loopback.ToString(),
+                    GetPort(listener),
+                    username,
+                    password,
+                    path,
+                    CancellationToken.None));
+
+            Assert.Contains("64", exception.Message, StringComparison.Ordinal);
+            Assert.False(File.Exists(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Capture_output_limits_dirty_rectangles_and_reports_omitted_count()
+    {
+        var capture = new ProbeCapture(
+            "capture.bgra",
+            1,
+            1,
+            Enumerable.Range(0, 10).Select(x => new FramebufferRect(x, 0, 1, 1)));
+
+        var output = ProbeOutput.FormatCapture(capture);
+
+        Assert.Contains("(7,0) 1x1", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("(8,0) 1x1", output, StringComparison.Ordinal);
+        Assert.Contains("2 omitted", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Hidden_password_ctrl_c_throws_and_restores_console_state()
     {
         var console = new FakePasswordConsole(
@@ -551,6 +626,41 @@ public sealed class ProtocolProbeTests
         var request = await ReadExactlyAsync(stream, 10);
         Assert.Equal(CreateFullRequest(initialWidth, 1), request);
 
+        if (scenario is CaptureScenario.CompleteOnSixtyFourthUpdate or CaptureScenario.IncompleteAfterSixtyFourUpdates)
+        {
+            for (var updateIndex = 0; updateIndex < 64; updateIndex++)
+            {
+                var complete = scenario == CaptureScenario.CompleteOnSixtyFourthUpdate && updateIndex == 63;
+                if (complete)
+                {
+                    await WriteRectangleUpdateAsync(
+                        stream,
+                        0,
+                        0,
+                        1,
+                        1,
+                        RfbEncodingType.Raw,
+                        [0, 0, 255, 0]);
+                }
+                else
+                {
+                    await stream.WriteAsync(new byte[] { 0, 0, 0, 0 });
+                }
+
+                if (updateIndex < 63)
+                {
+                    Assert.Equal(CreateFullRequest(1, 1), await ReadExactlyAsync(stream, 10));
+                }
+            }
+
+            if (scenario == CaptureScenario.IncompleteAfterSixtyFourUpdates)
+            {
+                await AssertClientClosedWithoutAnotherRequestAsync(stream);
+            }
+
+            return;
+        }
+
         if (scenario == CaptureScenario.Empty)
         {
             await stream.WriteAsync(new byte[] { 0, 0, 0, 0 });
@@ -662,6 +772,18 @@ public sealed class ProtocolProbeTests
         }
     }
 
+    private static async Task AssertClientClosedWithoutAnotherRequestAsync(Stream stream)
+    {
+        var buffer = new byte[1];
+        try
+        {
+            Assert.Equal(0, await stream.ReadAsync(buffer));
+        }
+        catch (IOException)
+        {
+        }
+    }
+
     private static int GetPort(TcpListener listener) => ((IPEndPoint)listener.LocalEndpoint).Port;
 
     private static void AddUInt32(List<byte> destination, uint value)
@@ -693,6 +815,8 @@ public sealed class ProtocolProbeTests
         DesktopSizeOnly,
         DesktopSizeThenFullRaw,
         PartialRawAcrossUpdates,
+        CompleteOnSixtyFourthUpdate,
+        IncompleteAfterSixtyFourUpdates,
     }
 
     private sealed class FakePasswordConsole(

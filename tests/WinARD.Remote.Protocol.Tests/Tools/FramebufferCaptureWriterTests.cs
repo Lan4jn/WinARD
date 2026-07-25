@@ -159,11 +159,31 @@ public sealed class FramebufferCaptureWriterTests
         Assert.Equal("cleanup failed", cleanupException.Message);
     }
 
+    [Fact]
+    public async Task CreateNew_failure_does_not_delete_uncreated_temporary_path()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var operations = new FakeCaptureFileOperations(Stream.Null)
+        {
+            CreateException = new IOException("create failed"),
+        };
+        var path = Path.Combine(Path.GetTempPath(), $"winard-{Guid.NewGuid():N}.bgra");
+
+        var exception = await Assert.ThrowsAsync<IOException>(() =>
+            FramebufferCaptureWriter.WriteAsync(path, framebuffer, operations, CancellationToken.None));
+
+        Assert.Equal("create failed", exception.Message);
+        Assert.NotNull(operations.CreatedPath);
+        Assert.Null(operations.DeletedPath);
+        Assert.Null(operations.Move);
+    }
+
     private sealed class FakeCaptureFileOperations(Stream stream) : ICaptureFileOperations
     {
         public string? CreatedPath { get; private set; }
         public string? DeletedPath { get; private set; }
         public (string Source, string Destination)? Move { get; private set; }
+        public Exception? CreateException { get; init; }
         public Exception? DeleteException { get; init; }
 
         public void CreateDirectory(string path)
@@ -173,6 +193,11 @@ public sealed class FramebufferCaptureWriterTests
         public Stream CreateNew(string path)
         {
             CreatedPath = path;
+            if (CreateException is not null)
+            {
+                throw CreateException;
+            }
+
             return stream;
         }
 

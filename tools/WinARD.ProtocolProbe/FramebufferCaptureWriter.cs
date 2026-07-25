@@ -110,10 +110,12 @@ public static class FramebufferCaptureWriter
         }
 
         var temporaryPath = CreateTemporaryPath(fullPath);
+        var temporaryCreated = false;
         try
         {
             await using (var output = fileOperations.CreateNew(temporaryPath))
             {
+                temporaryCreated = true;
                 await write(output);
                 await output.FlushAsync(cancellationToken);
             }
@@ -122,6 +124,11 @@ public static class FramebufferCaptureWriter
         }
         catch (Exception exception)
         {
+            if (!temporaryCreated)
+            {
+                throw;
+            }
+
             try
             {
                 fileOperations.Delete(temporaryPath);

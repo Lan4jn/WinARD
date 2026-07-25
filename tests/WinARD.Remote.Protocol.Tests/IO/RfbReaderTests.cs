@@ -284,12 +284,26 @@ public sealed class RfbReaderTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new ProtocolLimits(1, 4, 5));
     }
 
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(1, 0)]
+    [InlineData(1, 5)]
+    public void ProtocolLimits_rejects_invalid_work_or_cursor_limits(
+        int maxFramebufferUpdateWorkBytes,
+        int maxCursorBytes)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new ProtocolLimits(1, 4, 4, maxFramebufferUpdateWorkBytes, maxCursorBytes));
+    }
+
     [Fact]
     public void ProtocolLimits_default_has_required_values()
     {
         Assert.Equal(16 * 1024 * 1024, ProtocolLimits.Default.MaxMessageBytes);
         Assert.Equal(256 * 1024 * 1024, ProtocolLimits.Default.MaxFramebufferBytes);
         Assert.Equal(256 * 1024 * 1024, ProtocolLimits.Default.MaxFramebufferUpdateBytes);
+        Assert.Equal(768 * 1024 * 1024, ProtocolLimits.Default.MaxFramebufferUpdateWorkBytes);
+        Assert.Equal(16 * 1024 * 1024, ProtocolLimits.Default.MaxCursorBytes);
     }
 
     private sealed class ThrowOnReadStream : Stream

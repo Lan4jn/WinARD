@@ -53,6 +53,8 @@ Supported encodings:
 
 Updates use rectangle-level commit semantics: rectangles completed before a later rectangle fails remain applied. The failing rectangle itself is not partially committed. Dirty rectangles preserve successful wire order.
 
+Each `FramebufferUpdate` has two independent budgets. `MaxFramebufferUpdateBytes` limits bytes consumed from decoder payloads. `MaxFramebufferUpdateWorkBytes` limits estimated decoding work before reads, allocations, or copies: Raw charges wire bytes plus conversion and framebuffer writes, CopyRect charges copied BGRA bytes, DesktopSize charges replacement framebuffer initialization, and Cursor charges wire/mask bytes plus conversion and the defensive cursor copy. The budgets reset for every message. DesktopSize is additionally limited to four rectangles per update, and decoded cursor BGRA storage is bounded by `MaxCursorBytes`.
+
 ## Protocol probe capture
 
 The probe still exits immediately after successful authentication by default. It only initializes the session and requests a framebuffer when the user supplies an explicit path:
@@ -61,4 +63,6 @@ The probe still exits immediately after successful authentication by default. It
 dotnet run --project tools/WinARD.ProtocolProbe -- --capture-first-frame artifacts\first-frame.bgra
 ```
 
-The output format is selected by extension. `.bgra` writes exactly `width * height * 4` bytes in the framebuffer's top-down BGRA memory order with no header; `.bmp` remains available as an uncompressed 32-bit BMP. Missing parent directories are created and existing files are not overwritten. Capture succeeds only when the first update contains at least one dirty rectangle. The probe reports the dimensions, path, and dirty rectangles, and never prints the server name.
+The output format is selected by extension. `.bgra` writes exactly `width * height * 4` bytes in the framebuffer's top-down BGRA memory order with no header; `.bmp` remains available as an uncompressed 32-bit BMP. Missing parent directories are created and existing files are not overwritten. A unique temporary file is flushed and closed before a no-overwrite move publishes the final capture.
+
+Capture succeeds only after Raw pixel-content rectangles cover the complete current framebuffer. Coverage uses one fixed bit per pixel, resets after DesktopSize, observes cancellation while scanning, and may combine rectangles across at most 64 updates. Incomplete updates cause another full non-incremental request. Cursor, CopyRect, and DesktopSize do not count as initial pixel coverage. Probe output shows at most eight dirty rectangles followed by an omitted count, and never prints the server name.

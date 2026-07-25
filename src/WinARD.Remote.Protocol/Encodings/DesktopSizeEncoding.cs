@@ -20,6 +20,12 @@ public sealed class DesktopSizeEncoding : IRfbEncodingDecoder
             throw new RfbProtocolException("DesktopSize rectangle origin must be (0,0).");
         }
 
+        var framebufferBytes = PixelConverter.CheckedBgraLength(
+            rectangle.Width,
+            rectangle.Height,
+            framebuffer.Limits);
+        reader.ReserveDesktopSizeRectangle();
+        reader.ReserveFramebufferUpdateWorkBytes(framebufferBytes);
         framebuffer.Resize(rectangle.Width, rectangle.Height);
         return ValueTask.FromResult<IReadOnlyList<FramebufferRect>>(new[] { rectangle });
     }

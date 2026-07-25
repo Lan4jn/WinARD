@@ -6,9 +6,12 @@ namespace WinARD.Remote.Protocol.IO;
 
 public sealed class RfbReader
 {
+    private const int MaximumDesktopSizeRectangles = 4;
     private readonly Stream _stream;
     private readonly ProtocolLimits _limits;
     private int _framebufferUpdateBytes;
+    private long _framebufferUpdateWorkBytes;
+    private int _desktopSizeRectangles;
 
     public RfbReader(Stream stream, ProtocolLimits limits)
     {
@@ -74,6 +77,32 @@ public sealed class RfbReader
         }
 
         _framebufferUpdateBytes = checked((int)total);
+    }
+
+    internal void ReserveFramebufferUpdateWorkBytes(long count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+
+        var total = checked(_framebufferUpdateWorkBytes + count);
+        if (total > _limits.MaxFramebufferUpdateWorkBytes)
+        {
+            throw new RfbProtocolException(
+                $"Framebuffer update work estimate {total} exceeds the configured limit of " +
+                $"{_limits.MaxFramebufferUpdateWorkBytes} bytes.");
+        }
+
+        _framebufferUpdateWorkBytes = total;
+    }
+
+    internal void ReserveDesktopSizeRectangle()
+    {
+        if (_desktopSizeRectangles >= MaximumDesktopSizeRectangles)
+        {
+            throw new RfbProtocolException(
+                $"FramebufferUpdate contains more than {MaximumDesktopSizeRectangles} DesktopSize rectangles.");
+        }
+
+        _desktopSizeRectangles++;
     }
 
     internal async ValueTask<byte[]> ReadFramebufferPayloadBytesAsync(
