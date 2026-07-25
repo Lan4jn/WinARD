@@ -1,4 +1,5 @@
 using System.Text;
+using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.IO;
@@ -8,7 +9,14 @@ namespace WinARD.Remote.Protocol.Initialization;
 public static class RfbSessionInitializer
 {
     private const int MaximumDisplayNameCharacters = 4096;
-    private static readonly int[] RequestedEncodings = [0, 1, -239, -223];
+    private static readonly int[] RequestedEncodings =
+    [
+        (int)RfbEncodingType.Zrle,
+        (int)RfbEncodingType.Raw,
+        (int)RfbEncodingType.CopyRect,
+        (int)RfbEncodingType.Cursor,
+        (int)RfbEncodingType.DesktopSize,
+    ];
 
     /// <summary>
     /// Sends ClientInit, consumes ServerInit, and declares WinARD's pixel format and encodings.

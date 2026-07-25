@@ -241,23 +241,55 @@ public sealed class ZrleEncodingTests
         Assert.Equal(before, framebuffer.GetPixelsBgra32());
     }
 
-    [Fact]
-    public async Task Non_32_bit_pixel_format_is_rejected_before_payload_read()
+    [Theory]
+    [MemberData(nameof(PixelReaderFixtures))]
+    public async Task Raw_and_solid_tiles_use_legal_pixel_or_cpixel_layout(
+        PixelFormat format,
+        byte subencoding,
+        byte[] wirePixel,
+        uint expectedBgra)
     {
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
-        var payload = Compress([1, 1, 2]);
-        await using var stream = new MemoryStream(WithLength(payload));
-        var reader = new RfbReader(stream, ProtocolLimits.Default);
-        var format = new PixelFormat(16, 16, 0, 1, 31, 63, 31, 11, 5, 0);
 
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
-            new ZrleEncoding(format).DecodeAsync(
-                reader,
-                framebuffer,
-                new FramebufferRect(0, 0, 1, 1),
-                CancellationToken.None).AsTask());
+        _ = await DecodeAsync(
+            framebuffer,
+            format,
+            new FramebufferRect(0, 0, 1, 1),
+            [subencoding, .. wirePixel]);
 
-        Assert.Equal(0, stream.Position);
+        Assert.Equal(expectedBgra, framebuffer.GetBgra32(0, 0));
+    }
+
+    [Fact]
+    public async Task Packed_palette_reuses_ordinary_16_bit_pixel_reader()
+    {
+        using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);
+        var format = new PixelFormat(16, 16, 1, 1, 31, 63, 31, 11, 5, 0);
+
+        _ = await DecodeAsync(
+            framebuffer,
+            format,
+            new FramebufferRect(0, 0, 2, 1),
+            [2, 0xF8, 0, 0, 0x1F, 0b0100_0000]);
+
+        Assert.Equal(0xFFFF0000u, framebuffer.GetBgra32(0, 0));
+        Assert.Equal(0xFF0000FFu, framebuffer.GetBgra32(1, 0));
+    }
+
+    [Fact]
+    public async Task Plain_rle_reuses_high_three_byte_cpixel_reader()
+    {
+        using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);
+        var format = new PixelFormat(32, 24, 0, 1, 255, 255, 255, 24, 16, 8);
+
+        _ = await DecodeAsync(
+            framebuffer,
+            format,
+            new FramebufferRect(0, 0, 2, 1),
+            [128, 0x33, 0x22, 0x11, 1]);
+
+        Assert.Equal(0xFF112233u, framebuffer.GetBgra32(0, 0));
+        Assert.Equal(0xFF112233u, framebuffer.GetBgra32(1, 0));
     }
 
     [Fact]
@@ -504,6 +536,67 @@ public sealed class ZrleEncodingTests
         Enumerable.Range(0, framebuffer.Width)
             .Select(x => framebuffer.GetBgra32(x, 0) & 0xFF)
             .ToArray();
+
+    public static IEnumerable<object[]> PixelReaderFixtures()
+    {
+        var fixtures = new (PixelFormat Format, byte[] Pixel, uint Expected)[]
+        {
+            (
+                new PixelFormat(8, 8, 0, 1, 7, 7, 3, 5, 2, 0),
+                [0xE0],
+                0xFFFF0000u),
+            (
+                new PixelFormat(16, 16, 0, 1, 31, 63, 31, 11, 5, 0),
+                [0, 0xF8],
+                0xFFFF0000u),
+            (
+                new PixelFormat(16, 16, 1, 1, 31, 63, 31, 11, 5, 0),
+                [0xF8, 0],
+                0xFFFF0000u),
+            (
+                new PixelFormat(32, 24, 0, 1, 255, 255, 255, 16, 8, 0),
+                [0x33, 0x22, 0x11],
+                0xFF112233u),
+            (
+                new PixelFormat(32, 24, 1, 1, 255, 255, 255, 16, 8, 0),
+                [0x11, 0x22, 0x33],
+                0xFF112233u),
+            (
+                new PixelFormat(32, 24, 0, 1, 255, 255, 255, 24, 16, 8),
+                [0x33, 0x22, 0x11],
+                0xFF112233u),
+            (
+                new PixelFormat(32, 24, 1, 1, 255, 255, 255, 24, 16, 8),
+                [0x11, 0x22, 0x33],
+                0xFF112233u),
+            (
+                new PixelFormat(32, 24, 0, 1, 255, 255, 255, 24, 8, 0),
+                [0x33, 0x22, 0, 0x11],
+                0xFF112233u),
+            (
+                new PixelFormat(32, 24, 1, 1, 255, 255, 255, 24, 8, 0),
+                [0x11, 0, 0x22, 0x33],
+                0xFF112233u),
+            (
+                new PixelFormat(32, 3, 0, 1, 1, 1, 1, 31, 15, 0),
+                [1, 0x80, 0, 0x80],
+                0xFFFFFFFFu),
+            (
+                new PixelFormat(32, 32, 0, 1, 255, 255, 255, 16, 8, 0),
+                [0x33, 0x22, 0x11, 0xAA],
+                0xFF112233u),
+            (
+                new PixelFormat(32, 32, 1, 1, 255, 255, 255, 16, 8, 0),
+                [0xAA, 0x11, 0x22, 0x33],
+                0xFF112233u),
+        };
+
+        foreach (var fixture in fixtures)
+        {
+            yield return [fixture.Format, (byte)0, fixture.Pixel, fixture.Expected];
+            yield return [fixture.Format, (byte)1, fixture.Pixel, fixture.Expected];
+        }
+    }
 
     private sealed class SegmentedReadStream : Stream
     {

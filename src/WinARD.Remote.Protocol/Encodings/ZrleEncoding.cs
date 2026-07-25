@@ -11,6 +11,8 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
 {
     private const int TileSize = 64;
     private readonly PixelFormat _pixelFormat;
+    private readonly int _encodedPixelLength;
+    private readonly int _wirePixelOffset;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private SegmentedReadStream? _compressedInput;
     private ZLibStream? _zlib;
@@ -28,6 +30,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
     {
         ArgumentNullException.ThrowIfNull(pixelFormat);
         _pixelFormat = pixelFormat;
+        (_encodedPixelLength, _wirePixelOffset) = GetPixelLayout(pixelFormat);
         InitializeContext();
     }
 
@@ -47,7 +50,6 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
             ThrowIfUnavailable();
             cancellationToken.ThrowIfCancellationRequested();
             rectangle.ValidateWithin(framebuffer.Width, framebuffer.Height);
-            ValidatePixelFormat();
 
             reader.ReserveFramebufferUpdateBytes(sizeof(uint));
             var compressedLengthValue = await reader.ReadUInt32Async(cancellationToken);
@@ -312,7 +314,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
                 DecodeRawTile(data, ref offset, destination, destinationWidth, tileX, tileY, tileWidth, tileHeight);
                 return;
             case 1:
-                var solid = ReadCpixel(data, ref offset);
+                var solid = ReadPixel(data, ref offset);
                 FillTile(destination, destinationWidth, tileX, tileY, tileWidth, tileHeight, solid);
                 return;
             case >= 2 and <= 16:
@@ -362,7 +364,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
                     destinationWidth,
                     tileX + x,
                     tileY + y,
-                    ReadCpixel(data, ref offset));
+                    ReadPixel(data, ref offset));
             }
         }
     }
@@ -381,7 +383,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         var palette = new uint[paletteSize];
         for (var index = 0; index < paletteSize; index++)
         {
-            palette[index] = ReadCpixel(data, ref offset);
+            palette[index] = ReadPixel(data, ref offset);
         }
 
         var bitsPerIndex = paletteSize <= 2 ? 1 : paletteSize <= 4 ? 2 : 4;
@@ -426,7 +428,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         var decodedPixels = 0;
         while (decodedPixels < tilePixelCount)
         {
-            var pixel = ReadCpixel(data, ref offset);
+            var pixel = ReadPixel(data, ref offset);
             var runLength = 1;
             byte extension;
             do
@@ -455,59 +457,41 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IDisposable
         }
     }
 
-    private uint ReadCpixel(ReadOnlySpan<byte> data, ref int offset)
+    private uint ReadPixel(ReadOnlySpan<byte> data, ref int offset)
     {
-        var cpixelLength = _pixelFormat.Depth <= 24 ? 3 : 4;
-        var cpixel = ReadBytes(data, ref offset, cpixelLength);
-        Span<byte> wirePixel = stackalloc byte[4];
-        if (cpixelLength == 4)
+        var encodedPixel = ReadBytes(data, ref offset, _encodedPixelLength);
+        if (_encodedPixelLength == _pixelFormat.BytesPerPixel)
         {
-            cpixel.CopyTo(wirePixel);
-        }
-        else if (_pixelFormat.BigEndian)
-        {
-            cpixel.CopyTo(wirePixel[1..]);
-        }
-        else
-        {
-            cpixel.CopyTo(wirePixel);
+            return PixelConverter.ToBgra32Pixel(encodedPixel, _pixelFormat);
         }
 
+        Span<byte> wirePixel = stackalloc byte[4];
+        wirePixel.Clear();
+        encodedPixel.CopyTo(wirePixel.Slice(_wirePixelOffset, _encodedPixelLength));
         return PixelConverter.ToBgra32Pixel(wirePixel, _pixelFormat);
     }
 
-    private void ValidatePixelFormat()
+    private static (int EncodedLength, int WireOffset) GetPixelLayout(PixelFormat pixelFormat)
     {
-        if (_pixelFormat.BitsPerPixel != 32 || !_pixelFormat.TrueColor)
+        if (pixelFormat.BitsPerPixel != 32 || pixelFormat.Depth > 24)
         {
-            throw new RfbProtocolException("ZRLE requires a 32-bit true-color pixel format.");
+            return (pixelFormat.BytesPerPixel, 0);
         }
 
-        if (_pixelFormat.Depth <= 24)
+        var componentMask =
+            ((uint)pixelFormat.RedMax << pixelFormat.RedShift) |
+            ((uint)pixelFormat.GreenMax << pixelFormat.GreenShift) |
+            ((uint)pixelFormat.BlueMax << pixelFormat.BlueShift);
+        var fitsLowThreeBytes = (componentMask & 0xFF000000u) == 0;
+        var fitsHighThreeBytes = (componentMask & 0x000000FFu) == 0;
+        if (!fitsLowThreeBytes && !fitsHighThreeBytes)
         {
-            var highestComponentBit = Math.Max(
-                _pixelFormat.RedShift + BitWidth(_pixelFormat.RedMax),
-                Math.Max(
-                    _pixelFormat.GreenShift + BitWidth(_pixelFormat.GreenMax),
-                    _pixelFormat.BlueShift + BitWidth(_pixelFormat.BlueMax)));
-            if (highestComponentBit > 24)
-            {
-                throw new RfbProtocolException(
-                    "ZRLE CPIXEL cannot omit a byte that contains true-color component bits.");
-            }
-        }
-    }
-
-    private static int BitWidth(ushort value)
-    {
-        var width = 0;
-        while (value != 0)
-        {
-            width++;
-            value >>= 1;
+            return (pixelFormat.BytesPerPixel, 0);
         }
 
-        return width;
+        var usesHighThreeBytes = !fitsLowThreeBytes;
+        var wireOffset = pixelFormat.BigEndian == usesHighThreeBytes ? 0 : 1;
+        return (3, wireOffset);
     }
 
     private static byte ReadByte(ReadOnlySpan<byte> data, ref int offset)

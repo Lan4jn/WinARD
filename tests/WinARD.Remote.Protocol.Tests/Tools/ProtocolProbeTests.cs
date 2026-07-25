@@ -620,9 +620,19 @@ public sealed class ProtocolProbeTests
         serverInit.AddRange(Encoding.UTF8.GetBytes("Mac"));
         await stream.WriteAsync(serverInit.ToArray());
 
-        var declarations = await ReadExactlyAsync(stream, 40);
-        Assert.Equal((byte)0, declarations[0]);
-        Assert.Equal((byte)2, declarations[20]);
+        var declarationHeader = await ReadExactlyAsync(stream, 24);
+        Assert.Equal((byte)0, declarationHeader[0]);
+        Assert.Equal((byte)2, declarationHeader[20]);
+        Assert.Equal(5, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
+        Assert.Equal(
+            [
+                0, 0, 0, 16,
+                0, 0, 0, 0,
+                0, 0, 0, 1,
+                0xFF, 0xFF, 0xFF, 0x11,
+                0xFF, 0xFF, 0xFF, 0x21,
+            ],
+            await ReadExactlyAsync(stream, 20));
         var request = await ReadExactlyAsync(stream, 10);
         Assert.Equal(CreateFullRequest(initialWidth, 1), request);
 
