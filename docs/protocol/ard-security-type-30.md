@@ -87,4 +87,12 @@ Security: AppleRemoteDesktop (30)
 Authentication: success
 ```
 
-Automated fixture interoperability is covered by tests. Real-Mac acceptance remains pending until a reachable Mac and credentials are provided by the user; no host, username, password, or packet capture is stored in the repository.
+Automated fixture interoperability is covered by tests. On 2026-07-25, the user confirmed a successful `WinARD.ProtocolProbe` run against a real Mac with the following non-sensitive output:
+
+```text
+Version: 3.8
+Security: AppleRemoteDesktop (30)
+Authentication: success
+```
+
+This confirms real-Mac ARD authentication interoperability. The Mac host, username, and password were not recorded. The specific macOS major version was not provided, so this acceptance result is not attributed to a particular macOS release.
