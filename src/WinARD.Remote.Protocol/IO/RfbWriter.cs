@@ -18,54 +18,66 @@ public sealed class RfbWriter
         _state = SharedStates.GetValue(stream, static _ => new SharedWriteState());
     }
 
+    /// <summary>Writes one complete one-byte RFB message.</summary>
     public ValueTask WriteByteAsync(byte value, CancellationToken cancellationToken) =>
-        WriteBytesAsync(new byte[] { value }, cancellationToken);
+        WriteMessageAsync(new byte[] { value }, cancellationToken);
 
+    /// <summary>Writes one complete unsigned 16-bit RFB message.</summary>
     public ValueTask WriteUInt16Async(ushort value, CancellationToken cancellationToken)
     {
         var bytes = new byte[sizeof(ushort)];
         BinaryPrimitives.WriteUInt16BigEndian(bytes, value);
-        return WriteBytesAsync(bytes, cancellationToken);
+        return WriteMessageAsync(bytes, cancellationToken);
     }
 
+    /// <summary>Writes one complete unsigned 32-bit RFB message.</summary>
     public ValueTask WriteUInt32Async(uint value, CancellationToken cancellationToken)
     {
         var bytes = new byte[sizeof(uint)];
         BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
-        return WriteBytesAsync(bytes, cancellationToken);
+        return WriteMessageAsync(bytes, cancellationToken);
     }
 
+    /// <summary>Writes one complete signed 32-bit RFB message.</summary>
     public ValueTask WriteInt32Async(int value, CancellationToken cancellationToken)
     {
         var bytes = new byte[sizeof(int)];
         BinaryPrimitives.WriteInt32BigEndian(bytes, value);
-        return WriteBytesAsync(bytes, cancellationToken);
+        return WriteMessageAsync(bytes, cancellationToken);
     }
 
-    public async ValueTask WriteBytesAsync(
+    /// <summary>
+    /// Compatibility alias that treats <paramref name="value" /> as one complete logical RFB message.
+    /// Composite messages must be assembled before this call.
+    /// </summary>
+    public ValueTask WriteBytesAsync(
+        ReadOnlyMemory<byte> value,
+        CancellationToken cancellationToken) =>
+        WriteMessageAsync(value, cancellationToken);
+
+    /// <summary>Serializes and writes one complete logical RFB protocol message.</summary>
+    public async ValueTask WriteMessageAsync(
         ReadOnlyMemory<byte> value,
         CancellationToken cancellationToken)
     {
         _state.ThrowIfFaulted();
-        var entered = false;
+        await _state.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await _state.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            entered = true;
             _state.ThrowIfFaulted();
-            await _stream.WriteAsync(value, cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            _state.Fault();
-            throw;
+            try
+            {
+                await _stream.WriteAsync(value, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                _state.Fault();
+                throw;
+            }
         }
         finally
         {
-            if (entered)
-            {
-                _state.Gate.Release();
-            }
+            _state.Gate.Release();
         }
     }
 

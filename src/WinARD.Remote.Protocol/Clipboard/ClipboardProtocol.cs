@@ -33,7 +33,7 @@ public sealed class ClipboardProtocol
         var message = EncodeClientCutText(text, _maxUtf8Bytes);
         try
         {
-            await _writer.WriteBytesAsync(message, cancellationToken).ConfigureAwait(false);
+            await _writer.WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -131,12 +131,12 @@ public sealed class ClipboardProtocol
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxUtf8Bytes);
-        var type = await reader.ReadByteAsync(cancellationToken);
-        var padding = await reader.ReadBytesAsync(3, cancellationToken);
+        var type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        var padding = await reader.ReadBytesAsync(3, cancellationToken).ConfigureAwait(false);
         ValidateHeader([type, .. padding], expectedType, messageName);
-        var length = await reader.ReadUInt32Async(cancellationToken);
+        var length = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
         var payloadLength = ValidateLength(length, maxUtf8Bytes);
-        var payload = await reader.ReadBytesAsync(payloadLength, cancellationToken);
+        var payload = await reader.ReadBytesAsync(payloadLength, cancellationToken).ConfigureAwait(false);
         try
         {
             return DecodeText(payload, maxUtf8Bytes);

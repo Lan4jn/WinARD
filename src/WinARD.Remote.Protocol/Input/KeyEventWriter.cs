@@ -22,6 +22,6 @@ public sealed class KeyEventWriter
         message[0] = 4;
         message[1] = isDown ? (byte)1 : (byte)0;
         BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(4), keysym);
-        return _writer.WriteBytesAsync(message, cancellationToken);
+        return _writer.WriteMessageAsync(message, cancellationToken);
     }
 }

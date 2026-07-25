@@ -67,6 +67,41 @@ public sealed class RfbWriterTests
     }
 
     [Fact]
+    public async Task Prewrite_cancellation_does_not_poison_writer()
+    {
+        await using var stream = new MemoryStream();
+        var writer = new RfbWriter(stream);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            writer.WriteMessageAsync(new byte[] { 1 }, cancellation.Token).AsTask());
+        await writer.WriteMessageAsync(new byte[] { 2 }, CancellationToken.None);
+
+        Assert.Equal([2], stream.ToArray());
+    }
+
+    [Fact]
+    public async Task Cancellation_while_waiting_for_write_gate_does_not_poison_writer()
+    {
+        await using var stream = new BlockingFirstWriteStream();
+        var first = new RfbWriter(stream);
+        var second = new RfbWriter(stream);
+        var firstWrite = first.WriteMessageAsync(new byte[] { 1 }, CancellationToken.None).AsTask();
+        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+        using var cancellation = new CancellationTokenSource();
+        var waitingWrite = second.WriteMessageAsync(new byte[] { 2 }, cancellation.Token).AsTask();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waitingWrite);
+        stream.Release();
+        await firstWrite;
+        await second.WriteMessageAsync(new byte[] { 3 }, CancellationToken.None);
+
+        Assert.Equal([1, 3], stream.Bytes);
+    }
+
+    [Fact]
     public void Constructor_rejects_null_stream()
     {
         Assert.Throws<ArgumentNullException>(() => new RfbWriter(null!));
@@ -200,5 +235,42 @@ public sealed class RfbWriterTests
             Bytes.AddRange(buffer.Span[..Math.Min(2, buffer.Length)].ToArray());
             throw new IOException("Injected partial write failure.");
         }
+    }
+
+    private sealed class BlockingFirstWriteStream : Stream
+    {
+        private readonly TaskCompletionSource _started =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _writeCount;
+
+        public Task Started => _started.Task;
+        public List<byte> Bytes { get; } = [];
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => Bytes.Count;
+        public override long Position { get => Bytes.Count; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _writeCount) == 1)
+            {
+                _started.TrySetResult();
+                await _release.Task.WaitAsync(cancellationToken);
+            }
+
+            Bytes.AddRange(buffer.ToArray());
+        }
+
+        public void Release() => _release.TrySetResult();
     }
 }

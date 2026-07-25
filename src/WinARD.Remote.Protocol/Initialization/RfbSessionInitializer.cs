@@ -36,22 +36,24 @@ public static class RfbSessionInitializer
         var writer = new RfbWriter(stream);
         await writer.WriteByteAsync(1, cancellationToken).ConfigureAwait(false);
 
-        var width = await reader.ReadUInt16Async(cancellationToken);
-        var height = await reader.ReadUInt16Async(cancellationToken);
+        var width = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+        var height = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
         if (width == 0 || height == 0)
         {
             throw new RfbProtocolException("RFB ServerInit dimensions must be non-zero.");
         }
 
-        var serverPixelFormat = PixelFormat.Parse(await reader.ReadBytesAsync(16, cancellationToken));
-        var nameLength = await reader.ReadUInt32Async(cancellationToken);
+        var serverPixelFormat = PixelFormat.Parse(
+            await reader.ReadBytesAsync(16, cancellationToken).ConfigureAwait(false));
+        var nameLength = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
         if (nameLength > limits.MaxMessageBytes)
         {
             throw new RfbProtocolException(
                 $"RFB server name length {nameLength} exceeds the configured limit of {limits.MaxMessageBytes} bytes.");
         }
 
-        var nameBytes = await reader.ReadBytesAsync(checked((int)nameLength), cancellationToken);
+        var nameBytes = await reader.ReadBytesAsync(checked((int)nameLength), cancellationToken)
+            .ConfigureAwait(false);
         var (name, isTruncated) = CreateDisplayName(nameBytes);
 
         await WriteSetPixelFormatAsync(writer, cancellationToken).ConfigureAwait(false);
@@ -82,14 +84,14 @@ public static class RfbSessionInitializer
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(4), y);
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(6), width);
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(8), height);
-        await new RfbWriter(stream).WriteBytesAsync(message, cancellationToken).ConfigureAwait(false);
+        await new RfbWriter(stream).WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task WriteSetPixelFormatAsync(RfbWriter writer, CancellationToken cancellationToken)
     {
         var message = new byte[20];
         PixelFormat.WinArdBgra32.ToWireBytes().CopyTo(message, 4);
-        await writer.WriteBytesAsync(message, cancellationToken).ConfigureAwait(false);
+        await writer.WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task WriteSetEncodingsAsync(RfbWriter writer, CancellationToken cancellationToken)
@@ -106,7 +108,7 @@ public static class RfbSessionInitializer
                 RequestedEncodings[index]);
         }
 
-        await writer.WriteBytesAsync(message, cancellationToken).ConfigureAwait(false);
+        await writer.WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
     private static (string Name, bool IsTruncated) CreateDisplayName(ReadOnlySpan<byte> bytes)

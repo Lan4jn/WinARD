@@ -55,6 +55,7 @@ public sealed class ArdAuthenticator
 
         byte[]? usernameBytes = null;
         byte[]? passwordBytes = null;
+        byte[]? responseMessage = null;
         try
         {
             usernameBytes = CopyCredential(username, nameof(username));
@@ -62,23 +63,22 @@ public sealed class ArdAuthenticator
 
             var reader = new RfbReader(stream, limits);
             var writer = new RfbWriter(stream);
-            var challenge = await ReadChallengeAsync(reader, cancellationToken);
-            var response = CreateResponse(challenge, usernameBytes, passwordBytes);
-
-            await writer.WriteBytesAsync(response.EncryptedCredentialsMemory, cancellationToken);
-            await writer.WriteBytesAsync(response.ClientPublicKeyMemory, cancellationToken);
+            var challenge = await ReadChallengeAsync(reader, cancellationToken).ConfigureAwait(false);
+            responseMessage = CreateResponseMessage(challenge, usernameBytes, passwordBytes);
+            await writer.WriteMessageAsync(responseMessage, cancellationToken).ConfigureAwait(false);
             await ReadSecurityResultAsync(
                 reader,
                 version,
                 limits,
                 usernameBytes,
                 passwordBytes,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             ZeroMemory(usernameBytes);
             ZeroMemory(passwordBytes);
+            ZeroMemory(responseMessage);
         }
     }
 
@@ -86,22 +86,22 @@ public sealed class ArdAuthenticator
         RfbReader reader,
         CancellationToken cancellationToken)
     {
-        var generator = await reader.ReadUInt16Async(cancellationToken);
-        var keyLength = await reader.ReadUInt16Async(cancellationToken);
+        var generator = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+        var keyLength = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
         if (keyLength is < MinimumKeyLength or > MaximumKeyLength)
         {
             throw new RfbProtocolException(
                 $"ARD key length {keyLength} is outside the supported range of {MinimumKeyLength} to {MaximumKeyLength} bytes.");
         }
 
-        var modulus = await reader.ReadBytesAsync(keyLength, cancellationToken);
-        var serverPublicKey = await reader.ReadBytesAsync(keyLength, cancellationToken);
+        var modulus = await reader.ReadBytesAsync(keyLength, cancellationToken).ConfigureAwait(false);
+        var serverPublicKey = await reader.ReadBytesAsync(keyLength, cancellationToken).ConfigureAwait(false);
         var challenge = new ArdChallenge(generator, keyLength, modulus, serverPublicKey);
         ValidateChallenge(challenge);
         return challenge;
     }
 
-    private ArdResponse CreateResponse(
+    private byte[] CreateResponseMessage(
         ArdChallenge challenge,
         ReadOnlySpan<byte> username,
         ReadOnlySpan<byte> password)
@@ -112,6 +112,7 @@ public sealed class ArdAuthenticator
         var plaintextCredentials = new byte[CredentialPlaintextLength];
         var encryptedCredentials = new byte[CredentialPlaintextLength];
         var clientPublicKey = new byte[challenge.KeyLength];
+        byte[]? responseMessage = null;
 
         try
         {
@@ -119,7 +120,15 @@ public sealed class ArdAuthenticator
             DeriveAesKey(sharedSecret, aesKey);
             CreatePlaintextCredentials(username, password, plaintextCredentials);
             EncryptCredentials(plaintextCredentials, aesKey, encryptedCredentials);
-            return new ArdResponse(encryptedCredentials, clientPublicKey);
+            responseMessage = new byte[encryptedCredentials.Length + clientPublicKey.Length];
+            encryptedCredentials.CopyTo(responseMessage, 0);
+            clientPublicKey.CopyTo(responseMessage, encryptedCredentials.Length);
+            return responseMessage;
+        }
+        catch
+        {
+            ZeroMemory(responseMessage);
+            throw;
         }
         finally
         {
@@ -245,7 +254,7 @@ public sealed class ArdAuthenticator
         ReadOnlyMemory<byte> password,
         CancellationToken cancellationToken)
     {
-        var resultCode = await reader.ReadUInt32Async(cancellationToken);
+        var resultCode = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
         if (resultCode == 0)
         {
             return;
@@ -260,7 +269,7 @@ public sealed class ArdAuthenticator
                     limits,
                     username,
                     password,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 throw new ArdAuthenticationRejectedException(resultCode, failure.Reason, failure.IsTruncated);
             }
             catch (RfbProtocolException exception)

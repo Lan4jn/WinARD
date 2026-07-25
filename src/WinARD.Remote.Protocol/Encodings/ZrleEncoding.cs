@@ -18,6 +18,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IAsyncDisposable
     private SegmentedReadStream? _compressedInput;
     private ZLibStream? _zlib;
     private DecoderState _state = DecoderState.Active;
+    private Task? _disposeTask;
 
     public ZrleEncoding()
         : this(PixelFormat.WinArdBgra32)
@@ -144,18 +145,22 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_stateLock)
         {
-            if (_state is DecoderState.Disposing or DecoderState.Disposed)
+            if (_disposeTask is null)
             {
-                return;
+                _state = DecoderState.Disposing;
+                _disposeTask = DisposeCoreAsync();
             }
 
-            _state = DecoderState.Disposing;
+            return new ValueTask(_disposeTask);
         }
+    }
 
+    private async Task DisposeCoreAsync()
+    {
         await _gate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -164,6 +169,15 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IAsyncDisposable
             {
                 _state = DecoderState.Disposed;
             }
+        }
+        catch
+        {
+            lock (_stateLock)
+            {
+                _state = DecoderState.Faulted;
+            }
+
+            throw;
         }
         finally
         {
@@ -223,7 +237,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IAsyncDisposable
         lock (_stateLock)
         {
             ObjectDisposedException.ThrowIf(
-                _state is DecoderState.Disposing or DecoderState.Disposed,
+                _disposeTask is not null,
                 this);
         }
     }

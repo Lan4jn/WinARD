@@ -726,6 +726,46 @@ public sealed class FramebufferUpdateTests
         Assert.Equal(0, retry.Position);
     }
 
+    [Fact]
+    public async Task Concurrent_session_disposals_share_completion_while_apply_is_in_flight()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var session = FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32);
+        await using var stream = new BlockingReadStream();
+        using var cancellation = new CancellationTokenSource();
+        var apply = session.ApplyAsync(stream, cancellation.Token);
+        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var firstDispose = session.DisposeAsync().AsTask();
+        var secondDispose = session.DisposeAsync().AsTask();
+
+        Assert.False(firstDispose.IsCompleted);
+        Assert.False(secondDispose.IsCompleted);
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => apply);
+        await Task.WhenAll(firstDispose, secondDispose).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Concurrent_session_disposals_observe_the_same_cleanup_failure()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var decoder = new ThrowingDisposableDecoder();
+        var session = new FramebufferUpdateSession(
+            framebuffer,
+            new Dictionary<int, IRfbEncodingDecoder> { [decoder.EncodingId] = decoder });
+
+        var firstDispose = session.DisposeAsync().AsTask();
+        await decoder.DisposeStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        var secondDispose = session.DisposeAsync().AsTask();
+        Assert.False(secondDispose.IsCompleted);
+        decoder.ReleaseDispose();
+
+        var firstException = await Assert.ThrowsAsync<InvalidOperationException>(() => firstDispose);
+        var secondException = await Assert.ThrowsAsync<InvalidOperationException>(() => secondDispose);
+        Assert.Same(firstException, secondException);
+    }
+
     private static byte[] Update(params byte[][] rectangles)
     {
         var bytes = new List<byte> { 0, 0 };
@@ -759,6 +799,33 @@ public sealed class FramebufferUpdateTests
             WasCalled = true;
             return ValueTask.FromResult(result);
         }
+    }
+
+    private sealed class ThrowingDisposableDecoder : IRfbEncodingDecoder, IAsyncDisposable
+    {
+        private readonly TaskCompletionSource _disposeStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseDispose =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int EncodingId => 777;
+        public Task DisposeStarted => _disposeStarted.Task;
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            FramebufferModel framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(EncodingDecodeResult.Empty);
+
+        public async ValueTask DisposeAsync()
+        {
+            _disposeStarted.TrySetResult();
+            await _releaseDispose.Task;
+            throw new InvalidOperationException("Injected decoder disposal failure.");
+        }
+
+        public void ReleaseDispose() => _releaseDispose.TrySetResult();
     }
 
     private static byte[] Raw(ushort x, ushort y, ushort width, ushort height, byte[] pixels) =>

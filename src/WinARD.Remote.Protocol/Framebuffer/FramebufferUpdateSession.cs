@@ -10,6 +10,7 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly object _stateLock = new();
     private SessionState _state = SessionState.Active;
+    private Task? _disposeTask;
 
     internal FramebufferUpdateSession(
         Framebuffer framebuffer,
@@ -58,18 +59,22 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_stateLock)
         {
-            if (_state is SessionState.Disposing or SessionState.Disposed)
+            if (_disposeTask is null)
             {
-                return;
+                _state = SessionState.Disposing;
+                _disposeTask = DisposeCoreAsync();
             }
 
-            _state = SessionState.Disposing;
+            return new ValueTask(_disposeTask);
         }
+    }
 
+    private async Task DisposeCoreAsync()
+    {
         await _gate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -89,6 +94,15 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
             {
                 _state = SessionState.Disposed;
             }
+        }
+        catch
+        {
+            lock (_stateLock)
+            {
+                _state = SessionState.Faulted;
+            }
+
+            throw;
         }
         finally
         {

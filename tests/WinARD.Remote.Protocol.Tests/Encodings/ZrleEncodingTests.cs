@@ -4,6 +4,7 @@ using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.IO;
+using WinARD.Testing.Streams;
 using Xunit;
 using FramebufferModel = WinARD.Remote.Protocol.Framebuffer.Framebuffer;
 
@@ -476,6 +477,30 @@ public sealed class ZrleEncodingTests
                 new FramebufferRect(0, 0, 1, 1),
                 Compress([1, 1, 2, 3]),
                 CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Concurrent_disposals_share_completion_while_decode_is_in_flight()
+    {
+        await using var stream = new BlockingReadStream();
+        using var cancellation = new CancellationTokenSource();
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var decoder = new ZrleEncoding();
+        var decode = decoder.DecodeAsync(
+            new RfbReader(stream, ProtocolLimits.Default),
+            framebuffer,
+            new FramebufferRect(0, 0, 1, 1),
+            cancellation.Token).AsTask();
+        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var firstDispose = decoder.DisposeAsync().AsTask();
+        var secondDispose = decoder.DisposeAsync().AsTask();
+
+        Assert.False(firstDispose.IsCompleted);
+        Assert.False(secondDispose.IsCompleted);
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => decode);
+        await Task.WhenAll(firstDispose, secondDispose).WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     private static async Task<EncodingDecodeResult> DecodeAsync(

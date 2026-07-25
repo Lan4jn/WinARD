@@ -11,6 +11,7 @@ public sealed class KeyboardInputAdapter : IAsyncDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly object _stateLock = new();
     private AdapterState _state = AdapterState.Active;
+    private Task? _disposeTask;
 
     public KeyboardInputAdapter(KeyEventWriter writer)
     {
@@ -32,70 +33,68 @@ public sealed class KeyboardInputAdapter : IAsyncDisposable
     public async ValueTask KeyDownAsync(uint keysym, CancellationToken cancellationToken)
     {
         ThrowIfUnavailable();
-        var entered = false;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            entered = true;
             ThrowIfUnavailable();
-            await _writer.WriteAsync(true, keysym, cancellationToken).ConfigureAwait(false);
-            lock (_stateLock)
+            try
             {
-                if (_pressed.Add(keysym))
+                await _writer.WriteAsync(true, keysym, cancellationToken).ConfigureAwait(false);
+                ThrowIfUnavailable();
+                lock (_stateLock)
                 {
-                    _pressOrder.Add(keysym);
+                    if (_pressed.Add(keysym))
+                    {
+                        _pressOrder.Add(keysym);
+                    }
                 }
             }
-        }
-        catch
-        {
-            Fault();
-            throw;
+            catch
+            {
+                Fault();
+                throw;
+            }
         }
         finally
         {
-            if (entered)
-            {
-                _gate.Release();
-            }
+            _gate.Release();
         }
     }
 
     public async ValueTask KeyUpAsync(uint keysym, CancellationToken cancellationToken)
     {
         ThrowIfUnavailable();
-        var entered = false;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            entered = true;
             ThrowIfUnavailable();
-            lock (_stateLock)
+            try
             {
-                if (!_pressed.Contains(keysym))
+                lock (_stateLock)
                 {
-                    return;
+                    if (!_pressed.Contains(keysym))
+                    {
+                        return;
+                    }
+                }
+
+                await _writer.WriteAsync(false, keysym, cancellationToken).ConfigureAwait(false);
+                ThrowIfUnavailable();
+                lock (_stateLock)
+                {
+                    _pressed.Remove(keysym);
+                    _pressOrder.Remove(keysym);
                 }
             }
-
-            await _writer.WriteAsync(false, keysym, cancellationToken).ConfigureAwait(false);
-            lock (_stateLock)
+            catch
             {
-                _pressed.Remove(keysym);
-                _pressOrder.Remove(keysym);
+                Fault();
+                throw;
             }
-        }
-        catch
-        {
-            Fault();
-            throw;
         }
         finally
         {
-            if (entered)
-            {
-                _gate.Release();
-            }
+            _gate.Release();
         }
     }
 
@@ -108,59 +107,62 @@ public sealed class KeyboardInputAdapter : IAsyncDisposable
     public async ValueTask ReleaseAllAsync(CancellationToken cancellationToken)
     {
         ThrowIfUnavailable();
-        var entered = false;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            entered = true;
             ThrowIfUnavailable();
-            while (true)
+            try
             {
-                uint keysym;
-                lock (_stateLock)
+                while (true)
                 {
-                    if (_pressOrder.Count == 0)
+                    uint keysym;
+                    lock (_stateLock)
                     {
-                        break;
+                        if (_pressOrder.Count == 0)
+                        {
+                            break;
+                        }
+
+                        keysym = _pressOrder[^1];
                     }
 
-                    keysym = _pressOrder[^1];
-                }
-
-                await _writer.WriteAsync(false, keysym, cancellationToken).ConfigureAwait(false);
-                lock (_stateLock)
-                {
-                    _pressOrder.RemoveAt(_pressOrder.Count - 1);
-                    _pressed.Remove(keysym);
+                    await _writer.WriteAsync(false, keysym, cancellationToken).ConfigureAwait(false);
+                    ThrowIfUnavailable();
+                    lock (_stateLock)
+                    {
+                        _pressOrder.RemoveAt(_pressOrder.Count - 1);
+                        _pressed.Remove(keysym);
+                    }
                 }
             }
-        }
-        catch
-        {
-            Fault();
-            throw;
+            catch
+            {
+                Fault();
+                throw;
+            }
         }
         finally
         {
-            if (entered)
-            {
-                _gate.Release();
-            }
+            _gate.Release();
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_stateLock)
         {
-            if (_state is AdapterState.Disposing or AdapterState.Disposed)
+            if (_disposeTask is null)
             {
-                return;
+                _state = AdapterState.Disposing;
+                _disposeTask = DisposeCoreAsync();
             }
 
-            _state = AdapterState.Disposing;
+            return new ValueTask(_disposeTask);
         }
+    }
 
+    private async Task DisposeCoreAsync()
+    {
         await _gate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -170,6 +172,15 @@ public sealed class KeyboardInputAdapter : IAsyncDisposable
                 _pressed.Clear();
                 _state = AdapterState.Disposed;
             }
+        }
+        catch
+        {
+            lock (_stateLock)
+            {
+                _state = AdapterState.Faulted;
+            }
+
+            throw;
         }
         finally
         {

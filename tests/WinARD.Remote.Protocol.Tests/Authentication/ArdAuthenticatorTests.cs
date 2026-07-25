@@ -1,11 +1,13 @@
 using System.Buffers.Binary;
 using System.Numerics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using WinARD.ProtocolProbe;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Handshake;
+using WinARD.Remote.Protocol.Input;
 using WinARD.Remote.Protocol.IO;
 using WinARD.Testing.Rfb;
 using WinARD.Testing.Streams;
@@ -38,6 +40,49 @@ public sealed class ArdAuthenticatorTests
         Assert.Equal(0, server.GetClientPublicKey()[0]);
         Assert.Equal(server.KeyLength, server.GetSharedSecret().Length);
         Assert.Equal(0, server.GetSharedSecret()[0]);
+    }
+
+    [Fact]
+    public async Task Ard_response_is_one_message_and_cannot_interleave_with_pointer_message()
+    {
+        await using var stream = new BlockingFirstWriteDuplexStream(SuccessfulChallengeAndResult());
+        using var username = SecretMaterial.FromUtf8("operator");
+        using var password = SecretMaterial.FromUtf8("password");
+        var authentication = new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+            stream,
+            RfbVersion.V3_8,
+            username,
+            password,
+            CancellationToken.None);
+        await stream.WriteStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        var pointer = new PointerEventWriter(new RfbWriter(stream));
+        var pointerWrite = pointer.WriteAsync(1, 2, 3, CancellationToken.None).AsTask();
+
+        stream.ReleaseWrite();
+        await Task.WhenAll(authentication, pointerWrite).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal([192, 6], stream.WriteLengths);
+        Assert.Equal(198, stream.Bytes.Count);
+        Assert.Equal([5, 1, 0, 2, 0, 3], stream.Bytes.TakeLast(6));
+    }
+
+    [Fact]
+    public async Task Failed_ard_response_write_zeroes_combined_sensitive_message()
+    {
+        await using var stream = new CapturingFailureDuplexStream(SuccessfulChallengeAndResult());
+        using var username = SecretMaterial.FromUtf8("operator");
+        using var password = SecretMaterial.FromUtf8("password");
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                stream,
+                RfbVersion.V3_8,
+                username,
+                password,
+                CancellationToken.None));
+
+        Assert.NotNull(stream.CapturedBuffer);
+        Assert.All(stream.CapturedBuffer!, value => Assert.Equal(0, value));
     }
 
     [Fact]
@@ -876,6 +921,78 @@ public sealed class ArdAuthenticatorTests
         }
         catch (ObjectDisposedException)
         {
+        }
+    }
+
+    private static byte[] SuccessfulChallengeAndResult()
+    {
+        var modulus = Convert.FromHexString(FixtureModulusHex);
+        var serverPublicKey = Convert.FromHexString(
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007D");
+        return [.. ArdServerFixture.EncodeChallenge(5, 64, modulus, serverPublicKey), 0, 0, 0, 0];
+    }
+
+    private class ScriptedDuplexStream(byte[] input) : Stream
+    {
+        private readonly MemoryStream _input = new(input, writable: false);
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => _input.Read(buffer, offset, count);
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default) =>
+            _input.ReadAsync(buffer, cancellationToken);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class BlockingFirstWriteDuplexStream(byte[] input) : ScriptedDuplexStream(input)
+    {
+        private readonly TaskCompletionSource _writeStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseWrite =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _writeCount;
+
+        public Task WriteStarted => _writeStarted.Task;
+        public List<int> WriteLengths { get; } = [];
+        public List<byte> Bytes { get; } = [];
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _writeCount) == 1)
+            {
+                _writeStarted.TrySetResult();
+                await _releaseWrite.Task.WaitAsync(cancellationToken);
+            }
+
+            WriteLengths.Add(buffer.Length);
+            Bytes.AddRange(buffer.ToArray());
+        }
+
+        public void ReleaseWrite() => _releaseWrite.TrySetResult();
+    }
+
+    private sealed class CapturingFailureDuplexStream(byte[] input) : ScriptedDuplexStream(input)
+    {
+        public byte[]? CapturedBuffer { get; private set; }
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Assert.True(MemoryMarshal.TryGetArray(buffer, out var segment));
+            CapturedBuffer = segment.Array;
+            throw new IOException("Injected ARD response write failure.");
         }
     }
 

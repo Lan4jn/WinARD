@@ -54,7 +54,7 @@ public sealed class InputWriterTests
     }
 
     [Fact]
-    public async Task Cancellation_poisons_shared_writer_without_writing()
+    public async Task Prewrite_cancellation_leaves_shared_writer_healthy()
     {
         await using var stream = new MemoryStream();
         var pointer = new PointerEventWriter(new RfbWriter(stream));
@@ -64,10 +64,11 @@ public sealed class InputWriterTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             pointer.WriteAsync(0, 0, 0, cancellation.Token).AsTask());
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             key.WriteAsync(true, 1, cancellation.Token).AsTask());
+        await pointer.WriteAsync(0, 1, 2, CancellationToken.None);
 
-        Assert.Empty(stream.ToArray());
+        Assert.Equal([5, 0, 0, 1, 0, 2], stream.ToArray());
     }
 
     [Fact]
@@ -175,6 +176,44 @@ public sealed class InputWriterTests
         Assert.Equal([3u], WrittenKeysyms(stream.Bytes.ToArray().AsSpan(24)));
     }
 
+    [Fact]
+    public async Task Concurrent_keyboard_disposals_share_completion_while_write_is_in_flight()
+    {
+        await using var stream = new BlockingWriteStream();
+        var keyboard = new KeyboardInputAdapter(new KeyEventWriter(new RfbWriter(stream)));
+        var keyDown = keyboard.KeyDownAsync((uint)'A', CancellationToken.None).AsTask();
+        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var firstDispose = keyboard.DisposeAsync().AsTask();
+        var secondDispose = keyboard.DisposeAsync().AsTask();
+
+        Assert.False(firstDispose.IsCompleted);
+        Assert.False(secondDispose.IsCompleted);
+        stream.Release();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => keyDown);
+        await Task.WhenAll(firstDispose, secondDispose).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Empty(keyboard.PressedKeysyms);
+    }
+
+    [Fact]
+    public async Task Keyboard_wait_cancellation_does_not_fault_or_clear_state()
+    {
+        await using var stream = new BlockingWriteStream();
+        await using var keyboard = new KeyboardInputAdapter(new KeyEventWriter(new RfbWriter(stream)));
+        var firstKeyDown = keyboard.KeyDownAsync((uint)'A', CancellationToken.None).AsTask();
+        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+        using var cancellation = new CancellationTokenSource();
+        var waitingKeyDown = keyboard.KeyDownAsync((uint)'B', cancellation.Token).AsTask();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waitingKeyDown);
+        stream.Release();
+        await firstKeyDown;
+        await keyboard.KeyDownAsync((uint)'C', CancellationToken.None);
+
+        Assert.Equal([(uint)'A', (uint)'C'], keyboard.PressedKeysyms);
+    }
+
     private static uint[] WrittenKeysyms(ReadOnlySpan<byte> bytes)
     {
         var result = new uint[bytes.Length / 8];
@@ -226,5 +265,35 @@ public sealed class InputWriterTests
             Bytes.AddRange(buffer.ToArray());
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class BlockingWriteStream : Stream
+    {
+        private readonly TaskCompletionSource _started =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task Started => _started.Task;
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            _started.TrySetResult();
+            await _release.Task.WaitAsync(cancellationToken);
+        }
+
+        public void Release() => _release.TrySetResult();
     }
 }

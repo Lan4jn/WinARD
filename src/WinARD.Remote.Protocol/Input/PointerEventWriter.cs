@@ -29,6 +29,6 @@ public sealed class PointerEventWriter
         message[1] = buttons;
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(2), checked((ushort)x));
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(4), checked((ushort)y));
-        return _writer.WriteBytesAsync(message, cancellationToken);
+        return _writer.WriteMessageAsync(message, cancellationToken);
     }
 }

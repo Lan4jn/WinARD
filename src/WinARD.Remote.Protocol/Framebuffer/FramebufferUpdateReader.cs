@@ -48,14 +48,14 @@ public static class FramebufferUpdateReader
         cancellationToken.ThrowIfCancellationRequested();
 
         var reader = new RfbReader(stream, framebuffer.Limits);
-        var messageType = await reader.ReadByteAsync(cancellationToken);
+        var messageType = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
         if (messageType != 0)
         {
             throw new RfbProtocolException($"Expected FramebufferUpdate message type 0, received {messageType}.");
         }
 
-        _ = await reader.ReadByteAsync(cancellationToken);
-        var rectangleCount = await reader.ReadUInt16Async(cancellationToken);
+        _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        var rectangleCount = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
         if (rectangleCount > MaximumRectangleCount)
         {
             throw new RfbProtocolException(
@@ -68,11 +68,11 @@ public static class FramebufferUpdateReader
         var desktopResized = false;
         for (var index = 0; index < rectangleCount; index++)
         {
-            var x = await reader.ReadUInt16Async(cancellationToken);
-            var y = await reader.ReadUInt16Async(cancellationToken);
-            var width = await reader.ReadUInt16Async(cancellationToken);
-            var height = await reader.ReadUInt16Async(cancellationToken);
-            var encodingId = await reader.ReadInt32Async(cancellationToken);
+            var x = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+            var y = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+            var width = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+            var height = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+            var encodingId = await reader.ReadInt32Async(cancellationToken).ConfigureAwait(false);
             var encoding = (RfbEncodingType)encodingId;
             if (!decoders.TryGetValue(encodingId, out var decoder))
             {

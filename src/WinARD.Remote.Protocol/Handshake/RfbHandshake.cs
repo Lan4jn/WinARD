@@ -29,12 +29,15 @@ public static class RfbHandshake
 
         var reader = new RfbReader(stream, limits);
         var writer = new RfbWriter(stream);
-        var version = RfbVersion.Parse(await reader.ReadBytesAsync(VersionBannerLength, cancellationToken));
-        await writer.WriteBytesAsync(Encoding.ASCII.GetBytes(version.Banner), cancellationToken);
+        var version = RfbVersion.Parse(
+            await reader.ReadBytesAsync(VersionBannerLength, cancellationToken).ConfigureAwait(false));
+        await writer.WriteMessageAsync(Encoding.ASCII.GetBytes(version.Banner), cancellationToken)
+            .ConfigureAwait(false);
 
         return version == RfbVersion.V3_3
-            ? await NegotiateRfb33Async(reader, version, limits, cancellationToken)
-            : await NegotiateRfb37Or38Async(reader, writer, version, limits, cancellationToken);
+            ? await NegotiateRfb33Async(reader, version, limits, cancellationToken).ConfigureAwait(false)
+            : await NegotiateRfb37Or38Async(reader, writer, version, limits, cancellationToken)
+                .ConfigureAwait(false);
     }
 
     private static async Task<RfbHandshakeResult> NegotiateRfb33Async(
@@ -43,10 +46,10 @@ public static class RfbHandshake
         ProtocolLimits limits,
         CancellationToken cancellationToken)
     {
-        var securityType = await reader.ReadUInt32Async(cancellationToken);
+        var securityType = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
         if (securityType == (uint)RfbSecurityType.Invalid)
         {
-            throw await ReadRejectionAsync(reader, version, limits, cancellationToken);
+            throw await ReadRejectionAsync(reader, version, limits, cancellationToken).ConfigureAwait(false);
         }
 
         if (securityType != (uint)RfbSecurityType.AppleRemoteDesktop)
@@ -64,19 +67,21 @@ public static class RfbHandshake
         ProtocolLimits limits,
         CancellationToken cancellationToken)
     {
-        var numberOfSecurityTypes = await reader.ReadByteAsync(cancellationToken);
+        var numberOfSecurityTypes = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
         if (numberOfSecurityTypes == 0)
         {
-            throw await ReadRejectionAsync(reader, version, limits, cancellationToken);
+            throw await ReadRejectionAsync(reader, version, limits, cancellationToken).ConfigureAwait(false);
         }
 
-        var offeredTypes = await reader.ReadBytesAsync(numberOfSecurityTypes, cancellationToken);
+        var offeredTypes = await reader.ReadBytesAsync(numberOfSecurityTypes, cancellationToken)
+            .ConfigureAwait(false);
         if (!offeredTypes.Contains((byte)RfbSecurityType.AppleRemoteDesktop))
         {
             throw new UnsupportedSecurityTypeException(version, offeredTypes.Select(value => (uint)value));
         }
 
-        await writer.WriteByteAsync((byte)RfbSecurityType.AppleRemoteDesktop, cancellationToken);
+        await writer.WriteByteAsync((byte)RfbSecurityType.AppleRemoteDesktop, cancellationToken)
+            .ConfigureAwait(false);
         return new RfbHandshakeResult(version, RfbSecurityType.AppleRemoteDesktop);
     }
 
@@ -86,7 +91,8 @@ public static class RfbHandshake
         ProtocolLimits limits,
         CancellationToken cancellationToken)
     {
-        var failure = await RfbFailureReasonReader.ReadAsync(reader, limits, cancellationToken);
+        var failure = await RfbFailureReasonReader.ReadAsync(reader, limits, cancellationToken)
+            .ConfigureAwait(false);
         return new RfbConnectionRejectedException(version, failure.Reason, failure.IsTruncated);
     }
 }
