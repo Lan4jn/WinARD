@@ -35,6 +35,65 @@ public sealed class FramebufferUpdateTests
     }
 
     [Fact]
+    public async Task Public_cursor_decoder_updates_independent_cursor_without_touching_desktop()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var before = framebuffer.GetPixelsBgra32();
+        var reader = new RfbReader(
+            new MemoryStream([1, 2, 3, 0, 0x80]),
+            ProtocolLimits.Default);
+        var decoder = CreateCursorDecoder(PixelFormat.WinArdBgra32);
+
+        var dirtyRects = await decoder.DecodeAsync(
+            reader,
+            framebuffer,
+            new FramebufferRect(0, 0, 1, 1),
+            CancellationToken.None);
+
+        Assert.Empty(dirtyRects);
+        var cursor = Assert.IsType<RemoteCursor>(framebuffer.Cursor);
+        Assert.Equal([1, 2, 3, 255], cursor.GetPixelsBgra32());
+        Assert.Equal(before, framebuffer.GetPixelsBgra32());
+    }
+
+    [Fact]
+    public async Task Public_raw_decoder_uses_configured_noncanonical_pixel_format()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var format = new PixelFormat(16, 16, 1, 1, 31, 63, 31, 11, 5, 0);
+        var reader = new RfbReader(new MemoryStream([0xF8, 0]), ProtocolLimits.Default);
+        var decoder = CreateRawDecoder(format);
+        var rectangle = new FramebufferRect(0, 0, 1, 1);
+
+        var dirtyRects = await decoder.DecodeAsync(
+            reader,
+            framebuffer,
+            rectangle,
+            CancellationToken.None);
+
+        Assert.Equal(rectangle, Assert.Single(dirtyRects));
+        Assert.Equal(0xFFFF0000u, framebuffer.GetBgra32(0, 0));
+    }
+
+    [Fact]
+    public async Task Reader_dispatches_registered_decoder_through_public_contract()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var decoder = new RecordingDecoder((int)RfbEncodingType.Raw);
+        IReadOnlyDictionary<int, IRfbEncodingDecoder> decoders =
+            new Dictionary<int, IRfbEncodingDecoder> { [decoder.EncodingId] = decoder };
+
+        var result = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(Update(Header(0, 0, 1, 1, RfbEncodingType.Raw))),
+            framebuffer,
+            decoders,
+            CancellationToken.None);
+
+        Assert.True(decoder.WasCalled);
+        Assert.Equal(new FramebufferRect(0, 0, 1, 1), Assert.Single(result.DirtyRects));
+    }
+
+    [Fact]
     public async Task Raw_rectangle_updates_only_declared_region()
     {
         using var framebuffer = new FramebufferModel(4, 4, ProtocolLimits.Default);
@@ -373,6 +432,27 @@ public sealed class FramebufferUpdateTests
     }
 
     private static IRfbEncodingDecoder CreateRawDecoder() => new RawEncoding();
+
+    private static IRfbEncodingDecoder CreateRawDecoder(PixelFormat pixelFormat) => new RawEncoding(pixelFormat);
+
+    private static IRfbEncodingDecoder CreateCursorDecoder(PixelFormat pixelFormat) => new CursorEncoding(pixelFormat);
+
+    private sealed class RecordingDecoder(int encodingId) : IRfbEncodingDecoder
+    {
+        public int EncodingId { get; } = encodingId;
+
+        public bool WasCalled { get; private set; }
+
+        public ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+            RfbReader reader,
+            FramebufferModel framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken)
+        {
+            WasCalled = true;
+            return ValueTask.FromResult<IReadOnlyList<FramebufferRect>>([rectangle]);
+        }
+    }
 
     private static byte[] Raw(ushort x, ushort y, ushort width, ushort height, byte[] pixels) =>
         [.. Header(x, y, width, height, RfbEncodingType.Raw), .. pixels];

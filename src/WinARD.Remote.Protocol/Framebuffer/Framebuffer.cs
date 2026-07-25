@@ -24,7 +24,18 @@ public sealed class Framebuffer : IDisposable
     public int Height { get; private set; }
     public int Stride => checked(Width * 4);
 
+    public RemoteCursor? Cursor
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return _cursor;
+        }
+    }
+
     internal ProtocolLimits Limits => _limits;
+
+    private RemoteCursor? _cursor;
 
     public byte[] GetPixelsBgra32()
     {
@@ -106,6 +117,13 @@ public sealed class Framebuffer : IDisposable
         Width = width;
         Height = height;
         CryptographicOperations.ZeroMemory(previous);
+    }
+
+    internal void SetCursor(RemoteCursor cursor)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(cursor);
+        _cursor = cursor;
     }
 
     public void Dispose()

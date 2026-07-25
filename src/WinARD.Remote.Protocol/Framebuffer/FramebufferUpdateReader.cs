@@ -7,14 +7,6 @@ namespace WinARD.Remote.Protocol.Framebuffer;
 public static class FramebufferUpdateReader
 {
     private const int MaximumRectangleCount = 4096;
-    private static readonly Dictionary<int, IRfbEncodingDecoder> Decoders =
-        new IRfbEncodingDecoder[]
-        {
-            new RawEncoding(),
-            new CopyRectEncoding(),
-            new DesktopSizeEncoding(),
-            new CursorEncoding(),
-        }.ToDictionary(decoder => decoder.EncodingId);
 
     /// <summary>Consumes a complete server-to-client FramebufferUpdate message, including message type zero.</summary>
     public static async Task<FramebufferUpdateResult> ApplyAsync(
@@ -26,6 +18,24 @@ public static class FramebufferUpdateReader
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(framebuffer);
         ArgumentNullException.ThrowIfNull(pixelFormat);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        return await ApplyAsync(
+            stream,
+            framebuffer,
+            CreateDecoders(pixelFormat),
+            cancellationToken);
+    }
+
+    internal static async Task<FramebufferUpdateResult> ApplyAsync(
+        Stream stream,
+        Framebuffer framebuffer,
+        IReadOnlyDictionary<int, IRfbEncodingDecoder> decoders,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(framebuffer);
+        ArgumentNullException.ThrowIfNull(decoders);
         cancellationToken.ThrowIfCancellationRequested();
 
         var reader = new RfbReader(stream, framebuffer.Limits);
@@ -54,7 +64,7 @@ public static class FramebufferUpdateReader
             var height = await reader.ReadUInt16Async(cancellationToken);
             var encodingId = await reader.ReadInt32Async(cancellationToken);
             var encoding = (RfbEncodingType)encodingId;
-            if (!Decoders.TryGetValue(encodingId, out var decoder))
+            if (!decoders.TryGetValue(encodingId, out var decoder))
             {
                 throw new RfbProtocolException($"Unsupported RFB encoding ID {encodingId}.");
             }
@@ -64,34 +74,30 @@ public static class FramebufferUpdateReader
                 throw new RfbProtocolException($"RFB encoding {encodingId} requires non-zero rectangle dimensions.");
             }
 
-            if (encoding == RfbEncodingType.Cursor
-                || (encoding == RfbEncodingType.Raw && pixelFormat != PixelFormat.WinArdBgra32))
+            var previousWidth = framebuffer.Width;
+            var previousHeight = framebuffer.Height;
+            var previousCursor = framebuffer.Cursor;
+            var rectangle = encoding == RfbEncodingType.Cursor
+                ? FramebufferRect.CreateCursorRectangle(x, y, width, height)
+                : new FramebufferRect(x, y, width, height);
+            dirtyRects.AddRange(await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken));
+            if (!ReferenceEquals(previousCursor, framebuffer.Cursor))
             {
-                var decoded = encoding == RfbEncodingType.Cursor
-                    ? await CursorEncoding.DecodeWithContextAsync(
-                        reader, framebuffer, x, y, width, height, pixelFormat, cancellationToken)
-                    : await RawEncoding.DecodeWithContextAsync(
-                        reader, framebuffer, x, y, width, height, pixelFormat, cancellationToken);
-                if (decoded.DirtyRect is { } dirtyRect)
-                {
-                    dirtyRects.Add(dirtyRect);
-                }
-
-                if (decoded.Cursor is not null)
-                {
-                    cursor = decoded.Cursor;
-                }
-
-                desktopResized |= decoded.DesktopResized;
+                cursor = framebuffer.Cursor;
             }
-            else
-            {
-                var rectangle = new FramebufferRect(x, y, width, height);
-                dirtyRects.AddRange(await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken));
-                desktopResized |= encoding == RfbEncodingType.DesktopSize;
-            }
+
+            desktopResized |= previousWidth != framebuffer.Width || previousHeight != framebuffer.Height;
         }
 
         return new FramebufferUpdateResult(dirtyRects, cursor, desktopResized);
     }
+
+    private static Dictionary<int, IRfbEncodingDecoder> CreateDecoders(PixelFormat pixelFormat) =>
+        new IRfbEncodingDecoder[]
+        {
+            new RawEncoding(pixelFormat),
+            new CopyRectEncoding(),
+            new DesktopSizeEncoding(),
+            new CursorEncoding(pixelFormat),
+        }.ToDictionary(decoder => decoder.EncodingId);
 }

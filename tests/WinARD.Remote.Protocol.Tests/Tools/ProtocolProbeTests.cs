@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Text;
 using WinARD.ProtocolProbe;
 using WinARD.Remote.Protocol.Authentication;
+using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
@@ -96,6 +97,35 @@ public sealed class ProtocolProbeTests
                     CancellationToken.None));
 
             Assert.Contains("dirty rectangle", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False(File.Exists(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_probe_rejects_cursor_only_update_as_first_frame()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, sendCursorOnly: true);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            await Assert.ThrowsAsync<RfbProtocolException>(() =>
+                new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                    IPAddress.Loopback.ToString(),
+                    GetPort(listener),
+                    username,
+                    password,
+                    path,
+                    CancellationToken.None));
+
             Assert.False(File.Exists(path));
             await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
         }
@@ -383,7 +413,10 @@ public sealed class ProtocolProbeTests
         stageReached.TrySetResult();
     }
 
-    private static async Task RunCaptureServerAsync(TcpListener listener, bool sendEmptyUpdate = false)
+    private static async Task RunCaptureServerAsync(
+        TcpListener listener,
+        bool sendEmptyUpdate = false,
+        bool sendCursorOnly = false)
     {
         using var client = await listener.AcceptTcpClientAsync();
         await using var stream = client.GetStream();
@@ -418,6 +451,18 @@ public sealed class ProtocolProbeTests
         var update = new List<byte> { 0, 0, 0, sendEmptyUpdate ? (byte)0 : (byte)1 };
         if (sendEmptyUpdate)
         {
+            await stream.WriteAsync(update.ToArray());
+            return;
+        }
+
+        if (sendCursorOnly)
+        {
+            AddUInt16(update, 0);
+            AddUInt16(update, 0);
+            AddUInt16(update, 1);
+            AddUInt16(update, 1);
+            AddUInt32(update, unchecked((uint)(int)RfbEncodingType.Cursor));
+            update.AddRange([0, 0, 255, 0, 0x80]);
             await stream.WriteAsync(update.ToArray());
             return;
         }

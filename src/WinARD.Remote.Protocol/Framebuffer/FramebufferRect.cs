@@ -21,6 +21,11 @@ public readonly record struct FramebufferRect
     public int Width { get; }
     public int Height { get; }
 
+    internal static FramebufferRect CreateCursorRectangle(int x, int y, int width, int height) =>
+        width == 0 || height == 0
+            ? new FramebufferRect(x, y, width, height, allowEmpty: true)
+            : new FramebufferRect(x, y, width, height);
+
     public void ValidateWithin(int framebufferWidth, int framebufferHeight)
     {
         try
@@ -35,5 +40,22 @@ public readonly record struct FramebufferRect
         {
             throw new RfbProtocolException("Framebuffer rectangle coordinates overflowed.", exception);
         }
+    }
+
+    private FramebufferRect(int x, int y, int width, int height, bool allowEmpty)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(x);
+        ArgumentOutOfRangeException.ThrowIfNegative(y);
+        ArgumentOutOfRangeException.ThrowIfNegative(width);
+        ArgumentOutOfRangeException.ThrowIfNegative(height);
+        if (!allowEmpty && (width == 0 || height == 0))
+        {
+            throw new ArgumentOutOfRangeException(nameof(width));
+        }
+
+        X = x;
+        Y = y;
+        Width = width;
+        Height = height;
     }
 }

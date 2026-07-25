@@ -7,6 +7,19 @@ namespace WinARD.Remote.Protocol.Encodings;
 
 public sealed class CursorEncoding : IRfbEncodingDecoder
 {
+    private readonly PixelFormat _pixelFormat;
+
+    public CursorEncoding()
+        : this(PixelFormat.WinArdBgra32)
+    {
+    }
+
+    public CursorEncoding(PixelFormat pixelFormat)
+    {
+        ArgumentNullException.ThrowIfNull(pixelFormat);
+        _pixelFormat = pixelFormat;
+    }
+
     public int EncodingId => (int)RfbEncodingType.Cursor;
 
     public async ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
@@ -15,28 +28,10 @@ public sealed class CursorEncoding : IRfbEncodingDecoder
         FramebufferRect rectangle,
         CancellationToken cancellationToken)
     {
-        _ = await DecodeWithContextAsync(
-            reader,
-            framebuffer,
-            checked((ushort)rectangle.X),
-            checked((ushort)rectangle.Y),
-            checked((ushort)rectangle.Width),
-            checked((ushort)rectangle.Height),
-            PixelFormat.WinArdBgra32,
-            cancellationToken);
-        return Array.Empty<FramebufferRect>();
-    }
-
-    internal static async ValueTask<EncodingDecodeResult> DecodeWithContextAsync(
-        RfbReader reader,
-        Framebuffer.Framebuffer framebuffer,
-        ushort x,
-        ushort y,
-        ushort width,
-        ushort height,
-        PixelFormat pixelFormat,
-        CancellationToken cancellationToken)
-    {
+        var x = rectangle.X;
+        var y = rectangle.Y;
+        var width = rectangle.Width;
+        var height = rectangle.Height;
         if (width == 0 || height == 0)
         {
             if (width != 0 || height != 0)
@@ -44,7 +39,8 @@ public sealed class CursorEncoding : IRfbEncodingDecoder
                 throw new RfbProtocolException("An empty cursor must have both width and height set to zero.");
             }
 
-            return new EncodingDecodeResult(Cursor: new RemoteCursor(x, y, 0, 0, []));
+            framebuffer.SetCursor(new RemoteCursor(x, y, 0, 0, []));
+            return Array.Empty<FramebufferRect>();
         }
 
         if (x >= width || y >= height)
@@ -52,7 +48,7 @@ public sealed class CursorEncoding : IRfbEncodingDecoder
             throw new RfbProtocolException("Cursor hotspot lies outside the cursor image.");
         }
 
-        var pixelLength = PixelConverter.CheckedWireLength(width, height, pixelFormat, framebuffer.Limits);
+        var pixelLength = PixelConverter.CheckedWireLength(width, height, _pixelFormat, framebuffer.Limits);
         int maskStride;
         int maskLength;
         try
@@ -76,9 +72,10 @@ public sealed class CursorEncoding : IRfbEncodingDecoder
         try
         {
             mask = await reader.ReadBytesAsync(maskLength, cancellationToken);
-            bgraPixels = PixelConverter.ToBgra32(wirePixels, width, height, pixelFormat, framebuffer.Limits);
+            bgraPixels = PixelConverter.ToBgra32(wirePixels, width, height, _pixelFormat, framebuffer.Limits);
             ApplyMask(bgraPixels, mask, width, height, maskStride);
-            return new EncodingDecodeResult(Cursor: new RemoteCursor(x, y, width, height, bgraPixels));
+            framebuffer.SetCursor(new RemoteCursor(x, y, width, height, bgraPixels));
+            return Array.Empty<FramebufferRect>();
         }
         finally
         {

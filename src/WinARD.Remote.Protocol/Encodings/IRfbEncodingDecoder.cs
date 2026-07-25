@@ -14,8 +14,3 @@ public interface IRfbEncodingDecoder
         FramebufferRect rectangle,
         CancellationToken cancellationToken);
 }
-
-public sealed record EncodingDecodeResult(
-    FramebufferRect? DirtyRect = null,
-    RemoteCursor? Cursor = null,
-    bool DesktopResized = false);
