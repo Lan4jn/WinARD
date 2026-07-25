@@ -24,7 +24,7 @@ WinARD then requests this canonical client format:
 | red/green/blue maximum | 255 / 255 / 255 |
 | red/green/blue shift | 16 / 8 / 0 |
 
-The declared encodings, in preference order, are Raw (`0`), CopyRect (`1`), Cursor (`-239`), and DesktopSize (`-223`). Encoding IDs are signed 32-bit big-endian values. ZRLE is intentionally not declared by this implementation stage.
+The declared encodings, in preference order, are ZRLE (`16`), Raw (`0`), CopyRect (`1`), Cursor (`-239`), and DesktopSize (`-223`). ZRLE is preferred for compressed updates, with Raw retained as the fallback. Encoding IDs are signed 32-bit big-endian values. This declaration does not establish that the real-Mac capture described below selected or sent ZRLE.
 
 The initial framebuffer request is non-incremental and covers the complete dimensions returned by `ServerInit`.
 
