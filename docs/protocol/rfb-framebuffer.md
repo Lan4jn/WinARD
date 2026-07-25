@@ -66,3 +66,15 @@ dotnet run --project tools/WinARD.ProtocolProbe -- --capture-first-frame artifac
 The output format is selected by extension. `.bgra` writes exactly `width * height * 4` bytes in the framebuffer's top-down BGRA memory order with no header; `.bmp` remains available as an uncompressed 32-bit BMP. Missing parent directories are created and existing files are not overwritten. A unique temporary file is flushed and closed before a no-overwrite move publishes the final capture.
 
 Capture succeeds only after Raw pixel-content rectangles cover the complete current framebuffer. Coverage uses one fixed bit per pixel, resets after DesktopSize, observes cancellation while scanning, and may combine rectangles across at most 64 updates. Incomplete updates cause another full non-incremental request. Cursor, CopyRect, and DesktopSize do not count as initial pixel coverage. Probe output shows at most eight dirty rectangles followed by an omitted count, and never prints the server name.
+
+## Real-Mac interoperability evidence
+
+On 2026-07-25, the user confirmed a successful first-frame capture against a real Mac with the following non-sensitive results:
+
+- RFB version `3.8`;
+- Apple Remote Desktop security type `30`;
+- authentication succeeded;
+- framebuffer dimensions `3360x2100`;
+- the reported dirty rectangle covered the full framebuffer: `(0,0) 3360x2100`.
+
+The generated BMP decoded successfully during visual inspection. Its orientation and color channels were correct, and the captured content covered the complete screen. The Mac host, username, password, capture path, and screenshot contents were not recorded. The specific macOS major version was not provided, so this result is not attributed to a particular macOS release.
