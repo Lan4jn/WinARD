@@ -37,15 +37,27 @@ internal static class PixelConverter
         for (var pixelIndex = 0; pixelIndex < pixelCount; pixelIndex++)
         {
             var source = wirePixels.Slice(pixelIndex * bytesPerPixel, bytesPerPixel);
-            var value = ReadPixel(source, format.BigEndian);
             var destination = bgra.AsSpan(pixelIndex * 4, 4);
-            destination[0] = Scale((value >> format.BlueShift) & format.BlueMax, format.BlueMax);
-            destination[1] = Scale((value >> format.GreenShift) & format.GreenMax, format.GreenMax);
-            destination[2] = Scale((value >> format.RedShift) & format.RedMax, format.RedMax);
-            destination[3] = 255;
+            BinaryPrimitives.WriteUInt32LittleEndian(destination, ToBgra32Pixel(source, format));
         }
 
         return bgra;
+    }
+
+    public static uint ToBgra32Pixel(ReadOnlySpan<byte> wirePixel, PixelFormat format)
+    {
+        ArgumentNullException.ThrowIfNull(format);
+        if (wirePixel.Length != format.BytesPerPixel)
+        {
+            throw new RfbProtocolException(
+                $"Encoded pixel contains {wirePixel.Length} bytes; expected {format.BytesPerPixel}.");
+        }
+
+        var value = ReadPixel(wirePixel, format.BigEndian);
+        var blue = Scale((value >> format.BlueShift) & format.BlueMax, format.BlueMax);
+        var green = Scale((value >> format.GreenShift) & format.GreenMax, format.GreenMax);
+        var red = Scale((value >> format.RedShift) & format.RedMax, format.RedMax);
+        return 0xFF000000u | ((uint)red << 16) | ((uint)green << 8) | blue;
     }
 
     private static int CheckedPayloadLength(int width, int height, int bytesPerPixel, int limit, string limitName)

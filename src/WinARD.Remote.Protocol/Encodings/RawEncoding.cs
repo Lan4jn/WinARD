@@ -21,7 +21,7 @@ public sealed class RawEncoding : IRfbEncodingDecoder
 
     public int EncodingId => (int)RfbEncodingType.Raw;
 
-    public async ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+    public async ValueTask<EncodingDecodeResult> DecodeAsync(
         RfbReader reader,
         Framebuffer.Framebuffer framebuffer,
         FramebufferRect rectangle,
@@ -51,7 +51,7 @@ public sealed class RawEncoding : IRfbEncodingDecoder
                 _pixelFormat,
                 framebuffer.Limits);
             framebuffer.ApplyRaw(rectangle, bgraPixels);
-            return new[] { rectangle };
+            return new EncodingDecodeResult([rectangle], [rectangle]);
         }
         finally
         {

@@ -20,11 +20,17 @@ public static class FramebufferUpdateReader
         ArgumentNullException.ThrowIfNull(pixelFormat);
         cancellationToken.ThrowIfCancellationRequested();
 
-        return await ApplyAsync(
-            stream,
-            framebuffer,
-            CreateDecoders(pixelFormat),
-            cancellationToken);
+        using var session = CreateSession(framebuffer, pixelFormat);
+        return await session.ApplyAsync(stream, cancellationToken);
+    }
+
+    public static FramebufferUpdateSession CreateSession(
+        Framebuffer framebuffer,
+        PixelFormat pixelFormat)
+    {
+        ArgumentNullException.ThrowIfNull(framebuffer);
+        ArgumentNullException.ThrowIfNull(pixelFormat);
+        return new FramebufferUpdateSession(framebuffer, CreateDecoders(pixelFormat));
     }
 
     internal static async Task<FramebufferUpdateResult> ApplyAsync(
@@ -78,19 +84,18 @@ public static class FramebufferUpdateReader
             var previousWidth = framebuffer.Width;
             var previousHeight = framebuffer.Height;
             var previousCursor = framebuffer.Cursor;
-            var previousPixelContentVersion = framebuffer.PixelContentVersion;
             var rectangle = encoding == RfbEncodingType.Cursor
                 ? FramebufferRect.CreateCursorRectangle(x, y, width, height)
                 : new FramebufferRect(x, y, width, height);
-            dirtyRects.AddRange(await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken));
+            var decodeResult = await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken);
+            dirtyRects.AddRange(decodeResult.DirtyRects);
             if (previousWidth != framebuffer.Width || previousHeight != framebuffer.Height)
             {
                 pixelContentRects.Clear();
             }
-
-            if (previousPixelContentVersion != framebuffer.PixelContentVersion)
+            else
             {
-                pixelContentRects.Add(framebuffer.LastPixelContentRect);
+                pixelContentRects.AddRange(decodeResult.PixelContentRects);
             }
 
             if (!ReferenceEquals(previousCursor, framebuffer.Cursor))
@@ -109,6 +114,7 @@ public static class FramebufferUpdateReader
         {
             new RawEncoding(pixelFormat),
             new CopyRectEncoding(),
+            new ZrleEncoding(pixelFormat),
             new DesktopSizeEncoding(),
             new CursorEncoding(pixelFormat),
         }.ToDictionary(decoder => decoder.EncodingId);

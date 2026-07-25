@@ -7,7 +7,7 @@ public sealed class CopyRectEncoding : IRfbEncodingDecoder
 {
     public int EncodingId => (int)RfbEncodingType.CopyRect;
 
-    public async ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+    public async ValueTask<EncodingDecodeResult> DecodeAsync(
         RfbReader reader,
         Framebuffer.Framebuffer framebuffer,
         FramebufferRect rectangle,
@@ -20,6 +20,6 @@ public sealed class CopyRectEncoding : IRfbEncodingDecoder
         var sourceX = await reader.ReadUInt16Async(cancellationToken);
         var sourceY = await reader.ReadUInt16Async(cancellationToken);
         framebuffer.CopyRect(rectangle, sourceX, sourceY);
-        return new[] { rectangle };
+        return new EncodingDecodeResult([rectangle], []);
     }
 }

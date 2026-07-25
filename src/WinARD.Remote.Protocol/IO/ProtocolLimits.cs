@@ -10,7 +10,9 @@ public sealed record ProtocolLimits
             maxFramebufferBytes,
             maxFramebufferBytes,
             DefaultWorkBytes(maxFramebufferBytes),
-            Math.Min(maxFramebufferBytes, DefaultMaxCursorBytes))
+            Math.Min(maxFramebufferBytes, DefaultMaxCursorBytes),
+            maxFramebufferBytes,
+            maxFramebufferBytes)
     {
     }
 
@@ -20,7 +22,9 @@ public sealed record ProtocolLimits
             maxFramebufferBytes,
             maxFramebufferUpdateBytes,
             DefaultWorkBytes(maxFramebufferBytes),
-            Math.Min(maxFramebufferBytes, DefaultMaxCursorBytes))
+            Math.Min(maxFramebufferBytes, DefaultMaxCursorBytes),
+            maxFramebufferUpdateBytes,
+            maxFramebufferBytes)
     {
     }
 
@@ -30,12 +34,33 @@ public sealed record ProtocolLimits
         int maxFramebufferUpdateBytes,
         int maxFramebufferUpdateWorkBytes,
         int maxCursorBytes)
+        : this(
+            maxMessageBytes,
+            maxFramebufferBytes,
+            maxFramebufferUpdateBytes,
+            maxFramebufferUpdateWorkBytes,
+            maxCursorBytes,
+            maxFramebufferUpdateBytes,
+            Math.Min(maxFramebufferBytes, maxFramebufferUpdateWorkBytes))
+    {
+    }
+
+    public ProtocolLimits(
+        int maxMessageBytes,
+        int maxFramebufferBytes,
+        int maxFramebufferUpdateBytes,
+        int maxFramebufferUpdateWorkBytes,
+        int maxCursorBytes,
+        int maxZrleCompressedBytes,
+        int maxZrleDecompressedBytes)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxMessageBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFramebufferBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFramebufferUpdateBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFramebufferUpdateWorkBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxCursorBytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxZrleCompressedBytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxZrleDecompressedBytes);
         if (maxFramebufferUpdateBytes > maxFramebufferBytes)
         {
             throw new ArgumentOutOfRangeException(
@@ -50,11 +75,27 @@ public sealed record ProtocolLimits
                 "The cursor byte limit cannot exceed the framebuffer byte limit.");
         }
 
+        if (maxZrleCompressedBytes > maxFramebufferUpdateBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxZrleCompressedBytes),
+                "The ZRLE compressed byte limit cannot exceed the framebuffer update byte limit.");
+        }
+
+        if (maxZrleDecompressedBytes > maxFramebufferUpdateWorkBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxZrleDecompressedBytes),
+                "The ZRLE decompressed byte limit cannot exceed the framebuffer update work limit.");
+        }
+
         MaxMessageBytes = maxMessageBytes;
         MaxFramebufferBytes = maxFramebufferBytes;
         MaxFramebufferUpdateBytes = maxFramebufferUpdateBytes;
         MaxFramebufferUpdateWorkBytes = maxFramebufferUpdateWorkBytes;
         MaxCursorBytes = maxCursorBytes;
+        MaxZrleCompressedBytes = maxZrleCompressedBytes;
+        MaxZrleDecompressedBytes = maxZrleDecompressedBytes;
     }
 
     public static ProtocolLimits Default { get; } = new(
@@ -79,6 +120,12 @@ public sealed record ProtocolLimits
 
     /// <summary>Maximum BGRA storage for one decoded cursor image.</summary>
     public int MaxCursorBytes { get; }
+
+    /// <summary>Maximum compressed bytes in one ZRLE rectangle.</summary>
+    public int MaxZrleCompressedBytes { get; }
+
+    /// <summary>Maximum cumulative decompressed bytes in one ZRLE rectangle.</summary>
+    public int MaxZrleDecompressedBytes { get; }
 
     private static int DefaultWorkBytes(int maxFramebufferBytes) =>
         checked((int)Math.Min(int.MaxValue, (long)maxFramebufferBytes * 3));

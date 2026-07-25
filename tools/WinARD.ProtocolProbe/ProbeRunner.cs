@@ -82,15 +82,16 @@ public sealed class ProbeRunner
                 ProtocolLimits.Default,
                 operationCancellation.Token);
             using var framebuffer = new Framebuffer(server.Width, server.Height, ProtocolLimits.Default);
+            using var framebufferUpdates = FramebufferUpdateReader.CreateSession(
+                framebuffer,
+                PixelFormat.WinArdBgra32);
             var coverage = new PixelCoverage(server.Width, server.Height);
             var dirtyRects = new List<FramebufferRect>();
             for (var updateCount = 0; updateCount < MaximumInitialFramebufferUpdates; updateCount++)
             {
                 await WriteFullFramebufferUpdateRequestAsync(stream, framebuffer, operationCancellation.Token);
-                var update = await FramebufferUpdateReader.ApplyAsync(
+                var update = await framebufferUpdates.ApplyAsync(
                     stream,
-                    framebuffer,
-                    PixelFormat.WinArdBgra32,
                     operationCancellation.Token);
                 dirtyRects.AddRange(update.DirtyRects);
                 if (update.DesktopResized)

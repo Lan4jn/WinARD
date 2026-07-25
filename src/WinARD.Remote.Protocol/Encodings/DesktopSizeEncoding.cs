@@ -8,7 +8,7 @@ public sealed class DesktopSizeEncoding : IRfbEncodingDecoder
 {
     public int EncodingId => (int)RfbEncodingType.DesktopSize;
 
-    public ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+    public ValueTask<EncodingDecodeResult> DecodeAsync(
         RfbReader reader,
         Framebuffer.Framebuffer framebuffer,
         FramebufferRect rectangle,
@@ -27,6 +27,6 @@ public sealed class DesktopSizeEncoding : IRfbEncodingDecoder
         reader.ReserveDesktopSizeRectangle();
         reader.ReserveFramebufferUpdateWorkBytes(framebufferBytes);
         framebuffer.Resize(rectangle.Width, rectangle.Height);
-        return ValueTask.FromResult<IReadOnlyList<FramebufferRect>>(new[] { rectangle });
+        return ValueTask.FromResult(new EncodingDecodeResult([rectangle], []));
     }
 }

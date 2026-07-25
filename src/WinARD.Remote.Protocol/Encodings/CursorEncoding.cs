@@ -22,7 +22,7 @@ public sealed class CursorEncoding : IRfbEncodingDecoder
 
     public int EncodingId => (int)RfbEncodingType.Cursor;
 
-    public async ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+    public async ValueTask<EncodingDecodeResult> DecodeAsync(
         RfbReader reader,
         Framebuffer.Framebuffer framebuffer,
         FramebufferRect rectangle,
@@ -40,7 +40,7 @@ public sealed class CursorEncoding : IRfbEncodingDecoder
             }
 
             framebuffer.SetCursor(new RemoteCursor(x, y, 0, 0, []));
-            return Array.Empty<FramebufferRect>();
+            return EncodingDecodeResult.Empty;
         }
 
         if (x >= width || y >= height)
@@ -92,7 +92,7 @@ public sealed class CursorEncoding : IRfbEncodingDecoder
             bgraPixels = PixelConverter.ToBgra32(wirePixels, width, height, _pixelFormat, framebuffer.Limits);
             ApplyMask(bgraPixels, mask, width, height, maskStride);
             framebuffer.SetCursor(new RemoteCursor(x, y, width, height, bgraPixels));
-            return Array.Empty<FramebufferRect>();
+            return EncodingDecodeResult.Empty;
         }
         finally
         {

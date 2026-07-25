@@ -23,14 +23,15 @@ public sealed class FramebufferUpdateTests
         var decoder = CreateRawDecoder();
         var rectangle = new FramebufferRect(0, 0, 1, 1);
 
-        var dirtyRects = await decoder.DecodeAsync(
+        var decodeResult = await decoder.DecodeAsync(
             reader,
             framebuffer,
             rectangle,
             CancellationToken.None);
 
         Assert.Equal(0, decoder.EncodingId);
-        Assert.Equal(rectangle, Assert.Single(dirtyRects));
+        Assert.Equal(rectangle, Assert.Single(decodeResult.DirtyRects));
+        Assert.Equal(rectangle, Assert.Single(decodeResult.PixelContentRects));
         Assert.Equal(0xFFFF0000u, framebuffer.GetBgra32(0, 0));
     }
 
@@ -44,13 +45,14 @@ public sealed class FramebufferUpdateTests
             ProtocolLimits.Default);
         var decoder = CreateCursorDecoder(PixelFormat.WinArdBgra32);
 
-        var dirtyRects = await decoder.DecodeAsync(
+        var decodeResult = await decoder.DecodeAsync(
             reader,
             framebuffer,
             new FramebufferRect(0, 0, 1, 1),
             CancellationToken.None);
 
-        Assert.Empty(dirtyRects);
+        Assert.Empty(decodeResult.DirtyRects);
+        Assert.Empty(decodeResult.PixelContentRects);
         var cursor = Assert.IsType<RemoteCursor>(framebuffer.Cursor);
         Assert.Equal([1, 2, 3, 255], cursor.GetPixelsBgra32());
         Assert.Equal(before, framebuffer.GetPixelsBgra32());
@@ -65,32 +67,38 @@ public sealed class FramebufferUpdateTests
         var decoder = CreateRawDecoder(format);
         var rectangle = new FramebufferRect(0, 0, 1, 1);
 
-        var dirtyRects = await decoder.DecodeAsync(
+        var decodeResult = await decoder.DecodeAsync(
             reader,
             framebuffer,
             rectangle,
             CancellationToken.None);
 
-        Assert.Equal(rectangle, Assert.Single(dirtyRects));
+        Assert.Equal(rectangle, Assert.Single(decodeResult.DirtyRects));
+        Assert.Equal(rectangle, Assert.Single(decodeResult.PixelContentRects));
         Assert.Equal(0xFFFF0000u, framebuffer.GetBgra32(0, 0));
     }
 
     [Fact]
     public async Task Reader_dispatches_registered_decoder_through_public_contract()
     {
-        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
-        var decoder = new RecordingDecoder((int)RfbEncodingType.Raw);
+        var dirtyRect = new FramebufferRect(0, 0, 1, 1);
+        var contentRect = new FramebufferRect(1, 0, 1, 1);
+        var decoder = new RecordingDecoder(
+            (int)RfbEncodingType.Raw,
+            new EncodingDecodeResult([dirtyRect], [contentRect]));
         IReadOnlyDictionary<int, IRfbEncodingDecoder> decoders =
             new Dictionary<int, IRfbEncodingDecoder> { [decoder.EncodingId] = decoder };
+        using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);
 
         var result = await FramebufferUpdateReader.ApplyAsync(
-            new MemoryStream(Update(Header(0, 0, 1, 1, RfbEncodingType.Raw))),
+            new MemoryStream(Update(Header(0, 0, 2, 1, RfbEncodingType.Raw))),
             framebuffer,
             decoders,
             CancellationToken.None);
 
         Assert.True(decoder.WasCalled);
-        Assert.Equal(new FramebufferRect(0, 0, 1, 1), Assert.Single(result.DirtyRects));
+        Assert.Equal(dirtyRect, Assert.Single(result.DirtyRects));
+        Assert.Equal(contentRect, Assert.Single(result.PixelContentRects));
     }
 
     [Fact]
@@ -701,20 +709,20 @@ public sealed class FramebufferUpdateTests
 
     private static IRfbEncodingDecoder CreateCursorDecoder(PixelFormat pixelFormat) => new CursorEncoding(pixelFormat);
 
-    private sealed class RecordingDecoder(int encodingId) : IRfbEncodingDecoder
+    private sealed class RecordingDecoder(int encodingId, EncodingDecodeResult result) : IRfbEncodingDecoder
     {
         public int EncodingId { get; } = encodingId;
 
         public bool WasCalled { get; private set; }
 
-        public ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
             RfbReader reader,
             FramebufferModel framebuffer,
             FramebufferRect rectangle,
             CancellationToken cancellationToken)
         {
             WasCalled = true;
-            return ValueTask.FromResult<IReadOnlyList<FramebufferRect>>([rectangle]);
+            return ValueTask.FromResult(result);
         }
     }
 

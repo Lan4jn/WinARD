@@ -8,7 +8,7 @@ public interface IRfbEncodingDecoder
 {
     int EncodingId { get; }
 
-    ValueTask<IReadOnlyList<FramebufferRect>> DecodeAsync(
+    ValueTask<EncodingDecodeResult> DecodeAsync(
         RfbReader reader,
         FramebufferModel framebuffer,
         FramebufferRect rectangle,
