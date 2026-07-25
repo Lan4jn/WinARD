@@ -21,6 +21,17 @@ public sealed class RfbWriterTests
     }
 
     [Fact]
+    public async Task WriteInt32_writes_signed_big_endian_value()
+    {
+        await using var stream = new MemoryStream();
+        var writer = new RfbWriter(stream);
+
+        await writer.WriteInt32Async(-239, CancellationToken.None);
+
+        Assert.Equal([0xFF, 0xFF, 0xFF, 0x11], stream.ToArray());
+    }
+
+    [Fact]
     public async Task WriteBytes_appends_value_unchanged()
     {
         await using var stream = new MemoryStream();

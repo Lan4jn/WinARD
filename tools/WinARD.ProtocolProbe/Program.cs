@@ -5,7 +5,7 @@ internal static class Program
 {
     private const int DefaultPort = 5900;
 
-    private static async Task<int> Main()
+    private static async Task<int> Main(string[] args)
     {
         using var cancellation = new CancellationTokenSource();
         Console.CancelKeyPress += (_, eventArgs) =>
@@ -16,6 +16,12 @@ internal static class Program
 
         try
         {
+            if (!TryReadCapturePath(args, out var capturePath))
+            {
+                PrintUsage();
+                return 2;
+            }
+
             var host = ReadRequiredText("WINARD_HOST", "Host: ");
             var usernameText = ReadRequiredText("WINARD_USERNAME", "Username: ");
             if (host is null || usernameText is null || !TryReadPort(out var port))
@@ -32,11 +38,22 @@ internal static class Program
                 return 2;
             }
 
-            var result = await new ProbeRunner().RunAsync(host, port, username, password, cancellation.Token);
+            var result = await new ProbeRunner().RunAsync(
+                host,
+                port,
+                username,
+                password,
+                capturePath,
+                cancellation.Token);
 
             Console.WriteLine($"Version: {result.Version.Major}.{result.Version.Minor}");
             Console.WriteLine($"Security: {result.SecurityType} ({(byte)result.SecurityType})");
             Console.WriteLine("Authentication: success");
+            if (result.Capture is { } capture)
+            {
+                Console.WriteLine($"Captured: {capture.Width}x{capture.Height} -> {capture.Path}");
+            }
+
             return 0;
         }
         catch (Exception exception)
@@ -82,7 +99,29 @@ internal static class Program
         return int.TryParse(value, out port) && port is >= 1 and <= ushort.MaxValue;
     }
 
+    private static bool TryReadCapturePath(string[] args, out string? capturePath)
+    {
+        capturePath = null;
+        if (args.Length == 0)
+        {
+            return true;
+        }
+
+        if (args.Length != 2 || !string.Equals(args[0], "--capture-first-frame", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(args[1]))
+        {
+            return false;
+        }
+
+        capturePath = args[1];
+        return true;
+    }
+
     private static void PrintUsage() =>
         Console.Error.WriteLine(
-            "Set WINARD_HOST and WINARD_USERNAME (optional WINARD_PORT, default 5900), then run from an interactive console so the password can be read without echo.");
+            "Usage: WinARD.ProtocolProbe [--capture-first-frame <path.bmp>]. Set WINARD_HOST and WINARD_USERNAME (optional WINARD_PORT, default 5900), then run from an interactive console so the password can be read without echo.");
 }

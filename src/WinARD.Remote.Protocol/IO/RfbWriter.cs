@@ -29,6 +29,13 @@ public sealed class RfbWriter
         return WriteBytesAsync(bytes, cancellationToken);
     }
 
+    public ValueTask WriteInt32Async(int value, CancellationToken cancellationToken)
+    {
+        var bytes = new byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        return WriteBytesAsync(bytes, cancellationToken);
+    }
+
     public ValueTask WriteBytesAsync(ReadOnlyMemory<byte> value, CancellationToken cancellationToken) =>
         _stream.WriteAsync(value, cancellationToken);
 }

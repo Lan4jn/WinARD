@@ -6,6 +6,7 @@ using System.Text;
 using WinARD.ProtocolProbe;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Errors;
+using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
 using WinARD.Testing.Rfb;
 using Xunit;
@@ -16,6 +17,63 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 
 public sealed class ProtocolProbeTests
 {
+    [Fact]
+    public async Task Default_probe_exits_after_authentication_without_initializing_framebuffer()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var stageReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var serverTask = RunScriptedServerAsync(listener, null, null, stageReached);
+        using var username = SecretMaterial.FromUtf8("probe-user");
+        using var password = SecretMaterial.FromUtf8("probe-password");
+
+        var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+            IPAddress.Loopback.ToString(),
+            GetPort(listener),
+            username,
+            password,
+            CancellationToken.None);
+
+        Assert.Equal(RfbVersion.V3_8, result.Version);
+        Assert.Equal(RfbSecurityType.AppleRemoteDesktop, result.SecurityType);
+        Assert.Null(result.Capture);
+        await stageReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Capture_probe_initializes_requests_full_frame_and_writes_bmp()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bmp");
+        try
+        {
+            var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                IPAddress.Loopback.ToString(),
+                GetPort(listener),
+                username,
+                password,
+                path,
+                CancellationToken.None);
+
+            var capture = Assert.IsType<ProbeCapture>(result.Capture);
+            Assert.Equal(1, capture.Width);
+            Assert.Equal(1, capture.Height);
+            Assert.Equal(Path.GetFullPath(path), capture.Path);
+            var bmp = await File.ReadAllBytesAsync(path);
+            Assert.Equal([0, 0, 255, 255], bmp[54..]);
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
     [Fact]
     public void Hidden_password_ctrl_c_throws_and_restores_console_state()
     {
@@ -294,6 +352,48 @@ public sealed class ProtocolProbeTests
         stageReached.TrySetResult();
     }
 
+    private static async Task RunCaptureServerAsync(TcpListener listener)
+    {
+        using var client = await listener.AcceptTcpClientAsync();
+        await using var stream = client.GetStream();
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+        Assert.Equal(Encoding.ASCII.GetBytes("RFB 003.008\n"), await ReadExactlyAsync(stream, 12));
+        await stream.WriteAsync(new byte[] { 1, (byte)RfbSecurityType.AppleRemoteDesktop });
+        Assert.Equal(new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop }, await ReadExactlyAsync(stream, 1));
+
+        var modulus = Convert.FromHexString(
+            "D2652EF10104A3DDC1219700EDFBD1E19F7678B4A4F6D5952634BD8BF1D60326322B5D32366DC25CB4E8E73AF4312A70D2DCAF2747EB89D7E88553EECD6A283D");
+        var serverPublic = new byte[64];
+        serverPublic[^1] = 125;
+        await stream.WriteAsync(ArdServerFixture.EncodeChallenge(5, 64, modulus, serverPublic));
+        _ = await ReadExactlyAsync(stream, 128 + 64);
+        await stream.WriteAsync(new byte[4]);
+
+        Assert.Equal(new byte[] { 1 }, await ReadExactlyAsync(stream, 1));
+        var serverInit = new List<byte>();
+        AddUInt16(serverInit, 1);
+        AddUInt16(serverInit, 1);
+        serverInit.AddRange(PixelFormat.WinArdBgra32.ToWireBytes());
+        AddUInt32(serverInit, 3);
+        serverInit.AddRange(Encoding.UTF8.GetBytes("Mac"));
+        await stream.WriteAsync(serverInit.ToArray());
+
+        var declarations = await ReadExactlyAsync(stream, 40);
+        Assert.Equal((byte)0, declarations[0]);
+        Assert.Equal((byte)2, declarations[20]);
+        var request = await ReadExactlyAsync(stream, 10);
+        Assert.Equal([3, 0, 0, 0, 0, 0, 0, 1, 0, 1], request);
+
+        var update = new List<byte> { 0, 0, 0, 1 };
+        AddUInt16(update, 0);
+        AddUInt16(update, 0);
+        AddUInt16(update, 1);
+        AddUInt16(update, 1);
+        AddUInt32(update, 0);
+        update.AddRange([0, 0, 255, 0]);
+        await stream.WriteAsync(update.ToArray());
+    }
+
     private static async Task<byte[]> ReadExactlyAsync(Stream stream, int count)
     {
         var buffer = new byte[count];
@@ -332,6 +432,13 @@ public sealed class ProtocolProbeTests
     {
         Span<byte> bytes = stackalloc byte[sizeof(uint)];
         BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
+        destination.AddRange(bytes.ToArray());
+    }
+
+    private static void AddUInt16(List<byte> destination, ushort value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ushort)];
+        BinaryPrimitives.WriteUInt16BigEndian(bytes, value);
         destination.AddRange(bytes.ToArray());
     }
 

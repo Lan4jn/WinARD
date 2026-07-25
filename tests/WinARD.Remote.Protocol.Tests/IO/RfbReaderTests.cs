@@ -31,6 +31,15 @@ public sealed class RfbReaderTests
     }
 
     [Fact]
+    public async Task ReadInt32_reads_signed_big_endian_value()
+    {
+        await using var stream = new ChunkedReadStream([0xFF, 0xFF, 0xFF, 0x11], 1);
+        var reader = new RfbReader(stream, ProtocolLimits.Default);
+
+        Assert.Equal(-239, await reader.ReadInt32Async(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task ReadUInt16_rejects_width_above_message_limit_without_reading()
     {
         var stream = new ThrowOnReadStream();

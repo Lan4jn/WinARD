@@ -36,6 +36,12 @@ public sealed class RfbReader
         return BinaryPrimitives.ReadUInt32BigEndian(bytes);
     }
 
+    public async ValueTask<int> ReadInt32Async(CancellationToken cancellationToken)
+    {
+        var bytes = await ReadBytesAsync(sizeof(int), cancellationToken);
+        return BinaryPrimitives.ReadInt32BigEndian(bytes);
+    }
+
     public async ValueTask<byte[]> ReadBytesAsync(int count, CancellationToken cancellationToken)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(count);

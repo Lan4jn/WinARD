@@ -1,7 +1,10 @@
 using System.Net.Sockets;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Errors;
+using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
+using WinARD.Remote.Protocol.Initialization;
+using WinARD.Remote.Protocol.IO;
 
 namespace WinARD.ProtocolProbe;
 
@@ -31,6 +34,15 @@ public sealed class ProbeRunner
         int port,
         ISecretMaterial username,
         ISecretMaterial password,
+        CancellationToken cancellationToken) =>
+        await RunAsync(host, port, username, password, null, cancellationToken);
+
+    public async Task<ProbeResult> RunAsync(
+        string host,
+        int port,
+        ISecretMaterial username,
+        ISecretMaterial password,
+        string? captureFirstFramePath,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(host);
@@ -58,7 +70,36 @@ public sealed class ProbeRunner
                 username,
                 password,
                 operationCancellation.Token);
-            return new ProbeResult(handshake.Version, handshake.SecurityType);
+            if (captureFirstFramePath is null)
+            {
+                return new ProbeResult(handshake.Version, handshake.SecurityType);
+            }
+
+            ArgumentException.ThrowIfNullOrWhiteSpace(captureFirstFramePath);
+            var server = await RfbSessionInitializer.InitializeAsync(
+                stream,
+                ProtocolLimits.Default,
+                operationCancellation.Token);
+            using var framebuffer = new Framebuffer(server.Width, server.Height, ProtocolLimits.Default);
+            await RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
+                stream,
+                incremental: false,
+                0,
+                0,
+                checked((ushort)server.Width),
+                checked((ushort)server.Height),
+                operationCancellation.Token);
+            _ = await FramebufferUpdateReader.ApplyAsync(
+                stream,
+                framebuffer,
+                PixelFormat.WinArdBgra32,
+                operationCancellation.Token);
+            var fullPath = Path.GetFullPath(captureFirstFramePath);
+            await FramebufferCaptureWriter.WriteBmpAsync(fullPath, framebuffer, operationCancellation.Token);
+            return new ProbeResult(
+                handshake.Version,
+                handshake.SecurityType,
+                new ProbeCapture(fullPath, framebuffer.Width, framebuffer.Height));
         }
         catch (OperationCanceledException exception)
             when (!cancellationToken.IsCancellationRequested && operationCancellation.IsCancellationRequested)
