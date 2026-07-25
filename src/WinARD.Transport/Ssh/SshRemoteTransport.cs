@@ -17,6 +17,7 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
     private readonly OpenSshExecutablePaths _executables;
     private readonly TransportTimeouts _timeouts;
     private readonly TimeProvider _timeProvider;
+    private readonly OpenSshTunnelCleanupOptions _cleanupOptions;
 
     public SshRemoteTransport(
         ISshHostKeyPinStore pinStore,
@@ -30,7 +31,8 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             new TemporaryOpenSshKnownHostsFileFactory(),
             new WindowsOpenSshExecutableResolver(),
             timeouts ?? TransportTimeouts.Default,
-            timeProvider ?? TimeProvider.System)
+            timeProvider ?? TimeProvider.System,
+            OpenSshTunnelCleanupOptions.Default)
     {
     }
 
@@ -42,7 +44,8 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
         IOpenSshKnownHostsFileFactory knownHostsFactory,
         IOpenSshExecutableResolver executableResolver,
         TransportTimeouts timeouts,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        OpenSshTunnelCleanupOptions? cleanupOptions = null)
     {
         _processLauncher = processLauncher ??
             throw new ArgumentNullException(nameof(processLauncher));
@@ -57,6 +60,7 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
         _executables = executableResolver.Resolve();
         _timeouts = timeouts ?? throw new ArgumentNullException(nameof(timeouts));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _cleanupOptions = cleanupOptions ?? OpenSshTunnelCleanupOptions.Default;
     }
 
     public async Task<TransportConnection> ConnectAsync(
@@ -158,7 +162,12 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
         var diagnostics = OpenSshDiagnostics.DrainAsync(
             process.StandardError,
             cancellationToken);
-        var lifetime = new OpenSshTunnelLifetime(process, knownHosts, diagnostics);
+        var lifetime = new OpenSshTunnelLifetime(
+            process,
+            knownHosts,
+            diagnostics,
+            _cleanupOptions,
+            _timeProvider);
         try
         {
             var firstByte = new byte[1];
@@ -310,6 +319,11 @@ public static partial class OpenSshDiagnostics
         ArgumentNullException.ThrowIfNull(text);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumLength);
         var sanitized = SensitiveAssignment().Replace(text, "$1=[REDACTED]");
+        sanitized = UserKnownHostsFileAssignment().Replace(
+            sanitized,
+            "$1=[REDACTED]");
+        sanitized = IdentityFilePath().Replace(sanitized, "$1 [REDACTED]");
+        sanitized = KnownHostsPath().Replace(sanitized, "[REDACTED]");
         return sanitized.Length <= maximumLength
             ? sanitized
             : sanitized[..maximumLength];
@@ -319,12 +333,27 @@ public static partial class OpenSshDiagnostics
         @"(?i)(password|passphrase|token|secret)\s*=\s*([^\s]+)",
         RegexOptions.CultureInvariant)]
     private static partial Regex SensitiveAssignment();
+
+    [GeneratedRegex(
+        @"(?i)(UserKnownHostsFile)\s*=\s*(?:""[^""]*""|'[^']*'|[^\s;]+)",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex UserKnownHostsFileAssignment();
+
+    [GeneratedRegex(
+        @"(?i)(identity\s+file|load\s+key)\s+(?:""[^""]+""|'[^']+'|[^\s;]+)",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex IdentityFilePath();
+
+    [GeneratedRegex(
+        @"(?i)(?:""[^""]*\.known_hosts""|'[^']*\.known_hosts'|(?:[a-z]:\\|/)[^\r\n;]*?\.known_hosts)",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex KnownHostsPath();
 }
 
 public sealed class OpenSshTunnelException : Exception
 {
     public OpenSshTunnelException(int? exitCode, string diagnosticSummary)
-        : base(CreateMessage(exitCode, diagnosticSummary))
+        : base(CreateMessage(exitCode))
     {
         ExitCode = exitCode;
         DiagnosticSummary = diagnosticSummary ?? string.Empty;
@@ -334,15 +363,45 @@ public sealed class OpenSshTunnelException : Exception
 
     public string DiagnosticSummary { get; }
 
-    private static string CreateMessage(int? exitCode, string? diagnosticSummary)
+    private static string CreateMessage(int? exitCode)
     {
         var code = exitCode is null
             ? "unknown"
             : exitCode.Value.ToString(CultureInfo.InvariantCulture);
-        return string.IsNullOrWhiteSpace(diagnosticSummary)
-            ? $"OpenSSH failed to establish the remote tunnel (exit code {code})."
-            : $"OpenSSH failed to establish the remote tunnel (exit code {code}): {diagnosticSummary}";
+        return $"OpenSSH failed to establish the remote tunnel (exit code {code}).";
     }
+}
+
+public sealed record OpenSshTunnelCleanupOptions
+{
+    public static OpenSshTunnelCleanupOptions Default { get; } =
+        new(TimeSpan.FromSeconds(2));
+
+    public OpenSshTunnelCleanupOptions(TimeSpan cleanupTimeout)
+    {
+        if (cleanupTimeout <= TimeSpan.Zero ||
+            cleanupTimeout == Timeout.InfiniteTimeSpan)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(cleanupTimeout),
+                "Cleanup timeout must be finite and positive.");
+        }
+
+        CleanupTimeout = cleanupTimeout;
+    }
+
+    public TimeSpan CleanupTimeout { get; }
+}
+
+public sealed class OpenSshTunnelCleanupTimeoutException : TimeoutException
+{
+    public OpenSshTunnelCleanupTimeoutException(TimeSpan timeout)
+        : base($"OpenSSH tunnel cleanup exceeded {timeout}.")
+    {
+        Timeout = timeout;
+    }
+
+    public TimeSpan Timeout { get; }
 }
 
 public sealed class OpenSshAuthenticationUnsupportedException : Exception
@@ -467,7 +526,9 @@ internal sealed class PrefixDuplexStream(
 internal sealed class OpenSshTunnelLifetime(
     IOpenSshProcess process,
     IOpenSshKnownHostsFile knownHosts,
-    Task<string> diagnostics) : IAsyncDisposable
+    Task<string> diagnostics,
+    OpenSshTunnelCleanupOptions cleanupOptions,
+    TimeProvider timeProvider) : IAsyncDisposable
 {
     private readonly object _sync = new();
     private Task? _disposeTask;
@@ -486,64 +547,140 @@ internal sealed class OpenSshTunnelLifetime(
 
     private async Task DisposeCoreAsync()
     {
-        List<Exception>? failures = null;
-        Try(process.StandardInput.Dispose, ref failures);
+        var cleanupState = new CleanupState();
+        using var cleanupCancellation = new CancellationTokenSource(
+            cleanupOptions.CleanupTimeout,
+            timeProvider);
+        var cleanupToken = cleanupCancellation.Token;
+
+        await RunStepAsync(
+            _ =>
+            {
+                process.StandardInput.Dispose();
+                return Task.CompletedTask;
+            },
+            ignoreOperationCancellation: false,
+            suppressException: null,
+            cleanupState,
+            cleanupToken).ConfigureAwait(false);
         if (!process.HasExited)
         {
-            Try(() => process.Kill(entireProcessTree: true), ref failures);
+            await RunStepAsync(
+                _ => Task.Run(
+                    () => process.Kill(entireProcessTree: true),
+                    CancellationToken.None),
+                ignoreOperationCancellation: false,
+                suppressException: _ => process.HasExited,
+                cleanupState,
+                cleanupToken).ConfigureAwait(false);
         }
 
-        try
-        {
-            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
-        }
+        await RunStepAsync(
+            token => process.WaitForExitAsync(token),
+            ignoreOperationCancellation: false,
+            suppressException: null,
+            cleanupState,
+            cleanupToken).ConfigureAwait(false);
+        await RunStepAsync(
+            _ => diagnostics,
+            ignoreOperationCancellation: true,
+            suppressException: null,
+            cleanupState,
+            cleanupToken).ConfigureAwait(false);
+        await RunStepAsync(
+            _ => process.DisposeAsync().AsTask(),
+            ignoreOperationCancellation: false,
+            suppressException: null,
+            cleanupState,
+            cleanupToken).ConfigureAwait(false);
+        await RunStepAsync(
+            token => knownHosts.DeleteAsync(token).AsTask(),
+            ignoreOperationCancellation: false,
+            suppressException: null,
+            cleanupState,
+            cleanupToken).ConfigureAwait(false);
 
-        try
-        {
-            await diagnostics.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception exception)
-        {
-            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
-        }
-
-        try
-        {
-            await process.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
-        }
-
-        try
-        {
-            await knownHosts.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
-        }
-
-        TemporaryOpenSshKnownHostsFile.ThrowIfAny(failures);
+        TemporaryOpenSshKnownHostsFile.ThrowIfAny(cleanupState.Failures);
     }
 
-    private static void Try(Action action, ref List<Exception>? failures)
+    private async Task RunStepAsync(
+        Func<CancellationToken, Task> beginOperation,
+        bool ignoreOperationCancellation,
+        Func<Exception, bool>? suppressException,
+        CleanupState cleanupState,
+        CancellationToken cleanupToken)
     {
+        Task operation;
         try
         {
-            action();
+            operation = beginOperation(cleanupToken);
         }
         catch (Exception exception)
         {
-            TemporaryOpenSshKnownHostsFile.AddException(ref failures, exception);
+            if (suppressException?.Invoke(exception) == true)
+            {
+                return;
+            }
+
+            TemporaryOpenSshKnownHostsFile.AddException(
+                ref cleanupState.Failures,
+                exception);
+            return;
         }
+
+        try
+        {
+            if (operation.IsCompleted)
+            {
+                await operation.ConfigureAwait(false);
+            }
+            else
+            {
+                await operation.WaitAsync(cleanupToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cleanupToken.IsCancellationRequested)
+        {
+            ObserveFault(operation);
+            if (!cleanupState.TimeoutRecorded)
+            {
+                cleanupState.TimeoutRecorded = true;
+                TemporaryOpenSshKnownHostsFile.AddException(
+                    ref cleanupState.Failures,
+                    new OpenSshTunnelCleanupTimeoutException(
+                        cleanupOptions.CleanupTimeout));
+            }
+        }
+        catch (OperationCanceledException) when (ignoreOperationCancellation)
+        {
+        }
+        catch (Exception exception)
+        {
+            if (suppressException?.Invoke(exception) == true)
+            {
+                return;
+            }
+
+            TemporaryOpenSshKnownHostsFile.AddException(
+                ref cleanupState.Failures,
+                exception);
+        }
+    }
+
+    private static void ObserveFault(Task operation)
+    {
+        _ = operation.ContinueWith(
+            completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted |
+                TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private sealed class CleanupState
+    {
+        public bool TimeoutRecorded { get; set; }
+
+        public List<Exception>? Failures;
     }
 }

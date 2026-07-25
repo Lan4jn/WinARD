@@ -717,13 +717,15 @@ public interface IRemoteTransportFactory
 
 TCP 使用 `TcpClient.ConnectAsync(host, port, cancellationToken)`。SSH 使用受控的系统 OpenSSH 进程，通过 `ssh.exe -T -W <rfbHost>:<rfbPort>` 的 stdin/stdout 暴露双向流，不创建本地 TCP 监听端口。所有参数必须通过 `ProcessStartInfo.ArgumentList` 传入，并关闭 shell 执行。
 
-生产环境必须通过 Windows `GetSystemDirectoryW` 获取不受进程环境变量覆盖的原生 System32，再从其 `OpenSSH` 子目录解析 `ssh.exe` 与 `ssh-keyscan.exe`；也可使用管理员显式配置且已验证存在、文件名匹配的绝对路径。不得信任 `%WINDIR%`、当前目录或 `PATH` 搜索同名程序。Authenticode 签名验证不在 Task 8 范围内，作为发布前供应链门禁记录。
+生产环境必须通过 Windows `GetSystemDirectoryW` 获取不受进程环境变量覆盖的原生 System32，再从其 `OpenSSH` 子目录解析 `ssh.exe` 与 `ssh-keyscan.exe`；也可使用管理员显式配置且已验证存在、文件名匹配的绝对路径。不得信任 `%WINDIR%`、当前目录或 `PATH` 搜索同名程序。管理员绝对路径覆盖在“验证后、启动前”仍存在文件替换 TOCTOU 风险；覆盖文件的句柄绑定启动或等价防替换方案，以及系统和覆盖二进制的 Authenticode 签名验证，均为发布前供应链门禁。
 
 连接前运行有界的 `ssh-keyscan.exe`，独立解析原始公钥并计算 SHA-256 指纹；首次未知返回“需要用户确认”，已变化返回“阻断”。只有端点、算法和原始公钥均与固定值匹配，才为本次连接创建端点专用的临时 `known_hosts`，并使用 `StrictHostKeyChecking=yes`，禁止读取或更新全局及用户 known_hosts。
 
-`ssh-keyscan` 的 stdout/stderr 必须分别按字节数限制并并发排空。超限、取消、读取失败或非零退出都要保留主异常，再使用独立短超时 best-effort 执行进程树终止、等待退出和释放；任何 cleanup 异常不得覆盖主异常。临时 `known_hosts` 的流关闭和显式删除必须分别尝试，`DeleteOnClose` 仅作为附加防线。
+`ssh-keyscan` 的 stdout/stderr 必须分别按字节数限制并并发排空。超限、取消、读取失败或非零退出都要保留主异常，再使用独立短超时 best-effort 执行进程树终止、等待退出、观察全部读取任务和释放；任何 cleanup 异常不得覆盖主异常。
 
-隧道就绪以 RFB 服务端会立即发送 banner 为前提：在同一个总连接截止时间内读取至少一个 stdout 字节，并通过前缀流把该字节回放给协议层。stderr 必须异步排空、脱敏并限制诊断摘要长度；取消、超时、远端拒绝和并发释放均须终止进程树并删除临时 known_hosts。
+临时 `known_hosts` 必须在受控临时目录中以 `CreateNew` 创建并限制为当前用户访问；写入和刷新完成后必须关闭创建句柄，再把仅包含路径与显式删除能力的 lease 交给 OpenSSH。正常和异常清理都不得依赖 `DeleteOnClose`，而要显式尝试删除。进程崩溃或强制终止遗留的 `winard-*.known_hosts` 在下次启动时按所有者、命名和年龄安全清扫，仍是发布前必须实现的恢复门禁。
+
+隧道就绪以 RFB 服务端会立即发送 banner 为前提：在同一个总连接截止时间内读取至少一个 stdout 字节，并通过前缀流把该字节回放给协议层。stderr 必须异步排空、脱敏并限制诊断摘要长度；异常消息只保留稳定错误文本，身份文件、known_hosts 和临时路径只能出现在已脱敏的结构化诊断摘要中。取消、超时、远端拒绝和并发释放均须在一个独立短 cleanup 截止时间内 best-effort 尝试终止、等待、诊断观察、进程释放和临时 known_hosts 删除；单步失败或超时不得跳过后续步骤。
 
 密码及加密私钥口令不得进入命令行、环境变量、stdin、日志或异常。Task 8 只定义 askpass broker 边界并在存在凭据引用时明确报“不支持”；安全 askpass 集成和真实 OpenSSH 互操作验证作为 Task 9 的外部门槛。
 

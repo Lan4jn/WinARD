@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using WinARD.Domain.Connections;
@@ -138,6 +139,38 @@ public sealed class SshRemoteTransportTests
     }
 
     [Fact]
+    public async Task Tunnel_exception_message_is_stable_and_diagnostics_redact_OpenSSH_paths()
+    {
+        var fixture = new OpenSshFixture();
+        await fixture.ConfirmAsync();
+        fixture.Process.StandardOutputSource = Stream.Null;
+        var identityPath = @"C:\Users\Alice\.ssh\id_ed25519";
+        var knownHostsPath =
+            @"C:\Users\Alice\AppData\Local\Temp\winard-0123456789abcdef0123456789abcdef.known_hosts";
+        fixture.Process.StandardErrorSource = new MemoryStream(
+            Encoding.UTF8.GetBytes(
+                $"identity file \"{identityPath}\" type 3; " +
+                $"UserKnownHostsFile=\"{knownHostsPath}\"; Connection refused"));
+        fixture.Process.Exit(255);
+
+        var exception = await Assert.ThrowsAsync<OpenSshTunnelException>(
+            () => fixture.Transport.ConnectAsync(fixture.Profile, CancellationToken.None));
+
+        Assert.DoesNotContain("Connection refused", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(identityPath, exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(knownHostsPath, exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Connection refused", exception.DiagnosticSummary, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            identityPath,
+            exception.DiagnosticSummary,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(
+            knownHostsPath,
+            exception.DiagnosticSummary,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Concurrent_stream_disposal_kills_and_cleans_process_once()
     {
         var fixture = new OpenSshFixture();
@@ -154,6 +187,115 @@ public sealed class SshRemoteTransportTests
         Assert.Equal(1, fixture.Process.KillCount);
         Assert.Equal(1, fixture.Process.DisposeCount);
         Assert.Equal(1, fixture.KnownHosts.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Tunnel_cleanup_uses_one_short_deadline_and_attempts_every_step()
+    {
+        var process = new FakeOpenSshProcess
+        {
+            KillException = new InvalidOperationException("kill failed"),
+            WaitBlocks = true,
+            DisposeException = new IOException("process dispose failed"),
+        };
+        var knownHosts = new FakeKnownHostsFile(
+            new UnauthorizedAccessException("known_hosts delete failed"));
+        var diagnostics = new TaskCompletionSource<string>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lifetime = new OpenSshTunnelLifetime(
+            process,
+            knownHosts,
+            diagnostics.Task,
+            new OpenSshTunnelCleanupOptions(TimeSpan.FromMilliseconds(30)),
+            TimeProvider.System);
+        var stopwatch = Stopwatch.StartNew();
+
+        var aggregate = await Assert.ThrowsAsync<AggregateException>(
+            () => lifetime.DisposeAsync().AsTask());
+
+        stopwatch.Stop();
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2));
+        Assert.Contains(
+            aggregate.InnerExceptions,
+            exception => exception.Message == "kill failed");
+        Assert.Contains(
+            aggregate.InnerExceptions,
+            exception => exception is OpenSshTunnelCleanupTimeoutException);
+        Assert.Contains(
+            aggregate.InnerExceptions,
+            exception => exception.Message == "process dispose failed");
+        Assert.Contains(
+            aggregate.InnerExceptions,
+            exception => exception.Message == "known_hosts delete failed");
+        Assert.Equal(1, process.KillCount);
+        Assert.Equal(1, process.WaitCount);
+        Assert.Equal(1, process.DisposeCount);
+        Assert.Equal(1, knownHosts.DeleteCount);
+    }
+
+    [Fact]
+    public async Task Tunnel_cleanup_ignores_the_has_exited_kill_race()
+    {
+        var process = new FakeOpenSshProcess
+        {
+            ExitBeforeKillException = true,
+            KillException = new InvalidOperationException("already exited"),
+        };
+        var knownHosts = new FakeKnownHostsFile();
+        var lifetime = new OpenSshTunnelLifetime(
+            process,
+            knownHosts,
+            Task.FromResult(string.Empty),
+            OpenSshTunnelCleanupOptions.Default,
+            TimeProvider.System);
+
+        await lifetime.DisposeAsync();
+
+        Assert.Equal(1, process.KillCount);
+        Assert.Equal(1, process.WaitCount);
+        Assert.Equal(1, process.DisposeCount);
+        Assert.Equal(1, knownHosts.DeleteCount);
+    }
+
+    [Fact]
+    public async Task Tunnel_cleanup_bounds_a_blocking_synchronous_kill()
+    {
+        using var killGate = new ManualResetEventSlim();
+        var process = new FakeOpenSshProcess
+        {
+            KillGate = killGate,
+            WaitBlocks = true,
+        };
+        var knownHosts = new FakeKnownHostsFile();
+        var diagnostics = new TaskCompletionSource<string>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lifetime = new OpenSshTunnelLifetime(
+            process,
+            knownHosts,
+            diagnostics.Task,
+            new OpenSshTunnelCleanupOptions(TimeSpan.FromMilliseconds(100)),
+            TimeProvider.System);
+        var stopwatch = Stopwatch.StartNew();
+
+        OpenSshTunnelCleanupTimeoutException timeout;
+        try
+        {
+            var disposeTask = lifetime.DisposeAsync().AsTask();
+            await process.KillStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            timeout = await Assert.ThrowsAsync<OpenSshTunnelCleanupTimeoutException>(
+                () => disposeTask);
+        }
+        finally
+        {
+            stopwatch.Stop();
+            killGate.Set();
+        }
+
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2));
+        Assert.Equal(TimeSpan.FromMilliseconds(100), timeout.Timeout);
+        Assert.Equal(1, process.WaitCount);
+        Assert.Equal(1, process.DisposeCount);
+        Assert.Equal(1, knownHosts.DeleteCount);
     }
 
     [Fact]
@@ -341,6 +483,19 @@ public sealed class SshRemoteTransportTests
         public TaskCompletionSource ReadStarted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        public Exception? KillException { get; set; }
+
+        public ManualResetEventSlim? KillGate { get; set; }
+
+        public TaskCompletionSource KillStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool ExitBeforeKillException { get; set; }
+
+        public bool WaitBlocks { get; set; }
+
+        public Exception? DisposeException { get; set; }
+
         public bool HasExited => _exit.Task.IsCompleted;
 
         public int? ExitCode => HasExited ? _exit.Task.Result : null;
@@ -349,18 +504,39 @@ public sealed class SshRemoteTransportTests
 
         public int DisposeCount => _disposed;
 
+        public int WaitCount { get; private set; }
+
         public void Exit(int exitCode) => _exit.TrySetResult(exitCode);
 
         public void Kill(bool entireProcessTree)
         {
-            if (Interlocked.Increment(ref _killed) == 1)
+            Interlocked.Increment(ref _killed);
+            KillStarted.TrySetResult();
+            KillGate?.Wait();
+            if (ExitBeforeKillException)
             {
                 _exit.TrySetResult(-1);
             }
+
+            if (KillException is not null)
+            {
+                throw KillException;
+            }
+
+            _exit.TrySetResult(-1);
         }
 
-        public Task WaitForExitAsync(CancellationToken cancellationToken) =>
-            _exit.Task.WaitAsync(cancellationToken);
+        public async Task WaitForExitAsync(CancellationToken cancellationToken)
+        {
+            WaitCount++;
+            if (WaitBlocks)
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                return;
+            }
+
+            await _exit.Task.WaitAsync(cancellationToken);
+        }
 
         public ValueTask DisposeAsync()
         {
@@ -368,7 +544,9 @@ public sealed class SshRemoteTransportTests
             StandardInput.Dispose();
             StandardOutputSource.Dispose();
             StandardErrorSource.Dispose();
-            return ValueTask.CompletedTask;
+            return DisposeException is null
+                ? ValueTask.CompletedTask
+                : ValueTask.FromException(DisposeException);
         }
     }
 
@@ -458,8 +636,12 @@ public sealed class SshRemoteTransportTests
 
             public string Path => @"C:\Temp\strict known_hosts";
 
-            public ValueTask DisposeAsync()
+            public ValueTask DisposeAsync() =>
+                DeleteAsync(CancellationToken.None);
+
+            public ValueTask DeleteAsync(CancellationToken cancellationToken)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (Interlocked.Exchange(ref _disposed, 1) == 0)
                 {
                     owner.DisposeCount++;
@@ -471,6 +653,25 @@ public sealed class SshRemoteTransportTests
 
                 return ValueTask.CompletedTask;
             }
+        }
+    }
+
+    private sealed class FakeKnownHostsFile(Exception? deleteException = null)
+        : IOpenSshKnownHostsFile
+    {
+        public string Path => @"C:\Temp\strict known_hosts";
+
+        public int DeleteCount { get; private set; }
+
+        public ValueTask DisposeAsync() =>
+            DeleteAsync(CancellationToken.None);
+
+        public ValueTask DeleteAsync(CancellationToken cancellationToken)
+        {
+            DeleteCount++;
+            return deleteException is null
+                ? ValueTask.CompletedTask
+                : ValueTask.FromException(deleteException);
         }
     }
 

@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using WinARD.Domain.Connections;
 
@@ -51,6 +53,8 @@ public interface IOpenSshKnownHostsFileFactory
 public interface IOpenSshKnownHostsFile : IAsyncDisposable
 {
     string Path { get; }
+
+    ValueTask DeleteAsync(CancellationToken cancellationToken);
 }
 
 public sealed class SystemOpenSshProcessLauncher : IOpenSshProcessLauncher
@@ -204,7 +208,12 @@ public sealed class SystemOpenSshKeyScanLauncher : IOpenSshKeyScanLauncher
                 stderr,
                 waitForExit,
                 cancellationToken);
-            await RethrowAfterCleanupAsync(primary, process).ConfigureAwait(false);
+            await RethrowAfterCleanupAsync(
+                primary,
+                process,
+                stdout,
+                stderr,
+                waitForExit).ConfigureAwait(false);
             throw new InvalidOperationException("Unreachable.");
         }
     }
@@ -291,9 +300,17 @@ public sealed class SystemOpenSshKeyScanLauncher : IOpenSshKeyScanLauncher
 
     private async Task RethrowAfterCleanupAsync(
         Exception primaryException,
-        IOpenSshProcess process)
+        IOpenSshProcess process,
+        Task stdout,
+        Task stderr,
+        Task waitForExit)
     {
         var exceptions = new List<Exception> { primaryException };
+        var operationObservation = ObserveOperationTasksAsync(
+            stdout,
+            stderr,
+            waitForExit);
+        var cleanupTimedOut = false;
         if (!process.HasExited)
         {
             try
@@ -317,12 +334,36 @@ public sealed class SystemOpenSshKeyScanLauncher : IOpenSshKeyScanLauncher
         }
         catch (OperationCanceledException) when (cleanupCancellation.IsCancellationRequested)
         {
+            cleanupTimedOut = true;
             exceptions.Add(
                 new OpenSshProcessCleanupTimeoutException(_limits.CleanupTimeout));
         }
         catch (Exception exception)
         {
             AddFlattened(exceptions, exception);
+        }
+
+        try
+        {
+            if (operationObservation.IsCompleted)
+            {
+                await operationObservation.ConfigureAwait(false);
+            }
+            else
+            {
+                await operationObservation
+                    .WaitAsync(cleanupCancellation.Token)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cleanupCancellation.IsCancellationRequested)
+        {
+            if (!cleanupTimedOut)
+            {
+                exceptions.Add(
+                    new OpenSshProcessCleanupTimeoutException(
+                        _limits.CleanupTimeout));
+            }
         }
 
         try
@@ -340,6 +381,21 @@ public sealed class SystemOpenSshKeyScanLauncher : IOpenSshKeyScanLauncher
         }
 
         throw new AggregateException(exceptions);
+    }
+
+    private static async Task ObserveOperationTasksAsync(params Task[] operations)
+    {
+        try
+        {
+            await Task.WhenAll(operations).ConfigureAwait(false);
+        }
+        catch
+        {
+            foreach (var operation in operations)
+            {
+                _ = operation.Exception;
+            }
+        }
     }
 
     private static void AddFlattened(
@@ -449,6 +505,36 @@ public sealed class OpenSshProcessCleanupTimeoutException : TimeoutException
 public sealed class TemporaryOpenSshKnownHostsFileFactory
     : IOpenSshKnownHostsFileFactory
 {
+    private readonly string _temporaryDirectory;
+    private readonly IOpenSshKnownHostsPermissions _permissions;
+    private readonly IOpenSshTemporaryFileCleanup _cleanup;
+
+    public TemporaryOpenSshKnownHostsFileFactory()
+        : this(
+            Path.GetTempPath(),
+            new SystemOpenSshKnownHostsPermissions(),
+            new SystemOpenSshTemporaryFileCleanup())
+    {
+    }
+
+    internal TemporaryOpenSshKnownHostsFileFactory(
+        string temporaryDirectory,
+        IOpenSshKnownHostsPermissions permissions,
+        IOpenSshTemporaryFileCleanup cleanup)
+    {
+        if (string.IsNullOrWhiteSpace(temporaryDirectory))
+        {
+            throw new ArgumentException(
+                "Temporary directory cannot be blank.",
+                nameof(temporaryDirectory));
+        }
+
+        _temporaryDirectory = Path.GetFullPath(temporaryDirectory);
+        _permissions = permissions ??
+            throw new ArgumentNullException(nameof(permissions));
+        _cleanup = cleanup ?? throw new ArgumentNullException(nameof(cleanup));
+    }
+
     public async ValueTask<IOpenSshKnownHostsFile> CreateAsync(
         SshHostKeyPin pin,
         CancellationToken cancellationToken)
@@ -456,61 +542,45 @@ public sealed class TemporaryOpenSshKnownHostsFileFactory
         ArgumentNullException.ThrowIfNull(pin);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var path = System.IO.Path.Combine(
-            System.IO.Path.GetTempPath(),
+        var path = Path.Combine(
+            _temporaryDirectory,
             $"winard-{Guid.NewGuid():N}.known_hosts");
-        FileStream? stream = null;
         try
         {
-            stream = new FileStream(
+            await using (var stream = new FileStream(
                 path,
                 FileMode.CreateNew,
-                FileAccess.ReadWrite,
-                FileShare.Read | FileShare.Delete,
+                FileAccess.Write,
+                FileShare.None,
                 bufferSize: 4096,
-                FileOptions.Asynchronous | FileOptions.DeleteOnClose);
-            var content = Encoding.UTF8.GetBytes(OpenSshKnownHosts.Format(pin));
-            await stream.WriteAsync(content, cancellationToken).ConfigureAwait(false);
-            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-            stream.Position = 0;
-            return new TemporaryOpenSshKnownHostsFile(
-                path,
-                stream,
-                File.Delete);
+                FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                var content = Encoding.UTF8.GetBytes(OpenSshKnownHosts.Format(pin));
+                await stream
+                    .WriteAsync(content, cancellationToken)
+                    .ConfigureAwait(false);
+                await stream
+                    .FlushAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            _permissions.Apply(path);
+            return new TemporaryOpenSshKnownHostsFile(path, _cleanup);
         }
         catch (Exception primaryException)
         {
             List<Exception>? cleanupFailures = null;
-            if (stream is not null)
+            try
             {
-                try
-                {
-                    await new TemporaryOpenSshKnownHostsFile(
-                            path,
-                            stream,
-                            File.Delete)
-                        .DisposeAsync()
-                        .ConfigureAwait(false);
-                }
-                catch (Exception exception)
-                {
-                    TemporaryOpenSshKnownHostsFile.AddException(
-                        ref cleanupFailures,
-                        exception);
-                }
+                await _cleanup
+                    .DeleteAsync(path, CancellationToken.None)
+                    .ConfigureAwait(false);
             }
-            else
+            catch (Exception exception)
             {
-                try
-                {
-                    File.Delete(path);
-                }
-                catch (Exception exception)
-                {
-                    TemporaryOpenSshKnownHostsFile.AddException(
-                        ref cleanupFailures,
-                        exception);
-                }
+                TemporaryOpenSshKnownHostsFile.AddException(
+                    ref cleanupFailures,
+                    exception);
             }
 
             if (cleanupFailures is not null)
@@ -523,13 +593,11 @@ public sealed class TemporaryOpenSshKnownHostsFileFactory
             throw new InvalidOperationException("Unreachable.");
         }
     }
-
 }
 
 internal sealed class TemporaryOpenSshKnownHostsFile(
     string path,
-    Stream stream,
-    Action<string> deleteFile) : IOpenSshKnownHostsFile
+    IOpenSshTemporaryFileCleanup cleanup) : IOpenSshKnownHostsFile
 {
     private readonly object _sync = new();
     private Task? _disposeTask;
@@ -537,39 +605,20 @@ internal sealed class TemporaryOpenSshKnownHostsFile(
     public string Path { get; } = path;
 
     public ValueTask DisposeAsync()
+        => DeleteAsync(CancellationToken.None);
+
+    public ValueTask DeleteAsync(CancellationToken cancellationToken)
     {
         Task disposeTask;
         lock (_sync)
         {
-            _disposeTask ??= DisposeCoreAsync();
+            _disposeTask ??= cleanup
+                .DeleteAsync(Path, cancellationToken)
+                .AsTask();
             disposeTask = _disposeTask;
         }
 
         return new ValueTask(disposeTask);
-    }
-
-    private async Task DisposeCoreAsync()
-    {
-        List<Exception>? failures = null;
-        try
-        {
-            await stream.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            AddException(ref failures, exception);
-        }
-
-        try
-        {
-            deleteFile(Path);
-        }
-        catch (Exception exception)
-        {
-            AddException(ref failures, exception);
-        }
-
-        ThrowIfAny(failures);
     }
 
     internal static void AddException(
@@ -600,6 +649,66 @@ internal sealed class TemporaryOpenSshKnownHostsFile(
         }
 
         throw new AggregateException(failures);
+    }
+}
+
+internal interface IOpenSshKnownHostsPermissions
+{
+    void Apply(string path);
+}
+
+internal interface IOpenSshTemporaryFileCleanup
+{
+    ValueTask DeleteAsync(
+        string path,
+        CancellationToken cancellationToken);
+}
+
+internal sealed class SystemOpenSshTemporaryFileCleanup
+    : IOpenSshTemporaryFileCleanup
+{
+    public ValueTask DeleteAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        File.Delete(path);
+        return ValueTask.CompletedTask;
+    }
+}
+
+internal sealed class SystemOpenSshKnownHostsPermissions
+    : IOpenSshKnownHostsPermissions
+{
+    public void Apply(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            ApplyWindowsPermissions(path);
+            return;
+        }
+
+        File.SetUnixFileMode(
+            path,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite);
+    }
+
+    private static void ApplyWindowsPermissions(string path)
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var user = identity.User ??
+            throw new InvalidOperationException(
+                "Unable to determine the current Windows user.");
+        var security = new FileSecurity();
+        security.SetOwner(user);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(
+            new FileSystemAccessRule(
+                user,
+                FileSystemRights.FullControl,
+                InheritanceFlags.None,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+        new FileInfo(path).SetAccessControl(security);
     }
 }
 

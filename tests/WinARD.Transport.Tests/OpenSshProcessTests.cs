@@ -57,6 +57,25 @@ public sealed class OpenSshProcessTests
     }
 
     [Fact]
+    public async Task Keyscan_failure_observes_canceled_reader_tasks_before_returning()
+    {
+        var delayedReader = new DelayedCancellationFailureStream(
+            TimeSpan.FromMilliseconds(50));
+        var process = new FakeProcess
+        {
+            StandardOutputSource = new MemoryStream(new byte[33]),
+            StandardErrorSource = delayedReader,
+        };
+        var launcher = CreateLauncher(process, maximumBytes: 32);
+
+        await Assert.ThrowsAsync<OpenSshOutputLimitExceededException>(
+            () => launcher.ScanAsync(Start(), CancellationToken.None).AsTask());
+
+        Assert.True(delayedReader.Finished.IsCompleted);
+        Assert.Equal(1, process.DisposeCount);
+    }
+
+    [Fact]
     public async Task Caller_cancellation_preserves_the_primary_exception_and_all_cleanup_failures()
     {
         var process = new FakeProcess
@@ -289,6 +308,49 @@ public sealed class OpenSshProcessTests
             CancellationToken cancellationToken = default)
         {
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return 0;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class DelayedCancellationFailureStream(TimeSpan delay) : Stream
+    {
+        private readonly TaskCompletionSource _finished =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task Finished => _finished.Task;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                await Task.Delay(delay, CancellationToken.None);
+                _finished.TrySetResult();
+                throw new IOException("reader cleanup failed");
+            }
+
             return 0;
         }
 
