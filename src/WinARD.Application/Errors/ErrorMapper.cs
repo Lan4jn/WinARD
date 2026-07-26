@@ -35,7 +35,7 @@ public sealed class ErrorMapper : IErrorMapper
     {
         if (exception is OperationCanceledException)
         {
-            return ("CONNECTION_CANCELLED", "The connection attempt was cancelled.");
+            return ("CONNECTION_INTERRUPTED", "The connection ended before it completed.");
         }
 
         if (exception is SocketException socketException &&

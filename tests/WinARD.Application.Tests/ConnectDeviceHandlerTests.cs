@@ -33,7 +33,7 @@ public sealed class ConnectDeviceHandlerTests
         { new RfbConnectionRejectedException(RfbVersion.V3_8, "secret reason", false), "RFB_CONNECTION_REJECTED" },
         { new ArdAuthenticationRejectedException(1, "secret reason", false), "ARD_AUTH_REJECTED" },
         { new RfbProtocolException("secret packet"), "RFB_PROTOCOL_ERROR" },
-        { new OperationCanceledException("secret cancellation"), "CONNECTION_CANCELLED" },
+        { new OperationCanceledException("secret cancellation"), "CONNECTION_INTERRUPTED" },
     };
 
     [Fact]
@@ -143,6 +143,31 @@ public sealed class ConnectDeviceHandlerTests
         Assert.Equal("transport cleanup failed", exception.Message);
         Assert.Same(exception, repeated);
         Assert.Equal(SessionState.Idle, result.Session!.State);
+        Assert.Equal(1, client.DisposeCount);
+        Assert.Equal(1, lifetime.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Failed_remote_session_cleans_resources_once_under_concurrent_and_repeated_disposal()
+    {
+        var lifetime = new TestAsyncDisposable();
+        var client = new TestRfbClient();
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(lifetime),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            new ErrorMapper(() => "correlation-id"));
+        var result = await handler.HandleAsync(CreateProfile(), CancellationToken.None);
+        var session = Assert.IsType<RemoteSession>(result.Session);
+        session.MarkFailed();
+        Assert.Equal(SessionState.Failed, session.State);
+
+        var first = session.DisposeAsync().AsTask();
+        var second = session.DisposeAsync().AsTask();
+        await Task.WhenAll(first, second);
+        await session.DisposeAsync();
+
+        Assert.Equal(SessionState.Idle, session.State);
         Assert.Equal(1, client.DisposeCount);
         Assert.Equal(1, lifetime.DisposeCount);
     }
@@ -287,18 +312,19 @@ public sealed class ConnectDeviceHandlerTests
     public async Task Internal_operation_cancellation_is_mapped_as_failure_when_caller_did_not_cancel()
     {
         var primary = new OperationCanceledException("internal timeout");
-        var mapper = new CapturingErrorMapper();
         var handler = new ConnectDeviceHandler(
             new TestTransportFactory(),
             new TestSecretProvider(new TestConnectionSecret()),
             new TestRfbClientFactory(new TestRfbClient { NegotiateException = primary }),
-            mapper);
+            new ErrorMapper(() => "internal-correlation"));
 
         var result = await handler.HandleAsync(CreateProfile(), CancellationToken.None);
 
         Assert.Equal(SessionState.Failed, result.State);
         Assert.Equal(ConnectionStage.Negotiating, result.Error!.Stage);
-        Assert.Same(primary, mapper.Exception);
+        Assert.Equal("CONNECTION_INTERRUPTED", result.Error.Code);
+        Assert.NotEqual("CONNECTION_CANCELLED", result.Error.Code);
+        Assert.Equal("internal-correlation", result.Error.CorrelationId);
     }
 
     [Theory]

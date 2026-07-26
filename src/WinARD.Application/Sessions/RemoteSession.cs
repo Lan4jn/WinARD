@@ -7,6 +7,7 @@ namespace WinARD.Application.Sessions;
 public sealed class RemoteSession : IAsyncDisposable
 {
     private readonly object _disposeSync = new();
+    private readonly SessionStateMachine _stateMachine;
     private Task? _disposeTask;
 
     internal RemoteSession(
@@ -14,25 +15,54 @@ public sealed class RemoteSession : IAsyncDisposable
         TransportConnection transport,
         IRfbClient client)
     {
-        StateMachine = stateMachine ?? throw new ArgumentNullException(nameof(stateMachine));
+        _stateMachine = stateMachine ?? throw new ArgumentNullException(nameof(stateMachine));
         Transport = transport ?? throw new ArgumentNullException(nameof(transport));
         Client = client ?? throw new ArgumentNullException(nameof(client));
     }
 
-    public SessionStateMachine StateMachine { get; }
-
-    public SessionState State => StateMachine.Current;
+    public SessionState State
+    {
+        get
+        {
+            lock (_disposeSync)
+            {
+                return _stateMachine.Current;
+            }
+        }
+    }
 
     public TransportConnection Transport { get; }
 
     public IRfbClient Client { get; }
+
+    public void MarkFailed()
+    {
+        lock (_disposeSync)
+        {
+            if (_disposeTask is not null || _stateMachine.Current == SessionState.Failed)
+            {
+                return;
+            }
+
+            _stateMachine.MoveTo(SessionState.Failed);
+        }
+    }
 
     public ValueTask DisposeAsync()
     {
         Task disposeTask;
         lock (_disposeSync)
         {
-            _disposeTask ??= DisposeCoreAsync();
+            if (_disposeTask is null)
+            {
+                if (_stateMachine.Current == SessionState.Connected)
+                {
+                    _stateMachine.MoveTo(SessionState.Disconnecting);
+                }
+
+                _disposeTask = DisposeCoreAsync();
+            }
+
             disposeTask = _disposeTask;
         }
 
@@ -41,7 +71,6 @@ public sealed class RemoteSession : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
-        StateMachine.MoveTo(SessionState.Disconnecting);
         List<Exception>? failures = null;
         try
         {
@@ -61,7 +90,14 @@ public sealed class RemoteSession : IAsyncDisposable
             AddFailure(ref failures, exception);
         }
 
-        StateMachine.MoveTo(SessionState.Idle);
+        lock (_disposeSync)
+        {
+            if (_stateMachine.Current is SessionState.Disconnecting or SessionState.Failed)
+            {
+                _stateMachine.MoveTo(SessionState.Idle);
+            }
+        }
+
         if (failures is null)
         {
             return;
