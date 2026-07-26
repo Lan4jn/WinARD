@@ -122,6 +122,12 @@ public sealed class ClipboardProtocol
         int maxUtf8Bytes = DefaultMaxUtf8Bytes) =>
         ReadMessageAsync(reader, expectedType: 3, "ServerCutText", maxUtf8Bytes, cancellationToken);
 
+    public static ValueTask<string> ReadServerCutTextBodyAsync(
+        RfbReader reader,
+        CancellationToken cancellationToken,
+        int maxUtf8Bytes = DefaultMaxUtf8Bytes) =>
+        ReadMessageBodyAsync(reader, "ServerCutText", maxUtf8Bytes, cancellationToken);
+
     private static async ValueTask<string> ReadMessageAsync(
         RfbReader reader,
         byte expectedType,
@@ -132,8 +138,31 @@ public sealed class ClipboardProtocol
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxUtf8Bytes);
         var type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        if (type != expectedType)
+        {
+            throw new RfbProtocolException(
+                $"Expected {messageName} message type {expectedType}, received {type}.");
+        }
+
+        return await ReadMessageBodyAsync(
+            reader,
+            messageName,
+            maxUtf8Bytes,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async ValueTask<string> ReadMessageBodyAsync(
+        RfbReader reader,
+        string messageName,
+        int maxUtf8Bytes,
+        CancellationToken cancellationToken)
+    {
         var padding = await reader.ReadBytesAsync(3, cancellationToken).ConfigureAwait(false);
-        ValidateHeader([type, .. padding], expectedType, messageName);
+        if (padding[0] != 0 || padding[1] != 0 || padding[2] != 0)
+        {
+            throw new RfbProtocolException($"{messageName} padding bytes must be zero.");
+        }
+
         var length = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
         var payloadLength = ValidateLength(length, maxUtf8Bytes);
         var payload = await reader.ReadBytesAsync(payloadLength, cancellationToken).ConfigureAwait(false);

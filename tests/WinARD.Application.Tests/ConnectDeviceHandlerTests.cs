@@ -353,8 +353,8 @@ public sealed class ConnectDeviceHandlerTests
         await result.Session.DisposeAsync();
 
         Assert.Equal(SessionState.Idle, result.Session.State);
-        Assert.Equal("client-dispose", events[^2]);
-        Assert.Equal("transport-dispose", events[^1]);
+        Assert.Equal("transport-dispose", events[^2]);
+        Assert.Equal("client-dispose", events[^1]);
     }
 
     [Fact]

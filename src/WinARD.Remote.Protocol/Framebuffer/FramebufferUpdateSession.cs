@@ -59,6 +59,43 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
         }
     }
 
+    public async Task<FramebufferUpdateResult> ApplyBodyAsync(
+        Stream stream,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ThrowIfUnavailable();
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfUnavailable();
+            try
+            {
+                return await FramebufferUpdateReader.ApplyBodyAsync(
+                    stream,
+                    _framebuffer,
+                    _decoders,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                lock (_stateLock)
+                {
+                    if (_state == SessionState.Active)
+                    {
+                        _state = SessionState.Faulted;
+                    }
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public ValueTask DisposeAsync()
     {
         lock (_stateLock)

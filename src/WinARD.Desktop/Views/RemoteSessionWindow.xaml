@@ -1,0 +1,95 @@
+<Window
+    x:Class="WinARD.Desktop.Views.RemoteSessionWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="WinARD 远程会话">
+    <Grid x:Name="RootGrid">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <CommandBar DefaultLabelPosition="Right">
+            <AppBarButton
+                x:Name="FitButton"
+                AutomationProperties.AutomationId="RemoteFitButton"
+                Click="OnFitClicked"
+                Label="适应窗口" />
+            <AppBarButton
+                x:Name="ActualSizeButton"
+                AutomationProperties.AutomationId="RemoteActualSizeButton"
+                Click="OnActualSizeClicked"
+                Label="100%" />
+            <AppBarSeparator />
+            <AppBarButton
+                AutomationProperties.AutomationId="RemoteCtrlAltDeleteButton"
+                Click="OnSecureAttentionClicked"
+                Label="Ctrl+Alt+Delete" />
+            <AppBarToggleButton
+                x:Name="ClipboardButton"
+                AutomationProperties.AutomationId="RemoteClipboardButton"
+                Click="OnClipboardClicked"
+                IsChecked="True"
+                Label="剪贴板" />
+            <AppBarButton
+                AutomationProperties.AutomationId="RemoteFullscreenButton"
+                Click="OnFullscreenClicked"
+                Label="全屏" />
+            <AppBarButton
+                AutomationProperties.AutomationId="RemoteDisconnectButton"
+                Click="OnDisconnectClicked"
+                Label="断开" />
+        </CommandBar>
+
+        <Grid x:Name="ViewportHost" Grid.Row="1" Background="Black">
+            <Viewbox
+                x:Name="FrameViewbox"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch"
+                Stretch="Uniform">
+                <Button
+                    AutomationProperties.AutomationId="RemoteSwapChainPanel"
+                    AutomationProperties.Name="远程画面"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    HorizontalContentAlignment="Stretch"
+                    IsHitTestVisible="False"
+                    IsTabStop="False"
+                    Padding="0"
+                    VerticalContentAlignment="Stretch">
+                    <SwapChainPanel
+                        x:Name="FramePanel"
+                        Width="1"
+                        Height="1" />
+                </Button>
+            </Viewbox>
+            <Button
+                x:Name="InputSurface"
+                AutomationProperties.AutomationId="RemoteInputSurface"
+                Padding="0"
+                HorizontalContentAlignment="Stretch"
+                VerticalContentAlignment="Stretch"
+                Background="Transparent"
+                BorderThickness="0" />
+        </Grid>
+
+        <Grid Grid.Row="2" Padding="12,8" ColumnSpacing="16">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock
+                x:Name="StatusText"
+                AutomationProperties.AutomationId="RemoteSessionStatus"
+                VerticalAlignment="Center" />
+            <TextBlock
+                x:Name="QualityText"
+                Grid.Column="1"
+                AutomationProperties.AutomationId="RemoteConnectionQuality"
+                Opacity="0.7"
+                Text="单会话 · 增量更新"
+                VerticalAlignment="Center" />
+        </Grid>
+    </Grid>
+</Window>

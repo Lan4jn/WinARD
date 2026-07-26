@@ -54,6 +54,27 @@ public static class FramebufferUpdateReader
             throw new RfbProtocolException($"Expected FramebufferUpdate message type 0, received {messageType}.");
         }
 
+        return await ApplyBodyAsync(reader, framebuffer, decoders, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static Task<FramebufferUpdateResult> ApplyBodyAsync(
+        Stream stream,
+        Framebuffer framebuffer,
+        IReadOnlyDictionary<int, IRfbEncodingDecoder> decoders,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        return ApplyBodyAsync(new RfbReader(stream, framebuffer.Limits), framebuffer, decoders, cancellationToken);
+    }
+
+    private static async Task<FramebufferUpdateResult> ApplyBodyAsync(
+        RfbReader reader,
+        Framebuffer framebuffer,
+        IReadOnlyDictionary<int, IRfbEncodingDecoder> decoders,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
         _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
         var rectangleCount = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
         if (rectangleCount > MaximumRectangleCount)

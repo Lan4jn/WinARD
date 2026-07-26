@@ -6,6 +6,8 @@ using WinARD.Domain.Connections;
 using WinARD.Transport.Ssh;
 using Xunit;
 
+#pragma warning disable CA1707
+
 namespace WinARD.Desktop.Tests.Services;
 
 public sealed class ConnectionSessionControllerTests
@@ -62,6 +64,65 @@ public sealed class ConnectionSessionControllerTests
         Assert.False(sut.IsConnected);
         Assert.True(client.Disposed);
         await using var released = await coordinator.AcquireAsync();
+    }
+
+    [Fact]
+    public async Task Transfer_moves_session_and_lease_to_window_ownership_until_closed()
+    {
+        var client = new TrackingClient();
+        var coordinator = new ActiveSessionCoordinator();
+        await using var sut = Controller(client, coordinator);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+
+        var ownership = sut.TransferConnectedSession();
+
+        Assert.True(sut.IsConnected);
+        Assert.NotNull(ownership.Session);
+        Assert.Throws<InvalidOperationException>(() => sut.TransferConnectedSession());
+        await Assert.ThrowsAsync<SessionAlreadyActiveException>(async () =>
+        {
+            await using var lease = await coordinator.AcquireAsync();
+        });
+
+        await ownership.DisposeAsync();
+
+        Assert.False(sut.IsConnected);
+        Assert.True(client.Disposed);
+        await using var released = await coordinator.AcquireAsync();
+    }
+
+    [Fact]
+    public async Task Controller_and_window_concurrent_close_dispose_session_once()
+    {
+        var client = new TrackingClient();
+        var coordinator = new ActiveSessionCoordinator();
+        var sut = Controller(client, coordinator);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        var ownership = sut.TransferConnectedSession();
+
+        await Task.WhenAll(
+            sut.DisposeAsync().AsTask(),
+            ownership.DisposeAsync().AsTask());
+
+        Assert.Equal(1, client.DisposeCount);
+        await using var released = await coordinator.AcquireAsync();
+    }
+
+    [Fact]
+    public async Task Concurrent_controller_dispose_calls_wait_for_the_same_disposal()
+    {
+        var client = new BlockingDisposeClient();
+        var sut = Controller(client, new ActiveSessionCoordinator());
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+
+        var first = sut.DisposeAsync().AsTask();
+        await client.DisposeStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var second = sut.DisposeAsync().AsTask();
+
+        Assert.False(second.IsCompleted);
+        client.AllowDispose.TrySetResult();
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, client.DisposeCount);
     }
 
     [Theory]
@@ -236,6 +297,20 @@ public sealed class ConnectionSessionControllerTests
     private static ConnectionProfile Profile() => ConnectionProfile.Create(
         Guid.NewGuid(), "Studio", "studio.local", 5900, "operator");
 
+    private static ConnectionSessionController Controller(
+        IRfbClient client,
+        ActiveSessionCoordinator coordinator) =>
+        new(
+            new ConnectionAttemptWorkflow(
+                new ConnectDeviceHandler(
+                    new TrackingTransport(),
+                    new FixedSecretProvider(),
+                    new FixedClientFactory(client),
+                    new ErrorMapper()),
+                new Prompt(SshHostKeyPromptDecision.Cancel)),
+            coordinator,
+            new Repository());
+
     private static ConnectionProfile SshProfileFor(SshHostKeyEndpoint endpoint) =>
         Profile().WithSsh(SshProfile.Create(
             endpoint.Host,
@@ -340,7 +415,7 @@ public sealed class ConnectionSessionControllerTests
             ValueTask.FromResult<ISecret>(new Secret());
     }
 
-    private sealed class FixedClientFactory(TrackingClient client) : IRfbClientFactory
+    private sealed class FixedClientFactory(IRfbClient client) : IRfbClientFactory
     {
         public IRfbClient Create(Stream stream) => client;
     }
@@ -348,10 +423,31 @@ public sealed class ConnectionSessionControllerTests
     private sealed class TrackingClient : IRfbClient
     {
         public bool Disposed { get; private set; }
+        public int DisposeCount { get; private set; }
         public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public ValueTask DisposeAsync() { Disposed = true; return ValueTask.CompletedTask; }
+        public ValueTask DisposeAsync() { Disposed = true; DisposeCount++; return ValueTask.CompletedTask; }
+    }
+
+    private sealed class BlockingDisposeClient : IRfbClient
+    {
+        public TaskCompletionSource DisposeStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource AllowDispose { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int DisposeCount { get; private set; }
+
+        public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public async ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            DisposeStarted.TrySetResult();
+            await AllowDispose.Task;
+        }
     }
 
     private sealed class Secret : ISecret

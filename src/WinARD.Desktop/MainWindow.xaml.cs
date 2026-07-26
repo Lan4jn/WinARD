@@ -35,6 +35,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly ListView _connectionStages = new();
     private readonly ConnectionEditorService _connectionEditorService;
     private readonly ConnectionSessionController _sessionController;
+    private readonly IUiDispatcher _dispatcher;
     private readonly VaultCredentialStoreSession _vaultSession;
     private readonly CredentialPromptService _credentialPromptService;
     private readonly SshHostKeyPromptService _hostKeyPromptService;
@@ -42,6 +43,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly TextBlock _detailSource = new();
     private readonly TextBlock _detailEndpoint = new();
     private Task? _shutdownTask;
+    private RemoteSessionWindow? _remoteSessionWindow;
     private bool _allowClose;
     private bool _sessionBusy;
     private int _disposed;
@@ -51,6 +53,7 @@ public sealed partial class MainWindow : Window, IDisposable
         WinArdDatabase database,
         ConnectionEditorService connectionEditorService,
         ConnectionSessionController sessionController,
+        IUiDispatcher dispatcher,
         VaultCredentialStoreSession vaultSession,
         CredentialPromptService credentialPromptService,
         SshHostKeyPromptService hostKeyPromptService)
@@ -59,6 +62,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _connectionEditorService = connectionEditorService ?? throw new ArgumentNullException(nameof(connectionEditorService));
         _sessionController = sessionController ?? throw new ArgumentNullException(nameof(sessionController));
+        _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _vaultSession = vaultSession ?? throw new ArgumentNullException(nameof(vaultSession));
         _credentialPromptService = credentialPromptService ?? throw new ArgumentNullException(nameof(credentialPromptService));
         _hostKeyPromptService = hostKeyPromptService ?? throw new ArgumentNullException(nameof(hostKeyPromptService));
@@ -111,6 +115,7 @@ public sealed partial class MainWindow : Window, IDisposable
         heading.Children.Add(new TextBlock { Text = "连接到你的 Mac", Opacity = 0.68 });
         header.Children.Add(heading);
         var add = new Button { Content = "添加设备", HorizontalAlignment = HorizontalAlignment.Right };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(add, "AddDeviceButton");
         add.Click += (_, _) => ViewModel.AddDeviceCommand.Execute(null);
         Grid.SetColumn(add, 1);
         header.Children.Add(add);
@@ -463,6 +468,22 @@ public sealed partial class MainWindow : Window, IDisposable
         try
         {
             await _sessionController.ConnectAsync(profile, _shutdown.Token);
+            var ownership = _sessionController.TransferConnectedSession();
+            try
+            {
+                var remoteWindow = new RemoteSessionWindow(
+                    ownership.Session,
+                    ownership,
+                    _dispatcher);
+                remoteWindow.Closed += OnRemoteSessionWindowClosed;
+                _remoteSessionWindow = remoteWindow;
+                remoteWindow.Activate();
+            }
+            catch
+            {
+                await ownership.DisposeAsync();
+                throw;
+            }
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
@@ -497,7 +518,14 @@ public sealed partial class MainWindow : Window, IDisposable
         _connectionStatus.Text = "正在断开…";
         try
         {
-            await _sessionController.DisconnectAsync(_shutdown.Token);
+            if (_remoteSessionWindow is not null)
+            {
+                await _remoteSessionWindow.CloseSessionAsync();
+            }
+            else
+            {
+                await _sessionController.DisconnectAsync(_shutdown.Token);
+            }
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
@@ -545,6 +573,20 @@ public sealed partial class MainWindow : Window, IDisposable
         _ = _uiOperation.RunAsync(
             () => ViewModel.ApplySavedProfileAsync(profile, _shutdown.Token),
             _shutdown.Token);
+
+    private void OnRemoteSessionWindowClosed(object sender, WindowEventArgs args)
+    {
+        if (sender is RemoteSessionWindow window)
+        {
+            window.Closed -= OnRemoteSessionWindowClosed;
+            if (ReferenceEquals(_remoteSessionWindow, window))
+            {
+                _remoteSessionWindow = null;
+            }
+        }
+
+        RefreshConnectionPresentation();
+    }
 
     private async void OnDeleteClicked(object sender, RoutedEventArgs args)
     {
@@ -655,6 +697,11 @@ public sealed partial class MainWindow : Window, IDisposable
         _shutdown.Cancel();
         await _initializationTask;
         await _uiOperation.WhenIdleAsync();
+        if (_remoteSessionWindow is not null)
+        {
+            await _remoteSessionWindow.CloseSessionAsync();
+        }
+
         await _sessionController.DisposeAsync();
         await _uiOperation.RunAsync(() => ViewModel.DisposeAsync().AsTask());
         await _uiOperation.RunAsync(() => _database.DisposeAsync().AsTask());

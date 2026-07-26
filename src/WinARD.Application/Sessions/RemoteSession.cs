@@ -4,12 +4,13 @@ using WinARD.Domain.Sessions;
 
 namespace WinARD.Application.Sessions;
 
-public sealed class RemoteSession : IAsyncDisposable
+public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
 {
     private readonly object _disposeSync = new();
     private readonly IRfbClient _client;
     private readonly SessionStateMachine _stateMachine;
     private readonly TransportConnection _transport;
+    private readonly SemaphoreSlim _receiveGate = new(1, 1);
     private Task? _disposeTask;
 
     internal RemoteSession(
@@ -32,6 +33,65 @@ public sealed class RemoteSession : IAsyncDisposable
             }
         }
     }
+
+    public RemoteFramebufferSize FramebufferSize
+    {
+        get
+        {
+            EnsureConnected();
+            return _client.FramebufferSize;
+        }
+    }
+
+    public ValueTask RequestFramebufferUpdateAsync(
+        bool incremental,
+        CancellationToken cancellationToken)
+    {
+        EnsureConnected();
+        return _client.RequestFramebufferUpdateAsync(incremental, cancellationToken);
+    }
+
+    public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+    {
+        EnsureConnected();
+        await _receiveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            EnsureConnected();
+            return await _client.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _receiveGate.Release();
+        }
+    }
+
+    public ValueTask SendPointerAsync(
+        byte buttons,
+        int x,
+        int y,
+        CancellationToken cancellationToken)
+    {
+        EnsureConnected();
+        return _client.SendPointerAsync(buttons, x, y, cancellationToken);
+    }
+
+    public ValueTask SendKeyAsync(
+        uint keysym,
+        bool down,
+        CancellationToken cancellationToken)
+    {
+        EnsureConnected();
+        return _client.SendKeyAsync(keysym, down, cancellationToken);
+    }
+
+    public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken)
+    {
+        EnsureConnected();
+        return _client.SendClipboardTextAsync(text, cancellationToken);
+    }
+
+    public ValueTask DisconnectAsync() => DisposeAsync();
 
     public void MarkFailed()
     {
@@ -91,7 +151,7 @@ public sealed class RemoteSession : IAsyncDisposable
         List<Exception>? failures = null;
         try
         {
-            await _client.DisposeAsync().ConfigureAwait(false);
+            await _transport.DisposeAsync().ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -100,7 +160,7 @@ public sealed class RemoteSession : IAsyncDisposable
 
         try
         {
-            await _transport.DisposeAsync().ConfigureAwait(false);
+            await _client.DisposeAsync().ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -130,4 +190,16 @@ public sealed class RemoteSession : IAsyncDisposable
 
     private static void AddFailure(ref List<Exception>? failures, Exception exception) =>
         (failures ??= []).Add(exception);
+
+    private void EnsureConnected()
+    {
+        lock (_disposeSync)
+        {
+            ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
+            if (_stateMachine.Current != SessionState.Connected)
+            {
+                throw new InvalidOperationException("The remote session is not connected.");
+            }
+        }
+    }
 }

@@ -7,6 +7,7 @@ using WinARD.Application.Sessions;
 using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
+using WinARD.Desktop.Views;
 using WinARD.Infrastructure.Database;
 using WinARD.Infrastructure.Devices;
 using WinARD.Infrastructure.Discovery;
@@ -27,6 +28,20 @@ public partial class App : Microsoft.UI.Xaml.Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
+        if (Environment.GetCommandLineArgs()
+            .Contains("--remote-session-smoke", StringComparer.Ordinal))
+        {
+            var dispatcher = new DispatcherQueueUiDispatcher(
+                DispatcherQueue.GetForCurrentThread() ??
+                throw new InvalidOperationException("The WinUI dispatcher is unavailable."));
+            _window = new RemoteSessionWindow(
+                new SmokeRemoteSessionRuntime(),
+                new SmokeSessionOwnership(),
+                dispatcher);
+            _window.Activate();
+            return;
+        }
+
         _services = BuildServices();
         _window = _services.GetRequiredService<MainWindow>();
         _window.Activate();
@@ -35,9 +50,13 @@ public partial class App : Microsoft.UI.Xaml.Application
     private static ServiceProvider BuildServices()
     {
         var services = new ServiceCollection();
-        var dataDirectory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "WinARD");
+        var dataDirectory = Environment.GetEnvironmentVariable("WINARD_DATA_DIRECTORY");
+        if (string.IsNullOrWhiteSpace(dataDirectory))
+        {
+            dataDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "WinARD");
+        }
         services.AddSingleton(new WinArdDatabase(Path.Combine(dataDirectory, "winard.db")));
         services.AddSingleton<IDeviceRepository, SqliteDeviceRepository>();
         services.AddSingleton<IBonjourServiceWatcher, DnssdServiceWatcher>();
@@ -75,6 +94,75 @@ public partial class App : Microsoft.UI.Xaml.Application
         services.AddSingleton<MainWindowViewModel>();
         services.AddSingleton<MainWindow>();
         return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private sealed class SmokeRemoteSessionRuntime : IRemoteSessionRuntime
+    {
+        private bool _frameSent;
+
+        public RemoteFramebufferSize FramebufferSize => new(640, 360);
+
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            if (!_frameSent)
+            {
+                _frameSent = true;
+                var pixels = new byte[640 * 360 * 4];
+                for (var y = 0; y < 360; y++)
+                {
+                    for (var x = 0; x < 640; x++)
+                    {
+                        var offset = ((y * 640) + x) * 4;
+                        pixels[offset] = checked((byte)(x * 255 / 639));
+                        pixels[offset + 1] = checked((byte)(y * 255 / 359));
+                        pixels[offset + 2] = 48;
+                        pixels[offset + 3] = 255;
+                    }
+                }
+
+                return new RemoteFramebufferMessage(
+                    FramebufferSize,
+                    pixels,
+                    640 * 4,
+                    [new RemoteRectangle(0, 0, 640, 360)]);
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("Unreachable smoke receive state.");
+        }
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class SmokeSessionOwnership : IAsyncDisposable
+    {
+        private int _disposed;
+
+        public ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                var marker = Environment.GetEnvironmentVariable("WINARD_REMOTE_SMOKE_MARKER");
+                if (!string.IsNullOrWhiteSpace(marker))
+                {
+                    File.WriteAllText(marker, "released");
+                }
+            }
+
+            return ValueTask.CompletedTask;
+        }
     }
 
 }
