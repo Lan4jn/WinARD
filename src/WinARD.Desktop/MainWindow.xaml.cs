@@ -2,6 +2,7 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using WinARD.Infrastructure.Database;
 using WinRT.Interop;
@@ -11,13 +12,18 @@ namespace WinARD.Desktop;
 public sealed partial class MainWindow : Window, IDisposable
 {
     private readonly WinArdDatabase _database;
-    private readonly CancellationTokenSource _lifetime = new();
+    private readonly CancellationTokenSource _shutdown = new();
+    private readonly AsyncUiOperation _uiOperation = new();
+    private readonly AppWindow _appWindow;
+    private readonly Task _initializationTask;
     private readonly Grid _detailsHost = new();
     private readonly StackPanel _emptyState = new();
     private readonly Button _deleteButton = new();
     private readonly TextBlock _detailName = new();
     private readonly TextBlock _detailSource = new();
     private readonly TextBlock _detailEndpoint = new();
+    private Task? _shutdownTask;
+    private bool _allowClose;
     private int _disposed;
 
     public MainWindow(MainWindowViewModel viewModel, WinArdDatabase database)
@@ -26,10 +32,14 @@ public sealed partial class MainWindow : Window, IDisposable
         _database = database ?? throw new ArgumentNullException(nameof(database));
         InitializeComponent();
         BuildDeviceLibrary();
+        var windowHandle = WindowNative.GetWindowHandle(this);
+        var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(windowHandle);
+        _appWindow = AppWindow.GetFromWindowId(windowId);
+        _appWindow.Closing += OnClosing;
         Closed += OnClosed;
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
         ResizeWindow();
-        _ = InitializeAsync();
+        _initializationTask = _uiOperation.RunAsync(InitializeWithErrorHandlingAsync, _shutdown.Token);
     }
 
     public MainWindowViewModel ViewModel { get; }
@@ -196,19 +206,22 @@ public sealed partial class MainWindow : Window, IDisposable
         sidebar.Children.Add(label);
     }
 
-    private async Task InitializeAsync()
+    private async Task InitializeWithErrorHandlingAsync()
     {
         try
         {
-            await Task.Run(() => _database.InitializeAsync(_lifetime.Token), _lifetime.Token);
-            await ViewModel.InitializeAsync(_lifetime.Token);
+            await Task.Run(() => _database.InitializeAsync(_shutdown.Token), _shutdown.Token);
+            await ViewModel.InitializeAsync(_shutdown.Token);
         }
-        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
         }
         catch (Exception)
         {
-            await ShowStartupErrorAsync();
+            if (!_shutdown.IsCancellationRequested)
+            {
+                await ShowStartupErrorAsync();
+            }
         }
     }
 
@@ -223,6 +236,25 @@ public sealed partial class MainWindow : Window, IDisposable
     }
 
     private async void OnDeleteClicked(object sender, RoutedEventArgs args)
+    {
+        if (_shutdown.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            await _uiOperation.RunAsync(DeleteSelectedFromDialogAsync, _shutdown.Token);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private async Task DeleteSelectedFromDialogAsync()
     {
         var item = ViewModel.SelectedDevice;
         if (item?.Profile is null)
@@ -247,21 +279,17 @@ public sealed partial class MainWindow : Window, IDisposable
             ContentDialogResult.Secondary => false,
             _ => null,
         };
-        try
-        {
-            await ViewModel.DeleteSelectedAsync(deleteCredential, _lifetime.Token);
-        }
-        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
-        {
-        }
-        catch (Exception)
-        {
-            await ShowDeleteErrorAsync();
-        }
+        await ViewModel.DeleteSelectedAsync(deleteCredential, _shutdown.Token);
     }
 
     private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs args)
     {
+        if (args.PropertyName == nameof(MainWindowViewModel.IsDeleting))
+        {
+            _deleteButton.IsEnabled = !ViewModel.IsDeleting;
+            return;
+        }
+
         if (args.PropertyName != nameof(MainWindowViewModel.SelectedDevice))
         {
             return;
@@ -296,40 +324,53 @@ public sealed partial class MainWindow : Window, IDisposable
         await dialog.ShowAsync();
     }
 
-    private async Task ShowDeleteErrorAsync()
+    private void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
     {
-        var dialog = new ContentDialog
+        if (_allowClose)
         {
-            Title = "无法删除设备",
-            Content = "删除操作未能完成。请重试。",
-            CloseButtonText = "关闭",
-            XamlRoot = ShellRoot.XamlRoot,
-        };
-        await dialog.ShowAsync();
+            return;
+        }
+
+        args.Cancel = true;
+        _shutdownTask ??= ShutdownAndCloseAsync();
     }
 
-    private async void OnClosed(object sender, WindowEventArgs args)
+    private async Task ShutdownAndCloseAsync()
     {
-        _lifetime.Cancel();
+        _shutdown.Cancel();
+        await _initializationTask;
+        await _uiOperation.WhenIdleAsync();
+        await _uiOperation.RunAsync(() => ViewModel.DisposeAsync().AsTask());
+        await _uiOperation.RunAsync(() => _database.DisposeAsync().AsTask());
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
-        await ViewModel.DisposeAsync();
-        await _database.DisposeAsync();
+        _allowClose = true;
+        try
+        {
+            Close();
+        }
+        catch (Exception exception)
+        {
+            _uiOperation.Report(exception);
+        }
+    }
+
+    private void OnClosed(object sender, WindowEventArgs args)
+    {
+        _appWindow.Closing -= OnClosing;
         Dispose();
     }
 
     private void ResizeWindow()
     {
-        var windowHandle = WindowNative.GetWindowHandle(this);
-        var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(windowHandle);
-        AppWindow.GetFromWindowId(windowId).Resize(new Windows.Graphics.SizeInt32(1100, 720));
+        _appWindow.Resize(new Windows.Graphics.SizeInt32(1100, 720));
     }
 
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 0)
         {
-            _lifetime.Cancel();
-            _lifetime.Dispose();
+            _shutdown.Cancel();
+            _shutdown.Dispose();
         }
 
         GC.SuppressFinalize(this);

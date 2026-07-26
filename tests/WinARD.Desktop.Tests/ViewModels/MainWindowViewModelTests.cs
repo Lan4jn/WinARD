@@ -237,6 +237,84 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task Dispose_during_initialize_after_ui_mutation_cancels_without_object_disposed_error()
+    {
+        var repository = new FakeRepository(Profile(StudioId, "Studio Mac", "studio.local"));
+        var dispatcher = new MutationBlockingDispatcher();
+        var viewModel = Create(repository, dispatcher: dispatcher);
+        var initialize = viewModel.InitializeAsync(CancellationToken.None);
+        await dispatcher.MutationApplied.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var dispose = viewModel.DisposeAsync().AsTask();
+        dispatcher.ReleaseReturn.TrySetResult();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => initialize);
+        await dispose;
+        Assert.Equal(1, repository.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Dispose_continues_after_resource_failures_and_aggregates_them()
+    {
+        var repository = new FakeRepository { DisposeException = new IOException("repository dispose") };
+        var discovery = new FakeDiscovery { DisposeException = new IOException("discovery dispose") };
+        var credentialStore = new FakeCredentialStore { DisposeException = new IOException("credential dispose") };
+        var viewModel = Create(repository, discovery, credentialStore);
+
+        var exception = await Assert.ThrowsAsync<AggregateException>(() => viewModel.DisposeAsync().AsTask());
+
+        Assert.Equal(3, exception.InnerExceptions.Count);
+        Assert.Equal(1, discovery.DisposeCount);
+        Assert.Equal(1, repository.DisposeCount);
+        Assert.Equal(1, credentialStore.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Concurrent_deletes_remove_a_shared_credential_once_after_the_last_profile()
+    {
+        var shared = CredentialReference.Create("windows", "shared-concurrent");
+        var repository = new BlockingDeleteRepository(
+            Profile(StudioId, "Studio Mac", "studio.local").WithCredential(shared),
+            Profile(OfficeId, "Office Mini", "office.local").WithCredential(shared));
+        var credentialStore = new FakeCredentialStore();
+        await using var viewModel = new MainWindowViewModel(
+            repository, new FakeDiscovery(), credentialStore, new RecordingDispatcher());
+        await viewModel.InitializeAsync(CancellationToken.None);
+        viewModel.SelectedDevice = viewModel.SavedDevices.Single(item => item.Profile?.Id == StudioId);
+        var first = viewModel.DeleteSelectedAsync(deleteCredential: true, CancellationToken.None);
+        await repository.FirstDeleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        viewModel.SelectedDevice = viewModel.SavedDevices.Single(item => item.Profile?.Id == OfficeId);
+        var second = viewModel.DeleteSelectedAsync(deleteCredential: true, CancellationToken.None);
+
+        repository.ReleaseFirstDelete.TrySetResult();
+        await Task.WhenAll(first, second);
+
+        Assert.Equal([StudioId, OfficeId], repository.DeletedIds.Order());
+        Assert.Equal([shared], credentialStore.DeletedReferences);
+        Assert.Empty(viewModel.SavedDevices);
+    }
+
+    [Fact]
+    public async Task Dispose_waits_for_an_active_delete_before_disposing_the_repository()
+    {
+        var repository = new BlockingDeleteRepository(Profile(StudioId, "Studio Mac", "studio.local"));
+        var viewModel = new MainWindowViewModel(
+            repository, new FakeDiscovery(), new FakeCredentialStore(), new RecordingDispatcher());
+        await viewModel.InitializeAsync(CancellationToken.None);
+        viewModel.SelectedDevice = Assert.Single(viewModel.SavedDevices);
+        var delete = viewModel.DeleteSelectedAsync(deleteCredential: false, CancellationToken.None);
+        await repository.FirstDeleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var dispose = viewModel.DisposeAsync().AsTask();
+
+        Assert.False(repository.DisposeCalled.Task.IsCompleted);
+        repository.ReleaseFirstDelete.TrySetResult();
+        Assert.True(await delete);
+        await dispose;
+        Assert.True(repository.DisposeCalled.Task.IsCompletedSuccessfully);
+    }
+
+    [Fact]
     public async Task Removing_the_selected_discovery_item_clears_the_selection()
     {
         var nearby = Discovered("nearby", "Nearby MacBook", "nearby.local");
@@ -270,6 +348,49 @@ public sealed class MainWindowViewModelTests
         Assert.NotSame(original, viewModel.SelectedDevice);
         Assert.Equal("Renamed MacBook", viewModel.SelectedDevice?.DisplayName);
         Assert.Equal("renamed.local", viewModel.SelectedDevice?.Host);
+    }
+
+    [Fact]
+    public async Task Initialize_converges_when_discovery_adds_after_snapshot_before_replace()
+    {
+        var discovery = new FakeDiscovery { BlockCurrentRead = true };
+        var dispatcher = new SerialDispatcher();
+        await using var viewModel = Create(new FakeRepository(), discovery, dispatcher: dispatcher);
+
+        var initialize = viewModel.InitializeAsync(CancellationToken.None);
+        await Task.WhenAny(discovery.CurrentReadEntered.Task, dispatcher.FirstEnqueued.Task)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+        var added = Discovered("added", "Added Mac", "added.local");
+        discovery.Publish(DiscoveryChangeKind.Added, added);
+        discovery.ReleaseCurrentRead.Set();
+        await dispatcher.SecondEnqueued.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        dispatcher.RunAll();
+        await initialize;
+
+        Assert.Equal(discovery.Current.Select(device => device.Identity), viewModel.DiscoveredDevices.Select(device => device.Identity));
+    }
+
+    [Fact]
+    public async Task Initialize_converges_and_clears_selection_when_discovery_removes_after_snapshot_before_replace()
+    {
+        var removed = Discovered("removed", "Removed Mac", "removed.local");
+        var discovery = new FakeDiscovery(removed) { BlockCurrentRead = true };
+        var dispatcher = new SerialDispatcher();
+        await using var viewModel = Create(new FakeRepository(), discovery, dispatcher: dispatcher);
+        viewModel.SelectedDevice = DeviceItemViewModel.FromDiscovery(removed);
+
+        var initialize = viewModel.InitializeAsync(CancellationToken.None);
+        await Task.WhenAny(discovery.CurrentReadEntered.Task, dispatcher.FirstEnqueued.Task)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+        discovery.Publish(DiscoveryChangeKind.Removed, removed);
+        discovery.ReleaseCurrentRead.Set();
+        await dispatcher.SecondEnqueued.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        dispatcher.RunAll();
+        await initialize;
+
+        Assert.Empty(discovery.Current);
+        Assert.Empty(viewModel.DiscoveredDevices);
+        Assert.Null(viewModel.SelectedDevice);
     }
 
     private static MainWindowViewModel Create(
@@ -321,6 +442,11 @@ public sealed class MainWindowViewModelTests
             };
             _thread.SetApartmentState(ApartmentState.STA);
             _thread.Start();
+            if (!_started.Task.Wait(TimeSpan.FromSeconds(5)))
+            {
+                throw new TimeoutException("The dedicated UI test thread did not start.");
+            }
+
             ThreadId = _started.Task.GetAwaiter().GetResult();
         }
 
@@ -392,7 +518,12 @@ public sealed class MainWindowViewModelTests
         public async ValueTask DisposeAsync()
         {
             _queue.CompleteAdding();
-            await Task.Run(_thread.Join);
+            var joined = await Task.Run(() => _thread.Join(TimeSpan.FromSeconds(5)));
+            if (!joined)
+            {
+                throw new TimeoutException("The dedicated UI test thread did not stop.");
+            }
+
             _queue.Dispose();
         }
 
@@ -429,6 +560,125 @@ public sealed class MainWindowViewModelTests
         }
     }
 
+    private sealed class SerialDispatcher : IUiDispatcher
+    {
+        private readonly Queue<(Action Action, TaskCompletionSource Completion)> _pending = new();
+        private int _enqueueCount;
+
+        public TaskCompletionSource FirstEnqueued { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource SecondEnqueued { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_pending)
+            {
+                _pending.Enqueue((action, completion));
+                var count = ++_enqueueCount;
+                if (count >= 1)
+                {
+                    FirstEnqueued.TrySetResult();
+                }
+
+                if (count >= 2)
+                {
+                    SecondEnqueued.TrySetResult();
+                }
+            }
+
+            return completion.Task;
+        }
+
+        public void RunAll()
+        {
+            while (true)
+            {
+                (Action Action, TaskCompletionSource Completion) work;
+                lock (_pending)
+                {
+                    if (_pending.Count == 0)
+                    {
+                        return;
+                    }
+
+                    work = _pending.Dequeue();
+                }
+
+                try
+                {
+                    work.Action();
+                    work.Completion.TrySetResult();
+                }
+                catch (Exception exception)
+                {
+                    work.Completion.TrySetException(exception);
+                }
+            }
+        }
+    }
+
+    private sealed class MutationBlockingDispatcher : IUiDispatcher
+    {
+        public TaskCompletionSource MutationApplied { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseReturn { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            action();
+            MutationApplied.TrySetResult();
+            await ReleaseReturn.Task.ConfigureAwait(false);
+        }
+    }
+
+    private sealed class BlockingDeleteRepository(params ConnectionProfile[] profiles) : IDeviceRepository
+    {
+        private readonly object _gate = new();
+        private readonly List<ConnectionProfile> _profiles = [.. profiles];
+        private int _deleteCount;
+
+        public TaskCompletionSource FirstDeleteEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseFirstDelete { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource DisposeCalled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<Guid> DeletedIds { get; } = [];
+
+        public Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
+            Task.FromResult(GetSnapshot().SingleOrDefault(profile => profile.Id == id));
+        public Task<IReadOnlyList<ConnectionProfile>> GetAllAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<ConnectionProfile>>(GetSnapshot());
+
+        public async Task DeleteAsync(Guid id, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _deleteCount) == 1)
+            {
+                FirstDeleteEntered.TrySetResult();
+                await ReleaseFirstDelete.Task;
+            }
+
+            lock (_gate)
+            {
+                DeletedIds.Add(id);
+                _profiles.RemoveAll(profile => profile.Id == id);
+            }
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCalled.TrySetResult();
+            return ValueTask.CompletedTask;
+        }
+
+        private ConnectionProfile[] GetSnapshot()
+        {
+            lock (_gate)
+            {
+                return _profiles.ToArray();
+            }
+        }
+    }
+
     private sealed class FakeRepository(params ConnectionProfile[] profiles) : IDeviceRepository
     {
         private readonly List<ConnectionProfile> _profiles = [.. profiles];
@@ -438,6 +688,7 @@ public sealed class MainWindowViewModelTests
         public int LoadThreadId { get; private set; }
         public int DisposeCount { get; private set; }
         public Exception? DeleteException { get; init; }
+        public Exception? DisposeException { get; init; }
         public List<Guid> DeletedIds { get; } = [];
         public TaskCompletionSource LoadEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource ReleaseLoad { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -475,7 +726,9 @@ public sealed class MainWindowViewModelTests
         public ValueTask DisposeAsync()
         {
             DisposeCount++;
-            return ValueTask.CompletedTask;
+            return DisposeException is null
+                ? ValueTask.CompletedTask
+                : ValueTask.FromException(DisposeException);
         }
     }
 
@@ -484,10 +737,28 @@ public sealed class MainWindowViewModelTests
         private readonly List<DiscoveredDevice> _current = [.. devices];
 
         public event EventHandler<DiscoveryChange>? Changed;
-        public IReadOnlyList<DiscoveredDevice> Current => _current.ToArray();
+        public IReadOnlyList<DiscoveredDevice> Current
+        {
+            get
+            {
+                var snapshot = _current.ToArray();
+                CurrentReadEntered.TrySetResult();
+                if (BlockCurrentRead)
+                {
+                    ReleaseCurrentRead.Wait(TimeSpan.FromSeconds(5));
+                }
+
+                return snapshot;
+            }
+        }
+
+        public bool BlockCurrentRead { get; init; }
+        public TaskCompletionSource CurrentReadEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public ManualResetEventSlim ReleaseCurrentRead { get; } = new(initialState: false);
         public int StartCount { get; private set; }
         public int StartThreadId { get; private set; }
         public int DisposeCount { get; private set; }
+        public Exception? DisposeException { get; init; }
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
@@ -517,14 +788,18 @@ public sealed class MainWindowViewModelTests
         public ValueTask DisposeAsync()
         {
             DisposeCount++;
-            return ValueTask.CompletedTask;
+            return DisposeException is null
+                ? ValueTask.CompletedTask
+                : ValueTask.FromException(DisposeException);
         }
     }
 
-    private sealed class FakeCredentialStore : ICredentialStore
+    private sealed class FakeCredentialStore : ICredentialStore, IAsyncDisposable
     {
         public List<CredentialReference> DeletedReferences { get; } = [];
         public Exception? DeleteException { get; init; }
+        public Exception? DisposeException { get; init; }
+        public int DisposeCount { get; private set; }
 
         public ValueTask SaveAsync(CredentialReference reference, ISecret secret, CancellationToken cancellationToken) => throw new NotSupportedException();
         public ValueTask<ISecret?> ReadAsync(CredentialReference reference, CancellationToken cancellationToken) => throw new NotSupportedException();
@@ -541,6 +816,14 @@ public sealed class MainWindowViewModelTests
 
             DeletedReferences.Add(reference);
             return ValueTask.CompletedTask;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            return DisposeException is null
+                ? ValueTask.CompletedTask
+                : ValueTask.FromException(DisposeException);
         }
     }
 }

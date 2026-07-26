@@ -14,7 +14,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly ICredentialStore _credentialStore;
     private readonly IUiDispatcher _dispatcher;
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly SemaphoreSlim _deleteGate = new(1, 1);
     private readonly List<DeviceItemViewModel> _allSaved = [];
+    private readonly HashSet<Guid> _deletedIds = [];
     private Task? _initializeTask;
     private Task? _disposeTask;
     private string _searchText = string.Empty;
@@ -22,6 +24,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private string _statusMessage = string.Empty;
     private bool _initialized;
     private bool _disposed;
+    private bool _isDeleting;
 
     public MainWindowViewModel(
         IDeviceRepository repository,
@@ -67,6 +70,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     public bool HasNoDevices => SavedDevices.Count == 0 && DiscoveredDevices.Count == 0;
 
+    public bool IsDeleting
+    {
+        get => _isDeleting;
+        private set => SetProperty(ref _isDeleting, value);
+    }
+
     public Task InitializeAsync(CancellationToken cancellationToken)
     {
         lock (_lifecycleGate)
@@ -91,62 +100,108 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
 
         var profile = item.Profile;
-        var credentialReferences = deleteCredential.Value
-            ? GetCredentialReferences(profile)
-                .Except(
-                    _allSaved
-                        .Where(saved => saved.Profile?.Id != profile.Id)
-                        .SelectMany(saved => GetCredentialReferences(saved.Profile!)))
-                .ToArray()
-            : [];
-        var credentialCleanupFailed = false;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        var operationToken = linked.Token;
+        await _deleteGate.WaitAsync(operationToken).ConfigureAwait(false);
         try
         {
-            await Task.Run(
-                () => _repository.DeleteAsync(profile.Id, cancellationToken),
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception)
-        {
-            await _dispatcher.InvokeAsync(
-                () => StatusMessage = "无法删除设备。请重试。",
-                CancellationToken.None).ConfigureAwait(false);
-            return false;
-        }
+            lock (_lifecycleGate)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+            }
 
-        foreach (var reference in credentialReferences)
-        {
+            if (_deletedIds.Contains(profile.Id))
+            {
+                return false;
+            }
+
+            await _dispatcher.InvokeAsync(() => IsDeleting = true, operationToken).ConfigureAwait(false);
+            var credentialCleanupFailed = false;
             try
             {
                 await Task.Run(
-                    async () => await _credentialStore.DeleteAsync(reference, CancellationToken.None).ConfigureAwait(false),
-                    CancellationToken.None).ConfigureAwait(false);
+                    () => _repository.DeleteAsync(profile.Id, operationToken),
+                    operationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception)
             {
-                credentialCleanupFailed = true;
+                await _dispatcher.InvokeAsync(
+                    () => StatusMessage = "无法删除设备。请重试。",
+                    CancellationToken.None).ConfigureAwait(false);
+                return false;
             }
-        }
 
-        await _dispatcher.InvokeAsync(() =>
-        {
-            _allSaved.RemoveAll(saved => saved.Profile?.Id == profile.Id);
-            SavedDevices.Remove(item);
-            if (ReferenceEquals(SelectedDevice, item))
+            _deletedIds.Add(profile.Id);
+            if (deleteCredential.Value)
             {
-                SelectedDevice = null;
+                IReadOnlyList<WinARD.Domain.Connections.ConnectionProfile>? remainingProfiles = null;
+                try
+                {
+                    remainingProfiles = await Task.Run(
+                        () => _repository.GetAllAsync(CancellationToken.None),
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    credentialCleanupFailed = true;
+                }
+
+                if (remainingProfiles is not null)
+                {
+                    var retainedReferences = remainingProfiles.SelectMany(GetCredentialReferences).ToHashSet();
+                    foreach (var reference in GetCredentialReferences(profile).Except(retainedReferences))
+                    {
+                        try
+                        {
+                            await Task.Run(
+                                async () => await _credentialStore.DeleteAsync(reference, CancellationToken.None).ConfigureAwait(false),
+                                CancellationToken.None).ConfigureAwait(false);
+                        }
+                        catch (Exception)
+                        {
+                            credentialCleanupFailed = true;
+                        }
+                    }
+                }
             }
 
-            OnPropertyChanged(nameof(HasNoDevices));
-            StatusMessage = credentialCleanupFailed
-                ? "设备已删除，但部分关联凭据未能删除。"
-                : $"已删除“{profile.DisplayName}”。";
-        }, CancellationToken.None).ConfigureAwait(false);
-        return true;
+            await _dispatcher.InvokeAsync(() =>
+            {
+                _allSaved.RemoveAll(saved => saved.Profile?.Id == profile.Id);
+                var visible = SavedDevices.FirstOrDefault(saved => saved.Profile?.Id == profile.Id);
+                if (visible is not null)
+                {
+                    SavedDevices.Remove(visible);
+                }
+
+                if (SelectedDevice?.Profile?.Id == profile.Id)
+                {
+                    SelectedDevice = null;
+                }
+
+                OnPropertyChanged(nameof(HasNoDevices));
+                StatusMessage = credentialCleanupFailed
+                    ? "设备已删除，但部分关联凭据未能删除。"
+                    : $"已删除“{profile.DisplayName}”。";
+            }, CancellationToken.None).ConfigureAwait(false);
+            return true;
+        }
+        finally
+        {
+            try
+            {
+                await _dispatcher.InvokeAsync(() => IsDeleting = false, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception) when (_lifetime.IsCancellationRequested)
+            {
+            }
+
+            _deleteGate.Release();
+        }
     }
 
     public ValueTask DisposeAsync()
@@ -171,19 +226,31 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 () => _discovery.StartAsync(cancellationToken),
                 cancellationToken).ConfigureAwait(false);
             var saved = profiles.Select(DeviceItemViewModel.FromProfile).ToArray();
-            var discovered = _discovery.Current.Select(DeviceItemViewModel.FromDiscovery).ToArray();
             await _dispatcher.InvokeAsync(() =>
             {
+                var discovered = _discovery.Current
+                    .Select(DeviceItemViewModel.FromDiscovery)
+                    .OrderBy(item => item.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+                    .ToArray();
                 _allSaved.Clear();
                 _allSaved.AddRange(saved);
                 ReplaceSavedDevices();
-                Replace(DiscoveredDevices, discovered.OrderBy(item => item.DisplayName, StringComparer.CurrentCultureIgnoreCase));
+                Replace(DiscoveredDevices, discovered);
+                if (SelectedDevice?.Profile is null && SelectedDevice is not null)
+                {
+                    SelectedDevice = discovered.FirstOrDefault(item => item.Identity == SelectedDevice.Identity);
+                }
+
                 OnPropertyChanged(nameof(HasNoDevices));
             }, cancellationToken).ConfigureAwait(false);
 
             lock (_lifecycleGate)
             {
-                ObjectDisposedException.ThrowIf(_disposed, this);
+                if (_disposed)
+                {
+                    throw new OperationCanceledException(_lifetime.Token);
+                }
+
                 _initialized = true;
             }
         }
@@ -283,6 +350,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
 
         _discovery.Changed -= OnDiscoveryChanged;
+        var errors = new List<Exception>();
         if (initialize is not null)
         {
             try
@@ -292,17 +360,51 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             catch (OperationCanceledException)
             {
             }
+            catch (Exception exception)
+            {
+                errors.Add(exception);
+            }
         }
 
+        await _deleteGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        _deleteGate.Release();
+        await CaptureCleanupAsync(
+            () => _discovery.StopAsync(CancellationToken.None), errors).ConfigureAwait(false);
+        await CaptureCleanupAsync(
+            async () => await _discovery.DisposeAsync().ConfigureAwait(false), errors).ConfigureAwait(false);
+        await CaptureCleanupAsync(
+            async () => await _repository.DisposeAsync().ConfigureAwait(false), errors).ConfigureAwait(false);
+        if (_credentialStore is IAsyncDisposable asyncCredentialStore)
+        {
+            await CaptureCleanupAsync(
+                async () => await asyncCredentialStore.DisposeAsync().ConfigureAwait(false), errors).ConfigureAwait(false);
+        }
+        else if (_credentialStore is IDisposable credentialStore)
+        {
+            await CaptureCleanupAsync(() =>
+            {
+                credentialStore.Dispose();
+                return Task.CompletedTask;
+            }, errors).ConfigureAwait(false);
+        }
+
+        _deleteGate.Dispose();
+        _lifetime.Dispose();
+        if (errors.Count > 0)
+        {
+            throw new AggregateException(errors);
+        }
+    }
+
+    private static async Task CaptureCleanupAsync(Func<Task> cleanup, List<Exception> errors)
+    {
         try
         {
-            await _discovery.StopAsync(CancellationToken.None).ConfigureAwait(false);
+            await cleanup().ConfigureAwait(false);
         }
-        finally
+        catch (Exception exception)
         {
-            await _discovery.DisposeAsync().ConfigureAwait(false);
-            await _repository.DisposeAsync().ConfigureAwait(false);
-            _lifetime.Dispose();
+            errors.Add(exception);
         }
     }
 
