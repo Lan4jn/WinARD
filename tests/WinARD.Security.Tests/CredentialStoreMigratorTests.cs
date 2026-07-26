@@ -28,7 +28,7 @@ public sealed class CredentialStoreMigratorTests
             CancellationToken.None);
 
         Assert.True(source.Deleted);
-        Assert.Equal("migrate-cf18", target.ReadText());
+        AssertSecretText("migrate-cf18", target.ReadText());
     }
 
     [Fact]
@@ -64,7 +64,7 @@ public sealed class CredentialStoreMigratorTests
                 Reference,
                 CancellationToken.None).AsTask());
 
-        Assert.Equal("old-value-4e21", target.ReadText());
+        AssertSecretText("old-value-4e21", target.ReadText());
         Assert.False(source.Deleted);
     }
 
@@ -111,7 +111,7 @@ public sealed class CredentialStoreMigratorTests
                 CancellationToken.None).AsTask());
 
         Assert.IsType<IOException>(exception.InnerException);
-        Assert.Equal("new-value-8a11", target.ReadText());
+        AssertSecretText("new-value-8a11", target.ReadText());
         Assert.Equal(deleteBeforeThrow, source.Deleted);
     }
 
@@ -131,8 +131,145 @@ public sealed class CredentialStoreMigratorTests
                 Reference,
                 CancellationToken.None).AsTask());
 
-        Assert.Equal("new-value-8a11", target.ReadText());
+        AssertSecretText("new-value-8a11", target.ReadText());
         Assert.False(source.Deleted);
+    }
+
+    [Fact]
+    public async Task Target_save_commit_then_throw_deletes_new_target_and_keeps_source()
+    {
+        var source = new MemoryCredentialStore("new-value-8a11");
+        var target = new MemoryCredentialStore
+        {
+            SaveExceptionAfterFirstCommit = new IOException("target save uncertain"),
+        };
+
+        var exception = await Assert.ThrowsAsync<MigrationTargetWriteUncertainException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                CancellationToken.None).AsTask());
+
+        Assert.IsType<IOException>(exception.InnerException);
+        Assert.Null(target.ReadText());
+        Assert.False(source.Deleted);
+        Assert.True(target.RollbackUsedNonCancellableToken);
+    }
+
+    [Fact]
+    public async Task Target_save_commit_then_throw_restores_previous_target_and_keeps_source()
+    {
+        var source = new MemoryCredentialStore("new-value-8a11");
+        var target = new MemoryCredentialStore("old-value-4e21")
+        {
+            SaveExceptionAfterFirstCommit = new IOException("target save uncertain"),
+        };
+
+        var exception = await Assert.ThrowsAsync<MigrationTargetWriteUncertainException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                CancellationToken.None).AsTask());
+
+        Assert.IsType<IOException>(exception.InnerException);
+        AssertSecretText("old-value-4e21", target.ReadText());
+        Assert.False(source.Deleted);
+        Assert.True(target.RollbackUsedNonCancellableToken);
+    }
+
+    [Fact]
+    public async Task Target_save_commit_then_cancel_still_rolls_back_without_caller_token()
+    {
+        var source = new MemoryCredentialStore("new-value-8a11");
+        var target = new MemoryCredentialStore
+        {
+            SaveExceptionAfterFirstCommit = new OperationCanceledException(),
+        };
+
+        var exception = await Assert.ThrowsAsync<MigrationTargetWriteUncertainException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                new CancellationToken(canceled: false)).AsTask());
+
+        Assert.IsType<OperationCanceledException>(exception.InnerException);
+        Assert.Null(target.ReadText());
+        Assert.False(source.Deleted);
+        Assert.True(target.RollbackUsedNonCancellableToken);
+    }
+
+    [Fact]
+    public async Task Target_save_uncertainty_aggregates_rollback_failure_and_keeps_source()
+    {
+        var source = new MemoryCredentialStore("new-value-8a11");
+        var target = new MemoryCredentialStore
+        {
+            SaveExceptionAfterFirstCommit = new IOException("target save uncertain"),
+            DeleteException = new IOException("rollback failed"),
+        };
+
+        var aggregate = await Assert.ThrowsAsync<AggregateException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                CancellationToken.None).AsTask());
+
+        var uncertain = Assert.IsType<MigrationTargetWriteUncertainException>(
+            aggregate.InnerExceptions[0]);
+        Assert.IsType<IOException>(uncertain.InnerException);
+        Assert.Equal("rollback failed", aggregate.InnerExceptions[1].Message);
+        AssertSecretText("new-value-8a11", target.ReadText());
+        Assert.False(source.Deleted);
+    }
+
+    [Fact]
+    public async Task Target_save_uncertainty_aggregates_rollback_cancellation_and_keeps_source()
+    {
+        var source = new MemoryCredentialStore("new-value-8a11");
+        var target = new MemoryCredentialStore
+        {
+            SaveExceptionAfterFirstCommit = new IOException("target save uncertain"),
+            DeleteException = new OperationCanceledException(),
+        };
+
+        var aggregate = await Assert.ThrowsAsync<AggregateException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                CancellationToken.None).AsTask());
+
+        Assert.IsType<MigrationTargetWriteUncertainException>(aggregate.InnerExceptions[0]);
+        Assert.IsType<OperationCanceledException>(aggregate.InnerExceptions[1]);
+        AssertSecretText("new-value-8a11", target.ReadText());
+        Assert.False(source.Deleted);
+    }
+
+    private static void AssertSecretText(string expectedText, string? actualText)
+    {
+        Assert.NotNull(actualText);
+        var expected = Encoding.UTF8.GetBytes(expectedText);
+        var actual = Encoding.UTF8.GetBytes(actualText!);
+        Span<byte> expectedDigest = stackalloc byte[32];
+        Span<byte> actualDigest = stackalloc byte[32];
+        try
+        {
+            SHA256.HashData(expected, expectedDigest);
+            SHA256.HashData(actual, actualDigest);
+            Assert.Equal(expected.Length, actual.Length);
+            Assert.True(CryptographicOperations.FixedTimeEquals(expectedDigest, actualDigest));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(expected);
+            CryptographicOperations.ZeroMemory(actual);
+            CryptographicOperations.ZeroMemory(expectedDigest);
+            CryptographicOperations.ZeroMemory(actualDigest);
+        }
     }
 
     private sealed class MemoryCredentialStore(string? initial = null) : ICredentialStore
@@ -145,11 +282,15 @@ public sealed class CredentialStoreMigratorTests
 
         public Exception? DeleteException { get; init; }
 
+        public Exception? SaveExceptionAfterFirstCommit { get; init; }
+
         public bool DeleteValueBeforeThrow { get; init; }
 
-        private bool _wasSaved;
+        private int _saveCount;
 
         public bool Deleted { get; private set; }
+
+        public bool RollbackUsedNonCancellableToken { get; private set; }
 
         public ValueTask SaveAsync(
             CredentialReference reference,
@@ -161,7 +302,17 @@ public sealed class CredentialStoreMigratorTests
             secret.CopyTo(value);
             Replace(value);
             Deleted = false;
-            _wasSaved = true;
+            _saveCount++;
+            if (_saveCount == 1 && SaveExceptionAfterFirstCommit is not null)
+            {
+                return ValueTask.FromException(SaveExceptionAfterFirstCommit);
+            }
+
+            if (_saveCount > 1)
+            {
+                RollbackUsedNonCancellableToken = !cancellationToken.CanBeCanceled;
+            }
+
             return ValueTask.CompletedTask;
         }
 
@@ -176,7 +327,7 @@ public sealed class CredentialStoreMigratorTests
             }
 
             var copy = _value.ToArray();
-            if (CorruptReads || (CorruptReadsAfterSave && _wasSaved))
+            if (CorruptReads || (CorruptReadsAfterSave && _saveCount == 1))
             {
                 copy[0] ^= 1;
             }
@@ -189,6 +340,7 @@ public sealed class CredentialStoreMigratorTests
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            RollbackUsedNonCancellableToken = !cancellationToken.CanBeCanceled;
             if (DeleteException is not null)
             {
                 if (DeleteValueBeforeThrow)

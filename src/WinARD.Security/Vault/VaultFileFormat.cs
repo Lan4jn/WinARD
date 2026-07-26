@@ -46,7 +46,8 @@ internal static class VaultFileFormat
 
     public static byte[] Serialize(VaultDocument document)
     {
-        var manifest = BuildManifest(document);
+        var ownsManifest = document.ManifestData is null;
+        var manifest = document.ManifestData ?? BuildManifest(document);
         try
         {
             if (document.ManifestTag.Length != TagSize)
@@ -75,7 +76,10 @@ internal static class VaultFileFormat
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(manifest);
+            if (ownsManifest)
+            {
+                CryptographicOperations.ZeroMemory(manifest);
+            }
         }
     }
 

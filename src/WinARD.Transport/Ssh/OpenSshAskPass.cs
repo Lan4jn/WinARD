@@ -305,8 +305,20 @@ internal sealed class OpenSshAskPassSession : IOpenSshAskPassSession
 
     private async Task<bool> AuthenticateAsync(
         Stream pipe,
+        CancellationToken cancellationToken) =>
+        await AuthenticateFrameAsync(pipe, _challenge, cancellationToken).ConfigureAwait(false);
+
+    internal static async Task<bool> AuthenticateFrameAsync(
+        Stream pipe,
+        ReadOnlyMemory<byte> challenge,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(pipe);
+        if (challenge.Length != OpenSshAskPassLimits.ChallengeBytes)
+        {
+            return false;
+        }
+
         var lengthBytes = new byte[sizeof(int)];
         var request = new byte[OpenSshAskPassProtocol.RequestBytes];
         try
@@ -322,40 +334,13 @@ internal sealed class OpenSshAskPassSession : IOpenSshAskPassSession
                     .SequenceEqual(OpenSshAskPassProtocol.Magic) &&
                 CryptographicOperations.FixedTimeEquals(
                     request.AsSpan(OpenSshAskPassProtocol.Magic.Length),
-                    _challenge);
-            return authenticated &&
-                !await HasTrailingDataAsync(pipe, cancellationToken).ConfigureAwait(false);
+                    challenge.Span);
+            return authenticated;
         }
         finally
         {
             CryptographicOperations.ZeroMemory(lengthBytes);
             CryptographicOperations.ZeroMemory(request);
-        }
-    }
-
-    private static async Task<bool> HasTrailingDataAsync(
-        Stream pipe,
-        CancellationToken cancellationToken)
-    {
-        using var probeTimeout = new CancellationTokenSource(
-            TimeSpan.FromMilliseconds(25));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken,
-            probeTimeout.Token);
-        var extra = new byte[1];
-        try
-        {
-            return await pipe.ReadAsync(extra, linked.Token).ConfigureAwait(false) != 0;
-        }
-        catch (OperationCanceledException) when (
-            probeTimeout.IsCancellationRequested &&
-            !cancellationToken.IsCancellationRequested)
-        {
-            return false;
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(extra);
         }
     }
 

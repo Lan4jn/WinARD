@@ -16,6 +16,16 @@ public sealed class MigrationSourceDeleteUncertainException : IOException
     }
 }
 
+public sealed class MigrationTargetWriteUncertainException : IOException
+{
+    public MigrationTargetWriteUncertainException(Exception innerException)
+        : base(
+            "The target credential write failed after its final state became uncertain.",
+            innerException)
+    {
+    }
+}
+
 public sealed class CredentialStoreMigrator
 {
     [SuppressMessage(
@@ -43,14 +53,16 @@ public sealed class CredentialStoreMigrator
         using var previousTarget = await target
             .ReadAsync(reference, cancellationToken)
             .ConfigureAwait(false);
-        var targetWasWritten = false;
+        var targetWriteAttempted = false;
+        var targetWriteCompleted = false;
         var targetWasVerified = false;
         try
         {
+            targetWriteAttempted = true;
             await target
                 .SaveAsync(reference, sourceSecret, cancellationToken)
                 .ConfigureAwait(false);
-            targetWasWritten = true;
+            targetWriteCompleted = true;
             using var readback = await target
                 .ReadAsync(reference, cancellationToken)
                 .ConfigureAwait(false);
@@ -62,7 +74,6 @@ public sealed class CredentialStoreMigrator
 
             targetWasVerified = true;
             await source.DeleteAsync(reference, cancellationToken).ConfigureAwait(false);
-            targetWasWritten = false;
         }
         catch (Exception primaryException)
         {
@@ -71,32 +82,79 @@ public sealed class CredentialStoreMigrator
                 throw new MigrationSourceDeleteUncertainException(primaryException);
             }
 
-            if (targetWasWritten)
+            if (targetWriteAttempted)
             {
-                try
+                var reportedPrimary = targetWriteCompleted
+                    ? primaryException
+                    : new MigrationTargetWriteUncertainException(primaryException);
+                var recoveryExceptions = await RestoreTargetAsync(
+                    target,
+                    reference,
+                    previousTarget).ConfigureAwait(false);
+                if (recoveryExceptions.Count != 0)
                 {
-                    if (previousTarget is null)
-                    {
-                        await target
-                            .DeleteAsync(reference, CancellationToken.None)
-                            .ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        await target
-                            .SaveAsync(reference, previousTarget, CancellationToken.None)
-                            .ConfigureAwait(false);
-                    }
+                    throw new AggregateException(
+                        new[] { reportedPrimary }.Concat(recoveryExceptions));
                 }
-                catch (Exception rollbackException)
+
+                if (!targetWriteCompleted)
                 {
-                    throw new AggregateException(primaryException, rollbackException);
+                    throw reportedPrimary;
                 }
             }
 
             ExceptionDispatchInfo.Capture(primaryException).Throw();
             throw new InvalidOperationException("Unreachable.");
         }
+    }
+
+    private static async ValueTask<IReadOnlyList<Exception>> RestoreTargetAsync(
+        ICredentialStore target,
+        CredentialReference reference,
+        ISecret? previousTarget)
+    {
+        var exceptions = new List<Exception>();
+        try
+        {
+            if (previousTarget is null)
+            {
+                await target
+                    .DeleteAsync(reference, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await target
+                    .SaveAsync(reference, previousTarget, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (Exception exception)
+        {
+            exceptions.Add(exception);
+        }
+
+        try
+        {
+            using var recovered = await target
+                .ReadAsync(reference, CancellationToken.None)
+                .ConfigureAwait(false);
+            var restored = previousTarget is null
+                ? recovered is null
+                : recovered is not null && FixedTimeEqual(previousTarget, recovered);
+            if (!restored)
+            {
+                exceptions.Add(
+                    new CryptographicException(
+                        "Credential migration target recovery verification failed."));
+            }
+        }
+        catch (Exception exception)
+        {
+            exceptions.Add(exception);
+        }
+
+        return exceptions;
     }
 
     private static bool FixedTimeEqual(ISecret left, ISecret right)

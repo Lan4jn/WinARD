@@ -28,6 +28,14 @@ public sealed class VaultConcurrencyException : IOException
     }
 }
 
+public sealed class VaultFormatException : IOException
+{
+    public VaultFormatException(string safeMessage)
+        : base(safeMessage)
+    {
+    }
+}
+
 internal interface IVaultNonceSource
 {
     void Fill(Span<byte> destination);
@@ -51,18 +59,12 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
     public async ValueTask<VaultStorageSnapshot?> ReadAsync(
         CancellationToken cancellationToken)
     {
-        if (!File.Exists(_path))
+        var contents = await ReadCurrentAsync(cancellationToken).ConfigureAwait(false);
+        if (contents is null)
         {
             return null;
         }
 
-        var info = new FileInfo(_path);
-        if (info.Length > VaultFileFormat.MaximumFileBytes)
-        {
-            throw new InvalidDataException("The vault file exceeds its size limit.");
-        }
-
-        var contents = await File.ReadAllBytesAsync(_path, cancellationToken).ConfigureAwait(false);
         return new VaultStorageSnapshot(contents, VersionOf(contents));
     }
 
@@ -73,7 +75,7 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
     {
         if (contents.Length > VaultFileFormat.MaximumFileBytes)
         {
-            throw new InvalidDataException("The vault file exceeds its size limit.");
+            throw new VaultFormatException("The vault file exceeds its size limit.");
         }
 
         var directory = Path.GetDirectoryName(_path) ??
@@ -82,9 +84,7 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
         var lockPath = _path + ".lock";
         await using var exclusive = await OpenLockAsync(lockPath, cancellationToken)
             .ConfigureAwait(false);
-        var current = File.Exists(_path)
-            ? await File.ReadAllBytesAsync(_path, cancellationToken).ConfigureAwait(false)
-            : null;
+        var current = await ReadCurrentAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var currentVersion = current is null ? null : VersionOf(current);
@@ -150,6 +150,87 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
             catch (UnauthorizedAccessException)
             {
             }
+        }
+    }
+
+    internal static async ValueTask<byte[]> ReadBoundedAsync(
+        Stream stream,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        var buffer = new byte[64 * 1024];
+        using var contents = new MemoryStream();
+        var total = 0;
+        try
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var remaining = (VaultFileFormat.MaximumFileBytes + 1) - total;
+                var read = await stream
+                    .ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, remaining)), cancellationToken)
+                    .ConfigureAwait(false);
+                if (read == 0)
+                {
+                    return contents.ToArray();
+                }
+
+                total = checked(total + read);
+                if (total > VaultFileFormat.MaximumFileBytes)
+                {
+                    throw new VaultFormatException("The vault file exceeds its size limit.");
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                if (total > contents.Capacity)
+                {
+                    var doubled = contents.Capacity == 0
+                        ? buffer.Length
+                        : checked(contents.Capacity * 2);
+                    contents.Capacity = Math.Min(
+                        VaultFileFormat.MaximumFileBytes,
+                        Math.Max(total, doubled));
+                }
+
+                contents.Write(buffer, 0, read);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(buffer);
+            if (contents.TryGetBuffer(out var bufferedContents))
+            {
+                CryptographicOperations.ZeroMemory(
+                    bufferedContents.AsSpan(0, checked((int)contents.Length)));
+            }
+        }
+    }
+
+    private async ValueTask<byte[]?> ReadCurrentAsync(CancellationToken cancellationToken)
+    {
+        FileStream stream;
+        try
+        {
+            stream = new FileStream(
+                _path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                64 * 1024,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return null;
+        }
+
+        await using (stream)
+        {
+            return await ReadBoundedAsync(stream, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -302,9 +383,10 @@ public sealed class EncryptedCredentialVault :
                 key,
                 nonceSource,
                 new HashSet<string>(StringComparer.Ordinal));
-            var bytes = VaultFileFormat.Serialize(document);
+            byte[]? bytes = null;
             try
             {
+                bytes = VaultFileFormat.Serialize(document);
                 var write = await storage
                     .CompareExchangeAsync(bytes, expectedVersion: null, cancellationToken)
                     .ConfigureAwait(false);
@@ -326,7 +408,12 @@ public sealed class EncryptedCredentialVault :
             }
             finally
             {
-                CryptographicOperations.ZeroMemory(bytes);
+                if (bytes is not null)
+                {
+                    CryptographicOperations.ZeroMemory(bytes);
+                }
+
+                ClearManifestData(document);
             }
         }
         finally
@@ -394,6 +481,8 @@ public sealed class EncryptedCredentialVault :
             {
                 CryptographicOperations.ZeroMemory(key);
             }
+
+            ClearManifestData(document);
         }
     }
 
@@ -427,9 +516,10 @@ public sealed class EncryptedCredentialVault :
                     [referenceText] = replacement,
                 };
                 var document = BuildDocument(next, checked(_revision + 1));
-                var bytes = VaultFileFormat.Serialize(document);
+                byte[]? bytes = null;
                 try
                 {
+                    bytes = VaultFileFormat.Serialize(document);
                     var write = await _storage
                         .CompareExchangeAsync(bytes, _storageVersion, cancellationToken)
                         .ConfigureAwait(false);
@@ -443,7 +533,12 @@ public sealed class EncryptedCredentialVault :
                 }
                 finally
                 {
-                    CryptographicOperations.ZeroMemory(bytes);
+                    if (bytes is not null)
+                    {
+                        CryptographicOperations.ZeroMemory(bytes);
+                    }
+
+                    ClearManifestData(document);
                 }
 
                 if (_entries.Remove(referenceText, out var previous))
@@ -521,9 +616,10 @@ public sealed class EncryptedCredentialVault :
             var next = new Dictionary<string, VaultEntry>(_entries, StringComparer.Ordinal);
             next.Remove(referenceText);
             var document = BuildDocument(next, checked(_revision + 1));
-            var bytes = VaultFileFormat.Serialize(document);
+            byte[]? bytes = null;
             try
             {
+                bytes = VaultFileFormat.Serialize(document);
                 var write = await _storage
                     .CompareExchangeAsync(bytes, _storageVersion, cancellationToken)
                     .ConfigureAwait(false);
@@ -537,7 +633,12 @@ public sealed class EncryptedCredentialVault :
             }
             finally
             {
-                CryptographicOperations.ZeroMemory(bytes);
+                if (bytes is not null)
+                {
+                    CryptographicOperations.ZeroMemory(bytes);
+                }
+
+                ClearManifestData(document);
             }
 
             if (_entries.Remove(referenceText, out var removed))
@@ -831,6 +932,7 @@ public sealed class EncryptedCredentialVault :
         HashSet<string> nonceHistory)
     {
         var manifest = VaultFileFormat.BuildManifest(document);
+        var transferred = false;
         try
         {
             var forbidden = new HashSet<string>(nonceHistory, StringComparer.Ordinal)
@@ -843,16 +945,29 @@ public sealed class EncryptedCredentialVault :
             var nonce = GenerateUniqueNonce(nonceSource, forbidden);
             nonceHistory.Add(Convert.ToHexString(nonce));
             var tag = CreateManifestTag(key, manifest, nonce);
-            return document with
+            var authenticated = document with
             {
                 ManifestNonce = nonce,
                 ManifestTag = tag,
-                ManifestData = manifest.ToArray(),
+                ManifestData = manifest,
             };
+            transferred = true;
+            return authenticated;
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(manifest);
+            if (!transferred)
+            {
+                CryptographicOperations.ZeroMemory(manifest);
+            }
+        }
+    }
+
+    private static void ClearManifestData(VaultDocument document)
+    {
+        if (document.ManifestData is not null)
+        {
+            CryptographicOperations.ZeroMemory(document.ManifestData);
         }
     }
 

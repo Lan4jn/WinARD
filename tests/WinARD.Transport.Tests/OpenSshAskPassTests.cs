@@ -46,9 +46,7 @@ public sealed class OpenSshAskPassTests
             CancellationToken.None);
 
         Assert.Equal(0, exitCode);
-        Assert.Equal(
-            [.. Encoding.UTF8.GetBytes(InjectedSecret), (byte)'\n'],
-            output.ToArray());
+        AssertSecretOutput(output.ToArray());
     }
 
     [Fact]
@@ -151,42 +149,21 @@ public sealed class OpenSshAskPassTests
     }
 
     [Fact]
-    public async Task Exact_frame_with_trailing_byte_is_rejected_without_consumption()
+    public async Task Authenticated_frame_does_not_probe_for_late_trailing_data()
     {
-        var broker = CreateBroker(
-            new FakeCredentialStore(Encoding.UTF8.GetBytes(InjectedSecret)));
-        await using var session = await broker.PrepareAsync(
-            PasswordProfile(), CancellationToken.None);
-        var environment = session.Configure(Start()).Environment!;
-        await using (var malformed = await ConnectAsync(environment))
-        {
-            var challenge = Convert.FromBase64String(
-                environment[OpenSshAskPassEnvironment.Challenge]);
-            var frame = new byte[
-                sizeof(int) + OpenSshAskPassProtocol.RequestBytes + 1];
-            BinaryPrimitives.WriteInt32LittleEndian(
-                frame,
-                OpenSshAskPassProtocol.RequestBytes);
-            OpenSshAskPassProtocol.Magic.CopyTo(frame.AsSpan(sizeof(int)));
-            challenge.CopyTo(
-                frame,
-                sizeof(int) + OpenSshAskPassProtocol.Magic.Length);
-            frame[^1] = 0x7f;
-            try
-            {
-                await malformed.WriteAsync(frame);
-                await malformed.FlushAsync();
-            }
-            catch (IOException)
-            {
-            }
-        }
+        var challenge = RandomNumberGenerator.GetBytes(OpenSshAskPassLimits.ChallengeBytes);
+        var frame = new byte[sizeof(int) + OpenSshAskPassProtocol.RequestBytes];
+        BinaryPrimitives.WriteInt32LittleEndian(frame, OpenSshAskPassProtocol.RequestBytes);
+        OpenSshAskPassProtocol.Magic.CopyTo(frame.AsSpan(sizeof(int)));
+        challenge.CopyTo(frame, sizeof(int) + OpenSshAskPassProtocol.Magic.Length);
+        await using var stream = new ThrowOnReadPastEndStream(frame);
 
-        using var output = new MemoryStream();
-        Assert.Equal(
-            0,
-            await OpenSshAskPassClient.RunAsync(
-                environment, output, CancellationToken.None));
+        Assert.True(
+            await OpenSshAskPassSession.AuthenticateFrameAsync(
+                stream,
+                challenge,
+                CancellationToken.None));
+        Assert.Equal(frame.Length, stream.Position);
     }
 
     [Fact]
@@ -237,9 +214,7 @@ public sealed class OpenSshAskPassTests
 
         var success = await RunHelperAsync(environment);
         Assert.Equal(0, success.ExitCode);
-        Assert.Equal(
-            [.. Encoding.UTF8.GetBytes(InjectedSecret), (byte)'\n'],
-            success.StandardOutput);
+        AssertSecretOutput(success.StandardOutput);
         Assert.Empty(success.StandardError);
 
         await using var errorSession = await broker.PrepareAsync(
@@ -361,6 +336,26 @@ public sealed class OpenSshAskPassTests
         byte[] StandardOutput,
         string StandardError);
 
+    private static void AssertSecretOutput(byte[] actual)
+    {
+        var expected = Encoding.UTF8.GetBytes(InjectedSecret + "\n");
+        Span<byte> expectedDigest = stackalloc byte[32];
+        Span<byte> actualDigest = stackalloc byte[32];
+        try
+        {
+            SHA256.HashData(expected, expectedDigest);
+            SHA256.HashData(actual, actualDigest);
+            Assert.Equal(expected.Length, actual.Length);
+            Assert.True(CryptographicOperations.FixedTimeEquals(expectedDigest, actualDigest));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(expected);
+            CryptographicOperations.ZeroMemory(expectedDigest);
+            CryptographicOperations.ZeroMemory(actualDigest);
+        }
+    }
+
     private static SshProfile PasswordProfile() =>
         SshProfile.Create(
             "host",
@@ -372,6 +367,21 @@ public sealed class OpenSshAskPassTests
             CredentialReference.Create("windows", "ssh-password"),
             pinnedHostKeyAlgorithm: null,
             pinnedHostKeySha256: null);
+
+    private sealed class ThrowOnReadPastEndStream(byte[] contents) : MemoryStream(contents)
+    {
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (Position == Length)
+            {
+                throw new InvalidOperationException("Unexpected trailing-data probe.");
+            }
+
+            return base.ReadAsync(buffer, cancellationToken);
+        }
+    }
 
     [System.Diagnostics.CodeAnalysis.SuppressMessage(
         "Design",
