@@ -162,7 +162,14 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         IsPrimaryButtonEnabled = !busy && ViewModel.SaveCommand.CanExecute(null);
     }
 
-    private void UpdateState() => SetBusy(ViewModel.IsBusy);
+    private void UpdateState()
+    {
+        var state = ConnectionEditorDialogStatePresenter.Present(ViewModel);
+        BusyIndicator.IsActive = state.IsBusy;
+        TestButton.IsEnabled = state.TestEnabled;
+        IsPrimaryButtonEnabled = state.SaveEnabled;
+        StatusText.Text = state.StatusMessage;
+    }
 
     private static int NumberValue(NumberBox box) =>
         double.IsNaN(box.Value) ? 0 : checked((int)box.Value);

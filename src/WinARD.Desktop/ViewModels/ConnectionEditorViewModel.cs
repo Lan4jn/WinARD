@@ -31,7 +31,8 @@ public sealed record ConnectionProfileTestResult(
 public sealed class ConnectionEditorViewModel : ObservableObject
 {
     private const string UnsupportedCredentialStatus =
-        "凭据由不受支持的后端管理，可保存连接信息，但无法测试连接或修改密码。";
+        "凭据由不受支持的后端管理，可保存连接信息，但无法测试连接或修改密码。" +
+        "如需继续，请显式选择受支持的凭据保存方式。";
     private const string UnsupportedCredentialChangeError =
         "凭据由不受支持的后端管理。请先选择受支持的凭据保存方式再修改密码。";
     private readonly ConnectionProfile? _original;
@@ -197,6 +198,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
                 return;
             }
 
+            var clearedUnsupportedReference = _hasUnsupportedCredentialReference;
             _credentialModeChanged = true;
             if (_hasUnsupportedCredentialReference)
             {
@@ -209,6 +211,11 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             }
 
             SetValidated(ref _credentialSaveMode, value);
+            if (clearedUnsupportedReference)
+            {
+                SaveCommand.NotifyCanExecuteChanged();
+                TestConnectionCommand.NotifyCanExecuteChanged();
+            }
         }
     }
 
