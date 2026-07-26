@@ -1,7 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><IsPackable>false</IsPackable></PropertyGroup>
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <AppxGeneratePriEnabled>false</AppxGeneratePriEnabled>
+    <EnableCoreMrtTooling>false</EnableCoreMrtTooling>
+    <EnablePriGenTooling>false</EnablePriGenTooling>
+  </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\src\WinARD.Application\WinARD.Application.csproj" />
+    <ProjectReference Include="..\..\src\WinARD.Desktop\WinARD.Desktop.csproj" />
     <ProjectReference Include="..\WinARD.Testing\WinARD.Testing.csproj" />
   </ItemGroup>
   <ItemGroup>
