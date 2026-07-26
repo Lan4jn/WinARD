@@ -2,6 +2,8 @@
   <PropertyGroup><IsPackable>false</IsPackable></PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\WinARD.Application\WinARD.Application.csproj" />
+    <ProjectReference Include="..\..\src\WinARD.Remote.Protocol\WinARD.Remote.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\WinARD.Transport\WinARD.Transport.csproj" />
     <ProjectReference Include="..\WinARD.Testing\WinARD.Testing.csproj" />
   </ItemGroup>
   <ItemGroup>
