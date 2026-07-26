@@ -17,23 +17,50 @@ public sealed class RoutedCredentialStoreTests
         using var vault = new TransientCredentialStore();
         using var transient = new TransientCredentialStore();
         var prompt = new CredentialPromptService();
-        CredentialReference? prompted = null;
-        prompt.SetReferenceHandler((reference, cancellationToken) =>
+        CredentialPromptRequest? prompted = null;
+        prompt.SetReferenceHandler((request, cancellationToken) =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            prompted = reference;
+            prompted = request;
             return ValueTask.FromResult<ISecret>(
                 SecretBuffer.CopyFrom(Encoding.UTF8.GetBytes("prompted-ssh-secret")));
         });
         await using var sut = new RoutedCredentialStore(windows, vault, transient, prompt);
         var reference = CredentialReference.Create("ask", "profile/id/ssh-password");
 
-        using var secret = await sut.ReadAsync(reference, CancellationToken.None);
+        var request = new CredentialPromptRequest(reference, CredentialPromptPurpose.MacPassword);
+        using var secret = await sut.ReadForPromptAsync(request, CancellationToken.None);
 
-        Assert.Equal(reference, prompted);
+        Assert.Equal(request, prompted);
         Assert.Equal("prompted-ssh-secret", Read(secret!));
         Assert.Null(await windows.ReadAsync(reference, CancellationToken.None));
         Assert.Null(await vault.ReadAsync(reference, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(CredentialPromptPurpose.SshPassword)]
+    [InlineData(CredentialPromptPurpose.PrivateKeyPassphrase)]
+    public async Task OpaqueAskReferenceKeepsExplicitSshPurpose(CredentialPromptPurpose purpose)
+    {
+        using var windows = new TransientCredentialStore();
+        using var vault = new TransientCredentialStore();
+        using var transient = new TransientCredentialStore();
+        var prompt = new CredentialPromptService();
+        CredentialPromptRequest? prompted = null;
+        prompt.SetReferenceHandler((request, cancellationToken) =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            prompted = request;
+            return ValueTask.FromResult<ISecret>(SecretBuffer.CopyFrom([1]));
+        });
+        await using var sut = new RoutedCredentialStore(windows, vault, transient, prompt);
+        var request = new CredentialPromptRequest(
+            CredentialReference.Create("ask", "opaque-reference-without-purpose"),
+            purpose);
+
+        using var secret = await sut.ReadForPromptAsync(request, CancellationToken.None);
+
+        Assert.Equal(request, prompted);
     }
 
     [Fact]

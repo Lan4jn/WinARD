@@ -42,11 +42,11 @@ public sealed class ConnectionSessionControllerTests
             new FixedClientFactory(client),
             new ErrorMapper());
         var coordinator = new ActiveSessionCoordinator();
+        var prompt = new Prompt(SshHostKeyPromptDecision.Cancel);
         await using var sut = new ConnectionSessionController(
-            handler,
+            new ConnectionAttemptWorkflow(handler, prompt),
             coordinator,
-            new Repository(),
-            new Prompt(SshHostKeyPromptDecision.Cancel));
+            new Repository());
 
         await sut.ConnectAsync(Profile(), CancellationToken.None);
 
@@ -89,10 +89,9 @@ public sealed class ConnectionSessionControllerTests
         var repository = new Repository();
         var prompt = new Prompt(decision);
         await using var sut = new ConnectionSessionController(
-            handler,
+            new ConnectionAttemptWorkflow(handler, prompt),
             new ActiveSessionCoordinator(),
-            repository,
-            prompt);
+            repository);
 
         await sut.ConnectAsync(profile, CancellationToken.None);
 
@@ -102,6 +101,136 @@ public sealed class ConnectionSessionControllerTests
         Assert.Equal(candidate.Algorithm, prompt.Request.Algorithm);
         Assert.Equal(candidate.Fingerprint, prompt.Request.NewFingerprint);
         Assert.Equal(changed, prompt.Request.IsChanged);
+    }
+
+    [Theory]
+    [InlineData(false, SshHostKeyPromptDecision.Trust)]
+    [InlineData(true, SshHostKeyPromptDecision.Replace)]
+    public async Task SharedAttemptWorkflowReturnsAcceptedPinAndRetriesExactlyOnce(
+        bool changed,
+        SshHostKeyPromptDecision decision)
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(
+            endpoint,
+            "ssh-ed25519",
+            "AQIDBA==");
+        var profile = SshProfileFor(endpoint);
+        if (changed)
+        {
+            var old = SshHostKeyVerifier.CreateCandidate(
+                endpoint,
+                "ssh-ed25519",
+                "CQkJCQ==").ToPin();
+            profile = profile.WithSsh(profile.SshProfile!.WithHostKeyPin(old));
+        }
+
+        var transport = new HostKeyThenSuccessTransport(candidate, changed);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new FixedSecretProvider(),
+            new FixedClientFactory(new TrackingClient()),
+            new ErrorMapper());
+        var prompt = new Prompt(decision);
+        var acceptedProfiles = new List<ConnectionProfile>();
+        var sut = new ConnectionAttemptWorkflow(handler, prompt);
+
+        var outcome = await sut.AttemptAsync(
+            profile,
+            stageChanged: null,
+            (updated, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                acceptedProfiles.Add(updated);
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        Assert.NotNull(outcome.Result.Session);
+        Assert.Equal(2, transport.Attempts);
+        Assert.Single(acceptedProfiles);
+        Assert.Equal(candidate.ToPin(), outcome.Profile.SshProfile!.HostKeyPin);
+        Assert.Equal(candidate.ToPin(), acceptedProfiles[0].SshProfile!.HostKeyPin);
+        await outcome.Result.Session.DisposeAsync();
+    }
+
+    [Theory]
+    [InlineData(false, SshHostKeyPromptDecision.Cancel)]
+    [InlineData(false, SshHostKeyPromptDecision.Replace)]
+    [InlineData(true, SshHostKeyPromptDecision.Cancel)]
+    [InlineData(true, SshHostKeyPromptDecision.Trust)]
+    public async Task SharedAttemptWorkflowDoesNotRetryUnacceptedHostKeyDecision(
+        bool changed,
+        SshHostKeyPromptDecision decision)
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(
+            endpoint,
+            "ssh-ed25519",
+            "AQIDBA==");
+        var profile = SshProfileFor(endpoint);
+        if (changed)
+        {
+            var old = SshHostKeyVerifier.CreateCandidate(
+                endpoint,
+                "ssh-ed25519",
+                "CQkJCQ==").ToPin();
+            profile = profile.WithSsh(profile.SshProfile!.WithHostKeyPin(old));
+        }
+
+        var transport = new HostKeyThenSuccessTransport(candidate, changed);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new FixedSecretProvider(),
+            new FixedClientFactory(new TrackingClient()),
+            new ErrorMapper());
+        var accepted = 0;
+        var sut = new ConnectionAttemptWorkflow(handler, new Prompt(decision));
+
+        var outcome = await sut.AttemptAsync(
+            profile,
+            stageChanged: null,
+            (_, _) =>
+            {
+                accepted++;
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        Assert.Null(outcome.Result.Session);
+        Assert.Equal(1, transport.Attempts);
+        Assert.Equal(0, accepted);
+        Assert.Equal(profile, outcome.Profile);
+    }
+
+    [Fact]
+    public async Task SharedAttemptWorkflowRetriesAcceptedHostKeyOnlyOnce()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(
+            endpoint,
+            "ssh-ed25519",
+            "AQIDBA==");
+        var profile = SshProfileFor(endpoint);
+        var transport = new AlwaysUnknownHostKeyTransport(candidate);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new FixedSecretProvider(),
+            new FixedClientFactory(new TrackingClient()),
+            new ErrorMapper());
+        var sut = new ConnectionAttemptWorkflow(
+            handler,
+            new Prompt(SshHostKeyPromptDecision.Trust));
+
+        var outcome = await sut.AttemptAsync(
+            profile,
+            stageChanged: null,
+            acceptedHostKey: null,
+            CancellationToken.None);
+
+        Assert.Null(outcome.Result.Session);
+        Assert.Equal(2, transport.Attempts);
+        Assert.Equal(candidate.ToPin(), outcome.Profile.SshProfile!.HostKeyPin);
     }
 
     private static ConnectionProfile Profile() => ConnectionProfile.Create(
@@ -150,6 +279,22 @@ public sealed class ConnectionSessionControllerTests
             return Task.FromResult(new TransportConnection(
                 new MemoryStream(),
                 new EndPointDescription(profile.Host, profile.Port)));
+        }
+    }
+
+    private sealed class AlwaysUnknownHostKeyTransport(
+        SshHostKeyCandidate candidate) : IRemoteTransportFactory
+    {
+        public int Attempts { get; private set; }
+
+        public Task<TransportConnection> ConnectAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Attempts++;
+            var verification = SshHostKeyVerifier.Verify(candidate, null);
+            throw new SshHostKeyUnknownException(verification);
         }
     }
 

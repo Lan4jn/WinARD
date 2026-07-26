@@ -69,6 +69,7 @@ public partial class App : Microsoft.UI.Xaml.Application
         services.AddSingleton<SshHostKeyPromptService>();
         services.AddSingleton<ISshHostKeyPrompt>(provider =>
             provider.GetRequiredService<SshHostKeyPromptService>());
+        services.AddSingleton<ConnectionAttemptWorkflow>();
         services.AddSingleton<ConnectionSessionController>();
         services.AddSingleton<ConnectionEditorService>();
         services.AddSingleton<MainWindowViewModel>();

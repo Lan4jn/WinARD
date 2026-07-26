@@ -82,6 +82,44 @@ public sealed class ConnectionEditorViewModelTests
         Assert.Equal(pin, saved.SshProfile.HostKeyPin);
     }
 
+    [Fact]
+    public async Task DialogInitializationSameModeDoesNotDiscardOpaqueSshReferenceOrPin()
+    {
+        var macReference = CredentialReference.Create("windows", "mac");
+        var sshReference = CredentialReference.Create("opaque-store", "ssh/password");
+        var pin = new SshHostKeyPin(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "AAAAC3NzaC1lZDI1NTE5AAAAIFixture",
+            "SHA256:fixture");
+        var original = ConnectionProfile.Create(
+                Guid.NewGuid(), "Original", "mac.local", 5900, "mac-user")
+            .WithCredential(macReference)
+            .WithSsh(SshProfile.Create(
+                    "jump.local", 22, "ssh-user", null, "mac.local", 5900,
+                    credentialReference: null, null, null)
+                .WithAuthenticationCredentials(sshReference, null)
+                .WithHostKeyPin(pin));
+        ConnectionProfile? saved = null;
+        var sut = new ConnectionEditorViewModel(
+            original,
+            (profile, _, _, _) =>
+            {
+                saved = profile;
+                return Task.FromResult(profile);
+            },
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+
+        sut.CredentialSaveMode = CredentialSaveMode.WindowsCredentialManager;
+        sut.DisplayName = "Renamed";
+        await sut.SaveAsync(null, CancellationToken.None);
+
+        Assert.False(sut.CredentialModeChanged);
+        Assert.Equal(macReference, saved!.CredentialReference);
+        Assert.Equal(sshReference, saved.SshProfile!.PasswordCredentialReference);
+        Assert.Equal(pin, saved.SshProfile.HostKeyPin);
+    }
+
     [Theory]
     [InlineData(CredentialSaveMode.WindowsCredentialManager)]
     [InlineData(CredentialSaveMode.EncryptedVault)]
@@ -128,6 +166,49 @@ public sealed class ConnectionEditorViewModelTests
         Assert.Equal(0, saveCalls);
         Assert.Equal(expected, sut.TestResults);
         Assert.Equal("连接成功。", sut.StatusMessage);
+    }
+
+    [Fact]
+    public async Task TrustedTestConnectionPinIsIncludedInSubsequentSave()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var pin = new SshHostKeyPin(
+            endpoint,
+            "ssh-ed25519",
+            "AAAAC3NzaC1lZDI1NTE5AAAAIFixture",
+            "SHA256:fixture");
+        var original = ConnectionProfile.Create(
+                Guid.NewGuid(), "Studio", "studio.local", 5900, "operator")
+            .WithCredential(CredentialReference.Create("windows", "mac"))
+            .WithSsh(SshProfile.Create(
+                endpoint.Host, endpoint.Port, "ssh-user", null,
+                "studio.local", 5900,
+                CredentialReference.Create("windows", "ssh"), null, null));
+        ConnectionProfile? saved = null;
+        var stages = new[]
+        {
+            new ConnectionTestStageResult(
+                ConnectionStage.Connected,
+                true,
+                TimeSpan.FromMilliseconds(1),
+                "连接成功。"),
+        };
+        var sut = new ConnectionEditorViewModel(
+            original,
+            (profile, _, _, _) =>
+            {
+                saved = profile;
+                return Task.FromResult(new ConnectionProfileSaveResult(profile));
+            },
+            (profile, _, _, _) => Task.FromResult(new ConnectionProfileTestResult(
+                profile.WithSsh(profile.SshProfile!.WithHostKeyPin(pin)),
+                stages)));
+
+        await sut.TestConnectionAsync(null, CancellationToken.None);
+        await sut.SaveAsync(null, CancellationToken.None);
+
+        Assert.Equal(pin, sut.BuildProfile().SshProfile!.HostKeyPin);
+        Assert.Equal(pin, saved!.SshProfile!.HostKeyPin);
     }
 
     [Fact]

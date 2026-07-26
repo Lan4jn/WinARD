@@ -4,7 +4,7 @@ using WinARD.Domain.Security;
 
 namespace WinARD.Desktop.Services;
 
-public sealed class RoutedCredentialStore : ICredentialStore, IAsyncDisposable
+public sealed class RoutedCredentialStore : IPurposeAwareCredentialStore, IAsyncDisposable
 {
     private readonly IReadOnlyDictionary<string, ICredentialStore> _stores;
     private readonly CredentialPromptService _promptService;
@@ -32,11 +32,27 @@ public sealed class RoutedCredentialStore : ICredentialStore, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(reference);
         if (string.Equals(reference.Store, "ask", StringComparison.OrdinalIgnoreCase))
         {
-            return await _promptService.PromptReferenceAsync(reference, cancellationToken)
-                .ConfigureAwait(false);
+            throw new InvalidOperationException(
+                "每次询问的凭据读取必须指定提示用途。");
         }
 
         return await Store(reference).ReadAsync(reference, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<ISecret?> ReadForPromptAsync(
+        CredentialPromptRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (string.Equals(request.Reference.Store, "ask", StringComparison.OrdinalIgnoreCase))
+        {
+            return await _promptService.PromptReferenceAsync(request, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return await Store(request.Reference)
+            .ReadAsync(request.Reference, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(CredentialReference reference, CancellationToken cancellationToken) =>

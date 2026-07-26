@@ -17,7 +17,12 @@ public sealed class CredentialStoreConnectionSecretProvider(
             throw new InvalidOperationException("The selected device has no saved credential reference.");
         if (string.Equals(reference.Store, "ask", StringComparison.OrdinalIgnoreCase))
         {
-            return await _promptService.PromptAsync(profile, cancellationToken).ConfigureAwait(false);
+            return await _promptService.PromptReferenceAsync(
+                new CredentialPromptRequest(
+                    reference,
+                    CredentialPromptPurpose.MacPassword,
+                    profile.DisplayName),
+                cancellationToken).ConfigureAwait(false);
         }
 
         return await _credentialStore.ReadAsync(reference, cancellationToken).ConfigureAwait(false) ??

@@ -23,11 +23,15 @@ public sealed record ConnectionProfileSaveResult(
     ConnectionProfile Profile,
     string? Warning = null);
 
+public sealed record ConnectionProfileTestResult(
+    ConnectionProfile Profile,
+    IReadOnlyList<ConnectionTestStageResult> Stages);
+
 public sealed class ConnectionEditorViewModel : ObservableObject
 {
     private readonly ConnectionProfile? _original;
     private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> _save;
-    private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<IReadOnlyList<ConnectionTestStageResult>>> _test;
+    private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileTestResult>> _test;
     private string _displayName = string.Empty;
     private string _host = string.Empty;
     private int _port = 5900;
@@ -40,6 +44,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     private bool _hasSshAuthenticationSecret;
     private bool _hasUnsupportedCredentialReference;
     private bool _credentialModeChanged;
+    private SshHostKeyPin? _hostKeyPin;
     private CredentialSaveMode _credentialSaveMode;
     private IReadOnlyList<ConnectionTestStageResult> _testResults = [];
     private string _statusMessage = string.Empty;
@@ -53,7 +58,9 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             profile,
             async (candidate, mode, secret, cancellationToken) => new ConnectionProfileSaveResult(
                 await save(candidate, mode, secret, cancellationToken).ConfigureAwait(false)),
-            test)
+            async (candidate, mode, secret, cancellationToken) => new ConnectionProfileTestResult(
+                candidate,
+                await test(candidate, mode, secret, cancellationToken).ConfigureAwait(false)))
     {
     }
 
@@ -61,6 +68,19 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         ConnectionProfile? profile,
         Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> save,
         Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<IReadOnlyList<ConnectionTestStageResult>>> test)
+        : this(
+            profile,
+            save,
+            async (candidate, mode, secret, cancellationToken) => new ConnectionProfileTestResult(
+                candidate,
+                await test(candidate, mode, secret, cancellationToken).ConfigureAwait(false)))
+    {
+    }
+
+    public ConnectionEditorViewModel(
+        ConnectionProfile? profile,
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> save,
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileTestResult>> test)
     {
         _original = profile;
         _save = save ?? throw new ArgumentNullException(nameof(save));
@@ -89,6 +109,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             _sshPort = ssh.Port;
             _sshUsername = ssh.Username;
             _privateKeyPath = ssh.PrivateKeyPath ?? string.Empty;
+            _hostKeyPin = ssh.HostKeyPin;
         }
     }
 
@@ -161,6 +182,11 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         get => _credentialSaveMode;
         set
         {
+            if (_credentialSaveMode == value)
+            {
+                return;
+            }
+
             _credentialModeChanged = true;
             if (_hasUnsupportedCredentialReference)
             {
@@ -193,13 +219,17 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
     public bool IsBusy => Volatile.Read(ref _busy) != 0;
 
+    public ConnectionProfileSaveResult? LastSaveResult { get; private set; }
+
     public async Task<ConnectionProfile> SaveAsync(ISecret? secret, CancellationToken cancellationToken)
     {
         EnterBusy();
         try
         {
+            LastSaveResult = null;
             var profile = BuildProfile();
             var result = await _save(profile, CredentialSaveMode, secret, cancellationToken).ConfigureAwait(false);
+            LastSaveResult = result;
             StatusMessage = result.Warning ?? $"已保存“{result.Profile.DisplayName}”。";
             return result.Profile;
         }
@@ -216,8 +246,10 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         try
         {
             TestResults = [];
-            var results = await _test(BuildProfile(), CredentialSaveMode, secret, cancellationToken)
+            var result = await _test(BuildProfile(), CredentialSaveMode, secret, cancellationToken)
                 .ConfigureAwait(false);
+            _hostKeyPin = result.Profile.SshProfile?.HostKeyPin;
+            var results = result.Stages;
             TestResults = results;
             StatusMessage = results.Count == 0
                 ? "测试连接未返回结果。"
@@ -271,7 +303,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
                 originalSsh?.PasswordCredentialReference,
                 originalSsh?.PrivateKeyPassphraseCredentialReference);
         }
-        if (originalSsh?.HostKeyPin is { } pin)
+        if (_hostKeyPin is { } pin)
         {
             ssh = ssh.WithHostKeyPin(pin);
         }

@@ -4,31 +4,27 @@ using WinARD.Application.Sessions;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
-using WinARD.Transport.Ssh;
 
 namespace WinARD.Desktop.Services;
 
 public sealed class ConnectionSessionController : IAsyncDisposable
 {
-    private readonly ConnectDeviceHandler _handler;
+    private readonly ConnectionAttemptWorkflow _attemptWorkflow;
     private readonly ActiveSessionCoordinator _coordinator;
     private readonly IDeviceRepository _repository;
-    private readonly ISshHostKeyPrompt _hostKeyPrompt;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private RemoteSession? _session;
     private ActiveSessionCoordinator.ActiveSessionLease? _lease;
     private bool _disposed;
 
     public ConnectionSessionController(
-        ConnectDeviceHandler handler,
+        ConnectionAttemptWorkflow attemptWorkflow,
         ActiveSessionCoordinator coordinator,
-        IDeviceRepository repository,
-        ISshHostKeyPrompt hostKeyPrompt)
+        IDeviceRepository repository)
     {
-        _handler = handler ?? throw new ArgumentNullException(nameof(handler));
+        _attemptWorkflow = attemptWorkflow ?? throw new ArgumentNullException(nameof(attemptWorkflow));
         _coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         _repository = repository ?? throw new ArgumentNullException(nameof(repository));
-        _hostKeyPrompt = hostKeyPrompt ?? throw new ArgumentNullException(nameof(hostKeyPrompt));
     }
 
     public bool IsConnected => Volatile.Read(ref _session) is not null;
@@ -57,6 +53,12 @@ public sealed class ConnectionSessionController : IAsyncDisposable
             ConnectionStage? active = null;
             void StageChanged(ConnectionStage stage)
             {
+                if (stage == ConnectionStage.Resolving && active is not null)
+                {
+                    active = null;
+                    timer.Restart();
+                }
+
                 if (active is { } previous)
                 {
                     completed.Add(new ConnectionTestStageResult(previous, true, timer.Elapsed, "阶段完成。"));
@@ -68,42 +70,17 @@ public sealed class ConnectionSessionController : IAsyncDisposable
 
             try
             {
-                var hostKeyRetried = false;
-                ConnectResult result;
-                while (true)
-                {
-                    Exception? failure = null;
-                    result = await _handler.HandleWithFailureObservationAsync(
-                        profile,
-                        StageChanged,
-                        exception => failure = exception,
-                        cancellationToken).ConfigureAwait(false);
-                    if (result.Session is not null || hostKeyRetried ||
-                        !TryGetHostKeyFailure(failure, profile, out var verification, out var request))
+                var outcome = await _attemptWorkflow.AttemptAsync(
+                    profile,
+                    StageChanged,
+                    async (updated, token) =>
                     {
-                        break;
-                    }
-
-                    var decision = await _hostKeyPrompt.PromptAsync(request, cancellationToken)
-                        .ConfigureAwait(false);
-                    var accepted = request.IsChanged
-                        ? decision == SshHostKeyPromptDecision.Replace
-                        : decision == SshHostKeyPromptDecision.Trust;
-                    if (!accepted)
-                    {
-                        break;
-                    }
-
-                    var ssh = profile.SshProfile ??
-                        throw new InvalidOperationException("SSH 主机密钥确认缺少 SSH 配置。");
-                    profile = profile.WithSsh(ssh.WithHostKeyPin(verification.ToPin()));
-                    await _repository.SaveAsync(profile, cancellationToken).ConfigureAwait(false);
-                    ProfileUpdated?.Invoke(profile);
-                    hostKeyRetried = true;
-                    active = null;
-                    timer.Restart();
-                }
-
+                        await _repository.SaveAsync(updated, token).ConfigureAwait(false);
+                        ProfileUpdated?.Invoke(updated);
+                    },
+                    cancellationToken).ConfigureAwait(false);
+                profile = outcome.Profile;
+                var result = outcome.Result;
                 if (result.Session is null)
                 {
                     var error = result.Error ?? throw new InvalidOperationException("连接失败但没有错误信息。");
@@ -133,34 +110,6 @@ public sealed class ConnectionSessionController : IAsyncDisposable
         {
             _gate.Release();
         }
-    }
-
-    private static bool TryGetHostKeyFailure(
-        Exception? exception,
-        ConnectionProfile profile,
-        out SshHostKeyVerification verification,
-        out SshHostKeyPromptRequest request)
-    {
-        verification = exception switch
-        {
-            SshHostKeyUnknownException unknown => unknown.Verification,
-            SshHostKeyChangedException { Verification: not null } changed => changed.Verification,
-            _ => null!,
-        };
-        if (verification is null)
-        {
-            request = null!;
-            return false;
-        }
-
-        var isChanged = verification.Status == SshHostKeyStatus.Changed;
-        request = new SshHostKeyPromptRequest(
-            verification.Endpoint,
-            verification.Algorithm,
-            verification.Fingerprint,
-            isChanged ? profile.SshProfile?.HostKeyPin?.Fingerprint : null,
-            isChanged);
-        return true;
     }
 
     public async Task DisconnectAsync(CancellationToken cancellationToken)

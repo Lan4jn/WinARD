@@ -44,7 +44,9 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
 
     public ConnectionEditorViewModel ViewModel { get; }
 
-    public ConnectionProfile? SavedProfile { get; private set; }
+    public ConnectionProfileSaveResult? SavedOutcome { get; private set; }
+
+    public ConnectionProfile? SavedProfile => SavedOutcome?.Profile;
 
     public Task WhenIdleAsync() => _operations.WhenIdleAsync();
 
@@ -94,7 +96,9 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
                 SetBusy(true);
                 await UnlockVaultIfRequiredAsync();
                 using var secret = CaptureSecrets();
-                SavedProfile = await ViewModel.SaveAsync(secret?.Clone(), _lifetime.Token);
+                _ = await ViewModel.SaveAsync(secret?.Clone(), _lifetime.Token);
+                SavedOutcome = ViewModel.LastSaveResult ??
+                    throw new InvalidOperationException("保存完成但未返回结果。");
                 _saved = true;
                 Hide();
             }

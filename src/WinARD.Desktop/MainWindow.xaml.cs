@@ -72,7 +72,6 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
         ViewModel.AddDeviceRequested += OnAddDeviceRequested;
         ViewModel.EditDeviceRequested += OnEditDeviceRequested;
-        _credentialPromptService.SetHandler(PromptForCredentialAsync);
         _credentialPromptService.SetReferenceHandler(PromptForReferenceCredentialAsync);
         _hostKeyPromptService.SetHandler(PromptForHostKeyAsync);
         _sessionController.ProfileUpdated += OnConnectionProfileUpdated;
@@ -330,30 +329,29 @@ public sealed partial class MainWindow : Window, IDisposable
         };
         _ = await dialog.ShowAsync();
         await dialog.WhenIdleAsync();
-        if (dialog.SavedProfile is { } saved)
+        if (dialog.SavedOutcome is { } saved)
         {
-            await ViewModel.ApplySavedProfileAsync(saved, _shutdown.Token);
+            await ViewModel.ApplySavedProfileAsync(
+                saved.Profile,
+                saved.Warning,
+                _shutdown.Token);
         }
     }
 
-    private async ValueTask<ISecret> PromptForCredentialAsync(
-        ConnectionProfile profile,
-        CancellationToken cancellationToken) =>
-        await PromptForSecretAsync(
-            $"“{profile.DisplayName}”的 Mac 密码",
-            "输入连接凭据",
-            cancellationToken);
-
     private async ValueTask<ISecret> PromptForReferenceCredentialAsync(
-        WinARD.Domain.Security.CredentialReference reference,
+        CredentialPromptRequest request,
         CancellationToken cancellationToken)
     {
-        var header = reference.Key.EndsWith("/ssh-passphrase", StringComparison.OrdinalIgnoreCase)
-            ? "SSH 私钥口令"
-            : reference.Key.EndsWith("/ssh-password", StringComparison.OrdinalIgnoreCase)
-                ? "SSH 密码"
-                : "连接密码";
-        return await PromptForSecretAsync(header, "输入 SSH 凭据", cancellationToken);
+        var (header, title) = request.Purpose switch
+        {
+            CredentialPromptPurpose.MacPassword =>
+                ($"“{request.DisplayName ?? "连接"}”的 Mac 密码", "输入连接凭据"),
+            CredentialPromptPurpose.SshPassword => ("SSH 密码", "输入 SSH 凭据"),
+            CredentialPromptPurpose.PrivateKeyPassphrase => ("SSH 私钥口令", "输入 SSH 凭据"),
+            CredentialPromptPurpose.VaultMaster => ("凭据保险库主密码", "解锁凭据保险库"),
+            _ => throw new ArgumentOutOfRangeException(nameof(request)),
+        };
+        return await PromptForSecretAsync(header, title, cancellationToken);
     }
 
     private async ValueTask<ISecret> PromptForSecretAsync(
@@ -656,7 +654,6 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
         ViewModel.AddDeviceRequested -= OnAddDeviceRequested;
         ViewModel.EditDeviceRequested -= OnEditDeviceRequested;
-        _credentialPromptService.ClearHandler();
         _credentialPromptService.ClearReferenceHandler();
         _hostKeyPromptService.ClearHandler();
         _sessionController.ProfileUpdated -= OnConnectionProfileUpdated;

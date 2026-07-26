@@ -17,6 +17,38 @@ public sealed class OpenSshAskPassTests
 {
     private const string InjectedSecret = "askpass-value-77c9";
 
+    [Theory]
+    [InlineData(false, CredentialPromptPurpose.SshPassword)]
+    [InlineData(true, CredentialPromptPurpose.PrivateKeyPassphrase)]
+    public async Task Ask_reference_uses_explicit_credential_purpose(
+        bool privateKey,
+        CredentialPromptPurpose expectedPurpose)
+    {
+        var store = new PurposeAwareCredentialStore(
+            Encoding.UTF8.GetBytes(InjectedSecret));
+        var broker = CreateBroker(store);
+        var reference = CredentialReference.Create(
+            "ask",
+            "opaque-reference-without-purpose");
+        var profile = SshProfile.Create(
+            "host",
+            22,
+            "user",
+            privateKey ? @"C:\keys\id_ed25519" : null,
+            "127.0.0.1",
+            5900,
+            reference,
+            pinnedHostKeyAlgorithm: null,
+            pinnedHostKeySha256: null);
+
+        await using var session = await broker.PrepareAsync(
+            profile,
+            CancellationToken.None);
+
+        Assert.Equal(reference, store.LastRequest?.Reference);
+        Assert.Equal(expectedPurpose, store.LastRequest?.Purpose);
+    }
+
     [Fact]
     public async Task Successful_exchange_keeps_secret_out_of_arguments_and_environment()
     {
@@ -434,6 +466,48 @@ public sealed class OpenSshAskPassTests
                 CryptographicOperations.ZeroMemory(digest);
             }
         }
+
+        public ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
+            CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public ValueTask DeleteAsync(
+            CredentialReference reference,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
+    private sealed class PurposeAwareCredentialStore(byte[] value) : IPurposeAwareCredentialStore
+    {
+        public CredentialPromptRequest? LastRequest { get; private set; }
+
+        public ValueTask<ISecret?> ReadForPromptAsync(
+            CredentialPromptRequest request,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            LastRequest = request;
+            return ValueTask.FromResult<ISecret?>(new TrackingSecret(value));
+        }
+
+        public ValueTask SaveAsync(
+            CredentialReference reference,
+            ISecret secret,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public ValueTask<ISecret?> ReadAsync(
+            CredentialReference reference,
+            CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Prompt reads must carry an explicit purpose.");
+
+        public ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(
+            CredentialReference reference,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
 
         public ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
             CredentialReference reference,

@@ -12,12 +12,12 @@ public sealed class ConnectionEditorService(
     IDeviceRepository repository,
     ICredentialStore credentialStore,
     ITransientCredentialStore transientStore,
-    ConnectDeviceHandler connectHandler)
+    ConnectionAttemptWorkflow attemptWorkflow)
 {
     private readonly IDeviceRepository _repository = repository ?? throw new ArgumentNullException(nameof(repository));
     private readonly ICredentialStore _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
     private readonly ITransientCredentialStore _transientStore = transientStore ?? throw new ArgumentNullException(nameof(transientStore));
-    private readonly ConnectDeviceHandler _connectHandler = connectHandler ?? throw new ArgumentNullException(nameof(connectHandler));
+    private readonly ConnectionAttemptWorkflow _attemptWorkflow = attemptWorkflow ?? throw new ArgumentNullException(nameof(attemptWorkflow));
 
     public async Task<ConnectionProfile> SaveAsync(
         ConnectionProfile profile,
@@ -132,7 +132,7 @@ public sealed class ConnectionEditorService(
         return await CompleteCommittedSaveAsync(oldProfile, savedProfile).ConfigureAwait(false);
     }
 
-    public async Task<IReadOnlyList<ConnectionTestStageResult>> TestAsync(
+    public async Task<ConnectionProfileTestResult> TestAsync(
         ConnectionProfile profile,
         CredentialSaveMode mode,
         ISecret? secret,
@@ -153,6 +153,12 @@ public sealed class ConnectionEditorService(
         ConnectionStage? activeStage = null;
         void StageChanged(ConnectionStage stage)
         {
+            if (stage == ConnectionStage.Resolving && activeStage is not null)
+            {
+                activeStage = null;
+                timer.Restart();
+            }
+
             if (activeStage is { } previous)
             {
                 completed.Add(new ConnectionTestStageResult(
@@ -181,8 +187,20 @@ public sealed class ConnectionEditorService(
                     : testSsh.WithAuthenticationCredentials(null, sshReference));
             }
 
-            var result = await _connectHandler.HandleAsync(testProfile, StageChanged, cancellationToken)
+            var outcome = await _attemptWorkflow.AttemptAsync(
+                testProfile,
+                StageChanged,
+                acceptedHostKey: null,
+                cancellationToken)
                 .ConfigureAwait(false);
+            var result = outcome.Result;
+            var updatedDraft = profile;
+            if (profile.SshProfile is { } draftSsh &&
+                outcome.Profile.SshProfile?.HostKeyPin is { } acceptedPin)
+            {
+                updatedDraft = profile.WithSsh(draftSsh.WithHostKeyPin(acceptedPin));
+            }
+
             if (result.Session is not null)
             {
                 if (activeStage is { } connected)
@@ -195,12 +213,12 @@ public sealed class ConnectionEditorService(
                 }
 
                 await result.Session.DisposeAsync().ConfigureAwait(false);
-                return completed;
+                return new ConnectionProfileTestResult(updatedDraft, completed);
             }
 
             var error = result.Error ?? throw new InvalidOperationException("连接失败但未返回错误信息。");
             completed.Add(new ConnectionTestStageResult(error.Stage, false, timer.Elapsed, error.UserMessage));
-            return completed;
+            return new ConnectionProfileTestResult(updatedDraft, completed);
         }
         finally
         {

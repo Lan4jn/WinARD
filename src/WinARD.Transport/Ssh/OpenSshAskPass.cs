@@ -98,9 +98,17 @@ public sealed class OpenSshAskPassBroker : IOpenSshAskPassBroker
             return NoOpenSshAskPassSession.Instance;
         }
 
-        var secret = await _credentialStore
-            .ReadAsync(reference, cancellationToken)
-            .ConfigureAwait(false);
+        var promptPurpose = profile.PrivateKeyPath is null
+            ? CredentialPromptPurpose.SshPassword
+            : CredentialPromptPurpose.PrivateKeyPassphrase;
+        var secret = _credentialStore is IPurposeAwareCredentialStore purposeAwareStore
+            ? await purposeAwareStore.ReadForPromptAsync(
+                new CredentialPromptRequest(reference, promptPurpose),
+                cancellationToken).ConfigureAwait(false)
+            : string.Equals(reference.Store, "ask", StringComparison.OrdinalIgnoreCase)
+                ? throw new OpenSshAskPassException(
+                    "The configured credential store cannot prompt for SSH credentials.")
+                : await _credentialStore.ReadAsync(reference, cancellationToken).ConfigureAwait(false);
         if (secret is null)
         {
             throw new OpenSshAskPassException(

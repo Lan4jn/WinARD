@@ -7,6 +7,7 @@ using WinARD.Desktop.Services;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
 using WinARD.Security.Secrets;
+using WinARD.Transport.Ssh;
 using Xunit;
 
 namespace WinARD.Desktop.Tests.Services;
@@ -151,6 +152,68 @@ public sealed class ConnectionEditorServiceTests
         Assert.Empty(transient.References);
     }
 
+    [Theory]
+    [InlineData(false, SshHostKeyPromptDecision.Trust)]
+    [InlineData(true, SshHostKeyPromptDecision.Replace)]
+    public async Task TestAcceptedHostKeyUpdatesDraftWithoutSavingAndDisposesSession(
+        bool changed,
+        SshHostKeyPromptDecision decision)
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(
+            endpoint,
+            "ssh-ed25519",
+            "AQIDBA==");
+        var profile = Profile().WithSsh(SshProfile.Create(
+            endpoint.Host,
+            endpoint.Port,
+            "ssh-user",
+            privateKeyPath: null,
+            targetHost: "studio.local",
+            targetPort: 5900,
+            credentialReference: null,
+            pinnedHostKeyAlgorithm: null,
+            pinnedHostKeySha256: null));
+        if (changed)
+        {
+            var old = SshHostKeyVerifier.CreateCandidate(
+                endpoint,
+                "ssh-ed25519",
+                "CQkJCQ==").ToPin();
+            profile = profile.WithSsh(profile.SshProfile!.WithHostKeyPin(old));
+        }
+
+        var repository = new FakeRepository();
+        using var persistent = new VersionedCredentialStore();
+        using var transient = new VersionedCredentialStore();
+        var transport = new HostKeyThenSuccessTransport(candidate, changed);
+        var client = new TrackingClient();
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new FixedSecretProvider(),
+            new FixedClientFactory(client),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new Prompt(decision));
+        var sut = new ConnectionEditorService(
+            repository,
+            persistent,
+            transient,
+            workflow);
+        using var mac = Secret("mac-password");
+
+        var result = await sut.TestAsync(
+            profile,
+            CredentialSaveMode.WindowsCredentialManager,
+            mac,
+            CancellationToken.None);
+
+        Assert.Equal(0, repository.SaveCalls);
+        Assert.Equal(2, transport.Attempts);
+        Assert.True(client.Disposed);
+        Assert.Equal(candidate.ToPin(), result.Profile.SshProfile!.HostKeyPin);
+        Assert.Empty(transient.References);
+    }
+
     private static ConnectionEditorService CreateService(
         IDeviceRepository repository,
         ICredentialStore store,
@@ -158,11 +221,13 @@ public sealed class ConnectionEditorServiceTests
             repository,
             store,
             transientStore ?? (ITransientCredentialStore)store,
-            new ConnectDeviceHandler(
-                new UnusedTransport(),
-                new UnusedSecretProvider(),
-                new RfbClientFactory(),
-                new ErrorMapper()));
+            new ConnectionAttemptWorkflow(
+                new ConnectDeviceHandler(
+                    new UnusedTransport(),
+                    new UnusedSecretProvider(),
+                    new RfbClientFactory(),
+                    new ErrorMapper()),
+                new Prompt(SshHostKeyPromptDecision.Cancel)));
 
     private static ConnectionProfile Profile() => ConnectionProfile.Create(
         Guid.NewGuid(),
@@ -198,9 +263,12 @@ public sealed class ConnectionEditorServiceTests
 
         public Func<CancellationToken, Task>? SaveCallback { get; init; }
 
+        public int SaveCalls { get; private set; }
+
         public Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            SaveCalls++;
             if (FailSave)
             {
                 throw new IOException("repository failure");
@@ -379,5 +447,90 @@ public sealed class ConnectionEditorServiceTests
             ConnectionProfile profile,
             CancellationToken cancellationToken) =>
             throw new InvalidOperationException("Not used by save tests.");
+    }
+
+    private sealed class HostKeyThenSuccessTransport(
+        SshHostKeyCandidate candidate,
+        bool changed) : IRemoteTransportFactory
+    {
+        public int Attempts { get; private set; }
+
+        public Task<TransportConnection> ConnectAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Attempts++;
+            if (Attempts == 1)
+            {
+                var verification = SshHostKeyVerifier.Verify(
+                    candidate,
+                    changed ? profile.SshProfile!.HostKeyPin : null);
+                throw changed
+                    ? new SshHostKeyChangedException(verification)
+                    : new SshHostKeyUnknownException(verification);
+            }
+
+            return Task.FromResult(new TransportConnection(
+                new MemoryStream(),
+                new EndPointDescription(profile.Host, profile.Port)));
+        }
+    }
+
+    private sealed class Prompt(SshHostKeyPromptDecision decision) : ISshHostKeyPrompt
+    {
+        public ValueTask<SshHostKeyPromptDecision> PromptAsync(
+            SshHostKeyPromptRequest request,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return ValueTask.FromResult(decision);
+        }
+    }
+
+    private sealed class FixedSecretProvider : IConnectionSecretProvider
+    {
+        public ValueTask<ISecret> GetSecretAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult<ISecret>(new FixedSecret());
+    }
+
+    private sealed class FixedClientFactory(TrackingClient client) : IRfbClientFactory
+    {
+        public IRfbClient Create(Stream stream) => client;
+    }
+
+    private sealed class TrackingClient : IRfbClient
+    {
+        public bool Disposed { get; private set; }
+
+        public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task AuthenticateAsync(
+            string username,
+            ISecret secret,
+            CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public ValueTask DisposeAsync()
+        {
+            Disposed = true;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class FixedSecret : ISecret
+    {
+        public int Length => 1;
+
+        public void CopyTo(Span<byte> destination) => destination[0] = 1;
+
+        public ISecret Clone() => new FixedSecret();
+
+        public void Dispose()
+        {
+        }
     }
 }

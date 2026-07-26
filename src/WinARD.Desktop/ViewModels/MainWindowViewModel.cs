@@ -92,6 +92,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     public Task ApplySavedProfileAsync(
         WinARD.Domain.Connections.ConnectionProfile profile,
+        CancellationToken cancellationToken) =>
+        ApplySavedProfileAsync(profile, warning: null, cancellationToken);
+
+    public Task ApplySavedProfileAsync(
+        WinARD.Domain.Connections.ConnectionProfile profile,
+        string? warning,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -102,7 +108,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             _allSaved.Add(item);
             ReplaceSavedDevices();
             SelectedDevice = SavedDevices.FirstOrDefault(existing => existing.Profile?.Id == profile.Id) ?? item;
-            StatusMessage = $"已保存“{profile.DisplayName}”。";
+            StatusMessage = warning ?? $"已保存“{profile.DisplayName}”。";
         }, cancellationToken);
     }
 

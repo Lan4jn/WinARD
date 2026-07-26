@@ -62,6 +62,41 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task ApplySavedProfileKeepsSanitizedCredentialCleanupWarning()
+    {
+        var repository = new FakeRepository();
+        await using var viewModel = Create(repository);
+        await viewModel.InitializeAsync(CancellationToken.None);
+        var profile = Profile(StudioId, "Studio Mac", "studio.local");
+        const string warning = "连接已保存，但旧凭据未能清理。";
+
+        await viewModel.ApplySavedProfileAsync(
+            profile,
+            warning,
+            CancellationToken.None);
+
+        Assert.Equal(profile, Assert.Single(viewModel.SavedDevices).Profile);
+        Assert.Equal(profile, viewModel.SelectedDevice!.Profile);
+        Assert.Equal(warning, viewModel.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ApplySavedProfileWithoutWarningReportsOrdinarySaveStatus()
+    {
+        var repository = new FakeRepository();
+        await using var viewModel = Create(repository);
+        await viewModel.InitializeAsync(CancellationToken.None);
+        var profile = Profile(StudioId, "Studio Mac", "studio.local");
+
+        await viewModel.ApplySavedProfileAsync(
+            profile,
+            warning: null,
+            CancellationToken.None);
+
+        Assert.Equal("已保存“Studio Mac”。", viewModel.StatusMessage);
+    }
+
+    [Fact]
     public async Task Delete_with_credential_choice_removes_profile_and_credential()
     {
         var credential = CredentialReference.Create("windows", "office");

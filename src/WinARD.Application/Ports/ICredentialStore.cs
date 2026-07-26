@@ -155,3 +155,23 @@ public interface ICredentialStore
         CredentialReference reference,
         CancellationToken cancellationToken);
 }
+
+public enum CredentialPromptPurpose
+{
+    MacPassword,
+    SshPassword,
+    PrivateKeyPassphrase,
+    VaultMaster,
+}
+
+public sealed record CredentialPromptRequest(
+    CredentialReference Reference,
+    CredentialPromptPurpose Purpose,
+    string? DisplayName = null);
+
+public interface IPurposeAwareCredentialStore : ICredentialStore
+{
+    ValueTask<ISecret?> ReadForPromptAsync(
+        CredentialPromptRequest request,
+        CancellationToken cancellationToken);
+}
