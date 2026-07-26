@@ -99,7 +99,8 @@ public sealed class EncryptedCredentialVaultTests
         [
             .. original.AsSpan(0, countOffset),
             0, 0, 0, 0,
-            .. original.AsSpan(original.Length - VaultFileFormat.TagSize),
+            .. original.AsSpan(
+                original.Length - VaultFileFormat.NonceSize - VaultFileFormat.TagSize),
         ];
         await AssertTamperedAsync(storage);
 
@@ -112,7 +113,8 @@ public sealed class EncryptedCredentialVaultTests
             .. original.AsSpan(0, ranges[0].Start),
             .. original.AsSpan(ranges[1].Start, ranges[1].Length),
             .. original.AsSpan(ranges[0].Start, ranges[0].Length),
-            .. original.AsSpan(original.Length - VaultFileFormat.TagSize),
+            .. original.AsSpan(
+                original.Length - VaultFileFormat.NonceSize - VaultFileFormat.TagSize),
         ];
         await AssertTamperedAsync(storage);
 
@@ -121,7 +123,8 @@ public sealed class EncryptedCredentialVaultTests
             .. original.AsSpan(0, ranges[0].Start),
             .. original.AsSpan(ranges[0].Start, ranges[0].Length),
             .. original.AsSpan(ranges[0].Start, ranges[0].Length),
-            .. original.AsSpan(original.Length - VaultFileFormat.TagSize),
+            .. original.AsSpan(
+                original.Length - VaultFileFormat.NonceSize - VaultFileFormat.TagSize),
         ];
         await AssertTamperedAsync(storage);
     }
@@ -152,6 +155,208 @@ public sealed class EncryptedCredentialVaultTests
             CancellationToken.None);
         Assert.Null(await reopened.ReadAsync(Reference, CancellationToken.None));
         Assert.Null(await reopened.ReadAsync(secondReference, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Independent_file_storages_use_same_file_compare_exchange()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            $"winard-vault-{Guid.NewGuid():N}");
+        var path = Path.Combine(directory, "credentials.vault");
+        try
+        {
+            var firstStorage = new FileVaultStorage(path);
+            var secondStorage = new FileVaultStorage(path);
+            using (var createMaster = Utf8("master-52e6"))
+            {
+                await using var created = await EncryptedCredentialVault.CreateAsync(
+                    firstStorage,
+                    createMaster,
+                    TimeProvider.System,
+                    TimeSpan.FromMinutes(5),
+                    CancellationToken.None);
+                using var initial = Utf8("initial-value-7a8b");
+                await created.SaveAsync(Reference, initial, CancellationToken.None);
+            }
+
+            using var masterA = Utf8("master-52e6");
+            using var masterB = Utf8("master-52e6");
+            await using var first = await EncryptedCredentialVault.OpenAsync(
+                firstStorage,
+                masterA,
+                TimeProvider.System,
+                TimeSpan.FromMinutes(5),
+                CancellationToken.None);
+            await using var second = await EncryptedCredentialVault.OpenAsync(
+                secondStorage,
+                masterB,
+                TimeProvider.System,
+                TimeSpan.FromMinutes(5),
+                CancellationToken.None);
+            var secondReference = CredentialReference.Create("vault", "device/bravo");
+            using var value = Utf8("concurrent-value-315f");
+
+            await first.DeleteAsync(Reference, CancellationToken.None);
+            await Assert.ThrowsAsync<VaultConcurrencyException>(
+                () => second.SaveAsync(secondReference, value, CancellationToken.None).AsTask());
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Every_manifest_serialization_uses_a_distinct_nonce()
+    {
+        var storage = new InMemoryVaultStorage();
+        using var master = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.CreateAsync(
+            storage,
+            master,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            CancellationToken.None);
+        var initial = VaultFileFormat.Parse(storage.Bytes!).ManifestNonce;
+        using var first = Utf8("nonce-value-1a2b");
+        await vault.SaveAsync(Reference, first, CancellationToken.None);
+        var afterFirst = VaultFileFormat.Parse(storage.Bytes!).ManifestNonce;
+        using var second = Utf8("nonce-value-3c4d");
+        await vault.SaveAsync(Reference, second, CancellationToken.None);
+        var afterSecond = VaultFileFormat.Parse(storage.Bytes!).ManifestNonce;
+
+        Assert.NotEqual(initial, afterFirst);
+        Assert.NotEqual(afterFirst, afterSecond);
+        Assert.NotEqual(initial, afterSecond);
+    }
+
+    [Fact]
+    public async Task Forced_nonce_collisions_are_retried()
+    {
+        var nonceA = Enumerable.Repeat((byte)0x11, VaultFileFormat.NonceSize).ToArray();
+        var nonceB = Enumerable.Repeat((byte)0x22, VaultFileFormat.NonceSize).ToArray();
+        var nonceC = Enumerable.Repeat((byte)0x33, VaultFileFormat.NonceSize).ToArray();
+        var nonceD = Enumerable.Repeat((byte)0x44, VaultFileFormat.NonceSize).ToArray();
+        var nonceE = Enumerable.Repeat((byte)0x55, VaultFileFormat.NonceSize).ToArray();
+        var random = new SequenceVaultNonceSource(
+            nonceA,
+            nonceA,
+            nonceB,
+            nonceB,
+            nonceC,
+            nonceA,
+            nonceD,
+            nonceC,
+            nonceD,
+            nonceE);
+        var storage = new InMemoryVaultStorage();
+        using var master = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.CreateAsync(
+            storage,
+            master,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            random,
+            CancellationToken.None);
+        using var secret = Utf8("nonce-value-5e6f");
+
+        await vault.SaveAsync(Reference, secret, CancellationToken.None);
+        var firstDocument = VaultFileFormat.Parse(storage.Bytes!);
+        await vault.SaveAsync(Reference, secret, CancellationToken.None);
+        var secondDocument = VaultFileFormat.Parse(storage.Bytes!);
+
+        Assert.Equal(nonceC, firstDocument.ManifestNonce);
+        Assert.Equal(nonceB, firstDocument.Entries.Single().Value.Nonce);
+        Assert.Equal(nonceE, secondDocument.ManifestNonce);
+        Assert.Equal(nonceD, secondDocument.Entries.Single().Value.Nonce);
+    }
+
+    [Fact]
+    public async Task Exhausted_nonce_collisions_are_rejected()
+    {
+        var storage = new InMemoryVaultStorage();
+        using var master = Utf8("master-52e6");
+
+        await Assert.ThrowsAsync<CryptographicException>(
+            () => EncryptedCredentialVault.CreateAsync(
+                storage,
+                master,
+                TimeProvider.System,
+                TimeSpan.FromMinutes(5),
+                new ConstantVaultNonceSource(new byte[VaultFileFormat.NonceSize]),
+                CancellationToken.None).AsTask());
+        Assert.Null(storage.Bytes);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Key_derivation_gate_releases_when_secret_access_throws(
+        bool throwFromLength)
+    {
+        var failing = new ThrowingSecret(throwFromLength);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => EncryptedCredentialVault.CreateAsync(
+                new InMemoryVaultStorage(),
+                failing,
+                TimeProvider.System,
+                TimeSpan.FromMinutes(5),
+                CancellationToken.None).AsTask());
+
+        using var valid = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.CreateAsync(
+            new InMemoryVaultStorage(),
+            valid,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public void Serialized_size_limit_includes_manifest_nonce_and_tag()
+    {
+        var entries = Enumerable.Range(0, 15).ToDictionary(
+            static index => $"credential://vault/{index}",
+            static index => new VaultEntry(
+                $"credential://vault/{index}",
+                Enumerable.Repeat((byte)(index + 1), VaultFileFormat.NonceSize).ToArray(),
+                new byte[VaultFileFormat.MaximumSecretBytes],
+                new byte[VaultFileFormat.TagSize]),
+            StringComparer.Ordinal);
+        var finalReference = "credential://vault/final";
+        entries.Add(
+            finalReference,
+            new VaultEntry(
+                finalReference,
+                Enumerable.Repeat((byte)0x40, VaultFileFormat.NonceSize).ToArray(),
+                [],
+                new byte[VaultFileFormat.TagSize]));
+        var document = new VaultDocument(
+            VaultKdfParameters.Default,
+            new byte[VaultFileFormat.SaltSize],
+            new byte[VaultFileFormat.TagSize],
+            Revision: 0,
+            entries,
+            Enumerable.Repeat((byte)0x41, VaultFileFormat.NonceSize).ToArray(),
+            new byte[VaultFileFormat.TagSize]);
+        var emptyFinalManifestLength = VaultFileFormat.BuildManifest(document).Length;
+        var finalCiphertextLength =
+            VaultFileFormat.MaximumFileBytes -
+            VaultFileFormat.NonceSize -
+            VaultFileFormat.TagSize +
+            1 -
+            emptyFinalManifestLength;
+        entries[finalReference] = entries[finalReference] with
+        {
+            Ciphertext = new byte[finalCiphertextLength],
+        };
+
+        Assert.InRange(finalCiphertextLength, 1, VaultFileFormat.MaximumSecretBytes);
+        Assert.Throws<InvalidDataException>(() => VaultFileFormat.Serialize(document));
     }
 
     [Fact]
@@ -291,6 +496,7 @@ public sealed class EncryptedCredentialVaultTests
                     new byte[VaultFileFormat.TagSize],
                     Revision: 0,
                     entries,
+                    new byte[VaultFileFormat.NonceSize],
                     new byte[VaultFileFormat.TagSize])),
         };
         using var duplicateMaster = Utf8("master-52e6");
@@ -529,6 +735,41 @@ public sealed class EncryptedCredentialVaultTests
                 Dispose();
                 return ValueTask.CompletedTask;
             }
+        }
+    }
+
+    private sealed class SequenceVaultNonceSource(params byte[][] values)
+        : IVaultNonceSource
+    {
+        private readonly Queue<byte[]> _values = new(values);
+
+        public void Fill(Span<byte> destination)
+        {
+            var value = _values.Dequeue();
+            value.CopyTo(destination);
+        }
+    }
+
+    private sealed class ConstantVaultNonceSource(byte[] value) : IVaultNonceSource
+    {
+        public void Fill(Span<byte> destination) => value.CopyTo(destination);
+    }
+
+    private sealed class ThrowingSecret(bool throwFromLength)
+        : WinARD.Application.Ports.ISecret
+    {
+        public int Length => throwFromLength
+            ? throw new InvalidOperationException("length failed")
+            : 8;
+
+        public void CopyTo(Span<byte> destination) =>
+            throw new InvalidOperationException("copy failed");
+
+        public WinARD.Application.Ports.ISecret Clone() =>
+            throw new NotSupportedException();
+
+        public void Dispose()
+        {
         }
     }
 

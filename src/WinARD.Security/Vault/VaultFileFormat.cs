@@ -24,6 +24,7 @@ internal sealed record VaultDocument(
     byte[] VerifierTag,
     long Revision,
     IReadOnlyDictionary<string, VaultEntry> Entries,
+    byte[] ManifestNonce,
     byte[] ManifestTag,
     byte[]? ManifestData = null);
 
@@ -31,7 +32,7 @@ internal static class VaultFileFormat
 {
     private static readonly byte[] Magic = "WARDVLT1"u8.ToArray();
 
-    public const int Version = 1;
+    public const int Version = 2;
     public const int SaltSize = 16;
     public const int NonceSize = 12;
     public const int TagSize = 16;
@@ -53,7 +54,24 @@ internal static class VaultFileFormat
                 throw new InvalidDataException("The vault manifest tag length is invalid.");
             }
 
-            return [.. manifest, .. document.ManifestTag];
+            if (document.ManifestNonce.Length != NonceSize)
+            {
+                throw new InvalidDataException("The vault manifest nonce length is invalid.");
+            }
+
+            var result = new byte[
+                manifest.Length + document.ManifestNonce.Length + document.ManifestTag.Length];
+            manifest.CopyTo(result, 0);
+            document.ManifestNonce.CopyTo(result, manifest.Length);
+            document.ManifestTag.CopyTo(
+                result,
+                manifest.Length + document.ManifestNonce.Length);
+            if (result.Length > MaximumFileBytes)
+            {
+                throw new InvalidDataException("The vault file exceeds its size limit.");
+            }
+
+            return result;
         }
         finally
         {
@@ -187,11 +205,6 @@ internal static class VaultFileFormat
                     throw new InvalidDataException(
                         "A vault entry uses the reserved verifier nonce.");
                 }
-                if (nonce.AsSpan().IndexOfAnyExcept(byte.MaxValue) < 0)
-                {
-                    throw new InvalidDataException(
-                        "A vault entry uses the reserved manifest nonce.");
-                }
 
                 var ciphertextLength = reader.ReadInt32();
                 if (ciphertextLength is < 0 or > MaximumSecretBytes)
@@ -214,6 +227,20 @@ internal static class VaultFileFormat
             }
 
             var manifestLength = checked((int)stream.Position);
+            var manifestNonce = ReadExact(reader, NonceSize);
+            if (manifestNonce.AsSpan().IndexOfAnyExcept((byte)0) < 0)
+            {
+                throw new InvalidDataException(
+                    "The vault manifest nonce collides with the verifier nonce.");
+            }
+
+            if (entries.Values.Any(
+                entry => entry.Nonce.AsSpan().SequenceEqual(manifestNonce)))
+            {
+                throw new InvalidDataException(
+                    "The vault manifest nonce duplicates an entry nonce.");
+            }
+
             var manifestTag = ReadExact(reader, TagSize);
             if (stream.Position != stream.Length)
             {
@@ -226,6 +253,7 @@ internal static class VaultFileFormat
                 verifierTag,
                 revision,
                 entries,
+                manifestNonce,
                 manifestTag,
                 contents.AsSpan(0, manifestLength).ToArray());
         }

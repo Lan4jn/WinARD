@@ -28,6 +28,19 @@ public sealed class VaultConcurrencyException : IOException
     }
 }
 
+internal interface IVaultNonceSource
+{
+    void Fill(Span<byte> destination);
+}
+
+internal sealed class CryptographicVaultNonceSource : IVaultNonceSource
+{
+    public static CryptographicVaultNonceSource Instance { get; } = new();
+
+    public void Fill(Span<byte> destination) =>
+        RandomNumberGenerator.Fill(destination);
+}
+
 public sealed class FileVaultStorage(string path) : IVaultStorage
 {
     private readonly string _path = Path.GetFullPath(
@@ -197,6 +210,8 @@ public sealed class EncryptedCredentialVault :
     private readonly VaultKdfParameters _kdf;
     private readonly byte[] _salt;
     private readonly byte[] _verifierTag;
+    private readonly IVaultNonceSource _nonceSource;
+    private readonly HashSet<string> _manifestNonceHistory = new(StringComparer.Ordinal);
     private string _storageVersion;
     private long _revision;
     private Dictionary<string, VaultEntry> _entries;
@@ -213,7 +228,8 @@ public sealed class EncryptedCredentialVault :
         TimeSpan idleTimeout,
         VaultDocument document,
         byte[] key,
-        string storageVersion)
+        string storageVersion,
+        IVaultNonceSource nonceSource)
     {
         _storage = storage;
         _timeProvider = timeProvider;
@@ -223,20 +239,38 @@ public sealed class EncryptedCredentialVault :
         _verifierTag = document.VerifierTag;
         _revision = document.Revision;
         _storageVersion = storageVersion;
+        _nonceSource = nonceSource;
+        _manifestNonceHistory.Add(Convert.ToHexString(document.ManifestNonce));
         _entries = new Dictionary<string, VaultEntry>(document.Entries, StringComparer.Ordinal);
         _key = key;
         _lastActivity = timeProvider.GetUtcNow();
         ScheduleAutoLock(generation: 0, idleTimeout);
     }
 
-    public static async ValueTask<EncryptedCredentialVault> CreateAsync(
+    public static ValueTask<EncryptedCredentialVault> CreateAsync(
         IVaultStorage storage,
         ISecret masterPassword,
         TimeProvider timeProvider,
         TimeSpan idleTimeout,
+        CancellationToken cancellationToken) =>
+        CreateAsync(
+            storage,
+            masterPassword,
+            timeProvider,
+            idleTimeout,
+            CryptographicVaultNonceSource.Instance,
+            cancellationToken);
+
+    internal static async ValueTask<EncryptedCredentialVault> CreateAsync(
+        IVaultStorage storage,
+        ISecret masterPassword,
+        TimeProvider timeProvider,
+        TimeSpan idleTimeout,
+        IVaultNonceSource nonceSource,
         CancellationToken cancellationToken)
     {
         ValidateArguments(storage, masterPassword, timeProvider, idleTimeout);
+        ArgumentNullException.ThrowIfNull(nonceSource);
         if (await storage.ReadAsync(cancellationToken).ConfigureAwait(false) is not null)
         {
             throw new IOException("A vault already exists in the selected storage.");
@@ -261,8 +295,13 @@ public sealed class EncryptedCredentialVault :
                 verifierTag,
                 Revision: 0,
                 new Dictionary<string, VaultEntry>(StringComparer.Ordinal),
+                new byte[VaultFileFormat.NonceSize],
                 new byte[VaultFileFormat.TagSize]);
-            var document = WithManifestTag(unsignedDocument, key);
+            var document = WithManifestTag(
+                unsignedDocument,
+                key,
+                nonceSource,
+                new HashSet<string>(StringComparer.Ordinal));
             var bytes = VaultFileFormat.Serialize(document);
             try
             {
@@ -280,7 +319,8 @@ public sealed class EncryptedCredentialVault :
                     idleTimeout,
                     document,
                     key,
-                    write.Version);
+                    write.Version,
+                    nonceSource);
                 key = null;
                 return result;
             }
@@ -336,7 +376,8 @@ public sealed class EncryptedCredentialVault :
                 idleTimeout,
                 document,
                 key,
-                snapshot.Version);
+                snapshot.Version,
+                CryptographicVaultNonceSource.Instance);
             key = null;
             return result;
         }
@@ -590,9 +631,10 @@ public sealed class EncryptedCredentialVault :
         CancellationToken cancellationToken)
     {
         await KeyDerivationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        var password = new byte[masterPassword.Length];
+        byte[]? password = null;
         try
         {
+            password = new byte[masterPassword.Length];
             masterPassword.CopyTo(password);
             using var argon = new Argon2id(password)
             {
@@ -624,7 +666,11 @@ public sealed class EncryptedCredentialVault :
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(password);
+            if (password is not null)
+            {
+                CryptographicOperations.ZeroMemory(password);
+            }
+
             KeyDerivationGate.Release();
         }
     }
@@ -639,14 +685,8 @@ public sealed class EncryptedCredentialVault :
             existing.Select(static entry => Convert.ToHexString(entry.Nonce)),
             StringComparer.Ordinal);
         usedNonces.Add(new string('0', VaultFileFormat.NonceSize * 2));
-        usedNonces.Add(new string('F', VaultFileFormat.NonceSize * 2));
-        byte[] nonce;
-        do
-        {
-            nonce = RandomNumberGenerator.GetBytes(VaultFileFormat.NonceSize);
-        }
-        while (!usedNonces.Add(Convert.ToHexString(nonce)));
-
+        usedNonces.UnionWith(_manifestNonceHistory);
+        var nonce = GenerateUniqueNonce(_nonceSource, usedNonces);
         var ciphertext = new byte[plaintext.Length];
         var tag = new byte[VaultFileFormat.TagSize];
         var associatedData = VaultFileFormat.AssociatedData(
@@ -778,19 +818,34 @@ public sealed class EncryptedCredentialVault :
                 _verifierTag,
                 revision,
                 entries,
+                new byte[VaultFileFormat.NonceSize],
                 new byte[VaultFileFormat.TagSize]),
-            _key!);
+            _key!,
+            _nonceSource,
+            _manifestNonceHistory);
 
     private static VaultDocument WithManifestTag(
         VaultDocument document,
-        byte[] key)
+        byte[] key,
+        IVaultNonceSource nonceSource,
+        HashSet<string> nonceHistory)
     {
         var manifest = VaultFileFormat.BuildManifest(document);
         try
         {
-            var tag = CreateManifestTag(key, manifest);
+            var forbidden = new HashSet<string>(nonceHistory, StringComparer.Ordinal)
+            {
+                new string('0', VaultFileFormat.NonceSize * 2),
+            };
+            forbidden.UnionWith(
+                document.Entries.Values.Select(
+                    static entry => Convert.ToHexString(entry.Nonce)));
+            var nonce = GenerateUniqueNonce(nonceSource, forbidden);
+            nonceHistory.Add(Convert.ToHexString(nonce));
+            var tag = CreateManifestTag(key, manifest, nonce);
             return document with
             {
+                ManifestNonce = nonce,
                 ManifestTag = tag,
                 ManifestData = manifest.ToArray(),
             };
@@ -801,14 +856,17 @@ public sealed class EncryptedCredentialVault :
         }
     }
 
-    private static byte[] CreateManifestTag(byte[] key, byte[] manifest)
+    private static byte[] CreateManifestTag(
+        byte[] key,
+        byte[] manifest,
+        byte[] nonce)
     {
         var tag = new byte[VaultFileFormat.TagSize];
         try
         {
             using var aes = new AesGcm(key, VaultFileFormat.TagSize);
             aes.Encrypt(
-                ManifestNonce(),
+                nonce,
                 ReadOnlySpan<byte>.Empty,
                 Span<byte>.Empty,
                 tag,
@@ -829,7 +887,7 @@ public sealed class EncryptedCredentialVault :
         {
             using var aes = new AesGcm(key, VaultFileFormat.TagSize);
             aes.Decrypt(
-                ManifestNonce(),
+                document.ManifestNonce,
                 ReadOnlySpan<byte>.Empty,
                 document.ManifestTag,
                 Span<byte>.Empty,
@@ -844,11 +902,24 @@ public sealed class EncryptedCredentialVault :
         }
     }
 
-    private static byte[] ManifestNonce()
+    private static byte[] GenerateUniqueNonce(
+        IVaultNonceSource source,
+        HashSet<string> forbidden)
     {
-        var nonce = new byte[VaultFileFormat.NonceSize];
-        Array.Fill(nonce, byte.MaxValue);
-        return nonce;
+        for (var attempt = 0; attempt < 128; attempt++)
+        {
+            var nonce = new byte[VaultFileFormat.NonceSize];
+            source.Fill(nonce);
+            if (forbidden.Add(Convert.ToHexString(nonce)))
+            {
+                return nonce;
+            }
+
+            CryptographicOperations.ZeroMemory(nonce);
+        }
+
+        throw new CryptographicException(
+            "Unable to generate a unique vault authentication nonce.");
     }
 
     private void Touch()
