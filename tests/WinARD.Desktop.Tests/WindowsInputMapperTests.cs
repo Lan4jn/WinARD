@@ -40,19 +40,67 @@ public sealed class WindowsInputMapperTests
     }
 
     [Fact]
-    public async Task Repeated_down_and_unknown_up_are_ignored_and_release_order_is_reversed()
+    public async Task Repeated_printable_key_down_is_forwarded_but_one_up_clears_pressed_state()
     {
         var events = new List<(uint Keysym, bool Down)>();
         var mapper = Mapper(events);
 
         await mapper.KeyDownAsync(VirtualKey.A, 0x1e, false, "a", CancellationToken.None);
         await mapper.KeyDownAsync(VirtualKey.A, 0x1e, false, "a", CancellationToken.None);
+        await mapper.KeyDownAsync(VirtualKey.A, 0x1e, false, "a", CancellationToken.None);
+        await mapper.KeyUpAsync(VirtualKey.A, 0x1e, false, "a", CancellationToken.None);
+        await mapper.KeyUpAsync(VirtualKey.A, 0x1e, false, "a", CancellationToken.None);
+        await mapper.ReleaseAllAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [('a', true), ('a', true), ('a', true), ('a', false)],
+            events.Select(item => ((char)item.Keysym, item.Down)));
+    }
+
+    [Fact]
+    public async Task Repeated_navigation_key_down_is_forwarded_and_release_all_releases_once()
+    {
+        var events = new List<(uint Keysym, bool Down)>();
+        var mapper = Mapper(events);
+
+        await mapper.KeyDownAsync(VirtualKey.Left, 0x4b, true, null, CancellationToken.None);
+        await mapper.KeyDownAsync(VirtualKey.Left, 0x4b, true, null, CancellationToken.None);
+        await mapper.ReleaseAllAsync(CancellationToken.None);
+
+        Assert.Equal([(0xff51u, true), (0xff51u, true), (0xff51u, false)], events);
+    }
+
+    [Fact]
+    public async Task Repeated_modifier_and_lock_key_down_is_suppressed()
+    {
+        var events = new List<(uint Keysym, bool Down)>();
+        var mapper = Mapper(events);
+
+        await mapper.KeyDownAsync(VirtualKey.Shift, 0x2a, false, null, CancellationToken.None);
+        await mapper.KeyDownAsync(VirtualKey.Shift, 0x2a, false, null, CancellationToken.None);
+        await mapper.KeyDownAsync(VirtualKey.CapitalLock, 0x3a, false, null, CancellationToken.None);
+        await mapper.KeyDownAsync(VirtualKey.CapitalLock, 0x3a, false, null, CancellationToken.None);
+        await mapper.ReleaseAllAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [(0xffe1u, true), (0xffe5u, true), (0xffe5u, false), (0xffe1u, false)],
+            events);
+    }
+
+    [Fact]
+    public async Task Unknown_up_is_ignored_and_release_all_releases_only_remaining_pressed_keys()
+    {
+        var events = new List<(uint Keysym, bool Down)>();
+        var mapper = Mapper(events);
+
+        await mapper.KeyDownAsync(VirtualKey.A, 0x1e, false, "a", CancellationToken.None);
         await mapper.KeyDownAsync(VirtualKey.B, 0x30, false, "b", CancellationToken.None);
+        await mapper.KeyUpAsync(VirtualKey.A, 0x1e, false, "a", CancellationToken.None);
         await mapper.KeyUpAsync(VirtualKey.C, 0x2e, false, "c", CancellationToken.None);
         await mapper.ReleaseAllAsync(CancellationToken.None);
 
         Assert.Equal(
-            [('a', true), ('b', true), ('b', false), ('a', false)],
+            [('a', true), ('b', true), ('a', false), ('b', false)],
             events.Select(item => ((char)item.Keysym, item.Down)));
     }
 

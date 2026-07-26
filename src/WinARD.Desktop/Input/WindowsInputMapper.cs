@@ -42,6 +42,11 @@ public sealed class WindowsInputMapper : IAsyncDisposable
         {
             if (_pressed.ContainsKey(identity))
             {
+                if (!SuppressRepeat(keysym))
+                {
+                    await _sender(keysym, true, cancellationToken).ConfigureAwait(false);
+                }
+
                 return;
             }
 
@@ -324,6 +329,12 @@ public sealed class WindowsInputMapper : IAsyncDisposable
             _ => 0,
         };
     }
+
+    private static bool SuppressRepeat(uint keysym) => keysym is
+        LeftShift or RightShift or
+        LeftControl or RightControl or
+        LeftAlt or RightAlt or
+        0xffe5 or 0xff7f or 0xff14;
 
     private readonly record struct KeyIdentity(VirtualKey Key, int ScanCode, bool IsExtended);
 }

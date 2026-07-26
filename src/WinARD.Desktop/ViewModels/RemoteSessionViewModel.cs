@@ -166,10 +166,19 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception)
         {
-            await _dispatcher.InvokeAsync(
-                () => StatusMessage = "连接已中断。",
-                CancellationToken.None).ConfigureAwait(false);
-            await DisposeOwnershipOnceAsync().ConfigureAwait(false);
+            var ownershipDisposal = DisposeOwnershipOnceAsync();
+            try
+            {
+                await _dispatcher.InvokeAsync(
+                    () => StatusMessage = "连接已中断。",
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Status reporting is best-effort; ownership release must still complete.
+            }
+
+            await ownershipDisposal.ConfigureAwait(false);
         }
         finally
         {
@@ -209,6 +218,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     {
         List<Exception>? failures = null;
         _lifetime.Cancel();
+        var ownershipDisposal = DisposeOwnershipOnceAsync();
         var receive = _receiveTask;
         var present = _presentTask;
         if (receive is not null)
@@ -231,7 +241,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         await CaptureFailureAsync(
             DisposePresenterAsync(),
             failures ??= []).ConfigureAwait(false);
-        await CaptureFailureAsync(DisposeOwnershipOnceAsync(), failures ??= []).ConfigureAwait(false);
+        await CaptureFailureAsync(ownershipDisposal, failures ??= []).ConfigureAwait(false);
         _completion.TrySetResult();
         _lifetime.Dispose();
         if (failures.Count != 0)
@@ -264,7 +274,19 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     {
         lock (_sync)
         {
-            return _ownershipDisposeTask ??= _ownership.DisposeAsync().AsTask();
+            if (_ownershipDisposeTask is null)
+            {
+                try
+                {
+                    _ownershipDisposeTask = _ownership.DisposeAsync().AsTask();
+                }
+                catch (Exception exception)
+                {
+                    _ownershipDisposeTask = Task.FromException(exception);
+                }
+            }
+
+            return _ownershipDisposeTask;
         }
     }
 }

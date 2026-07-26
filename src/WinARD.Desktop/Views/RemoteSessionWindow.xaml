@@ -43,35 +43,46 @@
         </CommandBar>
 
         <Grid x:Name="ViewportHost" Grid.Row="1" Background="Black">
-            <Viewbox
-                x:Name="FrameViewbox"
-                HorizontalAlignment="Stretch"
-                VerticalAlignment="Stretch"
-                Stretch="Uniform">
-                <Button
-                    AutomationProperties.AutomationId="RemoteSwapChainPanel"
-                    AutomationProperties.Name="远程画面"
-                    Background="Transparent"
-                    BorderThickness="0"
-                    HorizontalContentAlignment="Stretch"
-                    IsHitTestVisible="False"
-                    IsTabStop="False"
-                    Padding="0"
-                    VerticalContentAlignment="Stretch">
-                    <SwapChainPanel
-                        x:Name="FramePanel"
-                        Width="1"
-                        Height="1" />
-                </Button>
-            </Viewbox>
-            <Button
-                x:Name="InputSurface"
-                AutomationProperties.AutomationId="RemoteInputSurface"
-                Padding="0"
-                HorizontalContentAlignment="Stretch"
-                VerticalContentAlignment="Stretch"
-                Background="Transparent"
-                BorderThickness="0" />
+            <ScrollViewer
+                x:Name="FrameScrollViewer"
+                AutomationProperties.AutomationId="RemoteFrameScrollViewer"
+                HorizontalScrollBarVisibility="Disabled"
+                HorizontalScrollMode="Disabled"
+                VerticalScrollBarVisibility="Disabled"
+                VerticalScrollMode="Disabled"
+                ZoomMode="Disabled">
+                <Grid x:Name="FrameSurface" HorizontalAlignment="Left" VerticalAlignment="Top">
+                    <Viewbox
+                        x:Name="FrameViewbox"
+                        HorizontalAlignment="Stretch"
+                        VerticalAlignment="Stretch"
+                        Stretch="Uniform">
+                        <Button
+                            AutomationProperties.AutomationId="RemoteSwapChainPanel"
+                            AutomationProperties.Name="远程画面"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            HorizontalContentAlignment="Stretch"
+                            IsHitTestVisible="False"
+                            IsTabStop="False"
+                            Padding="0"
+                            VerticalContentAlignment="Stretch">
+                            <SwapChainPanel
+                                x:Name="FramePanel"
+                                Width="1"
+                                Height="1" />
+                        </Button>
+                    </Viewbox>
+                    <Button
+                        x:Name="InputSurface"
+                        AutomationProperties.AutomationId="RemoteInputSurface"
+                        Padding="0"
+                        HorizontalContentAlignment="Stretch"
+                        VerticalContentAlignment="Stretch"
+                        Background="Transparent"
+                        BorderThickness="0" />
+                </Grid>
+            </ScrollViewer>
         </Grid>
 
         <Grid Grid.Row="2" Padding="12,8" ColumnSpacing="16">

@@ -98,9 +98,11 @@ public partial class App : Microsoft.UI.Xaml.Application
 
     private sealed class SmokeRemoteSessionRuntime : IRemoteSessionRuntime
     {
+        private const int SmokeWidth = 3840;
+        private const int SmokeHeight = 2160;
         private bool _frameSent;
 
-        public RemoteFramebufferSize FramebufferSize => new(640, 360);
+        public RemoteFramebufferSize FramebufferSize => new(SmokeWidth, SmokeHeight);
 
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
             ValueTask.CompletedTask;
@@ -110,14 +112,14 @@ public partial class App : Microsoft.UI.Xaml.Application
             if (!_frameSent)
             {
                 _frameSent = true;
-                var pixels = new byte[640 * 360 * 4];
-                for (var y = 0; y < 360; y++)
+                var pixels = new byte[SmokeWidth * SmokeHeight * 4];
+                for (var y = 0; y < SmokeHeight; y++)
                 {
-                    for (var x = 0; x < 640; x++)
+                    for (var x = 0; x < SmokeWidth; x++)
                     {
-                        var offset = ((y * 640) + x) * 4;
-                        pixels[offset] = checked((byte)(x * 255 / 639));
-                        pixels[offset + 1] = checked((byte)(y * 255 / 359));
+                        var offset = ((y * SmokeWidth) + x) * 4;
+                        pixels[offset] = checked((byte)(x * 255 / (SmokeWidth - 1)));
+                        pixels[offset + 1] = checked((byte)(y * 255 / (SmokeHeight - 1)));
                         pixels[offset + 2] = 48;
                         pixels[offset + 3] = 255;
                     }
@@ -126,8 +128,8 @@ public partial class App : Microsoft.UI.Xaml.Application
                 return new RemoteFramebufferMessage(
                     FramebufferSize,
                     pixels,
-                    640 * 4,
-                    [new RemoteRectangle(0, 0, 640, 360)]);
+                    SmokeWidth * 4,
+                    [new RemoteRectangle(0, 0, SmokeWidth, SmokeHeight)]);
             }
 
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);

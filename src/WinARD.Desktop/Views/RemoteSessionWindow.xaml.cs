@@ -76,7 +76,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         InputSurface.PointerWheelChanged += OnPointerWheelChanged;
         FramePanel.Loaded += OnFramePanelLoaded;
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
-        ViewportHost.SizeChanged += (_, _) => UpdateFrameSizing();
+        FrameScrollViewer.SizeChanged += (_, _) => UpdateFrameSizing();
         UpdateFrameSizing();
     }
 
@@ -239,17 +239,24 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private bool TryGetRemotePoint(PointerRoutedEventArgs args, out RemotePoint point)
     {
-        var position = args.GetCurrentPoint(InputSurface).Position;
+        var position = args.GetCurrentPoint(ViewportHost).Position;
         return CurrentTransform().TryMapToRemote(position.X, position.Y, out point);
     }
 
-    private ViewportTransform CurrentTransform() => ViewportTransform.Create(
-        _remoteSize.Width,
-        _remoteSize.Height,
-        InputSurface.ActualWidth,
-        InputSurface.ActualHeight,
-        RootGrid.XamlRoot?.RasterizationScale ?? 1,
-        _scaleMode);
+    private ViewportTransform CurrentTransform()
+    {
+        var viewportWidth = EffectiveViewportWidth();
+        var viewportHeight = EffectiveViewportHeight();
+        return ViewportTransform.Create(
+            _remoteSize.Width,
+            _remoteSize.Height,
+            viewportWidth,
+            viewportHeight,
+            RootGrid.XamlRoot?.RasterizationScale ?? 1,
+            _scaleMode,
+            FrameScrollViewer.HorizontalOffset,
+            FrameScrollViewer.VerticalOffset);
+    }
 
     private static RemotePointerButtons ToButtons(PointerPointProperties properties)
     {
@@ -263,6 +270,24 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private void UpdateFrameSizing()
     {
         var dpi = RootGrid.XamlRoot?.RasterizationScale ?? 1;
+        var layout = ViewportLayout.Create(
+            _remoteSize.Width,
+            _remoteSize.Height,
+            EffectiveViewportWidth(),
+            EffectiveViewportHeight(),
+            dpi,
+            _scaleMode,
+            FrameScrollViewer.HorizontalOffset,
+            FrameScrollViewer.VerticalOffset);
+        if (!layout.IsValid)
+        {
+            return;
+        }
+
+        FrameSurface.Width = layout.SurfaceWidth;
+        FrameSurface.Height = layout.SurfaceHeight;
+        FrameViewbox.Width = layout.SurfaceWidth;
+        FrameViewbox.Height = layout.SurfaceHeight;
         var scale = _scaleMode == ViewportScaleMode.ActualSize ? dpi : 1;
         FramePanel.Width = _remoteSize.Width / scale;
         FramePanel.Height = _remoteSize.Height / scale;
@@ -275,9 +300,36 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         FrameViewbox.VerticalAlignment = _scaleMode == ViewportScaleMode.Fit
             ? VerticalAlignment.Stretch
             : VerticalAlignment.Top;
+        FrameScrollViewer.HorizontalScrollMode = layout.IsScrollingEnabled
+            ? ScrollMode.Enabled
+            : ScrollMode.Disabled;
+        FrameScrollViewer.VerticalScrollMode = layout.IsScrollingEnabled
+            ? ScrollMode.Enabled
+            : ScrollMode.Disabled;
+        FrameScrollViewer.HorizontalScrollBarVisibility = layout.IsScrollingEnabled
+            ? ScrollBarVisibility.Auto
+            : ScrollBarVisibility.Disabled;
+        FrameScrollViewer.VerticalScrollBarVisibility = layout.IsScrollingEnabled
+            ? ScrollBarVisibility.Auto
+            : ScrollBarVisibility.Disabled;
+        _ = FrameScrollViewer.ChangeView(
+            layout.ScrollOffsetX,
+            layout.ScrollOffsetY,
+            null,
+            disableAnimation: true);
         FitButton.IsEnabled = _scaleMode != ViewportScaleMode.Fit;
         ActualSizeButton.IsEnabled = _scaleMode != ViewportScaleMode.ActualSize;
     }
+
+    private double EffectiveViewportWidth() =>
+        FrameScrollViewer.ViewportWidth > 0
+            ? FrameScrollViewer.ViewportWidth
+            : ViewportHost.ActualWidth;
+
+    private double EffectiveViewportHeight() =>
+        FrameScrollViewer.ViewportHeight > 0
+            ? FrameScrollViewer.ViewportHeight
+            : ViewportHost.ActualHeight;
 
     private void OnActivated(object sender, WindowActivatedEventArgs args)
     {

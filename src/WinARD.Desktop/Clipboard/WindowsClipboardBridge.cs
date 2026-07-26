@@ -24,6 +24,7 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
     private readonly int _maxUtf8Bytes;
     private readonly CancellationTokenSource _lifetime = new();
     private Task _pending = Task.CompletedTask;
+    private Task? _disposeTask;
     private string? _suppressedText;
     private bool _disposed;
     private bool _isEnabled = true;
@@ -47,7 +48,17 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
         _sendRemote = sendRemote ?? throw new ArgumentNullException(nameof(sendRemote));
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxUtf8Bytes);
         _maxUtf8Bytes = maxUtf8Bytes;
-        _adapter.Changed += OnClipboardChanged;
+        try
+        {
+            _dispatcher.InvokeAsync(
+                () => _adapter.Changed += OnClipboardChanged,
+                CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch
+        {
+            _lifetime.Dispose();
+            throw;
+        }
     }
 
     public bool IsEnabled
@@ -97,31 +108,73 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
+    {
+        lock (_sync)
+        {
+            _disposeTask ??= DisposeCoreAsync();
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
     {
         Task pending;
         lock (_sync)
         {
-            if (_disposed)
-            {
-                return;
-            }
-
             _disposed = true;
-            _adapter.Changed -= OnClipboardChanged;
-            _lifetime.Cancel();
             pending = _pending;
         }
+
+        List<Exception> failures = [];
+        CaptureFailure(_lifetime.Cancel, failures);
+        await CaptureFailureAsync(
+            () => _dispatcher.InvokeAsync(
+                () => _adapter.Changed -= OnClipboardChanged,
+                CancellationToken.None),
+            failures).ConfigureAwait(false);
 
         try
         {
             await pending.ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
         }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
 
-        _lifetime.Dispose();
+        CaptureFailure(_lifetime.Dispose, failures);
+        if (failures.Count != 0)
+        {
+            throw new AggregateException("Windows clipboard bridge cleanup failed.", failures);
+        }
+    }
+
+    private static void CaptureFailure(Action cleanup, List<Exception> failures)
+    {
+        try
+        {
+            cleanup();
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
+    }
+
+    private static async Task CaptureFailureAsync(Func<Task> cleanup, List<Exception> failures)
+    {
+        try
+        {
+            await cleanup().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
     }
 
     private void OnClipboardChanged(object? sender, object args)

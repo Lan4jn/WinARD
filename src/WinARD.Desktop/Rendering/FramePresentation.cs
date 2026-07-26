@@ -9,6 +9,94 @@ public enum ViewportScaleMode
     ActualSize,
 }
 
+public readonly record struct ViewportLayout
+{
+    private ViewportLayout(
+        double surfaceWidth,
+        double surfaceHeight,
+        double scrollOffsetX,
+        double scrollOffsetY,
+        bool isScrollingEnabled,
+        bool isValid)
+    {
+        SurfaceWidth = surfaceWidth;
+        SurfaceHeight = surfaceHeight;
+        ScrollOffsetX = scrollOffsetX;
+        ScrollOffsetY = scrollOffsetY;
+        IsScrollingEnabled = isScrollingEnabled;
+        IsValid = isValid;
+    }
+
+    public double SurfaceWidth { get; }
+    public double SurfaceHeight { get; }
+    public double ScrollOffsetX { get; }
+    public double ScrollOffsetY { get; }
+    public bool IsScrollingEnabled { get; }
+    public bool IsValid { get; }
+
+    public static ViewportLayout Create(
+        int remoteWidth,
+        int remoteHeight,
+        double viewportWidth,
+        double viewportHeight,
+        double dpiScale,
+        ViewportScaleMode mode,
+        double scrollOffsetX = 0,
+        double scrollOffsetY = 0)
+    {
+        if (remoteWidth <= 0 || remoteHeight <= 0 ||
+            !double.IsFinite(viewportWidth) || viewportWidth <= 0 ||
+            !double.IsFinite(viewportHeight) || viewportHeight <= 0 ||
+            !double.IsFinite(dpiScale) || dpiScale <= 0 ||
+            !double.IsFinite(scrollOffsetX) || !double.IsFinite(scrollOffsetY))
+        {
+            return default;
+        }
+
+        return mode switch
+        {
+            ViewportScaleMode.Fit => new ViewportLayout(
+                viewportWidth,
+                viewportHeight,
+                0,
+                0,
+                isScrollingEnabled: false,
+                isValid: true),
+            ViewportScaleMode.ActualSize => CreateActualSize(
+                remoteWidth,
+                remoteHeight,
+                viewportWidth,
+                viewportHeight,
+                dpiScale,
+                scrollOffsetX,
+                scrollOffsetY),
+            _ => throw new ArgumentOutOfRangeException(nameof(mode)),
+        };
+    }
+
+    private static ViewportLayout CreateActualSize(
+        int remoteWidth,
+        int remoteHeight,
+        double viewportWidth,
+        double viewportHeight,
+        double dpiScale,
+        double scrollOffsetX,
+        double scrollOffsetY)
+    {
+        var surfaceWidth = remoteWidth / dpiScale;
+        var surfaceHeight = remoteHeight / dpiScale;
+        var maximumOffsetX = Math.Max(0, surfaceWidth - viewportWidth);
+        var maximumOffsetY = Math.Max(0, surfaceHeight - viewportHeight);
+        return new ViewportLayout(
+            surfaceWidth,
+            surfaceHeight,
+            Math.Clamp(scrollOffsetX, 0, maximumOffsetX),
+            Math.Clamp(scrollOffsetY, 0, maximumOffsetY),
+            isScrollingEnabled: true,
+            isValid: true);
+    }
+}
+
 public readonly record struct ViewportTransform
 {
     private ViewportTransform(
@@ -17,6 +105,8 @@ public readonly record struct ViewportTransform
         double originX,
         double originY,
         double dipScale,
+        double scrollOffsetX,
+        double scrollOffsetY,
         bool isValid)
     {
         RemoteWidth = remoteWidth;
@@ -24,6 +114,8 @@ public readonly record struct ViewportTransform
         OriginX = originX;
         OriginY = originY;
         DipScale = dipScale;
+        ScrollOffsetX = scrollOffsetX;
+        ScrollOffsetY = scrollOffsetY;
         IsValid = isValid;
     }
 
@@ -32,6 +124,8 @@ public readonly record struct ViewportTransform
     public double OriginX { get; }
     public double OriginY { get; }
     public double DipScale { get; }
+    public double ScrollOffsetX { get; }
+    public double ScrollOffsetY { get; }
     public bool IsValid { get; }
 
     public static ViewportTransform Create(
@@ -40,12 +134,20 @@ public readonly record struct ViewportTransform
         double viewportWidth,
         double viewportHeight,
         double dpiScale,
-        ViewportScaleMode mode)
+        ViewportScaleMode mode,
+        double scrollOffsetX = 0,
+        double scrollOffsetY = 0)
     {
-        if (remoteWidth <= 0 || remoteHeight <= 0 ||
-            !double.IsFinite(viewportWidth) || viewportWidth <= 0 ||
-            !double.IsFinite(viewportHeight) || viewportHeight <= 0 ||
-            !double.IsFinite(dpiScale) || dpiScale <= 0)
+        var layout = ViewportLayout.Create(
+            remoteWidth,
+            remoteHeight,
+            viewportWidth,
+            viewportHeight,
+            dpiScale,
+            mode,
+            scrollOffsetX,
+            scrollOffsetY);
+        if (!layout.IsValid)
         {
             return default;
         }
@@ -75,6 +177,8 @@ public readonly record struct ViewportTransform
             originX,
             originY,
             scale,
+            layout.ScrollOffsetX,
+            layout.ScrollOffsetY,
             isValid: true);
     }
 
@@ -86,8 +190,8 @@ public readonly record struct ViewportTransform
             return false;
         }
 
-        var remoteX = Math.Floor((viewportX - OriginX) / DipScale);
-        var remoteY = Math.Floor((viewportY - OriginY) / DipScale);
+        var remoteX = Math.Floor((viewportX + ScrollOffsetX - OriginX) / DipScale);
+        var remoteY = Math.Floor((viewportY + ScrollOffsetY - OriginY) / DipScale);
         point = new RemotePoint(
             (int)Math.Clamp(remoteX, 0, RemoteWidth - 1d),
             (int)Math.Clamp(remoteY, 0, RemoteHeight - 1d));

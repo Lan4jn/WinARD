@@ -35,6 +35,31 @@ public sealed class RemoteSessionViewModelTests
     }
 
     [Fact]
+    public async Task Dispose_releases_ownership_before_waiting_for_receive_loop()
+    {
+        var receiveReleased = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var runtime = new OwnershipBoundRuntime(receiveReleased.Task);
+        var lifetime = new SignalingLifetime(receiveReleased);
+        var presenter = new TrackingPresenter();
+        var viewModel = new RemoteSessionViewModel(
+            runtime,
+            lifetime,
+            presenter,
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.ReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await viewModel.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, lifetime.DisposeCount);
+        Assert.True(runtime.ReceiveExited);
+        Assert.Equal(1, presenter.DisposeCount);
+    }
+
+    [Fact]
     public async Task Network_failure_is_observed_sanitized_and_releases_ownership()
     {
         var runtime = new FailingRuntime();
@@ -51,6 +76,33 @@ public sealed class RemoteSessionViewModelTests
 
         Assert.Equal("连接已中断。", viewModel.StatusMessage);
         Assert.DoesNotContain("sensitive", viewModel.StatusMessage, StringComparison.Ordinal);
+        Assert.Equal(1, lifetime.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Receive_failure_releases_ownership_when_status_dispatcher_fails()
+    {
+        var lifetime = new TrackingLifetime();
+        var viewModel = new RemoteSessionViewModel(
+            new FailingRuntime(),
+            lifetime,
+            new TrackingPresenter(),
+            new FailingDispatcher(),
+            clipboardBridge: null);
+
+        try
+        {
+            await viewModel.StartAsync(CancellationToken.None);
+            await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+            Assert.Equal(1, lifetime.DisposeCount);
+        }
+        finally
+        {
+            _ = await Assert.ThrowsAsync<AggregateException>(
+                () => viewModel.DisposeAsync().AsTask());
+        }
+
         Assert.Equal(1, lifetime.DisposeCount);
     }
 
@@ -85,6 +137,32 @@ public sealed class RemoteSessionViewModelTests
         _ = await Assert.ThrowsAsync<AggregateException>(() => viewModel.DisposeAsync().AsTask());
 
         Assert.Equal(1, lifetime.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Dispose_aggregates_synchronous_ownership_failure_and_disposes_ownership_once()
+    {
+        var lifetime = new SynchronouslyThrowingLifetime();
+        var presenter = new TrackingPresenter();
+        var viewModel = new RemoteSessionViewModel(
+            new FailingRuntime(),
+            lifetime,
+            presenter,
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var failure = await Assert.ThrowsAsync<AggregateException>(
+            () => viewModel.DisposeAsync().AsTask());
+
+        Assert.Contains(
+            failure.InnerExceptions,
+            exception => exception is InvalidOperationException
+                && exception.Message == "ownership cleanup failed");
+        Assert.Equal(1, lifetime.DisposeCount);
+        Assert.Equal(1, presenter.DisposeCount);
     }
 
     [Fact]
@@ -190,6 +268,30 @@ public sealed class RemoteSessionViewModelTests
         public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
     }
 
+    private sealed class OwnershipBoundRuntime(Task receiveReleased) : IRemoteSessionRuntime
+    {
+        public TaskCompletionSource ReceiveEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool ReceiveExited { get; private set; }
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            ReceiveEntered.TrySetResult();
+            await receiveReleased;
+            ReceiveExited = true;
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
     private sealed class ScriptedRuntime(params RemoteServerMessage[] messages) : IRemoteSessionRuntime
     {
         private readonly Queue<RemoteServerMessage> _messages = new(messages);
@@ -232,6 +334,29 @@ public sealed class RemoteSessionViewModelTests
     {
         public int DisposeCount { get; private set; }
         public ValueTask DisposeAsync() { DisposeCount++; return ValueTask.CompletedTask; }
+    }
+
+    private sealed class SignalingLifetime(TaskCompletionSource receiveReleased) : IAsyncDisposable
+    {
+        public int DisposeCount { get; private set; }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            receiveReleased.TrySetResult();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class SynchronouslyThrowingLifetime : IAsyncDisposable
+    {
+        public int DisposeCount { get; private set; }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            throw new InvalidOperationException("ownership cleanup failed");
+        }
     }
 
     private sealed class TrackingPresenter : IFramePresenter
@@ -296,5 +421,11 @@ public sealed class RemoteSessionViewModelTests
             action();
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class FailingDispatcher : IUiDispatcher
+    {
+        public Task InvokeAsync(Action action, CancellationToken cancellationToken = default) =>
+            Task.FromException(new InvalidOperationException("dispatcher unavailable"));
     }
 }

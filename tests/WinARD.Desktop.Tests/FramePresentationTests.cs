@@ -1,6 +1,7 @@
 using WinARD.Application.Ports;
 using WinARD.Desktop.Rendering;
 using Xunit;
+using System.Xml.Linq;
 
 #pragma warning disable CA1707
 
@@ -41,6 +42,107 @@ public sealed class FramePresentationTests
         Assert.True(transform.TryMapToRemote(100, 40, out var point));
         Assert.Equal(new RemotePoint(150, 60), point);
         Assert.False(invalid.TryMapToRemote(0, 0, out _));
+    }
+
+    [Fact]
+    public void Actual_size_maps_scrolled_viewport_to_remote_bottom_right()
+    {
+        var transform = ViewportTransform.Create(
+            3840,
+            2160,
+            1280,
+            720,
+            1.5,
+            ViewportScaleMode.ActualSize,
+            scrollOffsetX: 1280,
+            scrollOffsetY: 720);
+
+        Assert.True(transform.TryMapToRemote(1279.9, 719.9, out var point));
+        Assert.Equal(new RemotePoint(3839, 2159), point);
+    }
+
+    [Fact]
+    public void Actual_size_clamps_scrolled_coordinates_to_remote_bounds()
+    {
+        var transform = ViewportTransform.Create(
+            3840,
+            2160,
+            1280,
+            720,
+            1.5,
+            ViewportScaleMode.ActualSize,
+            scrollOffsetX: 1280,
+            scrollOffsetY: 720);
+
+        Assert.True(transform.TryMapToRemote(-5000, -5000, out var topLeft));
+        Assert.True(transform.TryMapToRemote(5000, 5000, out var bottomRight));
+        Assert.Equal(new RemotePoint(0, 0), topLeft);
+        Assert.Equal(new RemotePoint(3839, 2159), bottomRight);
+    }
+
+    [Fact]
+    public void Actual_size_layout_uses_remote_pixel_size_and_clamps_scroll_offsets()
+    {
+        var layout = ViewportLayout.Create(
+            3840,
+            2160,
+            1280,
+            720,
+            1.5,
+            ViewportScaleMode.ActualSize,
+            scrollOffsetX: 5000,
+            scrollOffsetY: 5000);
+
+        Assert.True(layout.IsValid);
+        Assert.True(layout.IsScrollingEnabled);
+        Assert.Equal(2560, layout.SurfaceWidth);
+        Assert.Equal(1440, layout.SurfaceHeight);
+        Assert.Equal(1280, layout.ScrollOffsetX);
+        Assert.Equal(720, layout.ScrollOffsetY);
+    }
+
+    [Fact]
+    public void Fit_layout_fills_viewport_and_resets_scroll_offsets()
+    {
+        var layout = ViewportLayout.Create(
+            3840,
+            2160,
+            1280,
+            720,
+            1.5,
+            ViewportScaleMode.Fit,
+            scrollOffsetX: 900,
+            scrollOffsetY: 600);
+
+        Assert.True(layout.IsValid);
+        Assert.False(layout.IsScrollingEnabled);
+        Assert.Equal(1280, layout.SurfaceWidth);
+        Assert.Equal(720, layout.SurfaceHeight);
+        Assert.Equal(0, layout.ScrollOffsetX);
+        Assert.Equal(0, layout.ScrollOffsetY);
+    }
+
+    [Fact]
+    public void Remote_session_surface_is_wrapped_in_an_automation_visible_scroll_viewer()
+    {
+        var sourcePath = FindRepositoryFile(
+            "src",
+            "WinARD.Desktop",
+            "Views",
+            "RemoteSessionWindow.xaml");
+        var document = XDocument.Load(sourcePath);
+        XNamespace presentation = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        var scrollViewer = document
+            .Descendants(presentation + "ScrollViewer")
+            .Single(element => (string?)element.Attribute(xaml + "Name") == "FrameScrollViewer");
+
+        Assert.Equal(
+            "RemoteFrameScrollViewer",
+            (string?)scrollViewer.Attribute("AutomationProperties.AutomationId"));
+        Assert.Contains(
+            scrollViewer.Descendants(presentation + "SwapChainPanel"),
+            element => (string?)element.Attribute(xaml + "Name") == "FramePanel");
     }
 
     [Fact]
@@ -136,6 +238,22 @@ public sealed class FramePresentationTests
             checked(width * height * 4),
             dirtyRectangles,
             new TestOwner(sequence, disposed, checked(width * height * 4)));
+
+    private static string FindRepositoryFile(params string[] segments)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            var candidate = Path.Combine([directory.FullName, .. segments]);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new FileNotFoundException($"Could not locate repository file: {Path.Combine(segments)}");
+    }
 
     private sealed class TestOwner(int sequence, List<int> disposed, int length = 4) : System.Buffers.IMemoryOwner<byte>
     {
