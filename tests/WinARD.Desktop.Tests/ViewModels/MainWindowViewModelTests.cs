@@ -170,25 +170,31 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task Initialize_is_shared_and_database_and_discovery_start_off_the_calling_thread()
+    public async Task Initialize_is_shared_and_background_work_stays_off_the_ui_thread()
     {
+        await using var uiThread = new DedicatedUiThreadDispatcher();
         var repository = new FakeRepository(Profile(StudioId, "Studio Mac", "studio.local")) { BlockLoad = true };
         var discovery = new FakeDiscovery();
-        var dispatcher = new RecordingDispatcher();
-        await using var viewModel = Create(repository, discovery, dispatcher: dispatcher);
-        var callingThread = Environment.CurrentManagedThreadId;
+        await using var viewModel = Create(repository, discovery, dispatcher: uiThread);
 
-        var first = viewModel.InitializeAsync(CancellationToken.None);
-        await repository.LoadEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var second = viewModel.InitializeAsync(CancellationToken.None);
-        repository.ReleaseLoad.SetResult();
-        await Task.WhenAll(first, second);
+        await uiThread.RunAsync(async () =>
+        {
+            Assert.Equal(uiThread.ThreadId, Environment.CurrentManagedThreadId);
+
+            var first = viewModel.InitializeAsync(CancellationToken.None);
+            await repository.LoadEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(uiThread.ThreadId, Environment.CurrentManagedThreadId);
+            var second = viewModel.InitializeAsync(CancellationToken.None);
+            repository.ReleaseLoad.SetResult();
+            await Task.WhenAll(first, second);
+        });
 
         Assert.Equal(1, repository.LoadCount);
         Assert.Equal(1, discovery.StartCount);
-        Assert.NotEqual(callingThread, repository.LoadThreadId);
-        Assert.NotEqual(callingThread, discovery.StartThreadId);
-        Assert.True(dispatcher.InvocationCount >= 1);
+        Assert.NotEqual(uiThread.ThreadId, repository.LoadThreadId);
+        Assert.NotEqual(uiThread.ThreadId, discovery.StartThreadId);
+        Assert.NotEmpty(uiThread.InvocationThreadIds);
+        Assert.All(uiThread.InvocationThreadIds, threadId => Assert.Equal(uiThread.ThreadId, threadId));
     }
 
     [Fact]
@@ -270,7 +276,7 @@ public sealed class MainWindowViewModelTests
         FakeRepository repository,
         FakeDiscovery? discovery = null,
         FakeCredentialStore? credentialStore = null,
-        RecordingDispatcher? dispatcher = null) =>
+        IUiDispatcher? dispatcher = null) =>
         new(repository, discovery ?? new FakeDiscovery(), credentialStore ?? new FakeCredentialStore(), dispatcher ?? new RecordingDispatcher());
 
     private static ConnectionProfile Profile(Guid id, string name, string host) =>
@@ -298,6 +304,129 @@ public sealed class MainWindowViewModelTests
         }
 
         public Task WhenIdleAsync() => Task.WhenAll(_pending.ToArray());
+    }
+
+    private sealed class DedicatedUiThreadDispatcher : IUiDispatcher, IAsyncDisposable
+    {
+        private readonly BlockingCollection<Action> _queue = [];
+        private readonly TaskCompletionSource<int> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly Thread _thread;
+
+        public DedicatedUiThreadDispatcher()
+        {
+            _thread = new Thread(Run)
+            {
+                IsBackground = true,
+                Name = "WinARD test UI thread",
+            };
+            _thread.SetApartmentState(ApartmentState.STA);
+            _thread.Start();
+            ThreadId = _started.Task.GetAwaiter().GetResult();
+        }
+
+        public int ThreadId { get; }
+        public ConcurrentQueue<int> InvocationThreadIds { get; } = new();
+
+        public Task RunAsync(Func<Task> action)
+        {
+            ArgumentNullException.ThrowIfNull(action);
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _queue.Add(() =>
+            {
+                Task task;
+                try
+                {
+                    task = action();
+                }
+                catch (Exception exception)
+                {
+                    completion.TrySetException(exception);
+                    return;
+                }
+
+                _ = task.ContinueWith(
+                    completed => Complete(completed, completion),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            });
+            return completion.Task;
+        }
+
+        public async Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(action);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Environment.CurrentManagedThreadId == ThreadId)
+            {
+                action();
+                InvocationThreadIds.Enqueue(Environment.CurrentManagedThreadId);
+                return;
+            }
+
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var registration = cancellationToken.Register(
+                () => completion.TrySetCanceled(cancellationToken));
+            _queue.Add(() =>
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    completion.TrySetCanceled(cancellationToken);
+                    return;
+                }
+
+                try
+                {
+                    action();
+                    InvocationThreadIds.Enqueue(Environment.CurrentManagedThreadId);
+                    completion.TrySetResult();
+                }
+                catch (Exception exception)
+                {
+                    completion.TrySetException(exception);
+                }
+            }, cancellationToken);
+            await completion.Task.ConfigureAwait(false);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _queue.CompleteAdding();
+            await Task.Run(_thread.Join);
+            _queue.Dispose();
+        }
+
+        private static void Complete(Task task, TaskCompletionSource completion)
+        {
+            if (task.IsCanceled)
+            {
+                completion.TrySetCanceled();
+            }
+            else if (task.Exception is not null)
+            {
+                completion.TrySetException(task.Exception.InnerExceptions);
+            }
+            else
+            {
+                completion.TrySetResult();
+            }
+        }
+
+        private void Run()
+        {
+            SynchronizationContext.SetSynchronizationContext(new QueueSynchronizationContext(_queue));
+            _started.TrySetResult(Environment.CurrentManagedThreadId);
+            foreach (var action in _queue.GetConsumingEnumerable())
+            {
+                action();
+            }
+        }
+
+        private sealed class QueueSynchronizationContext(BlockingCollection<Action> queue) : SynchronizationContext
+        {
+            public override void Post(SendOrPostCallback callback, object? state) =>
+                queue.Add(() => callback(state));
+        }
     }
 
     private sealed class FakeRepository(params ConnectionProfile[] profiles) : IDeviceRepository
