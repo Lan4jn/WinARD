@@ -545,6 +545,25 @@ public sealed class EncryptedCredentialVaultTests
     }
 
     [Fact]
+    public async Task Infinite_idle_timeout_disables_bottom_level_auto_lock()
+    {
+        var storage = await CreateStoredVaultAsync();
+        var time = new ManualTimeProvider();
+        using var master = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.OpenAsync(
+            storage,
+            master,
+            time,
+            Timeout.InfiniteTimeSpan,
+            CancellationToken.None);
+
+        time.Advance(TimeSpan.FromDays(365));
+
+        using var secret = await vault.ReadAsync(Reference, CancellationToken.None);
+        Assert.NotNull(secret);
+    }
+
+    [Fact]
     public async Task Expired_timer_waiting_behind_activity_does_not_lock_the_fresh_session()
     {
         var storage = await CreateStoredVaultAsync();

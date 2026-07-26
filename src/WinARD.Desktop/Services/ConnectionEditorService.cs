@@ -47,29 +47,31 @@ public sealed class ConnectionEditorService(
         }
 
         var package = secret as ConnectionEditorSecretPackage;
-        using var macSecret = package?.HasMacSecret == true ? package.CloneMacSecret() : secret?.Clone();
+        using var macSecret = package is not null
+            ? package.HasMacSecret ? package.CloneMacSecret() : null
+            : secret?.Clone();
         using var sshSecret = package?.HasSshSecret == true ? package.CloneSshSecret() : null;
-        var reference = macSecret is null && profile.CredentialReference is not null
-            ? profile.CredentialReference
+        var reference = mode == CredentialSaveMode.AskEveryTime
+            ? ReferenceFor(profile.Id, mode)
+            : macSecret is null
+            ? profile.CredentialReference ?? oldProfile?.CredentialReference
             : ReferenceFor(profile.Id, mode);
+        if (reference is null)
+        {
+            throw new InvalidOperationException("请选择密码后再保存到所选凭据存储。");
+        }
+
         var savedProfile = profile.WithCredential(reference);
-        savedProfile = WithSshCredentialReference(savedProfile, mode, sshSecret is not null);
+        savedProfile = WithSshCredentialReference(
+            savedProfile,
+            oldProfile,
+            mode,
+            sshSecret is not null);
 
         if (mode == CredentialSaveMode.AskEveryTime)
         {
             await _repository.SaveAsync(savedProfile, cancellationToken).ConfigureAwait(false);
             return await CompleteCommittedSaveAsync(oldProfile, savedProfile).ConfigureAwait(false);
-        }
-
-        if (macSecret is null)
-        {
-            if (oldProfile?.CredentialReference == reference)
-            {
-                await _repository.SaveAsync(savedProfile, cancellationToken).ConfigureAwait(false);
-                return await CompleteCommittedSaveAsync(oldProfile, savedProfile).ConfigureAwait(false);
-            }
-
-            throw new InvalidOperationException("请选择密码后再保存到所选凭据存储。");
         }
 
         CredentialReference? sshReference = null;
@@ -80,7 +82,9 @@ public sealed class ConnectionEditorService(
                 : savedSsh.PrivateKeyPassphraseCredentialReference;
         }
 
-        using var previous = await _credentialStore.ReadSnapshotAsync(reference, cancellationToken).ConfigureAwait(false);
+        using var previous = macSecret is null
+            ? null
+            : await _credentialStore.ReadSnapshotAsync(reference, cancellationToken).ConfigureAwait(false);
         using var previousSsh = sshReference is null
             ? null
             : await _credentialStore.ReadSnapshotAsync(sshReference, cancellationToken).ConfigureAwait(false);
@@ -88,12 +92,16 @@ public sealed class ConnectionEditorService(
         CredentialStoreWriteResult? sshWrite = null;
         try
         {
-            macWrite = await _credentialStore.CompareExchangeWithVersionAsync(
-                reference,
-                previous?.Version,
-                macSecret,
-                cancellationToken).ConfigureAwait(false);
-            EnsureWritten(macWrite);
+            if (macSecret is not null)
+            {
+                macWrite = await _credentialStore.CompareExchangeWithVersionAsync(
+                    reference,
+                    previous?.Version,
+                    macSecret,
+                    cancellationToken).ConfigureAwait(false);
+                EnsureWritten(macWrite);
+            }
+
             if (sshReference is not null && sshSecret is not null)
             {
                 sshWrite = await _credentialStore.CompareExchangeWithVersionAsync(
@@ -109,21 +117,21 @@ public sealed class ConnectionEditorService(
         catch (Exception saveException)
         {
             var rollbackErrors = new List<Exception>();
-            if (macWrite?.WrittenVersion is not null)
-            {
-                await RestoreCredentialAsync(
-                    reference,
-                    macWrite.WrittenVersion,
-                    previous,
-                    rollbackErrors).ConfigureAwait(false);
-            }
-
             if (sshReference is not null && sshWrite?.WrittenVersion is not null)
             {
                 await RestoreCredentialAsync(
                     sshReference,
                     sshWrite.WrittenVersion,
                     previousSsh,
+                    rollbackErrors).ConfigureAwait(false);
+            }
+
+            if (macWrite?.WrittenVersion is not null)
+            {
+                await RestoreCredentialAsync(
+                    reference,
+                    macWrite.WrittenVersion,
+                    previous,
                     rollbackErrors).ConfigureAwait(false);
             }
 
@@ -148,11 +156,26 @@ public sealed class ConnectionEditorService(
         ConnectionProfile profile,
         CredentialSaveMode mode,
         ISecret? secret,
+        CancellationToken cancellationToken) =>
+        await TestAsync(
+            profile,
+            mode,
+            secret,
+            hostKeyPrompt: null,
+            cancellationToken).ConfigureAwait(false);
+
+    public async Task<ConnectionProfileTestResult> TestAsync(
+        ConnectionProfile profile,
+        CredentialSaveMode mode,
+        ISecret? secret,
+        ISshHostKeyPrompt? hostKeyPrompt,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
         var package = secret as ConnectionEditorSecretPackage;
-        using var macSecret = package?.HasMacSecret == true ? package.CloneMacSecret() : secret?.Clone();
+        using var macSecret = package is not null
+            ? package.HasMacSecret ? package.CloneMacSecret() : null
+            : secret?.Clone();
         using var sshSecret = package?.HasSshSecret == true ? package.CloneSshSecret() : null;
         if (macSecret is null)
         {
@@ -203,6 +226,7 @@ public sealed class ConnectionEditorService(
                 testProfile,
                 StageChanged,
                 acceptedHostKey: null,
+                hostKeyPrompt,
                 cancellationToken)
                 .ConfigureAwait(false);
             var result = outcome.Result;
@@ -348,12 +372,32 @@ public sealed class ConnectionEditorService(
 
     private static ConnectionProfile WithSshCredentialReference(
         ConnectionProfile profile,
+        ConnectionProfile? oldProfile,
         CredentialSaveMode mode,
         bool replaceSecret)
     {
-        if (profile.SshProfile is not { } ssh || (!replaceSecret && mode != CredentialSaveMode.AskEveryTime))
+        if (profile.SshProfile is not { } ssh)
         {
             return profile;
+        }
+
+        if (!replaceSecret && mode != CredentialSaveMode.AskEveryTime)
+        {
+            var oldSsh = oldProfile?.SshProfile;
+            var preservedReference = ssh.PrivateKeyPath is null
+                ? ssh.PasswordCredentialReference ??
+                    (oldSsh is { PrivateKeyPath: null }
+                        ? oldSsh.PasswordCredentialReference
+                        : null)
+                : ssh.PrivateKeyPassphraseCredentialReference ??
+                    (oldSsh?.PrivateKeyPath is not null
+                        ? oldSsh.PrivateKeyPassphraseCredentialReference
+                        : null);
+            return preservedReference is null
+                ? profile
+                : profile.WithSsh(ssh.PrivateKeyPath is null
+                    ? ssh.WithAuthenticationCredentials(preservedReference, null)
+                    : ssh.WithAuthenticationCredentials(null, preservedReference));
         }
 
         var store = mode switch

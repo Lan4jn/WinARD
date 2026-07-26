@@ -22,6 +22,19 @@ public sealed class ConnectionAttemptWorkflow(
         ConnectionProfile profile,
         Action<ConnectionStage>? stageChanged,
         Func<ConnectionProfile, CancellationToken, Task>? acceptedHostKey,
+        CancellationToken cancellationToken) =>
+        await AttemptAsync(
+            profile,
+            stageChanged,
+            acceptedHostKey,
+            hostKeyPrompt: null,
+            cancellationToken).ConfigureAwait(false);
+
+    public async Task<ConnectionAttemptOutcome> AttemptAsync(
+        ConnectionProfile profile,
+        Action<ConnectionStage>? stageChanged,
+        Func<ConnectionProfile, CancellationToken, Task>? acceptedHostKey,
+        ISshHostKeyPrompt? hostKeyPrompt,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -40,7 +53,7 @@ public sealed class ConnectionAttemptWorkflow(
                 return new ConnectionAttemptOutcome(profile, result);
             }
 
-            var decision = await _hostKeyPrompt.PromptAsync(request, cancellationToken)
+            var decision = await (hostKeyPrompt ?? _hostKeyPrompt).PromptAsync(request, cancellationToken)
                 .ConfigureAwait(false);
             var accepted = request.IsChanged
                 ? decision == SshHostKeyPromptDecision.Replace

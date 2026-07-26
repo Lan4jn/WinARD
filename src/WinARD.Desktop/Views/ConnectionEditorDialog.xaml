@@ -33,6 +33,28 @@
                 </StackPanel>
             </Expander>
 
+            <Border x:Name="HostKeyPromptPanel"
+                    Visibility="Collapsed"
+                    Padding="12"
+                    BorderThickness="1"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    CornerRadius="6"
+                    AutomationProperties.AutomationId="EditorHostKeyPrompt">
+                <StackPanel Spacing="8">
+                    <TextBlock x:Name="HostKeyPromptTitle" FontWeight="SemiBold" />
+                    <TextBlock Text="请在继续前核对以下 SSH 主机密钥信息。" TextWrapping="Wrap" />
+                    <TextBlock x:Name="HostKeyEndpointText" AutomationProperties.AutomationId="EditorHostKeyEndpoint" />
+                    <TextBlock x:Name="HostKeyAlgorithmText" AutomationProperties.AutomationId="EditorHostKeyAlgorithm" />
+                    <TextBlock x:Name="HostKeyPreviousFingerprintText" TextWrapping="Wrap" AutomationProperties.AutomationId="EditorHostKeyPreviousFingerprint" />
+                    <TextBlock x:Name="HostKeyNewFingerprintText" TextWrapping="Wrap" AutomationProperties.AutomationId="EditorHostKeyNewFingerprint" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button x:Name="TrustHostKeyButton" Content="信任" Click="OnTrustHostKeyClicked" AutomationProperties.AutomationId="EditorTrustHostKey" />
+                        <Button x:Name="ReplaceHostKeyButton" Content="替换" Click="OnReplaceHostKeyClicked" AutomationProperties.AutomationId="EditorReplaceHostKey" />
+                        <Button Content="取消" Click="OnCancelHostKeyClicked" AutomationProperties.AutomationId="EditorCancelHostKey" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
             <Button x:Name="TestButton" Content="测试连接" Click="OnTestClicked" HorizontalAlignment="Left" AutomationProperties.AutomationId="TestConnectionButton" />
             <ProgressRing x:Name="BusyIndicator" IsActive="False" Width="24" Height="24" HorizontalAlignment="Left" />
             <TextBlock x:Name="StatusText" TextWrapping="Wrap" AutomationProperties.AutomationId="ConnectionEditorStatus" />

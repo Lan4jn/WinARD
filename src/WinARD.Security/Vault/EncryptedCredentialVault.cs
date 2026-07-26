@@ -325,7 +325,10 @@ public sealed class EncryptedCredentialVault :
         _entries = new Dictionary<string, VaultEntry>(document.Entries, StringComparer.Ordinal);
         _key = key;
         _lastActivity = timeProvider.GetUtcNow();
-        ScheduleAutoLock(generation: 0, idleTimeout);
+        if (idleTimeout != Timeout.InfiniteTimeSpan)
+        {
+            ScheduleAutoLock(generation: 0, idleTimeout);
+        }
     }
 
     public static ValueTask<EncryptedCredentialVault> CreateAsync(
@@ -891,7 +894,7 @@ public sealed class EncryptedCredentialVault :
             throw new ArgumentOutOfRangeException(nameof(masterPassword));
         }
 
-        if (idleTimeout <= TimeSpan.Zero || idleTimeout == Timeout.InfiniteTimeSpan)
+        if (idleTimeout <= TimeSpan.Zero && idleTimeout != Timeout.InfiniteTimeSpan)
         {
             throw new ArgumentOutOfRangeException(nameof(idleTimeout));
         }
@@ -1258,7 +1261,10 @@ public sealed class EncryptedCredentialVault :
     {
         _lastActivity = _timeProvider.GetUtcNow();
         var generation = checked(++_activityGeneration);
-        ScheduleAutoLock(generation, _idleTimeout);
+        if (_idleTimeout != Timeout.InfiniteTimeSpan)
+        {
+            ScheduleAutoLock(generation, _idleTimeout);
+        }
     }
 
     private void BeginAutoLock(long generation)

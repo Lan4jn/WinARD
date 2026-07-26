@@ -319,11 +319,18 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task OpenConnectionEditorAsync(ConnectionProfile? profile)
     {
+        using var hostKeyPrompt = new ConnectionEditorHostKeyPrompt();
         var viewModel = new ConnectionEditorViewModel(
             profile,
             _connectionEditorService.SaveWithResultAsync,
-            _connectionEditorService.TestAsync);
-        using var dialog = new ConnectionEditorDialog(viewModel, _vaultSession)
+            (candidate, mode, secret, cancellationToken) =>
+                _connectionEditorService.TestAsync(
+                    candidate,
+                    mode,
+                    secret,
+                    hostKeyPrompt,
+                    cancellationToken));
+        using var dialog = new ConnectionEditorDialog(viewModel, _vaultSession, hostKeyPrompt)
         {
             XamlRoot = ShellRoot.XamlRoot,
         };

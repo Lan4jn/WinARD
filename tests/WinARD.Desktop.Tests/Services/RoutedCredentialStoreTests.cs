@@ -82,6 +82,35 @@ public sealed class RoutedCredentialStoreTests
         Assert.NotNull(write.WrittenVersion);
     }
 
+    [Fact]
+    public async Task TransientStoreReturnsExactWrittenVersionWithoutRereadingConcurrentWinner()
+    {
+        using var store = new TransientCredentialStore();
+        var reference = CredentialReference.Create("transient", "exact-version");
+        using var first = SecretBuffer.CopyFrom([1]);
+        using var winner = SecretBuffer.CopyFrom([2]);
+
+        using var write = await store.CompareExchangeWithVersionAsync(
+            reference,
+            expectedVersion: null,
+            first,
+            CancellationToken.None);
+        await store.SaveAsync(reference, winner, CancellationToken.None);
+        using var current = await store.ReadSnapshotAsync(reference, CancellationToken.None);
+
+        Assert.Equal(CredentialStoreCompareExchangeResult.Succeeded, write.Result);
+        Assert.NotNull(write.WrittenVersion);
+        Assert.NotNull(current);
+        Assert.False(write.WrittenVersion.FixedTimeEquals(current.Version));
+
+        using var rollback = await store.CompareExchangeWithVersionAsync(
+            reference,
+            write.WrittenVersion,
+            replacement: null,
+            CancellationToken.None);
+        Assert.Equal(CredentialStoreCompareExchangeResult.Conflict, rollback.Result);
+    }
+
     private static string Read(ISecret secret)
     {
         var bytes = new byte[secret.Length];

@@ -35,6 +35,32 @@ public sealed class ConnectionEditorServiceTests
     }
 
     [Fact]
+    public async Task ExistingProfileChangedToAskEveryTimeReplacesPersistentReferencesWithoutSecrets()
+    {
+        var original = Profile()
+            .WithCredential(WinARD.Domain.Security.CredentialReference.Create("vault", "old/mac"))
+            .WithSsh(SshProfile.Create(
+                "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+                WinARD.Domain.Security.CredentialReference.Create("vault", "old/ssh"), null, null));
+        var repository = new FakeRepository { Existing = original };
+        using var store = new VersionedCredentialStore();
+        var sut = CreateService(repository, store, store);
+        var candidate = ProfileWithId(original.Id).WithSsh(SshProfile.Create(
+            "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+            credentialReference: null, null, null));
+
+        var saved = await sut.SaveAsync(
+            candidate,
+            CredentialSaveMode.AskEveryTime,
+            secret: null,
+            CancellationToken.None);
+
+        Assert.Equal("ask", saved.CredentialReference!.Store);
+        Assert.Equal("ask", saved.SshProfile!.PasswordCredentialReference!.Store);
+        Assert.Empty(store.CompareExchangeAttempts);
+    }
+
+    [Fact]
     public async Task RepositoryFailureRollsBackNewCredential()
     {
         var repository = new FakeRepository { FailSave = true };
@@ -118,6 +144,154 @@ public sealed class ConnectionEditorServiceTests
         Assert.Contains("先选择受支持的凭据保存方式", exception.Message, StringComparison.Ordinal);
         Assert.Equal(0, repository.SaveCalls);
         Assert.Empty(store.References);
+    }
+
+    [Fact]
+    public async Task SshOnlyPasswordUpdateWritesSshWithoutRewritingExistingMacCredential()
+    {
+        var macReference = WinARD.Domain.Security.CredentialReference.Create(
+            "vault",
+            "shared/mac");
+        var oldSshReference = WinARD.Domain.Security.CredentialReference.Create(
+            "vault",
+            "shared/ssh");
+        var original = Profile()
+            .WithCredential(macReference)
+            .WithSsh(SshProfile.Create(
+                "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+                oldSshReference, null, null));
+        var repository = new FakeRepository { Existing = original };
+        using var store = new VersionedCredentialStore();
+        using var existingMac = Secret("existing-mac");
+        using var existingSsh = Secret("existing-ssh");
+        await store.SaveAsync(macReference, existingMac, CancellationToken.None);
+        await store.SaveAsync(oldSshReference, existingSsh, CancellationToken.None);
+        var sut = CreateService(repository, store, store);
+        using var replacementSsh = Secret("replacement-ssh");
+        using var package = new ConnectionEditorSecretPackage(null, replacementSsh);
+
+        var candidate = ProfileWithId(original.Id).WithSsh(SshProfile.Create(
+            "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+            credentialReference: null, null, null));
+        var saved = await sut.SaveAsync(
+            candidate,
+            CredentialSaveMode.WindowsCredentialManager,
+            package,
+            CancellationToken.None);
+
+        var expectedSshReference = WinARD.Domain.Security.CredentialReference.Create(
+            "windows",
+            $"profile/{original.Id:D}/ssh-password");
+        using var actualSsh = await store.ReadAsync(expectedSshReference, CancellationToken.None);
+        using var actualMac = await store.ReadAsync(macReference, CancellationToken.None);
+        Assert.Equal(macReference, saved.CredentialReference);
+        Assert.Equal(expectedSshReference, saved.SshProfile!.PasswordCredentialReference);
+        Assert.Equal("replacement-ssh", ReadSecret(actualSsh!));
+        Assert.Equal("existing-mac", ReadSecret(actualMac!));
+        Assert.Equal([expectedSshReference], store.CompareExchangeAttempts);
+        Assert.Equal(saved, repository.Saved);
+    }
+
+    [Fact]
+    public async Task MacOnlyModeChangePreservesExistingSshCredentialForSameAuthenticationType()
+    {
+        var oldMac = WinARD.Domain.Security.CredentialReference.Create("vault", "old/mac");
+        var oldSsh = WinARD.Domain.Security.CredentialReference.Create("vault", "old/ssh");
+        var original = Profile().WithCredential(oldMac).WithSsh(SshProfile.Create(
+            "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+            oldSsh, null, null));
+        var repository = new FakeRepository { Existing = original };
+        using var store = new VersionedCredentialStore();
+        var sut = CreateService(repository, store, store);
+        var candidate = ProfileWithId(original.Id).WithSsh(SshProfile.Create(
+            "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+            credentialReference: null, null, null));
+        using var mac = Secret("new-mac");
+
+        var saved = await sut.SaveAsync(
+            candidate,
+            CredentialSaveMode.WindowsCredentialManager,
+            mac,
+            CancellationToken.None);
+
+        Assert.Equal("windows", saved.CredentialReference!.Store);
+        Assert.Equal(oldSsh, saved.SshProfile!.PasswordCredentialReference);
+        Assert.Single(store.CompareExchangeAttempts);
+        Assert.Equal(saved.CredentialReference, store.CompareExchangeAttempts[0]);
+    }
+
+    [Fact]
+    public async Task SshOnlyCompareExchangeConflictDoesNotCommitProfile()
+    {
+        var macReference = WinARD.Domain.Security.CredentialReference.Create("windows", "shared/mac");
+        var original = Profile()
+            .WithCredential(macReference)
+            .WithSsh(SshProfile.Create(
+                "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+                WinARD.Domain.Security.CredentialReference.Create("vault", "shared/ssh"),
+                null,
+                null));
+        var expectedSshReference = WinARD.Domain.Security.CredentialReference.Create(
+            "windows",
+            $"profile/{original.Id:D}/ssh-password");
+        var repository = new FakeRepository { Existing = original };
+        using var store = new VersionedCredentialStore
+        {
+            ConflictReference = expectedSshReference,
+        };
+        var sut = CreateService(repository, store, store);
+        using var ssh = Secret("replacement-ssh");
+        using var package = new ConnectionEditorSecretPackage(null, ssh);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => sut.SaveAsync(
+            original,
+            CredentialSaveMode.WindowsCredentialManager,
+            package,
+            CancellationToken.None));
+
+        Assert.Equal(0, repository.SaveCalls);
+        Assert.Null(await store.ReadAsync(expectedSshReference, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task SshOnlyRepositoryFailureDoesNotRollbackOverConcurrentWinner()
+    {
+        var original = Profile()
+            .WithCredential(WinARD.Domain.Security.CredentialReference.Create("windows", "shared/mac"))
+            .WithSsh(SshProfile.Create(
+                "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+                WinARD.Domain.Security.CredentialReference.Create("vault", "shared/ssh"),
+                null,
+                null));
+        var expectedSshReference = WinARD.Domain.Security.CredentialReference.Create(
+            "windows",
+            $"profile/{original.Id:D}/ssh-password");
+        using var store = new VersionedCredentialStore();
+        var repository = new FakeRepository
+        {
+            Existing = original,
+            SaveCallback = async cancellationToken =>
+            {
+                using var winner = Secret("concurrent-ssh-winner");
+                await store.SaveAsync(expectedSshReference, winner, cancellationToken);
+                throw new IOException("repository failure");
+            },
+        };
+        var sut = CreateService(repository, store, store);
+        using var ssh = Secret("this-save");
+        using var package = new ConnectionEditorSecretPackage(null, ssh);
+
+        await Assert.ThrowsAsync<AggregateException>(() => sut.SaveAsync(
+            original,
+            CredentialSaveMode.WindowsCredentialManager,
+            package,
+            CancellationToken.None));
+
+        using var actual = await store.ReadAsync(expectedSshReference, CancellationToken.None);
+        Assert.Equal("concurrent-ssh-winner", ReadSecret(actual!));
+        Assert.Equal(
+            [expectedSshReference, expectedSshReference],
+            store.CompareExchangeAttempts);
     }
 
     [Fact]
@@ -231,6 +405,23 @@ public sealed class ConnectionEditorServiceTests
         Assert.Empty(transient.References);
     }
 
+    [Fact]
+    public async Task TestWithSshOnlyPackageReportsMissingMacPassword()
+    {
+        using var store = new VersionedCredentialStore();
+        var sut = CreateService(new FakeRepository(), store, store);
+        using var ssh = Secret("ssh-password");
+        using var package = new ConnectionEditorSecretPackage(null, ssh);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => sut.TestAsync(
+            Profile(),
+            CredentialSaveMode.WindowsCredentialManager,
+            package,
+            CancellationToken.None));
+
+        Assert.Equal("测试连接需要临时密码。", exception.Message);
+    }
+
     [Theory]
     [InlineData(false, SshHostKeyPromptDecision.Trust)]
     [InlineData(true, SshHostKeyPromptDecision.Replace)]
@@ -272,24 +463,112 @@ public sealed class ConnectionEditorServiceTests
             new FixedSecretProvider(),
             new FixedClientFactory(client),
             new ErrorMapper());
-        var workflow = new ConnectionAttemptWorkflow(handler, new Prompt(decision));
+        var workflow = new ConnectionAttemptWorkflow(
+            handler,
+            new Prompt(SshHostKeyPromptDecision.Cancel));
         var sut = new ConnectionEditorService(
             repository,
             persistent,
             transient,
             workflow);
         using var mac = Secret("mac-password");
+        using var prompt = new ConnectionEditorHostKeyPrompt();
+        var promptShown = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        prompt.StateChanged += (_, _) =>
+        {
+            if (prompt.State.IsVisible)
+            {
+                promptShown.TrySetResult();
+            }
+        };
 
-        var result = await sut.TestAsync(
+        var test = sut.TestAsync(
             profile,
             CredentialSaveMode.WindowsCredentialManager,
             mac,
+            prompt,
             CancellationToken.None);
+        await promptShown.Task;
+        Assert.Equal(endpoint, prompt.State.Endpoint);
+        Assert.Equal(candidate.Algorithm, prompt.State.Algorithm);
+        Assert.Equal(candidate.Fingerprint, prompt.State.NewFingerprint);
+        Assert.Equal(changed, prompt.State.IsChanged);
+        if (decision == SshHostKeyPromptDecision.Replace)
+        {
+            prompt.Replace();
+        }
+        else
+        {
+            prompt.Trust();
+        }
+
+        var result = await test;
 
         Assert.Equal(0, repository.SaveCalls);
         Assert.Equal(2, transport.Attempts);
         Assert.True(client.Disposed);
         Assert.Equal(candidate.ToPin(), result.Profile.SshProfile!.HostKeyPin);
+        Assert.Empty(transient.References);
+    }
+
+    [Fact]
+    public async Task TestCanceledInlineHostKeyPromptDoesNotRetryAndCleansTransientSecrets()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(
+            endpoint,
+            "ssh-ed25519",
+            "AQIDBA==");
+        var profile = Profile().WithSsh(SshProfile.Create(
+            endpoint.Host,
+            endpoint.Port,
+            "ssh-user",
+            privateKeyPath: null,
+            targetHost: "studio.local",
+            targetPort: 5900,
+            credentialReference: null,
+            pinnedHostKeyAlgorithm: null,
+            pinnedHostKeySha256: null));
+        using var persistent = new VersionedCredentialStore();
+        using var transient = new VersionedCredentialStore();
+        var transport = new HostKeyThenSuccessTransport(candidate, changed: false);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new FixedSecretProvider(),
+            new FixedClientFactory(new TrackingClient()),
+            new ErrorMapper());
+        var sut = new ConnectionEditorService(
+            new FakeRepository(),
+            persistent,
+            transient,
+            new ConnectionAttemptWorkflow(
+                handler,
+                new Prompt(SshHostKeyPromptDecision.Cancel)));
+        using var mac = Secret("mac-password");
+        var prompt = new ConnectionEditorHostKeyPrompt();
+        var shown = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        prompt.StateChanged += (_, _) =>
+        {
+            if (prompt.State.IsVisible)
+            {
+                shown.TrySetResult();
+            }
+        };
+        var test = sut.TestAsync(
+            profile,
+            CredentialSaveMode.WindowsCredentialManager,
+            mac,
+            prompt,
+            CancellationToken.None);
+        await shown.Task;
+
+        prompt.Dispose();
+        var result = await test;
+
+        Assert.Equal(1, transport.Attempts);
+        Assert.Null(result.Profile.SshProfile!.HostKeyPin);
         Assert.Empty(transient.References);
     }
 
@@ -389,6 +668,10 @@ public sealed class ConnectionEditorServiceTests
 
         public List<WinARD.Domain.Security.CredentialReference> DeleteAttempts { get; } = [];
 
+        public List<WinARD.Domain.Security.CredentialReference> CompareExchangeAttempts { get; } = [];
+
+        public WinARD.Domain.Security.CredentialReference? ConflictReference { get; init; }
+
         public ValueTask SaveAsync(
             WinARD.Domain.Security.CredentialReference reference,
             ISecret secret,
@@ -444,6 +727,14 @@ public sealed class ConnectionEditorServiceTests
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            CompareExchangeAttempts.Add(reference);
+            if (reference == ConflictReference)
+            {
+                return ValueTask.FromResult(new CredentialStoreWriteResult(
+                    CredentialStoreCompareExchangeResult.Conflict,
+                    writtenVersion: null));
+            }
+
             var hasCurrent = _values.TryGetValue(reference, out var current);
             var matches = hasCurrent
                 ? expectedVersion is not null && expectedVersion.FixedTimeEquals(VersionBytes(current.Version))
@@ -544,6 +835,12 @@ public sealed class ConnectionEditorServiceTests
             CredentialStoreVersion? expectedVersion,
             ISecret? replacement,
             CancellationToken cancellationToken) => Fail<CredentialStoreCompareExchangeResult>();
+
+        public ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+            WinARD.Domain.Security.CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken) => Fail<CredentialStoreWriteResult>();
 
         public ValueTask DeleteAsync(
             WinARD.Domain.Security.CredentialReference reference,

@@ -16,14 +16,17 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
     private readonly CancellationTokenSource _lifetime = new();
     private readonly AsyncUiOperation _operations = new();
     private readonly VaultCredentialStoreSession? _vaultSession;
+    private readonly ConnectionEditorHostKeyPrompt? _hostKeyPrompt;
     private bool _saved;
 
     public ConnectionEditorDialog(
         ConnectionEditorViewModel viewModel,
-        VaultCredentialStoreSession? vaultSession = null)
+        VaultCredentialStoreSession? vaultSession = null,
+        ConnectionEditorHostKeyPrompt? hostKeyPrompt = null)
     {
         ViewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         _vaultSession = vaultSession;
+        _hostKeyPrompt = hostKeyPrompt;
         InitializeComponent();
         DisplayNameBox.Text = viewModel.DisplayName;
         HostBox.Text = viewModel.Host;
@@ -41,7 +44,13 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         WireFieldChanges();
         PrimaryButtonClick += OnSaveClicked;
         Closing += OnClosing;
+        if (_hostKeyPrompt is not null)
+        {
+            _hostKeyPrompt.StateChanged += OnHostKeyPromptStateChanged;
+        }
+
         UpdateState();
+        UpdateHostKeyPromptState();
     }
 
     public ConnectionEditorViewModel ViewModel { get; }
@@ -147,6 +156,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
 
     private void OnClosing(ContentDialog sender, ContentDialogClosingEventArgs args)
     {
+        _hostKeyPrompt?.Cancel();
         if (!_saved)
         {
             _lifetime.Cancel();
@@ -154,6 +164,43 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
 
         ClearPasswords();
     }
+
+    private void OnHostKeyPromptStateChanged(object? sender, EventArgs args)
+    {
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            UpdateHostKeyPromptState();
+            return;
+        }
+
+        _ = DispatcherQueue.TryEnqueue(UpdateHostKeyPromptState);
+    }
+
+    private void UpdateHostKeyPromptState()
+    {
+        var state = _hostKeyPrompt?.State ?? ConnectionEditorHostKeyPromptState.Hidden;
+        HostKeyPromptPanel.Visibility = state.IsVisible ? Visibility.Visible : Visibility.Collapsed;
+        HostKeyPromptTitle.Text = state.IsChanged ? "SSH 主机密钥已更改" : "未知的 SSH 主机密钥";
+        HostKeyEndpointText.Text = state.Endpoint is { } endpoint
+            ? $"端点：{endpoint.Host}:{endpoint.Port}"
+            : string.Empty;
+        HostKeyAlgorithmText.Text = $"算法：{state.Algorithm}";
+        HostKeyPreviousFingerprintText.Text = state.PreviousFingerprint is null
+            ? string.Empty
+            : $"原 SHA256：{state.PreviousFingerprint}";
+        HostKeyPreviousFingerprintText.Visibility = state.PreviousFingerprint is null
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+        HostKeyNewFingerprintText.Text = $"新 SHA256：{state.NewFingerprint}";
+        TrustHostKeyButton.Visibility = state.IsChanged ? Visibility.Collapsed : Visibility.Visible;
+        ReplaceHostKeyButton.Visibility = state.IsChanged ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void OnTrustHostKeyClicked(object sender, RoutedEventArgs args) => _hostKeyPrompt?.Trust();
+
+    private void OnReplaceHostKeyClicked(object sender, RoutedEventArgs args) => _hostKeyPrompt?.Replace();
+
+    private void OnCancelHostKeyClicked(object sender, RoutedEventArgs args) => _hostKeyPrompt?.Cancel();
 
     private void SetBusy(bool busy)
     {
@@ -242,6 +289,12 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
 
     public void Dispose()
     {
+        if (_hostKeyPrompt is not null)
+        {
+            _hostKeyPrompt.StateChanged -= OnHostKeyPromptStateChanged;
+            _hostKeyPrompt.Cancel();
+        }
+
         _lifetime.Cancel();
         ClearPasswords();
         _lifetime.Dispose();

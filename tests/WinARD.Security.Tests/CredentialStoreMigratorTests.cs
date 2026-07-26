@@ -426,7 +426,18 @@ public sealed class CredentialStoreMigratorTests
                 new CredentialStoreSnapshot(secret, CredentialStoreVersion.CopyFrom(version)));
         }
 
-        public ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
+        public async ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
+            CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken)
+        {
+            using var write = await CompareExchangeWithVersionAsync(
+                reference, expectedVersion, replacement, cancellationToken);
+            return write.Result;
+        }
+
+        public ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
             CredentialReference reference,
             CredentialStoreVersion? expectedVersion,
             ISecret? replacement,
@@ -436,14 +447,16 @@ public sealed class CredentialStoreMigratorTests
             RollbackUsedNonCancellableToken = !cancellationToken.CanBeCanceled;
             if (CompareExchangeException is not null)
             {
-                return ValueTask.FromException<CredentialStoreCompareExchangeResult>(
+                return ValueTask.FromException<CredentialStoreWriteResult>(
                     CompareExchangeException);
             }
 
             if (CompareExchangeConflictValue is not null)
             {
                 WriteExternal(CompareExchangeConflictValue);
-                return ValueTask.FromResult(CredentialStoreCompareExchangeResult.Conflict);
+                return ValueTask.FromResult(new CredentialStoreWriteResult(
+                    CredentialStoreCompareExchangeResult.Conflict,
+                    writtenVersion: null));
             }
 
             Span<byte> currentVersion = stackalloc byte[sizeof(long)];
@@ -453,7 +466,9 @@ public sealed class CredentialStoreMigratorTests
                 : expectedVersion is not null && expectedVersion.FixedTimeEquals(currentVersion);
             if (!matches)
             {
-                return ValueTask.FromResult(CredentialStoreCompareExchangeResult.Conflict);
+                return ValueTask.FromResult(new CredentialStoreWriteResult(
+                    CredentialStoreCompareExchangeResult.Conflict,
+                    writtenVersion: null));
             }
 
             byte[]? value = null;
@@ -466,7 +481,11 @@ public sealed class CredentialStoreMigratorTests
             Replace(value);
             Deleted = replacement is null;
             CompareExchangeWriteCount++;
-            return ValueTask.FromResult(CredentialStoreCompareExchangeResult.Succeeded);
+            Span<byte> writtenVersion = stackalloc byte[sizeof(long)];
+            BinaryPrimitives.WriteInt64LittleEndian(writtenVersion, _version);
+            return ValueTask.FromResult(new CredentialStoreWriteResult(
+                CredentialStoreCompareExchangeResult.Succeeded,
+                replacement is null ? null : CredentialStoreVersion.CopyFrom(writtenVersion)));
         }
 
         public ValueTask DeleteAsync(

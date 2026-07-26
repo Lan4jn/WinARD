@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using WinARD.Application.Ports;
 using WinARD.Domain.Security;
 
@@ -114,38 +113,55 @@ public interface ITransientCredentialStore : ICredentialStore
 
 public sealed class TransientCredentialStore : ITransientCredentialStore, IDisposable
 {
-    private readonly ConcurrentDictionary<CredentialReference, ISecret> _secrets = new();
+    private readonly object _gate = new();
+    private readonly Dictionary<CredentialReference, Entry> _secrets = [];
+    private long _nextVersion;
 
     public ValueTask SaveAsync(CredentialReference reference, ISecret secret, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(secret);
-        var clone = secret.Clone();
-        if (_secrets.TryGetValue(reference, out var old))
+        lock (_gate)
         {
-            old.Dispose();
+            var clone = secret.Clone();
+            if (_secrets.Remove(reference, out var old))
+            {
+                old.Secret.Dispose();
+            }
+
+            _secrets[reference] = new Entry(clone, ++_nextVersion);
         }
 
-        _secrets[reference] = clone;
         return ValueTask.CompletedTask;
     }
 
     public ValueTask<ISecret?> ReadAsync(CredentialReference reference, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return ValueTask.FromResult(_secrets.TryGetValue(reference, out var secret) ? secret.Clone() : null);
+        lock (_gate)
+        {
+            return ValueTask.FromResult(
+                _secrets.TryGetValue(reference, out var entry)
+                    ? entry.Secret.Clone()
+                    : null);
+        }
     }
 
-    public async ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(CredentialReference reference, CancellationToken cancellationToken)
+    public ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(CredentialReference reference, CancellationToken cancellationToken)
     {
-        using var secret = await ReadAsync(reference, cancellationToken).ConfigureAwait(false);
-        if (secret is null)
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
         {
-            return null;
-        }
+            if (!_secrets.TryGetValue(reference, out var entry))
+            {
+                return ValueTask.FromResult<CredentialStoreSnapshot?>(null);
+            }
 
-        return new CredentialStoreSnapshot(secret.Clone(), CredentialStoreVersion.CopyFrom([1]));
+            return ValueTask.FromResult<CredentialStoreSnapshot?>(new CredentialStoreSnapshot(
+                entry.Secret.Clone(),
+                Version(entry.Version)));
+        }
     }
 
     public async ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
@@ -154,24 +170,65 @@ public sealed class TransientCredentialStore : ITransientCredentialStore, IDispo
         ISecret? replacement,
         CancellationToken cancellationToken)
     {
-        if (replacement is null)
-        {
-            await DeleteAsync(reference, cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-            await SaveAsync(reference, replacement, cancellationToken).ConfigureAwait(false);
-        }
+        using var write = await CompareExchangeWithVersionAsync(
+            reference, expectedVersion, replacement, cancellationToken).ConfigureAwait(false);
+        return write.Result;
+    }
 
-        return CredentialStoreCompareExchangeResult.Succeeded;
+    public ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+        CredentialReference reference,
+        CredentialStoreVersion? expectedVersion,
+        ISecret? replacement,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentNullException.ThrowIfNull(reference);
+        lock (_gate)
+        {
+            var hasCurrent = _secrets.TryGetValue(reference, out var current);
+            using var currentVersion = hasCurrent ? Version(current!.Version) : null;
+            var matches = hasCurrent
+                ? expectedVersion is not null && expectedVersion.FixedTimeEquals(currentVersion!)
+                : expectedVersion is null;
+            if (!matches)
+            {
+                return ValueTask.FromResult(new CredentialStoreWriteResult(
+                    CredentialStoreCompareExchangeResult.Conflict,
+                    writtenVersion: null));
+            }
+
+            if (replacement is null)
+            {
+                if (hasCurrent)
+                {
+                    _secrets.Remove(reference);
+                    current!.Secret.Dispose();
+                }
+
+                return ValueTask.FromResult(new CredentialStoreWriteResult(
+                    CredentialStoreCompareExchangeResult.Succeeded,
+                    writtenVersion: null));
+            }
+
+            var clone = replacement.Clone();
+            current?.Secret.Dispose();
+            var version = ++_nextVersion;
+            _secrets[reference] = new Entry(clone, version);
+            return ValueTask.FromResult(new CredentialStoreWriteResult(
+                CredentialStoreCompareExchangeResult.Succeeded,
+                Version(version)));
+        }
     }
 
     public ValueTask DeleteAsync(CredentialReference reference, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (_secrets.TryRemove(reference, out var secret))
+        lock (_gate)
         {
-            secret.Dispose();
+            if (_secrets.Remove(reference, out var entry))
+            {
+                entry.Secret.Dispose();
+            }
         }
 
         return ValueTask.CompletedTask;
@@ -179,11 +236,19 @@ public sealed class TransientCredentialStore : ITransientCredentialStore, IDispo
 
     public void Dispose()
     {
-        foreach (var secret in _secrets.Values)
+        lock (_gate)
         {
-            secret.Dispose();
-        }
+            foreach (var entry in _secrets.Values)
+            {
+                entry.Secret.Dispose();
+            }
 
-        _secrets.Clear();
+            _secrets.Clear();
+        }
     }
+
+    private static CredentialStoreVersion Version(long value) =>
+        CredentialStoreVersion.CopyFrom(BitConverter.GetBytes(value));
+
+    private sealed record Entry(ISecret Secret, long Version);
 }

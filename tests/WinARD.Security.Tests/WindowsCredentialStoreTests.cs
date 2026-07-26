@@ -478,6 +478,13 @@ public sealed class WindowsCredentialStoreTests
             CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
+        public ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+            CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public ValueTask DeleteAsync(
             CredentialReference reference,
             CancellationToken cancellationToken)

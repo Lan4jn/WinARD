@@ -141,6 +141,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         await _deleteGate.WaitAsync(operationToken).ConfigureAwait(false);
         try
         {
+            operationToken.ThrowIfCancellationRequested();
             lock (_lifecycleGate)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);

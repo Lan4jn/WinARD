@@ -474,6 +474,13 @@ public sealed class OpenSshAskPassTests
             CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
+        public ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+            CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public ValueTask DeleteAsync(
             CredentialReference reference,
             CancellationToken cancellationToken) =>
@@ -510,6 +517,13 @@ public sealed class OpenSshAskPassTests
             throw new NotSupportedException();
 
         public ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
+            CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
             CredentialReference reference,
             CredentialStoreVersion? expectedVersion,
             ISecret? replacement,

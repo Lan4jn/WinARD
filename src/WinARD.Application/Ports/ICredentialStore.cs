@@ -131,25 +131,11 @@ public interface ICredentialStore
         ISecret? replacement,
         CancellationToken cancellationToken);
 
-    async ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+    ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
         CredentialReference reference,
         CredentialStoreVersion? expectedVersion,
         ISecret? replacement,
-        CancellationToken cancellationToken)
-    {
-        var result = await CompareExchangeAsync(
-            reference,
-            expectedVersion,
-            replacement,
-            cancellationToken).ConfigureAwait(false);
-        if (result != CredentialStoreCompareExchangeResult.Succeeded || replacement is null)
-        {
-            return new CredentialStoreWriteResult(result, writtenVersion: null);
-        }
-
-        using var snapshot = await ReadSnapshotAsync(reference, cancellationToken).ConfigureAwait(false);
-        return new CredentialStoreWriteResult(result, snapshot?.Version.Clone());
-    }
+        CancellationToken cancellationToken);
 
     ValueTask DeleteAsync(
         CredentialReference reference,
