@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using WinARD.Application.Ports;
 using WinARD.Domain.Security;
@@ -9,6 +10,13 @@ namespace WinARD.Security.WindowsCredentials;
 public sealed class WindowsCredentialStore : ICredentialStore
 {
     internal const int MaximumBlobBytes = 2560;
+    internal const int RevisionOffset = 9;
+    internal const int RevisionSize = 16;
+    internal const int HeaderSize = 29;
+    internal const int MaximumSecretBytes = MaximumBlobBytes - HeaderSize;
+    private const int FormatVersionOffset = 8;
+    private const int SecretLengthOffset = 25;
+    private const byte CurrentFormatVersion = 1;
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> TargetGates =
         new(StringComparer.Ordinal);
 
@@ -33,25 +41,22 @@ public sealed class WindowsCredentialStore : ICredentialStore
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(secret);
         cancellationToken.ThrowIfCancellationRequested();
-        if (secret.Length > MaximumBlobBytes)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(secret),
-                "Windows Credential Manager limits generic credential blobs to 2560 bytes.");
-        }
-
         var target = TargetName(reference);
         var gate = TargetGates.GetOrAdd(target, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        var value = new byte[secret.Length];
+        byte[]? value = null;
         try
         {
-            secret.CopyTo(value);
+            value = CreateBlob(secret, nameof(secret));
             _native.Write(target, value);
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(value);
+            if (value is not null)
+            {
+                CryptographicOperations.ZeroMemory(value);
+            }
+
             gate.Release();
         }
     }
@@ -70,7 +75,13 @@ public sealed class WindowsCredentialStore : ICredentialStore
         try
         {
             value = _native.Read(target);
-            return value is null ? null : SecretBuffer.CopyFrom(value);
+            if (value is null)
+            {
+                return null;
+            }
+
+            var secretLength = ValidateBlob(value);
+            return SecretBuffer.CopyFrom(value.AsSpan(HeaderSize, secretLength));
         }
         finally
         {
@@ -94,7 +105,6 @@ public sealed class WindowsCredentialStore : ICredentialStore
         var gate = TargetGates.GetOrAdd(target, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         byte[]? value = null;
-        byte[]? version = null;
         SecretBuffer? secret = null;
         CredentialStoreVersion? snapshotVersion = null;
         try
@@ -105,9 +115,10 @@ public sealed class WindowsCredentialStore : ICredentialStore
                 return null;
             }
 
-            version = SHA256.HashData(value);
-            secret = SecretBuffer.CopyFrom(value);
-            snapshotVersion = CredentialStoreVersion.CopyFrom(version);
+            var secretLength = ValidateBlob(value);
+            secret = SecretBuffer.CopyFrom(value.AsSpan(HeaderSize, secretLength));
+            snapshotVersion = CredentialStoreVersion.CopyFrom(
+                value.AsSpan(RevisionOffset, RevisionSize));
             var snapshot = new CredentialStoreSnapshot(secret, snapshotVersion);
             secret = null;
             snapshotVersion = null;
@@ -120,11 +131,6 @@ public sealed class WindowsCredentialStore : ICredentialStore
             if (value is not null)
             {
                 CryptographicOperations.ZeroMemory(value);
-            }
-
-            if (version is not null)
-            {
-                CryptographicOperations.ZeroMemory(version);
             }
 
             gate.Release();
@@ -140,25 +146,17 @@ public sealed class WindowsCredentialStore : ICredentialStore
         EnsureWindows();
         ArgumentNullException.ThrowIfNull(reference);
         cancellationToken.ThrowIfCancellationRequested();
-        if (replacement?.Length > MaximumBlobBytes)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(replacement),
-                "Windows Credential Manager limits generic credential blobs to 2560 bytes.");
-        }
-
         var target = TargetName(reference);
         var gate = TargetGates.GetOrAdd(target, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         byte[]? current = null;
-        byte[]? currentVersion = null;
         byte[]? replacementBytes = null;
         try
         {
             current = _native.Read(target);
             var matches = current is null
                 ? expectedVersion is null
-                : expectedVersion is not null && VersionMatches(current, expectedVersion, out currentVersion);
+                : expectedVersion is not null && VersionMatches(current, expectedVersion);
             if (!matches)
             {
                 return CredentialStoreCompareExchangeResult.Conflict;
@@ -170,8 +168,7 @@ public sealed class WindowsCredentialStore : ICredentialStore
             }
             else
             {
-                replacementBytes = new byte[replacement.Length];
-                replacement.CopyTo(replacementBytes);
+                replacementBytes = CreateBlob(replacement, nameof(replacement));
                 _native.Write(target, replacementBytes);
             }
 
@@ -182,11 +179,6 @@ public sealed class WindowsCredentialStore : ICredentialStore
             if (current is not null)
             {
                 CryptographicOperations.ZeroMemory(current);
-            }
-
-            if (currentVersion is not null)
-            {
-                CryptographicOperations.ZeroMemory(currentVersion);
             }
 
             if (replacementBytes is not null)
@@ -235,10 +227,67 @@ public sealed class WindowsCredentialStore : ICredentialStore
 
     private static bool VersionMatches(
         byte[] current,
-        CredentialStoreVersion expectedVersion,
-        out byte[] digest)
+        CredentialStoreVersion expectedVersion)
     {
-        digest = SHA256.HashData(current);
-        return expectedVersion.FixedTimeEquals(digest);
+        ValidateBlob(current);
+        return expectedVersion.FixedTimeEquals(
+            current.AsSpan(RevisionOffset, RevisionSize));
     }
+
+    private static byte[] CreateBlob(ISecret secret, string parameterName)
+    {
+        var secretLength = secret.Length;
+        if (secretLength > MaximumSecretBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                parameterName,
+                $"Windows credentials are limited to {MaximumSecretBytes} secret bytes after the WinARD version header.");
+        }
+
+        var blob = new byte[HeaderSize + secretLength];
+        try
+        {
+            BlobMagic.CopyTo(blob);
+            blob[FormatVersionOffset] = CurrentFormatVersion;
+            RandomNumberGenerator.Fill(blob.AsSpan(RevisionOffset, RevisionSize));
+            BinaryPrimitives.WriteInt32LittleEndian(
+                blob.AsSpan(SecretLengthOffset, sizeof(int)),
+                secretLength);
+            secret.CopyTo(blob.AsSpan(HeaderSize, secretLength));
+            return blob;
+        }
+        catch
+        {
+            CryptographicOperations.ZeroMemory(blob);
+            throw;
+        }
+    }
+
+    private static int ValidateBlob(ReadOnlySpan<byte> blob)
+    {
+        if (blob.Length < HeaderSize ||
+            !blob[..BlobMagic.Length].SequenceEqual(BlobMagic) ||
+            blob[FormatVersionOffset] != CurrentFormatVersion)
+        {
+            throw MalformedBlob();
+        }
+
+        var secretLength = BinaryPrimitives.ReadInt32LittleEndian(
+            blob.Slice(SecretLengthOffset, sizeof(int)));
+        if (secretLength < 0 ||
+            secretLength > MaximumSecretBytes ||
+            blob.Length != HeaderSize + secretLength)
+        {
+            throw MalformedBlob();
+        }
+
+        return secretLength;
+    }
+
+    private static ReadOnlySpan<byte> BlobMagic => "WinARD-C"u8;
+
+    private static InvalidDataException MalformedBlob() =>
+        new(
+            "The Windows credential is not a supported versioned WinARD credential blob. " +
+            "Legacy raw credential blobs are intentionally rejected.");
 }

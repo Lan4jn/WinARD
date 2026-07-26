@@ -34,6 +34,16 @@ public sealed class CredentialStoreVersion : IDisposable
             CryptographicOperations.FixedTimeEquals(value, candidate);
     }
 
+    public bool FixedTimeEquals(CredentialStoreVersion candidate)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        var value = _value ?? throw new ObjectDisposedException(nameof(CredentialStoreVersion));
+        var candidateValue = candidate._value ??
+            throw new ObjectDisposedException(nameof(CredentialStoreVersion));
+        return value.Length == candidateValue.Length &&
+            CryptographicOperations.FixedTimeEquals(value, candidateValue);
+    }
+
     public void Dispose()
     {
         var value = Interlocked.Exchange(ref _value, null);
