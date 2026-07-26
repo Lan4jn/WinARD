@@ -1,0 +1,100 @@
+using Microsoft.Data.Sqlite;
+using WinARD.Infrastructure.Database;
+using Xunit;
+
+#pragma warning disable CA1707
+
+namespace WinARD.Infrastructure.Tests;
+
+public sealed class WinArdDatabaseTests
+{
+    [Fact]
+    public async Task Failed_migration_rolls_back_schema_and_version()
+    {
+        using var fixture = new TempDatabase();
+        await using var database = new WinArdDatabase(fixture.Path);
+        var migration = new FailingMigration();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            database.InitializeAsync([migration], CancellationToken.None));
+
+        await using var connection = new SqliteConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('partial_table', 'schema_version');";
+        Assert.Equal(0L, (long)(await command.ExecuteScalarAsync() ?? -1L));
+    }
+
+    [Fact]
+    public async Task Future_schema_version_is_rejected_without_modification()
+    {
+        using var fixture = new TempDatabase();
+        var builder = new SqliteConnectionStringBuilder { DataSource = fixture.Path, Pooling = false };
+        await using (var connection = new SqliteConnection(builder.ToString()))
+        {
+            await connection.OpenAsync();
+            var seed = connection.CreateCommand();
+            seed.CommandText = "CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (999);";
+            await seed.ExecuteNonQueryAsync();
+        }
+
+        await using var database = new WinArdDatabase(fixture.Path);
+        await Assert.ThrowsAsync<UnsupportedSchemaVersionException>(() => database.InitializeAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Concurrent_initialization_leaves_exactly_one_version_row()
+    {
+        using var fixture = new TempDatabase();
+        var databases = Enumerable.Range(0, 8).Select(_ => new WinArdDatabase(fixture.Path)).ToArray();
+        try
+        {
+            await Task.WhenAll(databases.Select(database => database.InitializeAsync(CancellationToken.None)));
+            await using var connection = new SqliteConnection(databases[0].ConnectionString);
+            await connection.OpenAsync();
+            var command = connection.CreateCommand();
+            command.CommandText = "SELECT COUNT(*), MIN(version), MAX(version) FROM schema_version;";
+            await using var reader = await command.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal(1L, reader.GetInt64(0));
+            Assert.Equal(1L, reader.GetInt64(1));
+            Assert.Equal(1L, reader.GetInt64(2));
+        }
+        finally
+        {
+            foreach (var database in databases)
+            {
+                await database.DisposeAsync();
+            }
+        }
+    }
+
+    private sealed class FailingMigration : IDatabaseMigration
+    {
+        public int Version => 1;
+
+        public async Task ApplyAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
+        {
+            var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "CREATE TABLE partial_table(id INTEGER);";
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            throw new InvalidOperationException("fixture migration failure");
+        }
+    }
+
+    private sealed class TempDatabase : IDisposable
+    {
+        private readonly string _directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "WinARD.Tests", Guid.NewGuid().ToString("N"));
+
+        public TempDatabase()
+        {
+            System.IO.Directory.CreateDirectory(_directory);
+            Path = System.IO.Path.Combine(_directory, "winard.db");
+        }
+
+        public string Path { get; }
+
+        public void Dispose() => System.IO.Directory.Delete(_directory, recursive: true);
+    }
+}
