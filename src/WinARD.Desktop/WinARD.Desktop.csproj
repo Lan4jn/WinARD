@@ -22,6 +22,7 @@
     <ProjectReference Include="..\WinARD.Remote.Protocol\WinARD.Remote.Protocol.csproj" />
     <ProjectReference Include="..\WinARD.Security\WinARD.Security.csproj" />
     <ProjectReference Include="..\WinARD.Transport\WinARD.Transport.csproj" />
+    <ProjectReference Include="..\..\tools\WinARD.OpenSshAskPass\WinARD.OpenSshAskPass.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" />

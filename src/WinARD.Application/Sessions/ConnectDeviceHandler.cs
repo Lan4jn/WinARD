@@ -29,6 +29,12 @@ public sealed class ConnectDeviceHandler
 
     public async Task<ConnectResult> HandleAsync(
         ConnectionProfile profile,
+        CancellationToken cancellationToken) =>
+        await HandleAsync(profile, stageChanged: null, cancellationToken).ConfigureAwait(false);
+
+    public async Task<ConnectResult> HandleAsync(
+        ConnectionProfile profile,
+        Action<ConnectionStage>? stageChanged,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -42,24 +48,30 @@ public sealed class ConnectDeviceHandler
         try
         {
             stateMachine.MoveTo(SessionState.Resolving);
+            stageChanged?.Invoke(ConnectionStage.Resolving);
             secret = await _secretProvider.GetSecretAsync(profile, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             stateMachine.MoveTo(SessionState.Connecting);
+            stageChanged?.Invoke(ConnectionStage.Connecting);
             transport = await _transportFactory.ConnectAsync(profile, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             stateMachine.MoveTo(SessionState.Negotiating);
+            stageChanged?.Invoke(ConnectionStage.Negotiating);
             client = _clientFactory.Create(transport.Stream);
             await client.NegotiateAsync(cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             stateMachine.MoveTo(SessionState.Authenticating);
+            stageChanged?.Invoke(ConnectionStage.Authenticating);
             await client.AuthenticateAsync(profile.MacUsername, secret, cancellationToken).ConfigureAwait(false);
             secret.Dispose();
             secret = null;
             cancellationToken.ThrowIfCancellationRequested();
             stateMachine.MoveTo(SessionState.Initializing);
+            stageChanged?.Invoke(ConnectionStage.Initializing);
             await client.InitializeAsync(cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             stateMachine.MoveTo(SessionState.Connected);
+            stageChanged?.Invoke(ConnectionStage.Connected);
 
             return new ConnectResult(
                 stateMachine.Current,

@@ -11,7 +11,7 @@ using WinARD.Infrastructure.Database;
 using WinARD.Infrastructure.Devices;
 using WinARD.Infrastructure.Discovery;
 using WinARD.Security.WindowsCredentials;
-using WinARD.Transport.Tcp;
+using WinARD.Security.Vault;
 
 namespace WinARD.Desktop;
 
@@ -42,17 +42,30 @@ public partial class App : Microsoft.UI.Xaml.Application
         services.AddSingleton<IDeviceRepository, SqliteDeviceRepository>();
         services.AddSingleton<IBonjourServiceWatcher, DnssdServiceWatcher>();
         services.AddSingleton<IDeviceDiscovery, BonjourDeviceDiscovery>();
-        services.AddSingleton<ICredentialStore, WindowsCredentialStore>();
+        var windowsStore = new WindowsCredentialStore();
+        services.AddSingleton(windowsStore);
+        services.AddSingleton(new VaultCredentialStoreSession(
+            new FileVaultStorage(Path.Combine(dataDirectory, "credentials.vault")),
+            TimeProvider.System,
+            TimeSpan.FromMinutes(15)));
+        services.AddSingleton<TransientCredentialStore>();
+        services.AddSingleton<CredentialPromptService>();
+        services.AddSingleton<ICredentialStore>(provider => new RoutedCredentialStore(
+            provider.GetRequiredService<WindowsCredentialStore>(),
+            provider.GetRequiredService<VaultCredentialStoreSession>(),
+            provider.GetRequiredService<TransientCredentialStore>()));
         services.AddSingleton<IUiDispatcher>(_ => new DispatcherQueueUiDispatcher(
             DispatcherQueue.GetForCurrentThread() ??
             throw new InvalidOperationException("The WinUI dispatcher is unavailable.")));
         services.AddSingleton<IConnectionSecretProvider, CredentialStoreConnectionSecretProvider>();
-        services.AddSingleton<IRemoteTransportFactory, TcpRemoteTransport>();
-        services.AddSingleton<IRfbClientFactory, UnavailableRfbClientFactory>();
+        services.AddSingleton<IRemoteTransportFactory, RoutingRemoteTransport>();
+        services.AddSingleton<IRfbClientFactory, RfbClientFactory>();
         services.AddSingleton<IErrorMapper, ErrorMapper>();
         services.AddSingleton<ConnectDeviceHandler>();
+        services.AddSingleton<ConnectionEditorService>();
         services.AddSingleton<MainWindowViewModel>();
         services.AddSingleton<MainWindow>();
         return services.BuildServiceProvider(validateScopes: true);
     }
+
 }

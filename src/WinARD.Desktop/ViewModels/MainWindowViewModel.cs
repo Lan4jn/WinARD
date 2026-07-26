@@ -37,12 +37,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _discovery.Changed += OnDiscoveryChanged;
-        AddDeviceCommand = new RelayCommand(() => StatusMessage = "添加设备向导将在下一阶段提供。");
+        AddDeviceCommand = new RelayCommand(() => AddDeviceRequested?.Invoke(this, EventArgs.Empty));
+        EditDeviceCommand = new RelayCommand(
+            () => EditDeviceRequested?.Invoke(SelectedDevice!.Profile!),
+            () => SelectedDevice?.Profile is not null);
     }
 
     public ObservableCollection<DeviceItemViewModel> SavedDevices { get; } = [];
     public ObservableCollection<DeviceItemViewModel> DiscoveredDevices { get; } = [];
     public IRelayCommand AddDeviceCommand { get; }
+    public IRelayCommand EditDeviceCommand { get; }
+
+    public event EventHandler? AddDeviceRequested;
+
+    public event Action<WinARD.Domain.Connections.ConnectionProfile>? EditDeviceRequested;
 
     public string SearchText
     {
@@ -59,7 +67,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public DeviceItemViewModel? SelectedDevice
     {
         get => _selectedDevice;
-        set => SetProperty(ref _selectedDevice, value);
+        set
+        {
+            if (SetProperty(ref _selectedDevice, value))
+            {
+                EditDeviceCommand.NotifyCanExecuteChanged();
+            }
+        }
     }
 
     public string StatusMessage
@@ -74,6 +88,22 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     {
         get => _isDeleting;
         private set => SetProperty(ref _isDeleting, value);
+    }
+
+    public Task ApplySavedProfileAsync(
+        WinARD.Domain.Connections.ConnectionProfile profile,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        return _dispatcher.InvokeAsync(() =>
+        {
+            var item = DeviceItemViewModel.FromProfile(profile);
+            _allSaved.RemoveAll(existing => existing.Profile?.Id == profile.Id);
+            _allSaved.Add(item);
+            ReplaceSavedDevices();
+            SelectedDevice = SavedDevices.FirstOrDefault(existing => existing.Profile?.Id == profile.Id) ?? item;
+            StatusMessage = $"已保存“{profile.DisplayName}”。";
+        }, cancellationToken);
     }
 
     public Task InitializeAsync(CancellationToken cancellationToken)

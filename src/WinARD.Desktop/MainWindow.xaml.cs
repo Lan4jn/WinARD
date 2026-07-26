@@ -1,10 +1,17 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using WinARD.Application.Ports;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
+using WinARD.Desktop.Services;
+using WinARD.Desktop.Views;
+using WinARD.Domain.Connections;
 using WinARD.Infrastructure.Database;
+using WinARD.Security.Secrets;
 using WinRT.Interop;
 
 namespace WinARD.Desktop;
@@ -19,6 +26,10 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly Grid _detailsHost = new();
     private readonly StackPanel _emptyState = new();
     private readonly Button _deleteButton = new();
+    private readonly Button _editButton = new();
+    private readonly ConnectionEditorService _connectionEditorService;
+    private readonly VaultCredentialStoreSession _vaultSession;
+    private readonly CredentialPromptService _credentialPromptService;
     private readonly TextBlock _detailName = new();
     private readonly TextBlock _detailSource = new();
     private readonly TextBlock _detailEndpoint = new();
@@ -26,10 +37,18 @@ public sealed partial class MainWindow : Window, IDisposable
     private bool _allowClose;
     private int _disposed;
 
-    public MainWindow(MainWindowViewModel viewModel, WinArdDatabase database)
+    public MainWindow(
+        MainWindowViewModel viewModel,
+        WinArdDatabase database,
+        ConnectionEditorService connectionEditorService,
+        VaultCredentialStoreSession vaultSession,
+        CredentialPromptService credentialPromptService)
     {
         ViewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         _database = database ?? throw new ArgumentNullException(nameof(database));
+        _connectionEditorService = connectionEditorService ?? throw new ArgumentNullException(nameof(connectionEditorService));
+        _vaultSession = vaultSession ?? throw new ArgumentNullException(nameof(vaultSession));
+        _credentialPromptService = credentialPromptService ?? throw new ArgumentNullException(nameof(credentialPromptService));
         InitializeComponent();
         BuildDeviceLibrary();
         var windowHandle = WindowNative.GetWindowHandle(this);
@@ -38,6 +57,9 @@ public sealed partial class MainWindow : Window, IDisposable
         _appWindow.Closing += OnClosing;
         Closed += OnClosed;
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
+        ViewModel.AddDeviceRequested += OnAddDeviceRequested;
+        ViewModel.EditDeviceRequested += OnEditDeviceRequested;
+        _credentialPromptService.SetHandler(PromptForCredentialAsync);
         ResizeWindow();
         _initializationTask = _uiOperation.RunAsync(InitializeWithErrorHandlingAsync, _shutdown.Token);
     }
@@ -120,11 +142,21 @@ public sealed partial class MainWindow : Window, IDisposable
         content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         content.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         Grid.SetColumn(content, 1);
+        var actions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        _editButton.Content = "编辑设备";
+        _editButton.Visibility = Visibility.Collapsed;
+        _editButton.Click += (_, _) => ViewModel.EditDeviceCommand.Execute(null);
+        actions.Children.Add(_editButton);
         _deleteButton.Content = "删除设备";
-        _deleteButton.HorizontalAlignment = HorizontalAlignment.Right;
         _deleteButton.Visibility = Visibility.Collapsed;
         _deleteButton.Click += OnDeleteClicked;
-        content.Children.Add(_deleteButton);
+        actions.Children.Add(_deleteButton);
+        content.Children.Add(actions);
 
         var body = new Grid();
         Grid.SetRow(body, 1);
@@ -235,6 +267,74 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.SelectedDevice = item;
     }
 
+    private void OnAddDeviceRequested(object? sender, EventArgs args) =>
+        _ = _uiOperation.RunAsync(() => OpenConnectionEditorAsync(null), _shutdown.Token);
+
+    private void OnEditDeviceRequested(ConnectionProfile profile) =>
+        _ = _uiOperation.RunAsync(() => OpenConnectionEditorAsync(profile), _shutdown.Token);
+
+    private async Task OpenConnectionEditorAsync(ConnectionProfile? profile)
+    {
+        var viewModel = new ConnectionEditorViewModel(
+            profile,
+            _connectionEditorService.SaveAsync,
+            _connectionEditorService.TestAsync);
+        using var dialog = new ConnectionEditorDialog(viewModel, _vaultSession)
+        {
+            XamlRoot = ShellRoot.XamlRoot,
+        };
+        _ = await dialog.ShowAsync();
+        await dialog.WhenIdleAsync();
+        if (dialog.SavedProfile is { } saved)
+        {
+            await ViewModel.ApplySavedProfileAsync(saved, _shutdown.Token);
+        }
+    }
+
+    private async ValueTask<ISecret> PromptForCredentialAsync(
+        ConnectionProfile profile,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var passwordBox = new PasswordBox
+        {
+            Header = $"“{profile.DisplayName}”的 Mac 密码",
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+            passwordBox,
+            "CredentialPromptPassword");
+        var dialog = new ContentDialog
+        {
+            Title = "输入连接凭据",
+            Content = passwordBox,
+            PrimaryButtonText = "继续",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = ShellRoot.XamlRoot,
+        };
+        var result = await dialog.ShowAsync();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (result != ContentDialogResult.Primary || passwordBox.Password.Length == 0)
+        {
+            passwordBox.Password = string.Empty;
+            throw new OperationCanceledException("用户取消了凭据输入。", cancellationToken);
+        }
+
+        var bytes = new byte[Encoding.UTF8.GetByteCount(passwordBox.Password)];
+        try
+        {
+            _ = Encoding.UTF8.GetBytes(passwordBox.Password, bytes);
+            using var prompt = new CredentialPromptViewModel();
+            prompt.Supply(SecretBuffer.CopyFrom(bytes));
+            return prompt.Take();
+        }
+        finally
+        {
+            passwordBox.Password = string.Empty;
+            CryptographicOperations.ZeroMemory(bytes);
+        }
+    }
+
     private async void OnDeleteClicked(object sender, RoutedEventArgs args)
     {
         if (_shutdown.IsCancellationRequested)
@@ -301,6 +401,7 @@ public sealed partial class MainWindow : Window, IDisposable
             _detailsHost.Visibility = Visibility.Collapsed;
             _emptyState.Visibility = Visibility.Visible;
             _deleteButton.Visibility = Visibility.Collapsed;
+            _editButton.Visibility = Visibility.Collapsed;
             return;
         }
 
@@ -310,6 +411,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _detailsHost.Visibility = Visibility.Visible;
         _emptyState.Visibility = Visibility.Collapsed;
         _deleteButton.Visibility = item.Profile is null ? Visibility.Collapsed : Visibility.Visible;
+        _editButton.Visibility = item.Profile is null ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private async Task ShowStartupErrorAsync()
@@ -343,6 +445,9 @@ public sealed partial class MainWindow : Window, IDisposable
         await _uiOperation.RunAsync(() => ViewModel.DisposeAsync().AsTask());
         await _uiOperation.RunAsync(() => _database.DisposeAsync().AsTask());
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        ViewModel.AddDeviceRequested -= OnAddDeviceRequested;
+        ViewModel.EditDeviceRequested -= OnEditDeviceRequested;
+        _credentialPromptService.ClearHandler();
         _allowClose = true;
         try
         {

@@ -1,0 +1,48 @@
+<ContentDialog
+    x:Class="WinARD.Desktop.Views.ConnectionEditorDialog"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="连接编辑器"
+    PrimaryButtonText="保存"
+    CloseButtonText="取消"
+    DefaultButton="Primary">
+    <ScrollViewer MaxHeight="620" MinWidth="520">
+        <StackPanel Spacing="12">
+            <TextBlock Text="基本信息" Style="{StaticResource SubtitleTextBlockStyle}" />
+            <TextBox x:Name="DisplayNameBox" Header="显示名称" AutomationProperties.AutomationId="ConnectionDisplayName" />
+            <TextBox x:Name="HostBox" Header="Mac 地址" AutomationProperties.AutomationId="ConnectionHost" />
+            <NumberBox x:Name="PortBox" Header="端口" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="ConnectionPort" />
+            <TextBox x:Name="MacUsernameBox" Header="Mac 用户名" AutomationProperties.AutomationId="ConnectionMacUsername" />
+            <PasswordBox x:Name="MacPasswordBox" Header="Mac 密码（仅在提交时读取）" PasswordChanged="OnPasswordChanged" AutomationProperties.AutomationId="ConnectionMacPassword" />
+
+            <ComboBox x:Name="CredentialModeBox" Header="凭据保存方式" SelectionChanged="OnCredentialModeChanged" AutomationProperties.AutomationId="CredentialSaveMode">
+                <ComboBoxItem Content="Windows 凭据管理器" Tag="WindowsCredentialManager" />
+                <ComboBoxItem Content="WinARD 加密库" Tag="EncryptedVault" />
+                <ComboBoxItem Content="每次询问" Tag="AskEveryTime" />
+            </ComboBox>
+            <PasswordBox x:Name="VaultMasterPasswordBox" Header="加密库主密码（仅用于创建或解锁）" AutomationProperties.AutomationId="VaultMasterPassword" />
+
+            <ToggleSwitch x:Name="UseSshSwitch" Header="通过 SSH 隧道连接" Toggled="OnUseSshToggled" AutomationProperties.AutomationId="ConnectionUseSsh" />
+            <Expander x:Name="SshSection" Header="SSH 设置">
+                <StackPanel Spacing="10" Padding="0,8,0,0">
+                    <TextBox x:Name="SshHostBox" Header="SSH 主机" AutomationProperties.AutomationId="ConnectionSshHost" />
+                    <NumberBox x:Name="SshPortBox" Header="SSH 端口" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="ConnectionSshPort" />
+                    <TextBox x:Name="SshUsernameBox" Header="SSH 用户名" AutomationProperties.AutomationId="ConnectionSshUsername" />
+                    <TextBox x:Name="PrivateKeyPathBox" Header="私钥路径（留空表示密码认证）" AutomationProperties.AutomationId="ConnectionPrivateKeyPath" />
+                    <PasswordBox x:Name="SshPasswordBox" Header="SSH 密码或私钥口令（临时）" PasswordChanged="OnPasswordChanged" AutomationProperties.AutomationId="ConnectionSshPassword" />
+                </StackPanel>
+            </Expander>
+
+            <Button x:Name="TestButton" Content="测试连接" Click="OnTestClicked" HorizontalAlignment="Left" AutomationProperties.AutomationId="TestConnectionButton" />
+            <ProgressRing x:Name="BusyIndicator" IsActive="False" Width="24" Height="24" HorizontalAlignment="Left" />
+            <TextBlock x:Name="StatusText" TextWrapping="Wrap" AutomationProperties.AutomationId="ConnectionEditorStatus" />
+            <ItemsControl x:Name="StageResults">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding Message}" TextWrapping="Wrap" />
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </StackPanel>
+    </ScrollViewer>
+</ContentDialog>

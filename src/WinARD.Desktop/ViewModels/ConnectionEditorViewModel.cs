@@ -1,0 +1,334 @@
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using WinARD.Application.Ports;
+using WinARD.Domain.Connections;
+using WinARD.Domain.Errors;
+
+namespace WinARD.Desktop.ViewModels;
+
+public enum CredentialSaveMode
+{
+    WindowsCredentialManager,
+    EncryptedVault,
+    AskEveryTime,
+}
+
+public sealed record ConnectionTestStageResult(
+    ConnectionStage Stage,
+    bool Succeeded,
+    TimeSpan Duration,
+    string Message);
+
+public sealed class ConnectionEditorViewModel : ObservableObject
+{
+    private readonly ConnectionProfile? _original;
+    private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfile>> _save;
+    private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<IReadOnlyList<ConnectionTestStageResult>>> _test;
+    private string _displayName = string.Empty;
+    private string _host = string.Empty;
+    private int _port = 5900;
+    private string _macUsername = string.Empty;
+    private bool _useSsh;
+    private string _sshHost = string.Empty;
+    private int _sshPort = 22;
+    private string _sshUsername = string.Empty;
+    private string _privateKeyPath = string.Empty;
+    private bool _hasSshAuthenticationSecret;
+    private CredentialSaveMode _credentialSaveMode;
+    private IReadOnlyList<ConnectionTestStageResult> _testResults = [];
+    private string _statusMessage = string.Empty;
+    private int _busy;
+
+    public ConnectionEditorViewModel(
+        ConnectionProfile? profile,
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfile>> save,
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<IReadOnlyList<ConnectionTestStageResult>>> test)
+    {
+        _original = profile;
+        _save = save ?? throw new ArgumentNullException(nameof(save));
+        _test = test ?? throw new ArgumentNullException(nameof(test));
+        SaveCommand = new AsyncRelayCommand<ISecret?>(
+            secret => SaveAsync(secret, CancellationToken.None),
+            _ => CanSave());
+        TestConnectionCommand = new AsyncRelayCommand<ISecret?>(
+            secret => TestConnectionAsync(secret, CancellationToken.None),
+            _ => CanSave());
+
+        if (profile is null)
+        {
+            return;
+        }
+
+        _displayName = profile.DisplayName;
+        _host = profile.Host;
+        _port = profile.Port;
+        _macUsername = profile.MacUsername;
+        _useSsh = profile.TransportMode == TransportMode.Ssh;
+        _credentialSaveMode = ModeFromProfile(profile);
+        if (profile.SshProfile is { } ssh)
+        {
+            _sshHost = ssh.Host;
+            _sshPort = ssh.Port;
+            _sshUsername = ssh.Username;
+            _privateKeyPath = ssh.PrivateKeyPath ?? string.Empty;
+        }
+    }
+
+    public IAsyncRelayCommand<ISecret?> SaveCommand { get; }
+
+    public IAsyncRelayCommand<ISecret?> TestConnectionCommand { get; }
+
+    public string DisplayName
+    {
+        get => _displayName;
+        set => SetValidated(ref _displayName, value ?? string.Empty);
+    }
+
+    public string Host
+    {
+        get => _host;
+        set => SetValidated(ref _host, value ?? string.Empty);
+    }
+
+    public int Port
+    {
+        get => _port;
+        set => SetValidated(ref _port, value);
+    }
+
+    public string MacUsername
+    {
+        get => _macUsername;
+        set => SetValidated(ref _macUsername, value ?? string.Empty);
+    }
+
+    public bool UseSsh
+    {
+        get => _useSsh;
+        set => SetValidated(ref _useSsh, value);
+    }
+
+    public string SshHost
+    {
+        get => _sshHost;
+        set => SetValidated(ref _sshHost, value ?? string.Empty);
+    }
+
+    public int SshPort
+    {
+        get => _sshPort;
+        set => SetValidated(ref _sshPort, value);
+    }
+
+    public string SshUsername
+    {
+        get => _sshUsername;
+        set => SetValidated(ref _sshUsername, value ?? string.Empty);
+    }
+
+    public string PrivateKeyPath
+    {
+        get => _privateKeyPath;
+        set => SetValidated(ref _privateKeyPath, value ?? string.Empty);
+    }
+
+    public bool HasSshAuthenticationSecret
+    {
+        get => _hasSshAuthenticationSecret;
+        set => SetValidated(ref _hasSshAuthenticationSecret, value);
+    }
+
+    public CredentialSaveMode CredentialSaveMode
+    {
+        get => _credentialSaveMode;
+        set => SetValidated(ref _credentialSaveMode, value);
+    }
+
+    public IReadOnlyList<CredentialSaveMode> CredentialSaveModes { get; } =
+        Enum.GetValues<CredentialSaveMode>();
+
+    public IReadOnlyList<ConnectionTestStageResult> TestResults
+    {
+        get => _testResults;
+        private set => SetProperty(ref _testResults, value);
+    }
+
+    public string StatusMessage
+    {
+        get => _statusMessage;
+        private set => SetProperty(ref _statusMessage, value);
+    }
+
+    public bool IsBusy => Volatile.Read(ref _busy) != 0;
+
+    public async Task<ConnectionProfile> SaveAsync(ISecret? secret, CancellationToken cancellationToken)
+    {
+        EnterBusy();
+        try
+        {
+            var profile = BuildProfile();
+            var saved = await _save(profile, CredentialSaveMode, secret, cancellationToken).ConfigureAwait(false);
+            StatusMessage = $"已保存“{saved.DisplayName}”。";
+            return saved;
+        }
+        finally
+        {
+            secret?.Dispose();
+            ExitBusy();
+        }
+    }
+
+    public async Task TestConnectionAsync(ISecret? secret, CancellationToken cancellationToken)
+    {
+        EnterBusy();
+        try
+        {
+            TestResults = [];
+            var results = await _test(BuildProfile(), CredentialSaveMode, secret, cancellationToken)
+                .ConfigureAwait(false);
+            TestResults = results;
+            StatusMessage = results.Count == 0
+                ? "测试连接未返回结果。"
+                : results[^1].Message;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            StatusMessage = "测试连接已取消。";
+            throw;
+        }
+        finally
+        {
+            secret?.Dispose();
+            ExitBusy();
+        }
+    }
+
+    public ConnectionProfile BuildProfile()
+    {
+        if (!FieldsAreValid())
+        {
+            throw new InvalidOperationException("连接信息不完整或无效。");
+        }
+
+        var profile = ConnectionProfile.Create(
+            _original?.Id ?? Guid.NewGuid(), DisplayName, Host, Port, MacUsername);
+        if (_original?.CredentialReference is { } macReference)
+        {
+            profile = profile.WithCredential(macReference);
+        }
+
+        if (!UseSsh)
+        {
+            return profile;
+        }
+
+        var originalSsh = _original?.SshProfile;
+        var ssh = SshProfile.Create(
+            SshHost,
+            SshPort,
+            SshUsername,
+            string.IsNullOrWhiteSpace(PrivateKeyPath) ? null : PrivateKeyPath,
+            Host,
+            Port,
+            originalSsh?.CredentialReference,
+            originalSsh?.PinnedHostKeyAlgorithm,
+            originalSsh?.PinnedHostKeySha256);
+        ssh = ssh.WithAuthenticationCredentials(
+            originalSsh?.PasswordCredentialReference,
+            originalSsh?.PrivateKeyPassphraseCredentialReference);
+        if (originalSsh?.HostKeyPin is { } pin)
+        {
+            ssh = ssh.WithHostKeyPin(pin);
+        }
+
+        return profile.WithSsh(ssh);
+    }
+
+    private bool CanSave() => !IsBusy && FieldsAreValid();
+
+    private bool FieldsAreValid()
+    {
+        if (string.IsNullOrWhiteSpace(DisplayName) || !ValidHost(Host) ||
+            Port is < 1 or > 65535 || string.IsNullOrWhiteSpace(MacUsername))
+        {
+            return false;
+        }
+
+        if (!UseSsh)
+        {
+            return true;
+        }
+
+        var hasExistingSshCredential = _original?.SshProfile is
+        {
+            PasswordCredentialReference: not null
+        } or
+        {
+            PrivateKeyPassphraseCredentialReference: not null
+        };
+        return ValidHost(SshHost) && SshPort is >= 1 and <= 65535 &&
+            !string.IsNullOrWhiteSpace(SshUsername) &&
+            (!string.IsNullOrWhiteSpace(PrivateKeyPath) || HasSshAuthenticationSecret ||
+             hasExistingSshCredential || CredentialSaveMode == CredentialSaveMode.AskEveryTime);
+    }
+
+    private static bool ValidHost(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var host = value.Trim();
+        if (host.Length >= 2 && host[0] == '[' && host[^1] == ']')
+        {
+            host = host[1..^1];
+        }
+
+        return Uri.CheckHostName(host) != UriHostNameType.Unknown;
+    }
+
+    private static CredentialSaveMode ModeFromProfile(ConnectionProfile profile)
+    {
+        var store = profile.CredentialReference?.Store ??
+            profile.SshProfile?.PasswordCredentialReference?.Store ??
+            profile.SshProfile?.PrivateKeyPassphraseCredentialReference?.Store;
+        return store?.ToLowerInvariant() switch
+        {
+            "vault" => CredentialSaveMode.EncryptedVault,
+            "ask" => CredentialSaveMode.AskEveryTime,
+            _ => CredentialSaveMode.WindowsCredentialManager,
+        };
+    }
+
+    private void SetValidated<T>(ref T field, T value, [System.Runtime.CompilerServices.CallerMemberName] string? propertyName = null)
+    {
+        if (!SetProperty(ref field, value, propertyName))
+        {
+            return;
+        }
+
+        SaveCommand.NotifyCanExecuteChanged();
+        TestConnectionCommand.NotifyCanExecuteChanged();
+    }
+
+    private void EnterBusy()
+    {
+        if (Interlocked.CompareExchange(ref _busy, 1, 0) != 0)
+        {
+            throw new InvalidOperationException("另一个连接编辑操作正在进行。");
+        }
+
+        OnPropertyChanged(nameof(IsBusy));
+        SaveCommand.NotifyCanExecuteChanged();
+        TestConnectionCommand.NotifyCanExecuteChanged();
+    }
+
+    private void ExitBusy()
+    {
+        Volatile.Write(ref _busy, 0);
+        OnPropertyChanged(nameof(IsBusy));
+        SaveCommand.NotifyCanExecuteChanged();
+        TestConnectionCommand.NotifyCanExecuteChanged();
+    }
+}
