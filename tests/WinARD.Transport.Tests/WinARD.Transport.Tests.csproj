@@ -2,6 +2,8 @@
   <PropertyGroup><IsPackable>false</IsPackable></PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\WinARD.Transport\WinARD.Transport.csproj" />
+    <ProjectReference Include="..\..\tools\WinARD.OpenSshAskPass\WinARD.OpenSshAskPass.csproj"
+                      ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\WinARD.Testing\WinARD.Testing.csproj" />
   </ItemGroup>
   <ItemGroup>

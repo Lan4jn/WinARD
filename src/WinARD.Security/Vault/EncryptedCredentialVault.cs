@@ -8,11 +8,24 @@ namespace WinARD.Security.Vault;
 
 public interface IVaultStorage
 {
-    ValueTask<byte[]?> ReadAsync(CancellationToken cancellationToken);
+    ValueTask<VaultStorageSnapshot?> ReadAsync(CancellationToken cancellationToken);
 
-    ValueTask WriteAtomicallyAsync(
+    ValueTask<VaultStorageWriteResult> CompareExchangeAsync(
         ReadOnlyMemory<byte> contents,
+        string? expectedVersion,
         CancellationToken cancellationToken);
+}
+
+public sealed record VaultStorageSnapshot(byte[] Contents, string Version);
+
+public sealed record VaultStorageWriteResult(bool Written, string? Version);
+
+public sealed class VaultConcurrencyException : IOException
+{
+    public VaultConcurrencyException()
+        : base("The credential vault changed in another instance.")
+    {
+    }
 }
 
 public sealed class FileVaultStorage(string path) : IVaultStorage
@@ -22,7 +35,8 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
             ? throw new ArgumentException("Vault path cannot be blank.", nameof(path))
             : path);
 
-    public async ValueTask<byte[]?> ReadAsync(CancellationToken cancellationToken)
+    public async ValueTask<VaultStorageSnapshot?> ReadAsync(
+        CancellationToken cancellationToken)
     {
         if (!File.Exists(_path))
         {
@@ -35,11 +49,13 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
             throw new InvalidDataException("The vault file exceeds its size limit.");
         }
 
-        return await File.ReadAllBytesAsync(_path, cancellationToken).ConfigureAwait(false);
+        var contents = await File.ReadAllBytesAsync(_path, cancellationToken).ConfigureAwait(false);
+        return new VaultStorageSnapshot(contents, VersionOf(contents));
     }
 
-    public async ValueTask WriteAtomicallyAsync(
+    public async ValueTask<VaultStorageWriteResult> CompareExchangeAsync(
         ReadOnlyMemory<byte> contents,
+        string? expectedVersion,
         CancellationToken cancellationToken)
     {
         if (contents.Length > VaultFileFormat.MaximumFileBytes)
@@ -50,6 +66,28 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
         var directory = Path.GetDirectoryName(_path) ??
             throw new InvalidOperationException("The vault path has no parent directory.");
         Directory.CreateDirectory(directory);
+        var lockPath = _path + ".lock";
+        await using var exclusive = await OpenLockAsync(lockPath, cancellationToken)
+            .ConfigureAwait(false);
+        var current = File.Exists(_path)
+            ? await File.ReadAllBytesAsync(_path, cancellationToken).ConfigureAwait(false)
+            : null;
+        try
+        {
+            var currentVersion = current is null ? null : VersionOf(current);
+            if (!string.Equals(currentVersion, expectedVersion, StringComparison.Ordinal))
+            {
+                return new VaultStorageWriteResult(false, currentVersion);
+            }
+        }
+        finally
+        {
+            if (current is not null)
+            {
+                CryptographicOperations.ZeroMemory(current);
+            }
+        }
+
         var temporary = Path.Combine(
             directory,
             $".{Path.GetFileName(_path)}.{Guid.NewGuid():N}.tmp");
@@ -76,6 +114,16 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
             {
                 File.Move(temporary, _path);
             }
+
+            var versionBytes = contents.ToArray();
+            try
+            {
+                return new VaultStorageWriteResult(true, VersionOf(versionBytes));
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(versionBytes);
+            }
         }
         finally
         {
@@ -91,6 +139,41 @@ public sealed class FileVaultStorage(string path) : IVaultStorage
             }
         }
     }
+
+    private static async ValueTask<FileStream> OpenLockAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 50; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                return new FileStream(
+                    path,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    1,
+                    FileOptions.Asynchronous | FileOptions.DeleteOnClose);
+            }
+            catch (IOException)
+            {
+                if (attempt == 49)
+                {
+                    break;
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(10), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        throw new VaultConcurrencyException();
+    }
+
+    private static string VersionOf(ReadOnlySpan<byte> contents) =>
+        Convert.ToHexString(SHA256.HashData(contents));
 }
 
 public sealed class VaultLockedException : InvalidOperationException
@@ -105,6 +188,7 @@ public sealed class EncryptedCredentialVault :
     ICredentialStore,
     IAsyncDisposable
 {
+    private static readonly SemaphoreSlim KeyDerivationGate = new(1, 1);
     private readonly IVaultStorage _storage;
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _idleTimeout;
@@ -113,9 +197,13 @@ public sealed class EncryptedCredentialVault :
     private readonly VaultKdfParameters _kdf;
     private readonly byte[] _salt;
     private readonly byte[] _verifierTag;
+    private string _storageVersion;
+    private long _revision;
     private Dictionary<string, VaultEntry> _entries;
     private byte[]? _key;
     private ITimer? _idleTimer;
+    private DateTimeOffset _lastActivity;
+    private long _activityGeneration;
     private Task? _disposeTask;
     private bool _disposed;
 
@@ -124,7 +212,8 @@ public sealed class EncryptedCredentialVault :
         TimeProvider timeProvider,
         TimeSpan idleTimeout,
         VaultDocument document,
-        byte[] key)
+        byte[] key,
+        string storageVersion)
     {
         _storage = storage;
         _timeProvider = timeProvider;
@@ -132,13 +221,12 @@ public sealed class EncryptedCredentialVault :
         _kdf = document.Kdf;
         _salt = document.Salt;
         _verifierTag = document.VerifierTag;
+        _revision = document.Revision;
+        _storageVersion = storageVersion;
         _entries = new Dictionary<string, VaultEntry>(document.Entries, StringComparer.Ordinal);
         _key = key;
-        _idleTimer = timeProvider.CreateTimer(
-            static state => ((EncryptedCredentialVault)state!).BeginAutoLock(),
-            this,
-            idleTimeout,
-            Timeout.InfiniteTimeSpan);
+        _lastActivity = timeProvider.GetUtcNow();
+        ScheduleAutoLock(generation: 0, idleTimeout);
     }
 
     public static async ValueTask<EncryptedCredentialVault> CreateAsync(
@@ -167,29 +255,39 @@ public sealed class EncryptedCredentialVault :
                 key,
                 VaultKdfParameters.Default,
                 salt);
-            var document = new VaultDocument(
+            var unsignedDocument = new VaultDocument(
                 VaultKdfParameters.Default,
                 salt,
                 verifierTag,
-                new Dictionary<string, VaultEntry>(StringComparer.Ordinal));
+                Revision: 0,
+                new Dictionary<string, VaultEntry>(StringComparer.Ordinal),
+                new byte[VaultFileFormat.TagSize]);
+            var document = WithManifestTag(unsignedDocument, key);
             var bytes = VaultFileFormat.Serialize(document);
             try
             {
-                await storage.WriteAtomicallyAsync(bytes, cancellationToken).ConfigureAwait(false);
+                var write = await storage
+                    .CompareExchangeAsync(bytes, expectedVersion: null, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!write.Written || write.Version is null)
+                {
+                    throw new VaultConcurrencyException();
+                }
+
+                var result = new EncryptedCredentialVault(
+                    storage,
+                    timeProvider,
+                    idleTimeout,
+                    document,
+                    key,
+                    write.Version);
+                key = null;
+                return result;
             }
             finally
             {
                 CryptographicOperations.ZeroMemory(bytes);
             }
-
-            var result = new EncryptedCredentialVault(
-                storage,
-                timeProvider,
-                idleTimeout,
-                document,
-                key);
-            key = null;
-            return result;
         }
         finally
         {
@@ -208,8 +306,9 @@ public sealed class EncryptedCredentialVault :
         CancellationToken cancellationToken)
     {
         ValidateArguments(storage, masterPassword, timeProvider, idleTimeout);
-        var bytes = await storage.ReadAsync(cancellationToken).ConfigureAwait(false) ??
+        var snapshot = await storage.ReadAsync(cancellationToken).ConfigureAwait(false) ??
             throw new FileNotFoundException("The credential vault does not exist.");
+        var bytes = snapshot.Contents;
         VaultDocument document;
         try
         {
@@ -229,13 +328,15 @@ public sealed class EncryptedCredentialVault :
                 document.Kdf,
                 cancellationToken).ConfigureAwait(false);
             ValidateVerifier(document, key);
+            ValidateManifest(document, key);
             ValidateAllEntries(document, key);
             var result = new EncryptedCredentialVault(
                 storage,
                 timeProvider,
                 idleTimeout,
                 document,
-                key);
+                key,
+                snapshot.Version);
             key = null;
             return result;
         }
@@ -284,13 +385,20 @@ public sealed class EncryptedCredentialVault :
                 {
                     [referenceText] = replacement,
                 };
-                var bytes = VaultFileFormat.Serialize(
-                    new VaultDocument(_kdf, _salt, _verifierTag, next));
+                var document = BuildDocument(next, checked(_revision + 1));
+                var bytes = VaultFileFormat.Serialize(document);
                 try
                 {
-                    await _storage
-                        .WriteAtomicallyAsync(bytes, cancellationToken)
+                    var write = await _storage
+                        .CompareExchangeAsync(bytes, _storageVersion, cancellationToken)
                         .ConfigureAwait(false);
+                    if (!write.Written || write.Version is null)
+                    {
+                        throw new VaultConcurrencyException();
+                    }
+
+                    _storageVersion = write.Version;
+                    _revision = document.Revision;
                 }
                 finally
                 {
@@ -371,11 +479,20 @@ public sealed class EncryptedCredentialVault :
 
             var next = new Dictionary<string, VaultEntry>(_entries, StringComparer.Ordinal);
             next.Remove(referenceText);
-            var bytes = VaultFileFormat.Serialize(
-                new VaultDocument(_kdf, _salt, _verifierTag, next));
+            var document = BuildDocument(next, checked(_revision + 1));
+            var bytes = VaultFileFormat.Serialize(document);
             try
             {
-                await _storage.WriteAtomicallyAsync(bytes, cancellationToken).ConfigureAwait(false);
+                var write = await _storage
+                    .CompareExchangeAsync(bytes, _storageVersion, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!write.Written || write.Version is null)
+                {
+                    throw new VaultConcurrencyException();
+                }
+
+                _storageVersion = write.Version;
+                _revision = document.Revision;
             }
             finally
             {
@@ -472,7 +589,7 @@ public sealed class EncryptedCredentialVault :
         VaultKdfParameters kdf,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        await KeyDerivationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         var password = new byte[masterPassword.Length];
         try
         {
@@ -485,11 +602,30 @@ public sealed class EncryptedCredentialVault :
                 MemorySize = kdf.MemoryKiB,
             };
             var derivation = argon.GetBytesAsync(32);
-            return await derivation.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await derivation.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var abandonedResult = await derivation.ConfigureAwait(false);
+                    CryptographicOperations.ZeroMemory(abandonedResult);
+                }
+                catch (Exception)
+                {
+                    // Observe the non-cancellable Argon2 operation before releasing
+                    // the password buffer and concurrency gate.
+                }
+
+                throw;
+            }
         }
         finally
         {
             CryptographicOperations.ZeroMemory(password);
+            KeyDerivationGate.Release();
         }
     }
 
@@ -503,6 +639,7 @@ public sealed class EncryptedCredentialVault :
             existing.Select(static entry => Convert.ToHexString(entry.Nonce)),
             StringComparer.Ordinal);
         usedNonces.Add(new string('0', VaultFileFormat.NonceSize * 2));
+        usedNonces.Add(new string('F', VaultFileFormat.NonceSize * 2));
         byte[] nonce;
         do
         {
@@ -631,25 +768,146 @@ public sealed class EncryptedCredentialVault :
         }
     }
 
+    private VaultDocument BuildDocument(
+        IReadOnlyDictionary<string, VaultEntry> entries,
+        long revision) =>
+        WithManifestTag(
+            new VaultDocument(
+                _kdf,
+                _salt,
+                _verifierTag,
+                revision,
+                entries,
+                new byte[VaultFileFormat.TagSize]),
+            _key!);
+
+    private static VaultDocument WithManifestTag(
+        VaultDocument document,
+        byte[] key)
+    {
+        var manifest = VaultFileFormat.BuildManifest(document);
+        try
+        {
+            var tag = CreateManifestTag(key, manifest);
+            return document with
+            {
+                ManifestTag = tag,
+                ManifestData = manifest.ToArray(),
+            };
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(manifest);
+        }
+    }
+
+    private static byte[] CreateManifestTag(byte[] key, byte[] manifest)
+    {
+        var tag = new byte[VaultFileFormat.TagSize];
+        try
+        {
+            using var aes = new AesGcm(key, VaultFileFormat.TagSize);
+            aes.Encrypt(
+                ManifestNonce(),
+                ReadOnlySpan<byte>.Empty,
+                Span<byte>.Empty,
+                tag,
+                manifest);
+            return tag;
+        }
+        catch
+        {
+            CryptographicOperations.ZeroMemory(tag);
+            throw;
+        }
+    }
+
+    private static void ValidateManifest(VaultDocument document, byte[] key)
+    {
+        var manifest = document.ManifestData ?? VaultFileFormat.BuildManifest(document);
+        try
+        {
+            using var aes = new AesGcm(key, VaultFileFormat.TagSize);
+            aes.Decrypt(
+                ManifestNonce(),
+                ReadOnlySpan<byte>.Empty,
+                document.ManifestTag,
+                Span<byte>.Empty,
+                manifest);
+        }
+        finally
+        {
+            if (document.ManifestData is null)
+            {
+                CryptographicOperations.ZeroMemory(manifest);
+            }
+        }
+    }
+
+    private static byte[] ManifestNonce()
+    {
+        var nonce = new byte[VaultFileFormat.NonceSize];
+        Array.Fill(nonce, byte.MaxValue);
+        return nonce;
+    }
+
     private void Touch()
     {
-        _idleTimer?.Change(_idleTimeout, Timeout.InfiniteTimeSpan);
+        _lastActivity = _timeProvider.GetUtcNow();
+        var generation = checked(++_activityGeneration);
+        ScheduleAutoLock(generation, _idleTimeout);
     }
 
-    private void BeginAutoLock()
+    private void BeginAutoLock(long generation)
     {
-        _ = AutoLockAsync();
+        _ = AutoLockAsync(generation);
     }
 
-    private async Task AutoLockAsync()
+    private async Task AutoLockAsync(long generation)
     {
         try
         {
-            await LockAsync().ConfigureAwait(false);
+            await _mutex.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_disposed || _key is null || generation != _activityGeneration)
+                {
+                    return;
+                }
+
+                var remaining = (_lastActivity + _idleTimeout) - _timeProvider.GetUtcNow();
+                if (remaining > TimeSpan.Zero)
+                {
+                    ScheduleAutoLock(generation, remaining);
+                    return;
+                }
+
+                ClearKey();
+                await DisposeTimerAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _mutex.Release();
+            }
         }
         catch (ObjectDisposedException)
         {
         }
+    }
+
+    private void ScheduleAutoLock(long generation, TimeSpan dueTime)
+    {
+        var timer = _timeProvider.CreateTimer(
+            static state =>
+            {
+                var timerState = (AutoLockTimerState)state!;
+                timerState.Owner.BeginAutoLock(timerState.Generation);
+            },
+            new AutoLockTimerState(this, generation),
+            dueTime,
+            Timeout.InfiniteTimeSpan);
+        var previous = Interlocked.Exchange(ref _idleTimer, timer);
+        previous?.Dispose();
     }
 
     private async ValueTask DisposeTimerAsync()
@@ -693,4 +951,8 @@ public sealed class EncryptedCredentialVault :
         CryptographicOperations.ZeroMemory(entry.Ciphertext);
         CryptographicOperations.ZeroMemory(entry.Tag);
     }
+
+    private sealed record AutoLockTimerState(
+        EncryptedCredentialVault Owner,
+        long Generation);
 }

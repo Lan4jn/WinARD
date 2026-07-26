@@ -6,6 +6,16 @@ using WinARD.Domain.Security;
 
 namespace WinARD.Security.Migration;
 
+public sealed class MigrationSourceDeleteUncertainException : IOException
+{
+    public MigrationSourceDeleteUncertainException(Exception innerException)
+        : base(
+            "The credential was verified in the target store, but source deletion is uncertain.",
+            innerException)
+    {
+    }
+}
+
 public sealed class CredentialStoreMigrator
 {
     [SuppressMessage(
@@ -34,6 +44,7 @@ public sealed class CredentialStoreMigrator
             .ReadAsync(reference, cancellationToken)
             .ConfigureAwait(false);
         var targetWasWritten = false;
+        var targetWasVerified = false;
         try
         {
             await target
@@ -49,11 +60,17 @@ public sealed class CredentialStoreMigrator
                     "Credential migration verification failed.");
             }
 
+            targetWasVerified = true;
             await source.DeleteAsync(reference, cancellationToken).ConfigureAwait(false);
             targetWasWritten = false;
         }
         catch (Exception primaryException)
         {
+            if (targetWasVerified)
+            {
+                throw new MigrationSourceDeleteUncertainException(primaryException);
+            }
+
             if (targetWasWritten)
             {
                 try

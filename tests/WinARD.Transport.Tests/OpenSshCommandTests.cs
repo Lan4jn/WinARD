@@ -43,6 +43,10 @@ public sealed class OpenSshCommandTests
                 "-o", "GlobalKnownHostsFile=NUL",
                 "-o", "UpdateHostKeys=no",
                 "-o", "CheckHostIP=no",
+                "-o", "PubkeyAuthentication=yes",
+                "-o", "PasswordAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no",
+                "-o", "NumberOfPasswordPrompts=1",
                 "-o", "IdentitiesOnly=yes",
                 "-o", "PreferredAuthentications=publickey",
                 "-i", @"C:\Keys\mac key",
@@ -89,6 +93,10 @@ public sealed class OpenSshCommandTests
         Assert.Contains(
             "PreferredAuthentications=password,keyboard-interactive",
             start.Arguments);
+        Assert.Contains("PubkeyAuthentication=no", start.Arguments);
+        Assert.Contains("PasswordAuthentication=yes", start.Arguments);
+        Assert.Contains("KbdInteractiveAuthentication=yes", start.Arguments);
+        Assert.Contains("NumberOfPasswordPrompts=1", start.Arguments);
         Assert.DoesNotContain("password-reference", start.Arguments);
     }
 

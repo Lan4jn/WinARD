@@ -1,5 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Buffers.Binary;
+using System.IO.Pipes;
+using System.Diagnostics;
 using WinARD.Application.Ports;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Security;
@@ -103,6 +106,158 @@ public sealed class OpenSshAskPassTests
     }
 
     [Fact]
+    public async Task Truncated_client_isolated_then_valid_client_succeeds()
+    {
+        var broker = CreateBroker(
+            new FakeCredentialStore(Encoding.UTF8.GetBytes(InjectedSecret)));
+        await using var session = await broker.PrepareAsync(
+            PasswordProfile(), CancellationToken.None);
+        var environment = session.Configure(Start()).Environment!;
+        await using (var malformed = await ConnectAsync(environment))
+        {
+            await malformed.WriteAsync(new byte[] { 1, 2, 3 });
+        }
+
+        using var output = new MemoryStream();
+        Assert.Equal(
+            0,
+            await OpenSshAskPassClient.RunAsync(
+                environment, output, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Oversized_frame_is_rejected_then_valid_client_succeeds()
+    {
+        var broker = CreateBroker(
+            new FakeCredentialStore(Encoding.UTF8.GetBytes(InjectedSecret)));
+        await using var session = await broker.PrepareAsync(
+            PasswordProfile(), CancellationToken.None);
+        var environment = session.Configure(Start()).Environment!;
+        await using (var malformed = await ConnectAsync(environment))
+        {
+            var length = new byte[sizeof(int)];
+            BinaryPrimitives.WriteInt32LittleEndian(
+                length,
+                OpenSshAskPassProtocol.RequestBytes + 1);
+            await malformed.WriteAsync(length);
+            await malformed.FlushAsync();
+        }
+
+        using var output = new MemoryStream();
+        Assert.Equal(
+            0,
+            await OpenSshAskPassClient.RunAsync(
+                environment, output, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Exact_frame_with_trailing_byte_is_rejected_without_consumption()
+    {
+        var broker = CreateBroker(
+            new FakeCredentialStore(Encoding.UTF8.GetBytes(InjectedSecret)));
+        await using var session = await broker.PrepareAsync(
+            PasswordProfile(), CancellationToken.None);
+        var environment = session.Configure(Start()).Environment!;
+        await using (var malformed = await ConnectAsync(environment))
+        {
+            var challenge = Convert.FromBase64String(
+                environment[OpenSshAskPassEnvironment.Challenge]);
+            var frame = new byte[
+                sizeof(int) + OpenSshAskPassProtocol.RequestBytes + 1];
+            BinaryPrimitives.WriteInt32LittleEndian(
+                frame,
+                OpenSshAskPassProtocol.RequestBytes);
+            OpenSshAskPassProtocol.Magic.CopyTo(frame.AsSpan(sizeof(int)));
+            challenge.CopyTo(
+                frame,
+                sizeof(int) + OpenSshAskPassProtocol.Magic.Length);
+            frame[^1] = 0x7f;
+            try
+            {
+                await malformed.WriteAsync(frame);
+                await malformed.FlushAsync();
+            }
+            catch (IOException)
+            {
+            }
+        }
+
+        using var output = new MemoryStream();
+        Assert.Equal(
+            0,
+            await OpenSshAskPassClient.RunAsync(
+                environment, output, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Concurrent_clients_allow_exactly_one_secret_consumption()
+    {
+        var broker = CreateBroker(
+            new FakeCredentialStore(Encoding.UTF8.GetBytes(InjectedSecret)));
+        await using var session = await broker.PrepareAsync(
+            PasswordProfile(), CancellationToken.None);
+        var environment = session.Configure(Start()).Environment!;
+        using var first = new MemoryStream();
+        using var second = new MemoryStream();
+
+        var results = await Task.WhenAll(
+            OpenSshAskPassClient.RunAsync(environment, first, CancellationToken.None),
+            OpenSshAskPassClient.RunAsync(environment, second, CancellationToken.None));
+
+        Assert.Equal(1, results.Count(static result => result == 0));
+        Assert.Equal(1, results.Count(static result => result != 0));
+    }
+
+    [Fact]
+    public async Task Stalled_client_times_out_without_consuming_the_session()
+    {
+        var broker = CreateBroker(
+            new FakeCredentialStore(Encoding.UTF8.GetBytes(InjectedSecret)));
+        await using var session = await broker.PrepareAsync(
+            PasswordProfile(), CancellationToken.None);
+        var environment = session.Configure(Start()).Environment!;
+        await using var stalled = await ConnectAsync(environment);
+        await Task.Delay(TimeSpan.FromMilliseconds(1100));
+
+        using var output = new MemoryStream();
+        Assert.Equal(
+            0,
+            await OpenSshAskPassClient.RunAsync(
+                environment, output, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Published_helper_process_returns_secret_and_safe_error_code()
+    {
+        var broker = CreateBroker(
+            new FakeCredentialStore(Encoding.UTF8.GetBytes(InjectedSecret)));
+        await using var session = await broker.PrepareAsync(
+            PasswordProfile(), CancellationToken.None);
+        var environment = session.Configure(Start()).Environment!;
+
+        var success = await RunHelperAsync(environment);
+        Assert.Equal(0, success.ExitCode);
+        Assert.Equal(
+            [.. Encoding.UTF8.GetBytes(InjectedSecret), (byte)'\n'],
+            success.StandardOutput);
+        Assert.Empty(success.StandardError);
+
+        await using var errorSession = await broker.PrepareAsync(
+            PasswordProfile(), CancellationToken.None);
+        var invalid = new Dictionary<string, string>(
+            errorSession.Configure(Start()).Environment!,
+            StringComparer.OrdinalIgnoreCase)
+        {
+            [OpenSshAskPassEnvironment.Challenge] =
+                Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)),
+        };
+        var failure = await RunHelperAsync(invalid);
+        Assert.NotEqual(0, failure.ExitCode);
+        Assert.Empty(failure.StandardOutput);
+        Assert.StartsWith("ASKPASS_E_", failure.StandardError, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Oversized_secret_is_rejected_and_cancelled_session_disposes_secret()
     {
         var store = new FakeCredentialStore(new byte[OpenSshAskPassLimits.MaximumSecretBytes + 1]);
@@ -142,6 +297,69 @@ public sealed class OpenSshAskPassTests
         new(
             Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh.exe"),
             ["-T", "user@host"]);
+
+    private static async Task<NamedPipeClientStream> ConnectAsync(
+        IReadOnlyDictionary<string, string> environment)
+    {
+        var pipe = new NamedPipeClientStream(
+            ".",
+            environment[OpenSshAskPassEnvironment.PipeName],
+            PipeDirection.InOut,
+            PipeOptions.Asynchronous);
+        await pipe.ConnectAsync(2000);
+        return pipe;
+    }
+
+    private static async Task<HelperResult> RunHelperAsync(
+        IReadOnlyDictionary<string, string> environment)
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "WinARD.sln")))
+        {
+            root = root.Parent;
+        }
+
+        Assert.NotNull(root);
+        var configuration = AppContext.BaseDirectory.Contains(
+            $"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}",
+            StringComparison.OrdinalIgnoreCase)
+            ? "Release"
+            : "Debug";
+        var helper = Path.Combine(
+            root!.FullName,
+            "tools",
+            "WinARD.OpenSshAskPass",
+            "bin",
+            configuration,
+            "net8.0-windows10.0.19041.0",
+            "WinARD.OpenSshAskPass.exe");
+        var start = new ProcessStartInfo
+        {
+            FileName = helper,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (var pair in environment)
+        {
+            start.Environment[pair.Key] = pair.Value;
+        }
+
+        using var process = Process.Start(start) ??
+            throw new InvalidOperationException("Unable to start askpass helper.");
+        using var output = new MemoryStream();
+        var outputTask = process.StandardOutput.BaseStream.CopyToAsync(output);
+        var errorTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await outputTask;
+        return new HelperResult(process.ExitCode, output.ToArray(), await errorTask);
+    }
+
+    private sealed record HelperResult(
+        int ExitCode,
+        byte[] StandardOutput,
+        string StandardError);
 
     private static SshProfile PasswordProfile() =>
         SshProfile.Create(

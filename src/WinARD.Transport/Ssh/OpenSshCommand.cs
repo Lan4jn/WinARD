@@ -49,6 +49,26 @@ internal static class OpenSshCommandBuilder
             "-o",
             "CheckHostIP=no",
         };
+        var passwordAuthentication =
+            profile.PrivateKeyPath is null &&
+            profile.PasswordCredentialReference is not null;
+        arguments.Add("-o");
+        arguments.Add(
+            passwordAuthentication
+                ? "PubkeyAuthentication=no"
+                : "PubkeyAuthentication=yes");
+        arguments.Add("-o");
+        arguments.Add(
+            passwordAuthentication
+                ? "PasswordAuthentication=yes"
+                : "PasswordAuthentication=no");
+        arguments.Add("-o");
+        arguments.Add(
+            passwordAuthentication
+                ? "KbdInteractiveAuthentication=yes"
+                : "KbdInteractiveAuthentication=no");
+        arguments.Add("-o");
+        arguments.Add("NumberOfPasswordPrompts=1");
 
         if (profile.PrivateKeyPath is not null)
         {

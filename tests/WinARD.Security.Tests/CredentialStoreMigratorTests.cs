@@ -90,6 +90,51 @@ public sealed class CredentialStoreMigratorTests
         Assert.False(source.Deleted);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Source_delete_failure_is_uncertain_and_preserves_verified_target(
+        bool deleteBeforeThrow)
+    {
+        var source = new MemoryCredentialStore("new-value-8a11")
+        {
+            DeleteException = new IOException("source delete uncertain"),
+            DeleteValueBeforeThrow = deleteBeforeThrow,
+        };
+        var target = new MemoryCredentialStore();
+
+        var exception = await Assert.ThrowsAsync<MigrationSourceDeleteUncertainException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                CancellationToken.None).AsTask());
+
+        Assert.IsType<IOException>(exception.InnerException);
+        Assert.Equal("new-value-8a11", target.ReadText());
+        Assert.Equal(deleteBeforeThrow, source.Deleted);
+    }
+
+    [Fact]
+    public async Task Source_delete_cancellation_preserves_verified_target()
+    {
+        var source = new MemoryCredentialStore("new-value-8a11")
+        {
+            DeleteException = new OperationCanceledException(),
+        };
+        var target = new MemoryCredentialStore();
+
+        await Assert.ThrowsAsync<MigrationSourceDeleteUncertainException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                CancellationToken.None).AsTask());
+
+        Assert.Equal("new-value-8a11", target.ReadText());
+        Assert.False(source.Deleted);
+    }
+
     private sealed class MemoryCredentialStore(string? initial = null) : ICredentialStore
     {
         private byte[]? _value = initial is null ? null : Encoding.UTF8.GetBytes(initial);
@@ -99,6 +144,8 @@ public sealed class CredentialStoreMigratorTests
         public bool CorruptReadsAfterSave { get; init; }
 
         public Exception? DeleteException { get; init; }
+
+        public bool DeleteValueBeforeThrow { get; init; }
 
         private bool _wasSaved;
 
@@ -144,6 +191,12 @@ public sealed class CredentialStoreMigratorTests
             cancellationToken.ThrowIfCancellationRequested();
             if (DeleteException is not null)
             {
+                if (DeleteValueBeforeThrow)
+                {
+                    Replace(null);
+                    Deleted = true;
+                }
+
                 return ValueTask.FromException(DeleteException);
             }
 

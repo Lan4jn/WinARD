@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace WinARD.Security.Vault;
@@ -21,7 +22,10 @@ internal sealed record VaultDocument(
     VaultKdfParameters Kdf,
     byte[] Salt,
     byte[] VerifierTag,
-    IReadOnlyDictionary<string, VaultEntry> Entries);
+    long Revision,
+    IReadOnlyDictionary<string, VaultEntry> Entries,
+    byte[] ManifestTag,
+    byte[]? ManifestData = null);
 
 internal static class VaultFileFormat
 {
@@ -40,6 +44,24 @@ internal static class VaultFileFormat
     public const int MaximumParallelism = 16;
 
     public static byte[] Serialize(VaultDocument document)
+    {
+        var manifest = BuildManifest(document);
+        try
+        {
+            if (document.ManifestTag.Length != TagSize)
+            {
+                throw new InvalidDataException("The vault manifest tag length is invalid.");
+            }
+
+            return [.. manifest, .. document.ManifestTag];
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(manifest);
+        }
+    }
+
+    public static byte[] BuildManifest(VaultDocument document)
     {
         ValidateKdf(document.Kdf);
         if (document.Salt.Length != SaltSize)
@@ -66,6 +88,7 @@ internal static class VaultFileFormat
         writer.Write(document.Kdf.Parallelism);
         writer.Write(document.Salt);
         writer.Write(document.VerifierTag);
+        writer.Write(document.Revision);
         writer.Write(document.Entries.Count);
         foreach (var pair in document.Entries.OrderBy(static pair => pair.Key, StringComparer.Ordinal))
         {
@@ -125,6 +148,12 @@ internal static class VaultFileFormat
             ValidateKdf(kdf);
             var salt = ReadExact(reader, SaltSize);
             var verifierTag = ReadExact(reader, TagSize);
+            var revision = reader.ReadInt64();
+            if (revision < 0)
+            {
+                throw new InvalidDataException("The vault revision is invalid.");
+            }
+
             var count = reader.ReadInt32();
             if (count is < 0 or > MaximumEntries)
             {
@@ -158,6 +187,11 @@ internal static class VaultFileFormat
                     throw new InvalidDataException(
                         "A vault entry uses the reserved verifier nonce.");
                 }
+                if (nonce.AsSpan().IndexOfAnyExcept(byte.MaxValue) < 0)
+                {
+                    throw new InvalidDataException(
+                        "A vault entry uses the reserved manifest nonce.");
+                }
 
                 var ciphertextLength = reader.ReadInt32();
                 if (ciphertextLength is < 0 or > MaximumSecretBytes)
@@ -179,12 +213,21 @@ internal static class VaultFileFormat
                 }
             }
 
+            var manifestLength = checked((int)stream.Position);
+            var manifestTag = ReadExact(reader, TagSize);
             if (stream.Position != stream.Length)
             {
                 throw new InvalidDataException("The vault contains trailing data.");
             }
 
-            return new VaultDocument(kdf, salt, verifierTag, entries);
+            return new VaultDocument(
+                kdf,
+                salt,
+                verifierTag,
+                revision,
+                entries,
+                manifestTag,
+                contents.AsSpan(0, manifestLength).ToArray());
         }
         catch (EndOfStreamException exception)
         {

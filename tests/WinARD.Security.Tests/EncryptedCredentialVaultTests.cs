@@ -90,6 +90,71 @@ public sealed class EncryptedCredentialVaultTests
     }
 
     [Fact]
+    public async Task Manifest_rejects_zeroed_count_with_truncation_entry_deletion_and_reordering()
+    {
+        var storage = await CreateStoredVaultWithTwoEntriesAsync();
+        var original = storage.Bytes!.ToArray();
+        var countOffset = 64;
+        storage.Bytes =
+        [
+            .. original.AsSpan(0, countOffset),
+            0, 0, 0, 0,
+            .. original.AsSpan(original.Length - VaultFileFormat.TagSize),
+        ];
+        await AssertTamperedAsync(storage);
+
+        storage.Bytes = original[..^20];
+        await AssertTamperedAsync(storage);
+
+        var ranges = EntryRanges(original);
+        storage.Bytes =
+        [
+            .. original.AsSpan(0, ranges[0].Start),
+            .. original.AsSpan(ranges[1].Start, ranges[1].Length),
+            .. original.AsSpan(ranges[0].Start, ranges[0].Length),
+            .. original.AsSpan(original.Length - VaultFileFormat.TagSize),
+        ];
+        await AssertTamperedAsync(storage);
+
+        storage.Bytes =
+        [
+            .. original.AsSpan(0, ranges[0].Start),
+            .. original.AsSpan(ranges[0].Start, ranges[0].Length),
+            .. original.AsSpan(ranges[0].Start, ranges[0].Length),
+            .. original.AsSpan(original.Length - VaultFileFormat.TagSize),
+        ];
+        await AssertTamperedAsync(storage);
+    }
+
+    [Fact]
+    public async Task Concurrent_instances_use_compare_exchange_without_lost_updates()
+    {
+        var storage = await CreateStoredVaultAsync();
+        using var masterA = Utf8("master-52e6");
+        using var masterB = Utf8("master-52e6");
+        await using var first = await EncryptedCredentialVault.OpenAsync(
+            storage, masterA, TimeProvider.System, TimeSpan.FromMinutes(5), CancellationToken.None);
+        await using var second = await EncryptedCredentialVault.OpenAsync(
+            storage, masterB, TimeProvider.System, TimeSpan.FromMinutes(5), CancellationToken.None);
+        var secondReference = CredentialReference.Create("vault", "device/bravo");
+        using var value = Utf8("concurrent-value-315f");
+
+        await first.DeleteAsync(Reference, CancellationToken.None);
+        await Assert.ThrowsAsync<VaultConcurrencyException>(
+            () => second.SaveAsync(secondReference, value, CancellationToken.None).AsTask());
+
+        using var reopenMaster = Utf8("master-52e6");
+        await using var reopened = await EncryptedCredentialVault.OpenAsync(
+            storage,
+            reopenMaster,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            CancellationToken.None);
+        Assert.Null(await reopened.ReadAsync(Reference, CancellationToken.None));
+        Assert.Null(await reopened.ReadAsync(secondReference, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Failed_atomic_write_keeps_previous_vault_readable()
     {
         var storage = await CreateStoredVaultAsync();
@@ -148,6 +213,37 @@ public sealed class EncryptedCredentialVaultTests
     }
 
     [Fact]
+    public async Task Expired_timer_waiting_behind_activity_does_not_lock_the_fresh_session()
+    {
+        var storage = await CreateStoredVaultAsync();
+        var time = new ManualTimeProvider();
+        using var master = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.OpenAsync(
+            storage,
+            master,
+            time,
+            TimeSpan.FromMinutes(1),
+            CancellationToken.None);
+        storage.WriteStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        storage.ContinueWrite = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var replacement = Utf8("fresh-activity-2a19");
+        var save = vault.SaveAsync(Reference, replacement, CancellationToken.None).AsTask();
+        await storage.WriteStarted.Task;
+
+        time.Advance(TimeSpan.FromMinutes(1));
+        storage.ContinueWrite.SetResult();
+        await save;
+
+        using var read = await vault.ReadAsync(Reference, CancellationToken.None);
+        Assert.NotNull(read);
+        time.Advance(TimeSpan.FromMinutes(1));
+        await Assert.ThrowsAsync<VaultLockedException>(
+            () => vault.ReadAsync(Reference, CancellationToken.None).AsTask());
+    }
+
+    [Fact]
     public async Task Rejects_KDF_DOS_values_truncation_and_duplicate_nonces()
     {
         var storage = await CreateStoredVaultAsync();
@@ -172,7 +268,7 @@ public sealed class EncryptedCredentialVaultTests
                 TimeSpan.FromMinutes(5),
                 CancellationToken.None).AsTask());
 
-        var nonce = new byte[VaultFileFormat.NonceSize];
+        var nonce = Enumerable.Repeat((byte)0x42, VaultFileFormat.NonceSize).ToArray();
         var entries = new Dictionary<string, VaultEntry>(StringComparer.Ordinal)
         {
             ["credential://vault/one"] = new(
@@ -193,7 +289,9 @@ public sealed class EncryptedCredentialVaultTests
                     VaultKdfParameters.Default,
                     new byte[VaultFileFormat.SaltSize],
                     new byte[VaultFileFormat.TagSize],
-                    entries)),
+                    Revision: 0,
+                    entries,
+                    new byte[VaultFileFormat.TagSize])),
         };
         using var duplicateMaster = Utf8("master-52e6");
         await Assert.ThrowsAsync<InvalidDataException>(
@@ -220,6 +318,55 @@ public sealed class EncryptedCredentialVaultTests
         return storage;
     }
 
+    private static async Task<InMemoryVaultStorage> CreateStoredVaultWithTwoEntriesAsync()
+    {
+        var storage = await CreateStoredVaultAsync();
+        using var master = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.OpenAsync(
+            storage,
+            master,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            CancellationToken.None);
+        using var secret = Utf8("credential-b7e2");
+        await vault.SaveAsync(
+            CredentialReference.Create("vault", "device/bravo"),
+            secret,
+            CancellationToken.None);
+        return storage;
+    }
+
+    private static async Task AssertTamperedAsync(InMemoryVaultStorage storage)
+    {
+        using var master = Utf8("master-52e6");
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => EncryptedCredentialVault.OpenAsync(
+                storage,
+                master,
+                TimeProvider.System,
+                TimeSpan.FromMinutes(5),
+                CancellationToken.None).AsTask());
+    }
+
+    private static List<(int Start, int Length)> EntryRanges(byte[] file)
+    {
+        var countOffset = 64;
+        var count = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(countOffset));
+        var offset = countOffset + sizeof(int);
+        var result = new List<(int Start, int Length)>();
+        for (var index = 0; index < count; index++)
+        {
+            var start = offset;
+            var referenceLength = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(offset));
+            offset += sizeof(int) + referenceLength + VaultFileFormat.NonceSize;
+            var ciphertextLength = BinaryPrimitives.ReadInt32LittleEndian(file.AsSpan(offset));
+            offset += sizeof(int) + ciphertextLength + VaultFileFormat.TagSize;
+            result.Add((start, offset - start));
+        }
+
+        return result;
+    }
+
     private static SecretBuffer Utf8(string value) =>
         SecretBuffer.CopyFrom(Encoding.UTF8.GetBytes(value));
 
@@ -239,28 +386,67 @@ public sealed class EncryptedCredentialVaultTests
 
     private sealed class InMemoryVaultStorage : IVaultStorage
     {
-        public byte[]? Bytes { get; set; }
+        private byte[]? _bytes;
+        private int _version;
+
+        public byte[]? Bytes
+        {
+            get => _bytes;
+            set
+            {
+                _bytes = value;
+                _version++;
+            }
+        }
 
         public Exception? WriteException { get; set; }
 
-        public ValueTask<byte[]?> ReadAsync(CancellationToken cancellationToken)
+        public TaskCompletionSource? WriteStarted { get; set; }
+
+        public TaskCompletionSource? ContinueWrite { get; set; }
+
+        public ValueTask<VaultStorageSnapshot?> ReadAsync(
+            CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return ValueTask.FromResult(Bytes?.ToArray());
+            return ValueTask.FromResult(
+                _bytes is null
+                    ? null
+                    : new VaultStorageSnapshot(
+                        _bytes.ToArray(),
+                        _version.ToString(System.Globalization.CultureInfo.InvariantCulture)));
         }
 
-        public ValueTask WriteAtomicallyAsync(
+        public async ValueTask<VaultStorageWriteResult> CompareExchangeAsync(
             ReadOnlyMemory<byte> contents,
+            string? expectedVersion,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (WriteException is not null)
             {
-                return ValueTask.FromException(WriteException);
+                throw WriteException;
             }
 
-            Bytes = contents.ToArray();
-            return ValueTask.CompletedTask;
+            WriteStarted?.TrySetResult();
+            if (ContinueWrite is not null)
+            {
+                await ContinueWrite.Task.WaitAsync(cancellationToken);
+            }
+
+            var currentVersion = _bytes is null
+                ? null
+                : _version.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (!string.Equals(currentVersion, expectedVersion, StringComparison.Ordinal))
+            {
+                return new VaultStorageWriteResult(false, currentVersion);
+            }
+
+            _bytes = contents.ToArray();
+            _version++;
+            return new VaultStorageWriteResult(
+                true,
+                _version.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
     }
 

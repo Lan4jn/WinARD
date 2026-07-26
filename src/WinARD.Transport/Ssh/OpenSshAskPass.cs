@@ -245,32 +245,50 @@ internal sealed class OpenSshAskPassSession : IOpenSshAskPassSession
                  Volatile.Read(ref _consumed) == 0;
                  attempt++)
             {
-                await using var pipe = new NamedPipeServerStream(
-                    _pipeName,
-                    PipeDirection.InOut,
-                    maxNumberOfServerInstances: 1,
-                    PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-                await pipe.WaitForConnectionAsync(linked.Token).ConfigureAwait(false);
-                if (!await AuthenticateAsync(pipe, linked.Token).ConfigureAwait(false))
+                try
                 {
-                    await WriteStatusAsync(
-                        pipe,
-                        OpenSshAskPassStatus.Unauthorized,
-                        linked.Token).ConfigureAwait(false);
-                    continue;
-                }
+                    await using var pipe = new NamedPipeServerStream(
+                        _pipeName,
+                        PipeDirection.InOut,
+                        maxNumberOfServerInstances: 1,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                    await pipe.WaitForConnectionAsync(linked.Token).ConfigureAwait(false);
+                    using var clientTimeout = new CancellationTokenSource(
+                        TimeSpan.FromMilliseconds(
+                            Math.Clamp(_timeout.TotalMilliseconds / 2, 100, 1000)));
+                    using var clientLinked = CancellationTokenSource.CreateLinkedTokenSource(
+                        linked.Token,
+                        clientTimeout.Token);
+                    if (!await AuthenticateAsync(pipe, clientLinked.Token).ConfigureAwait(false))
+                    {
+                        await WriteStatusAsync(
+                            pipe,
+                            OpenSshAskPassStatus.Unauthorized,
+                            clientLinked.Token).ConfigureAwait(false);
+                        continue;
+                    }
 
-                if (Interlocked.Exchange(ref _consumed, 1) != 0)
+                    if (Interlocked.Exchange(ref _consumed, 1) != 0)
+                    {
+                        await WriteStatusAsync(
+                            pipe,
+                            OpenSshAskPassStatus.Consumed,
+                            clientLinked.Token).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    await WriteSecretAsync(pipe, clientLinked.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!linked.IsCancellationRequested)
                 {
-                    await WriteStatusAsync(
-                        pipe,
-                        OpenSshAskPassStatus.Consumed,
-                        linked.Token).ConfigureAwait(false);
-                    continue;
                 }
-
-                await WriteSecretAsync(pipe, linked.Token).ConfigureAwait(false);
+                catch (EndOfStreamException)
+                {
+                }
+                catch (IOException)
+                {
+                }
             }
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested)
@@ -289,19 +307,55 @@ internal sealed class OpenSshAskPassSession : IOpenSshAskPassSession
         Stream pipe,
         CancellationToken cancellationToken)
     {
+        var lengthBytes = new byte[sizeof(int)];
         var request = new byte[OpenSshAskPassProtocol.RequestBytes];
         try
         {
+            await ReadExactlyAsync(pipe, lengthBytes, cancellationToken).ConfigureAwait(false);
+            if (BinaryPrimitives.ReadInt32LittleEndian(lengthBytes) != request.Length)
+            {
+                return false;
+            }
+
             await ReadExactlyAsync(pipe, request, cancellationToken).ConfigureAwait(false);
-            return request.AsSpan(0, OpenSshAskPassProtocol.Magic.Length)
+            var authenticated = request.AsSpan(0, OpenSshAskPassProtocol.Magic.Length)
                     .SequenceEqual(OpenSshAskPassProtocol.Magic) &&
                 CryptographicOperations.FixedTimeEquals(
                     request.AsSpan(OpenSshAskPassProtocol.Magic.Length),
                     _challenge);
+            return authenticated &&
+                !await HasTrailingDataAsync(pipe, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
+            CryptographicOperations.ZeroMemory(lengthBytes);
             CryptographicOperations.ZeroMemory(request);
+        }
+    }
+
+    private static async Task<bool> HasTrailingDataAsync(
+        Stream pipe,
+        CancellationToken cancellationToken)
+    {
+        using var probeTimeout = new CancellationTokenSource(
+            TimeSpan.FromMilliseconds(25));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            probeTimeout.Token);
+        var extra = new byte[1];
+        try
+        {
+            return await pipe.ReadAsync(extra, linked.Token).ConfigureAwait(false) != 0;
+        }
+        catch (OperationCanceledException) when (
+            probeTimeout.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(extra);
         }
     }
 
@@ -438,11 +492,18 @@ public static class OpenSshAskPassClient
                     PipeDirection.InOut,
                     PipeOptions.Asynchronous);
                 await pipe.ConnectAsync(linked.Token).ConfigureAwait(false);
-                var request = new byte[OpenSshAskPassProtocol.RequestBytes];
+                var request = new byte[
+                    sizeof(int) + OpenSshAskPassProtocol.RequestBytes];
                 try
                 {
-                    OpenSshAskPassProtocol.Magic.CopyTo(request);
-                    challenge.CopyTo(request, OpenSshAskPassProtocol.Magic.Length);
+                    BinaryPrimitives.WriteInt32LittleEndian(
+                        request,
+                        OpenSshAskPassProtocol.RequestBytes);
+                    OpenSshAskPassProtocol.Magic.CopyTo(
+                        request.AsSpan(sizeof(int)));
+                    challenge.CopyTo(
+                        request,
+                        sizeof(int) + OpenSshAskPassProtocol.Magic.Length);
                     await pipe.WriteAsync(request, linked.Token).ConfigureAwait(false);
                     await pipe.FlushAsync(linked.Token).ConfigureAwait(false);
                 }
