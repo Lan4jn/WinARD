@@ -1,3 +1,4 @@
+using System.Buffers;
 using WinARD.Application.Ports;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Clipboard;
@@ -15,14 +16,21 @@ public sealed class RfbClientFactory : IRfbClientFactory
     public IRfbClient Create(Stream stream) => new RfbClient(stream);
 }
 
-internal sealed class RfbClient(Stream stream) : IRfbClient
+internal sealed class RfbClient : IRfbClient
 {
-    private readonly Stream _stream = stream ?? throw new ArgumentNullException(nameof(stream));
+    private readonly Stream _stream;
+    private readonly FramebufferSnapshotFactory _snapshotFactory;
     private RfbHandshakeResult? _handshake;
     private RfbServerInit? _serverInit;
     private Framebuffer? _framebuffer;
     private FramebufferUpdateSession? _framebufferUpdates;
     private bool _disposed;
+
+    public RfbClient(Stream stream, FramebufferSnapshotFactory? snapshotFactory = null)
+    {
+        _stream = stream ?? throw new ArgumentNullException(nameof(stream));
+        _snapshotFactory = snapshotFactory ?? new FramebufferSnapshotFactory();
+    }
 
     public RemoteFramebufferSize FramebufferSize
     {
@@ -96,18 +104,10 @@ internal sealed class RfbClient(Stream stream) : IRfbClient
         {
             case 0:
                 {
-                    var update = await updates.ApplyBodyAsync(_stream, cancellationToken).ConfigureAwait(false);
-                    return new RemoteFramebufferMessage(
-                        new RemoteFramebufferSize(framebuffer.Width, framebuffer.Height),
-                        framebuffer.GetPixelsBgra32(),
-                        framebuffer.Stride,
-                        update.DirtyRects
-                            .Select(rectangle => new RemoteRectangle(
-                                rectangle.X,
-                                rectangle.Y,
-                                rectangle.Width,
-                                rectangle.Height))
-                            .ToArray());
+                    return await updates.ApplyBodyAsync(
+                        _stream,
+                        (surface, update) => _snapshotFactory.CreateServerMessage(surface, update),
+                        cancellationToken).ConfigureAwait(false);
                 }
             case 2:
                 return new RemoteBellMessage();
@@ -185,4 +185,82 @@ internal sealed class RfbClient(Stream stream) : IRfbClient
 
         private ISecret Secret => _secret ?? throw new ObjectDisposedException(nameof(ApplicationSecretMaterial));
     }
+}
+
+internal sealed class FramebufferSnapshotFactory
+{
+    private readonly Func<int, IMemoryOwner<byte>> _rent;
+    private readonly Action<int>? _copyObserver;
+
+    public FramebufferSnapshotFactory(
+        Func<int, IMemoryOwner<byte>>? rent = null,
+        Action<int>? copyObserver = null)
+    {
+        _rent = rent ?? (length => MemoryPool<byte>.Shared.Rent(length));
+        _copyObserver = copyObserver;
+    }
+
+    public RemoteFramebufferMessage Create(
+        Framebuffer framebuffer,
+        FramebufferUpdateResult update)
+    {
+        ArgumentNullException.ThrowIfNull(framebuffer);
+        ArgumentNullException.ThrowIfNull(update);
+        var cursor = CreateCursorUpdate(update.Cursor);
+        var length = framebuffer.PixelByteLength;
+        var owner = _rent(length);
+        try
+        {
+            if (owner.Memory.Length < length)
+            {
+                throw new InvalidOperationException("The framebuffer owner is smaller than requested.");
+            }
+
+            framebuffer.CopyPixelsTo(owner.Memory.Span[..length]);
+            _copyObserver?.Invoke(length);
+            return new RemoteFramebufferMessage(
+                new RemoteFramebufferSize(framebuffer.Width, framebuffer.Height),
+                owner,
+                length,
+                framebuffer.Stride,
+                update.DirtyRects
+                    .Select(rectangle => new RemoteRectangle(
+                        rectangle.X,
+                        rectangle.Y,
+                        rectangle.Width,
+                        rectangle.Height))
+                    .ToArray(),
+                cursor);
+        }
+        catch
+        {
+            owner.Dispose();
+            cursor?.Dispose();
+            throw;
+        }
+    }
+
+    public RemoteServerMessage CreateServerMessage(
+        Framebuffer framebuffer,
+        FramebufferUpdateResult update)
+    {
+        ArgumentNullException.ThrowIfNull(framebuffer);
+        ArgumentNullException.ThrowIfNull(update);
+        if (update.Cursor is not null && update.DirtyRects.Count == 0 && !update.DesktopResized)
+        {
+            return new RemoteCursorMessage(CreateCursorUpdate(update.Cursor)!);
+        }
+
+        return Create(framebuffer, update);
+    }
+
+    private static RemoteCursorUpdate? CreateCursorUpdate(RemoteCursor? cursor) =>
+        cursor is null
+            ? null
+            : new RemoteCursorUpdate(
+                cursor.HotspotX,
+                cursor.HotspotY,
+                cursor.Width,
+                cursor.Height,
+                cursor.GetPixelsBgra32());
 }

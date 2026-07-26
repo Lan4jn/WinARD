@@ -47,3 +47,36 @@ internal sealed class RemoteInputOperationRunner(
         }
     }
 }
+
+internal sealed class RemoteCursorVisibilityController(
+    Action<bool> setHostCursorHidden,
+    Action<bool> setOverlayVisible)
+{
+    private readonly Action<bool> _setHostCursorHidden =
+        setHostCursorHidden ?? throw new ArgumentNullException(nameof(setHostCursorHidden));
+    private readonly Action<bool> _setOverlayVisible =
+        setOverlayVisible ?? throw new ArgumentNullException(nameof(setOverlayVisible));
+
+    public void SetRemoteCursorVisible(bool visible)
+    {
+        _setHostCursorHidden(visible);
+        _setOverlayVisible(visible);
+    }
+
+    public void Reset() => SetRemoteCursorVisible(false);
+}
+
+internal static class RemotePointerDispatch
+{
+    public static Task RunAsync(
+        Action updateLocalState,
+        RemoteInputOperationRunner runner,
+        Func<Task> send)
+    {
+        ArgumentNullException.ThrowIfNull(updateLocalState);
+        ArgumentNullException.ThrowIfNull(runner);
+        ArgumentNullException.ThrowIfNull(send);
+        updateLocalState();
+        return runner.RunAsync(send);
+    }
+}

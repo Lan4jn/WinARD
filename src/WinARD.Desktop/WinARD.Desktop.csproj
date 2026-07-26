@@ -17,6 +17,7 @@
     <EnablePriGenTooling>false</EnablePriGenTooling>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\WinARD.CursorResources\WinARD.CursorResources.csproj" />
     <ProjectReference Include="..\WinARD.Application\WinARD.Application.csproj" />
     <ProjectReference Include="..\WinARD.Infrastructure\WinARD.Infrastructure.csproj" />
     <ProjectReference Include="..\WinARD.Remote.Protocol\WinARD.Remote.Protocol.csproj" />

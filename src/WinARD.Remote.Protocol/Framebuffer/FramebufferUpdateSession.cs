@@ -62,8 +62,18 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
     public async Task<FramebufferUpdateResult> ApplyBodyAsync(
         Stream stream,
         CancellationToken cancellationToken)
+        => await ApplyBodyAsync(
+            stream,
+            static (_, result) => result,
+            cancellationToken).ConfigureAwait(false);
+
+    public async Task<TResult> ApplyBodyAsync<TResult>(
+        Stream stream,
+        Func<Framebuffer, FramebufferUpdateResult, TResult> projector,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(projector);
         ThrowIfUnavailable();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -71,11 +81,12 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
             ThrowIfUnavailable();
             try
             {
-                return await FramebufferUpdateReader.ApplyBodyAsync(
+                var result = await FramebufferUpdateReader.ApplyBodyAsync(
                     stream,
                     _framebuffer,
                     _decoders,
                     cancellationToken).ConfigureAwait(false);
+                return projector(_framebuffer, result);
             }
             catch
             {

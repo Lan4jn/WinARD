@@ -260,6 +260,8 @@ public static class FrameValidation
 
 public sealed class FramePacket : IDisposable
 {
+    private const int MaximumDirtyRectangles = 256;
+    private const int MinimumRectanglesForCoverageCollapse = 8;
     private IMemoryOwner<byte>? _owner;
 
     public FramePacket(
@@ -284,7 +286,7 @@ public sealed class FramePacket : IDisposable
         Height = height;
         Stride = stride;
         Length = length;
-        DirtyRectangles = dirtyRectangles;
+        DirtyRectangles = NormalizeDirtyRectangles(dirtyRectangles, width, height);
         _owner = owner;
     }
 
@@ -297,31 +299,89 @@ public sealed class FramePacket : IDisposable
     public ReadOnlyMemory<byte> Pixels =>
         (_owner ?? throw new ObjectDisposedException(nameof(FramePacket))).Memory[..Length];
 
-    public static FramePacket CopyFrom(long sequence, RemoteFramebufferMessage message)
+    public static FramePacket TakeFrom(long sequence, RemoteFramebufferMessage message)
     {
         ArgumentNullException.ThrowIfNull(message);
         FrameValidation.ValidateBgra32(
             message.Size.Width,
             message.Size.Height,
             message.Stride,
-            message.Bgra32.Length);
-        var owner = MemoryPool<byte>.Shared.Rent(message.Bgra32.Length);
-        message.Bgra32.CopyTo(owner.Memory.Span);
-        return new FramePacket(
-            sequence,
-            message.Size.Width,
-            message.Size.Height,
-            message.Stride,
-            message.Bgra32.Length,
-            FrameValidation.ClipDirtyRectangles(
-                message.DirtyRectangles,
+            message.Length);
+        var owner = message.TakePixelOwnership();
+        try
+        {
+            return new FramePacket(
+                sequence,
                 message.Size.Width,
-                message.Size.Height),
-            owner);
+                message.Size.Height,
+                message.Stride,
+                message.Length,
+                message.DirtyRectangles,
+                owner);
+        }
+        catch
+        {
+            owner.Dispose();
+            throw;
+        }
     }
 
-    internal void MarkEntireFrameDirty() =>
-        DirtyRectangles = [new RemoteRectangle(0, 0, Width, Height)];
+    internal void MergeDirtyRectanglesFrom(FramePacket dropped)
+    {
+        ArgumentNullException.ThrowIfNull(dropped);
+        if (dropped.Width != Width || dropped.Height != Height)
+        {
+            DirtyRectangles = [new RemoteRectangle(0, 0, Width, Height)];
+            return;
+        }
+
+        DirtyRectangles = NormalizeDirtyRectangles(
+            dropped.DirtyRectangles.Concat(DirtyRectangles),
+            Width,
+            Height);
+    }
+
+    private static RemoteRectangle[] NormalizeDirtyRectangles(
+        IEnumerable<RemoteRectangle> rectangles,
+        int width,
+        int height)
+    {
+        var fullFrame = new RemoteRectangle(0, 0, width, height);
+        var normalized = FrameValidation.ClipDirtyRectangles(rectangles, width, height)
+            .Distinct()
+            .ToArray();
+        if (normalized.Contains(fullFrame) ||
+            normalized.Length > MaximumDirtyRectangles ||
+            (normalized.Length >= MinimumRectanglesForCoverageCollapse &&
+             CoversAtLeastHalfOfFrame(normalized, width, height)))
+        {
+            return [fullFrame];
+        }
+
+        return normalized;
+    }
+
+    private static bool CoversAtLeastHalfOfFrame(
+        IEnumerable<RemoteRectangle> rectangles,
+        int width,
+        int height)
+    {
+        var frameArea = (long)width * height;
+        var threshold = (frameArea + 1) / 2;
+        long coveredArea = 0;
+        foreach (var rectangle in rectangles)
+        {
+            var rectangleArea = (long)rectangle.Width * rectangle.Height;
+            if (rectangleArea >= threshold - coveredArea)
+            {
+                return true;
+            }
+
+            coveredArea += rectangleArea;
+        }
+
+        return false;
+    }
 
     public void Dispose() => Interlocked.Exchange(ref _owner, null)?.Dispose();
 }
@@ -350,7 +410,7 @@ public sealed class LatestFrameMailbox : IAsyncDisposable
             replaced = _latest;
             if (replaced is not null)
             {
-                frame.MarkEntireFrameDirty();
+                frame.MergeDirtyRectanglesFrom(replaced);
             }
 
             _latest = frame;

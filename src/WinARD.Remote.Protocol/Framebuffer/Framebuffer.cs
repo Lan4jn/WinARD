@@ -35,10 +35,31 @@ public sealed class Framebuffer : IDisposable
     }
 
     internal ProtocolLimits Limits => _limits;
+
+    public int PixelByteLength
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return _pixels.Length;
+        }
+    }
+
     public byte[] GetPixelsBgra32()
     {
         ThrowIfDisposed();
         return (byte[])_pixels.Clone();
+    }
+
+    public void CopyPixelsTo(Span<byte> destination)
+    {
+        ThrowIfDisposed();
+        if (destination.Length < _pixels.Length)
+        {
+            throw new ArgumentException("Destination is smaller than the framebuffer.", nameof(destination));
+        }
+
+        _pixels.CopyTo(destination);
     }
 
     public uint GetBgra32(int x, int y)

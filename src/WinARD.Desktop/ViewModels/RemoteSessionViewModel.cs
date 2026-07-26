@@ -22,10 +22,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Task? _receiveTask;
     private Task? _presentTask;
+    private Task? _monitorTask;
     private Task? _disposeTask;
     private Task? _ownershipDisposeTask;
     private long _sequence;
     private RemoteFramebufferSize _framebufferSize;
+    private RemoteCursorUpdate? _remoteCursor;
     private string _statusMessage = "已连接。";
 
     public RemoteSessionViewModel(
@@ -56,6 +58,19 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         private set => SetProperty(ref _statusMessage, value);
     }
 
+    public RemoteCursorUpdate? RemoteCursor
+    {
+        get => _remoteCursor;
+        private set
+        {
+            var previous = _remoteCursor;
+            if (SetProperty(ref _remoteCursor, value))
+            {
+                previous?.Dispose();
+            }
+        }
+    }
+
     public Task Completion => _completion.Task;
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -71,6 +86,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
             _receiveTask = ReceiveLoopAsync(_lifetime.Token);
             _presentTask = PresentLoopAsync(_lifetime.Token);
+            _monitorTask = MonitorLoopsAsync(_receiveTask, _presentTask);
             return Task.CompletedTask;
         }
     }
@@ -137,16 +153,46 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 switch (message)
                 {
                     case RemoteFramebufferMessage frame:
-                        if (FramebufferSize != frame.Size)
+                        using (frame)
                         {
-                            await _dispatcher.InvokeAsync(
-                                () => FramebufferSize = frame.Size,
+                            var cursor = frame.TakeCursorOwnership();
+                            try
+                            {
+                                if (FramebufferSize != frame.Size)
+                                {
+                                    await _dispatcher.InvokeAsync(
+                                        () => FramebufferSize = frame.Size,
+                                        cancellationToken).ConfigureAwait(false);
+                                }
+
+                                _frames.Publish(FramePacket.TakeFrom(
+                                    Interlocked.Increment(ref _sequence),
+                                    frame));
+                                if (cursor is not null)
+                                {
+                                    await PublishCursorAsync(cursor, cancellationToken).ConfigureAwait(false);
+                                    cursor = null;
+                                }
+                            }
+                            finally
+                            {
+                                if (cursor is not null && !ReferenceEquals(RemoteCursor, cursor))
+                                {
+                                    cursor.Dispose();
+                                }
+                            }
+                        }
+                        await _session.RequestFramebufferUpdateAsync(
+                            incremental: true,
+                            cancellationToken).ConfigureAwait(false);
+                        break;
+                    case RemoteCursorMessage cursorMessage:
+                        using (cursorMessage)
+                        {
+                            await PublishCursorAsync(
+                                cursorMessage.TakeCursorOwnership(),
                                 cancellationToken).ConfigureAwait(false);
                         }
-
-                        _frames.Publish(FramePacket.CopyFrom(
-                            Interlocked.Increment(ref _sequence),
-                            frame));
                         await _session.RequestFramebufferUpdateAsync(
                             incremental: true,
                             cancellationToken).ConfigureAwait(false);
@@ -164,26 +210,6 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
-        catch (Exception)
-        {
-            var ownershipDisposal = DisposeOwnershipOnceAsync();
-            try
-            {
-                await _dispatcher.InvokeAsync(
-                    () => StatusMessage = "连接已中断。",
-                    CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (Exception)
-            {
-                // Status reporting is best-effort; ownership release must still complete.
-            }
-
-            await ownershipDisposal.ConfigureAwait(false);
-        }
-        finally
-        {
-            _completion.TrySetResult();
-        }
     }
 
     private async Task PresentLoopAsync(CancellationToken cancellationToken)
@@ -193,20 +219,11 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             while (true)
             {
                 using var frame = await _frames.ReadLatestAsync(cancellationToken).ConfigureAwait(false);
-                try
+                await _dispatcher.InvokeAsync(() =>
                 {
-                    await _dispatcher.InvokeAsync(() =>
-                    {
-                        _presenter.Resize(frame.Width, frame.Height);
-                        _presenter.Present(frame.Pixels.Span, frame.Stride, frame.DirtyRectangles);
-                    }, cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception) when (!cancellationToken.IsCancellationRequested)
-                {
-                    await _dispatcher.InvokeAsync(
-                        () => StatusMessage = "画面呈现暂时不可用。",
-                        CancellationToken.None).ConfigureAwait(false);
-                }
+                    _presenter.Resize(frame.Width, frame.Height);
+                    _presenter.Present(frame.Pixels.Span, frame.Stride, frame.DirtyRectangles);
+                }, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -219,15 +236,14 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         List<Exception>? failures = null;
         _lifetime.Cancel();
         var ownershipDisposal = DisposeOwnershipOnceAsync();
-        var receive = _receiveTask;
-        var present = _presentTask;
-        if (receive is not null)
+        var monitor = _monitorTask;
+        if (monitor is not null)
         {
-            await CaptureFailureAsync(receive, failures ??= []).ConfigureAwait(false);
+            await CaptureFailureAsync(monitor, failures ??= []).ConfigureAwait(false);
         }
-        if (present is not null)
+        else
         {
-            await CaptureFailureAsync(present, failures ??= []).ConfigureAwait(false);
+            _completion.TrySetResult();
         }
 
         await CaptureFailureAsync(_inputMapper.DisposeAsync().AsTask(), failures ??= []).ConfigureAwait(false);
@@ -237,6 +253,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         }
 
         await CaptureFailureAsync(_frames.DisposeAsync().AsTask(), failures ??= []).ConfigureAwait(false);
+        await CaptureFailureAsync(DisposeCursorAsync(), failures ??= []).ConfigureAwait(false);
         Task presenterDisposal = Task.CompletedTask;
         await CaptureFailureAsync(
             DisposePresenterAsync(),
@@ -287,6 +304,101 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             }
 
             return _ownershipDisposeTask;
+        }
+    }
+
+    private async Task MonitorLoopsAsync(Task receive, Task present)
+    {
+        try
+        {
+            var completed = await Task.WhenAny(receive, present).ConfigureAwait(false);
+            var wasTerminalFailure = completed.IsFaulted && !_lifetime.IsCancellationRequested;
+            if (wasTerminalFailure)
+            {
+                _lifetime.Cancel();
+            }
+
+            var ownershipDisposal = DisposeOwnershipOnceAsync();
+            if (wasTerminalFailure)
+            {
+                var status = ReferenceEquals(completed, present)
+                    ? "画面呈现失败，会话正在关闭。"
+                    : "连接已中断。";
+                try
+                {
+                    await _dispatcher.InvokeAsync(
+                        () => StatusMessage = status,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // Terminal cleanup must not depend on status reporting.
+                }
+            }
+
+            await ObserveFailureAsync(receive).ConfigureAwait(false);
+            await ObserveFailureAsync(present).ConfigureAwait(false);
+            await ObserveFailureAsync(ownershipDisposal).ConfigureAwait(false);
+        }
+        finally
+        {
+            _completion.TrySetResult();
+        }
+    }
+
+    private static async Task ObserveFailureAsync(Task operation)
+    {
+        try
+        {
+            await operation.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private async Task PublishCursorAsync(
+        RemoteCursorUpdate cursor,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!cursor.IsVisible)
+            {
+                cursor.Dispose();
+                await _dispatcher.InvokeAsync(
+                    () => RemoteCursor = null,
+                    cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            await _dispatcher.InvokeAsync(
+                () => RemoteCursor = cursor,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            if (!ReferenceEquals(RemoteCursor, cursor))
+            {
+                cursor.Dispose();
+            }
+
+            throw;
+        }
+    }
+
+    private async Task DisposeCursorAsync()
+    {
+        try
+        {
+            await _dispatcher.InvokeAsync(
+                () => RemoteCursor = null,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _remoteCursor, null)?.Dispose();
+            throw;
         }
     }
 }

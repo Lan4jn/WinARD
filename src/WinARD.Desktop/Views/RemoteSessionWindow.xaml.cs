@@ -3,6 +3,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Input;
+using Microsoft.UI.Xaml.Media.Imaging;
+using System.Runtime.InteropServices.WindowsRuntime;
 using WinARD.Application.Ports;
 using WinARD.Desktop.Clipboard;
 using WinARD.Desktop.Input;
@@ -20,6 +22,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly IUiDispatcher _dispatcher;
     private readonly WindowsClipboardBridge _clipboardBridge;
     private readonly RemoteInputOperationRunner _inputOperations;
+    private readonly RemoteCursorVisibilityController _cursorVisibility;
     private readonly RemoteTextInputBuffer _textInput = new();
     private readonly AppWindow _appWindow;
     private RemoteFramebufferSize _remoteSize;
@@ -33,14 +36,15 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     public RemoteSessionWindow(
         IRemoteSessionRuntime session,
         IAsyncDisposable ownership,
-        IUiDispatcher dispatcher)
+        IUiDispatcher dispatcher,
+        IFramePresenter? presenter = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(ownership);
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         InitializeComponent();
         _remoteSize = session.FramebufferSize;
-        var presenter = new D3DFramePresenter(FramePanel);
+        presenter ??= new D3DFramePresenter(FramePanel);
         _clipboardBridge = new WindowsClipboardBridge(dispatcher, session.SendClipboardTextAsync);
         ViewModel = new RemoteSessionViewModel(
             session,
@@ -53,6 +57,11 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             ViewModel.ReportInputFailureAsync,
             CloseSessionAsync,
             () => _lifetime.IsCancellationRequested);
+        _cursorVisibility = new RemoteCursorVisibilityController(
+            InputSurface.SetHostCursorHidden,
+            visible => RemoteCursorOverlay.Visibility = visible
+                ? Visibility.Visible
+                : Visibility.Collapsed);
         StatusText.SetBinding(TextBlock.TextProperty, new Microsoft.UI.Xaml.Data.Binding
         {
             Source = ViewModel,
@@ -97,6 +106,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         FramePanel.Loaded -= OnFramePanelLoaded;
         _ = ViewModel.StartAsync(_lifetime.Token);
         _ = ObserveCompletionAsync();
+        _ = ObserveFailureAsync(ObserveSmokePointerProbeAsync());
     }
 
     private void OnFitClicked(object sender, RoutedEventArgs args)
@@ -187,17 +197,17 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     {
         _ = InputSurface.Focus(FocusState.Pointer);
         _ = InputSurface.CapturePointer(args.Pointer);
-        _ = _inputOperations.RunAsync(() => SendPointerAsync(args));
+        QueuePointerSend(args);
         args.Handled = true;
     }
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs args) =>
-        _ = _inputOperations.RunAsync(() => SendPointerAsync(args));
+        QueuePointerSend(args);
 
     private void OnPointerReleased(object sender, PointerRoutedEventArgs args)
     {
         InputSurface.ReleasePointerCapture(args.Pointer);
-        _ = _inputOperations.RunAsync(() => SendPointerAsync(args));
+        QueuePointerSend(args);
         args.Handled = true;
     }
 
@@ -206,11 +216,11 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnPointerWheelChanged(object sender, PointerRoutedEventArgs args)
     {
-        _ = _inputOperations.RunAsync(() => SendWheelAsync(args));
+        QueueWheelSend(args);
         args.Handled = true;
     }
 
-    private async Task SendWheelAsync(PointerRoutedEventArgs args)
+    private void QueueWheelSend(PointerRoutedEventArgs args)
     {
         if (!TryGetRemotePoint(args, out var point))
         {
@@ -220,21 +230,39 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         var properties = args.GetCurrentPoint(InputSurface).Properties;
         var baseMask = WindowsInputMapper.ToPointerMask(ToButtons(properties));
         var wheelMask = WindowsInputMapper.WithWheel(baseMask, properties.MouseWheelDelta);
-        await ViewModel.SendPointerAsync(wheelMask, point, _lifetime.Token);
-        await ViewModel.SendPointerAsync(baseMask, point, _lifetime.Token);
+        _ = RemotePointerDispatch.RunAsync(
+            () => UpdateLocalPointerState(point, baseMask),
+            _inputOperations,
+            async () =>
+            {
+                await ViewModel.SendPointerAsync(wheelMask, point, _lifetime.Token);
+                await ViewModel.SendPointerAsync(baseMask, point, _lifetime.Token);
+            });
     }
 
-    private async Task SendPointerAsync(PointerRoutedEventArgs args)
+    private void QueuePointerSend(PointerRoutedEventArgs args)
     {
         if (!TryGetRemotePoint(args, out var point))
         {
             return;
         }
 
-        _lastPointer = point;
-        _pointerMask = WindowsInputMapper.ToPointerMask(
+        var pointerMask = WindowsInputMapper.ToPointerMask(
             ToButtons(args.GetCurrentPoint(InputSurface).Properties));
-        await ViewModel.SendPointerAsync(_pointerMask, point, _lifetime.Token);
+        _ = RemotePointerDispatch.RunAsync(
+            () => UpdateLocalPointerState(point, pointerMask),
+            _inputOperations,
+            () => ViewModel.SendPointerAsync(
+                pointerMask,
+                point,
+                _lifetime.Token).AsTask());
+    }
+
+    private void UpdateLocalPointerState(RemotePoint point, byte pointerMask)
+    {
+        _lastPointer = point;
+        _pointerMask = pointerMask;
+        UpdateCursorPosition();
     }
 
     private bool TryGetRemotePoint(PointerRoutedEventArgs args, out RemotePoint point)
@@ -319,6 +347,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             disableAnimation: true);
         FitButton.IsEnabled = _scaleMode != ViewportScaleMode.Fit;
         ActualSizeButton.IsEnabled = _scaleMode != ViewportScaleMode.ActualSize;
+        UpdateCursorPosition();
     }
 
     private double EffectiveViewportWidth() =>
@@ -355,6 +384,14 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         {
             _remoteSize = ViewModel.FramebufferSize;
             UpdateFrameSizing();
+        }
+        else if (args.PropertyName == nameof(RemoteSessionViewModel.RemoteCursor))
+        {
+            UpdateRemoteCursor();
+        }
+        else if (args.PropertyName == nameof(RemoteSessionViewModel.StatusMessage))
+        {
+            WriteSmokeMarker("WINARD_REMOTE_SMOKE_STATUS_MARKER", ViewModel.StatusMessage);
         }
     }
 
@@ -426,14 +463,54 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
     }
 
+    private async Task ObserveSmokePointerProbeAsync()
+    {
+        var trigger = Environment.GetEnvironmentVariable(
+            "WINARD_REMOTE_SMOKE_POINTER_PROBE_TRIGGER");
+        if (string.IsNullOrWhiteSpace(trigger))
+        {
+            return;
+        }
+
+        while (!File.Exists(trigger))
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(50), _lifetime.Token).ConfigureAwait(false);
+        }
+
+        Task send = Task.CompletedTask;
+        await _dispatcher.InvokeAsync(
+            () =>
+            {
+                var point = new RemotePoint(
+                    Math.Max(0, _remoteSize.Width / 2),
+                    Math.Max(0, _remoteSize.Height / 2));
+                send = RemotePointerDispatch.RunAsync(
+                    () => UpdateLocalPointerState(point, _pointerMask),
+                    _inputOperations,
+                    () => ViewModel.SendPointerAsync(
+                        _pointerMask,
+                        point,
+                        _lifetime.Token).AsTask());
+            },
+            _lifetime.Token).ConfigureAwait(false);
+        await send.ConfigureAwait(false);
+    }
+
     private async Task ObserveCompletionAsync()
     {
-        await ViewModel.Completion.ConfigureAwait(false);
-        if (!_lifetime.IsCancellationRequested)
+        try
         {
-            await _dispatcher.InvokeAsync(
-                () => _ = CloseSessionAsync(),
-                CancellationToken.None).ConfigureAwait(false);
+            await ViewModel.Completion.ConfigureAwait(false);
+            if (!_lifetime.IsCancellationRequested)
+            {
+                await _dispatcher.InvokeAsync(
+                    () => _ = CloseSessionAsync(),
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        catch (Exception)
+        {
+            // Completion observation must never become an unobserved fire-and-forget failure.
         }
     }
 
@@ -441,7 +518,88 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     {
         _appWindow.Closing -= OnClosing;
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        _cursorVisibility.Reset();
+        InputSurface.Dispose();
         _lifetime.Dispose();
+    }
+
+    private void UpdateRemoteCursor()
+    {
+        var cursor = ViewModel.RemoteCursor;
+        if (cursor is null)
+        {
+            RemoteCursorOverlay.Source = null;
+            _cursorVisibility.SetRemoteCursorVisible(false);
+            WriteSmokeMarker("WINARD_REMOTE_SMOKE_CURSOR_MARKER", "hidden");
+            WriteHostCursorSmokeMarker();
+            return;
+        }
+
+        var bitmap = new WriteableBitmap(cursor.Width, cursor.Height);
+        using (var stream = bitmap.PixelBuffer.AsStream())
+        {
+            stream.Write(cursor.Bgra32.Span);
+        }
+
+        RemoteCursorOverlay.Source = bitmap;
+        _cursorVisibility.SetRemoteCursorVisible(true);
+        WriteSmokeMarker("WINARD_REMOTE_SMOKE_CURSOR_MARKER", "visible");
+        WriteHostCursorSmokeMarker();
+        UpdateCursorPosition();
+    }
+
+    private void WriteHostCursorSmokeMarker()
+    {
+        var value = InputSurface.CurrentHostCursor switch
+        {
+            InputDesktopResourceCursor cursor =>
+                $"{nameof(InputDesktopResourceCursor)}|{cursor.ResourceId}|{cursor.ModuleName}",
+            InputSystemCursor cursor =>
+                $"{nameof(InputSystemCursor)}|{cursor.CursorShape}",
+            null => "null",
+            var cursor => cursor.GetType().Name
+        };
+        WriteSmokeMarker("WINARD_REMOTE_SMOKE_HOST_CURSOR_MARKER", value);
+    }
+
+    private void UpdateCursorPosition()
+    {
+        var cursor = ViewModel.RemoteCursor;
+        var transform = CurrentTransform();
+        if (cursor is null || !transform.IsValid)
+        {
+            return;
+        }
+
+        RemoteCursorOverlay.Width = cursor.Width * transform.DipScale;
+        RemoteCursorOverlay.Height = cursor.Height * transform.DipScale;
+        Canvas.SetLeft(
+            RemoteCursorOverlay,
+            transform.OriginX + ((_lastPointer.X - cursor.HotspotX) * transform.DipScale));
+        Canvas.SetTop(
+            RemoteCursorOverlay,
+            transform.OriginY + ((_lastPointer.Y - cursor.HotspotY) * transform.DipScale));
+        WriteSmokeMarker(
+            "WINARD_REMOTE_SMOKE_POINTER_MARKER",
+            $"{_lastPointer.X},{_lastPointer.Y}");
+    }
+
+    private static void WriteSmokeMarker(string environmentVariable, string value)
+    {
+        var marker = Environment.GetEnvironmentVariable(environmentVariable);
+        if (string.IsNullOrWhiteSpace(marker))
+        {
+            return;
+        }
+
+        try
+        {
+            File.WriteAllText(marker, value);
+        }
+        catch (Exception)
+        {
+            // Smoke diagnostics are best-effort and never affect a real session.
+        }
     }
 
 }

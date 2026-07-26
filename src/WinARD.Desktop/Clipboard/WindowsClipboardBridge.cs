@@ -23,9 +23,11 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
     private readonly Func<string, CancellationToken, ValueTask> _sendRemote;
     private readonly int _maxUtf8Bytes;
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly Queue<RemoteWriteContext> _expectedRemoteCallbacks = [];
     private Task _pending = Task.CompletedTask;
     private Task? _disposeTask;
-    private string? _suppressedText;
+    private RemoteWriteContext? _activeRemoteWrite;
+    private long _generation;
     private bool _disposed;
     private bool _isEnabled = true;
 
@@ -74,10 +76,16 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
         {
             lock (_sync)
             {
+                if (_isEnabled == value)
+                {
+                    return;
+                }
+
                 _isEnabled = value;
                 if (!value)
                 {
-                    _suppressedText = null;
+                    _generation++;
+                    _expectedRemoteCallbacks.Clear();
                 }
             }
         }
@@ -85,18 +93,20 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
 
     public async ValueTask SetRemoteTextAsync(string text, CancellationToken cancellationToken)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (!IsEnabled)
-        {
-            return;
-        }
-        var sanitized = Sanitize(text, _maxUtf8Bytes);
+        long generation;
         lock (_sync)
         {
-            _suppressedText = sanitized;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_isEnabled)
+            {
+                return;
+            }
+
+            generation = _generation;
         }
 
-        await _dispatcher.InvokeAsync(() => _adapter.SetText(sanitized), cancellationToken)
+        var sanitized = Sanitize(text, _maxUtf8Bytes);
+        await _dispatcher.InvokeAsync(() => ApplyRemoteText(sanitized, generation), cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -123,6 +133,8 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
         lock (_sync)
         {
             _disposed = true;
+            _generation++;
+            _expectedRemoteCallbacks.Clear();
             pending = _pending;
         }
 
@@ -186,15 +198,35 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
                 return;
             }
 
-            _pending = ObserveLocalChangeAsync(_pending, _lifetime.Token);
+            var remoteWrite = _activeRemoteWrite;
+            if (remoteWrite is not null)
+            {
+                remoteWrite.CallbackClaimed = true;
+            }
+            else if (_expectedRemoteCallbacks.TryDequeue(out var expectedRemoteCallback))
+            {
+                remoteWrite = expectedRemoteCallback;
+            }
+
+            var generation = remoteWrite?.Generation ?? _generation;
+            _pending = ObserveLocalChangeAsync(_pending, remoteWrite, generation, _lifetime.Token);
         }
     }
 
-    private async Task ObserveLocalChangeAsync(Task predecessor, CancellationToken cancellationToken)
+    private async Task ObserveLocalChangeAsync(
+        Task predecessor,
+        RemoteWriteContext? remoteWrite,
+        long generation,
+        CancellationToken cancellationToken)
     {
         try
         {
             await predecessor.ConfigureAwait(false);
+            if (remoteWrite is not null)
+            {
+                await remoteWrite.Completion.Task.ConfigureAwait(false);
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
             Task<string?>? readTask = null;
             await _dispatcher.InvokeAsync(
@@ -223,14 +255,14 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
 
             lock (_sync)
             {
-                if (_disposed || !_isEnabled)
+                if (_disposed || !_isEnabled || generation != _generation)
                 {
                     return;
                 }
 
-                if (string.Equals(_suppressedText, sanitized, StringComparison.Ordinal))
+                if (remoteWrite is { Succeeded: true } &&
+                    string.Equals(remoteWrite.SuppressedText, sanitized, StringComparison.Ordinal))
                 {
-                    _suppressedText = null;
                     return;
                 }
             }
@@ -246,6 +278,47 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
         }
     }
 
+    private void ApplyRemoteText(string text, long generation)
+    {
+        RemoteWriteContext remoteWrite;
+        lock (_sync)
+        {
+            if (_disposed || !_isEnabled || generation != _generation)
+            {
+                return;
+            }
+
+            remoteWrite = new RemoteWriteContext(generation);
+            _activeRemoteWrite = remoteWrite;
+        }
+
+        try
+        {
+            _adapter.SetText(text);
+            lock (_sync)
+            {
+                remoteWrite.Succeeded = true;
+                remoteWrite.SuppressedText = text;
+                if (!_disposed && _isEnabled && generation == _generation && !remoteWrite.CallbackClaimed)
+                {
+                    _expectedRemoteCallbacks.Enqueue(remoteWrite);
+                }
+            }
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_activeRemoteWrite, remoteWrite))
+                {
+                    _activeRemoteWrite = null;
+                }
+            }
+
+            remoteWrite.Completion.TrySetResult();
+        }
+    }
+
     private static string Sanitize(string text, int maxUtf8Bytes)
     {
         ArgumentNullException.ThrowIfNull(text);
@@ -254,6 +327,20 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
         var encoded = ClipboardProtocol.EncodeText(sanitized, maxUtf8Bytes);
         CryptographicOperations.ZeroMemory(encoded);
         return sanitized;
+    }
+
+    private sealed class RemoteWriteContext(long generation)
+    {
+        public TaskCompletionSource Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public long Generation { get; } = generation;
+
+        public string? SuppressedText { get; set; }
+
+        public bool CallbackClaimed { get; set; }
+
+        public bool Succeeded { get; set; }
     }
 
     private sealed class WindowsClipboardAdapter : IWindowsClipboardAdapter

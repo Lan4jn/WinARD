@@ -28,8 +28,14 @@ public partial class App : Microsoft.UI.Xaml.Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        if (Environment.GetCommandLineArgs()
-            .Contains("--remote-session-smoke", StringComparer.Ordinal))
+        var commandLine = Environment.GetCommandLineArgs();
+        var isRemoteSessionSmoke = commandLine.Contains(
+            "--remote-session-smoke",
+            StringComparer.Ordinal);
+        var isPresenterFailureSmoke = commandLine.Contains(
+            "--remote-session-smoke-presenter-failure",
+            StringComparer.Ordinal);
+        if (isRemoteSessionSmoke || isPresenterFailureSmoke)
         {
             var dispatcher = new DispatcherQueueUiDispatcher(
                 DispatcherQueue.GetForCurrentThread() ??
@@ -37,7 +43,8 @@ public partial class App : Microsoft.UI.Xaml.Application
             _window = new RemoteSessionWindow(
                 new SmokeRemoteSessionRuntime(),
                 new SmokeSessionOwnership(),
-                dispatcher);
+                dispatcher,
+                isPresenterFailureSmoke ? new SmokeFailingPresenter() : null);
             _window.Activate();
             return;
         }
@@ -101,6 +108,7 @@ public partial class App : Microsoft.UI.Xaml.Application
         private const int SmokeWidth = 3840;
         private const int SmokeHeight = 2160;
         private bool _frameSent;
+        private bool _hiddenCursorSent;
 
         public RemoteFramebufferSize FramebufferSize => new(SmokeWidth, SmokeHeight);
 
@@ -129,15 +137,49 @@ public partial class App : Microsoft.UI.Xaml.Application
                     FramebufferSize,
                     pixels,
                     SmokeWidth * 4,
-                    [new RemoteRectangle(0, 0, SmokeWidth, SmokeHeight)]);
+                    [new RemoteRectangle(0, 0, SmokeWidth, SmokeHeight)],
+                    VisibleCursor());
+            }
+
+            if (!_hiddenCursorSent)
+            {
+                var trigger = Environment.GetEnvironmentVariable(
+                    "WINARD_REMOTE_SMOKE_CURSOR_HIDE_TRIGGER");
+                if (!string.IsNullOrWhiteSpace(trigger))
+                {
+                    while (!File.Exists(trigger))
+                    {
+                        await Task.Delay(TimeSpan.FromMilliseconds(50), cancellationToken);
+                    }
+
+                    _hiddenCursorSent = true;
+                    return new RemoteCursorMessage(
+                        new RemoteCursorUpdate(0, 0, 0, 0, []));
+                }
             }
 
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             throw new InvalidOperationException("Unreachable smoke receive state.");
         }
 
-        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) =>
-            ValueTask.CompletedTask;
+        public async ValueTask SendPointerAsync(
+            byte buttons,
+            int x,
+            int y,
+            CancellationToken cancellationToken)
+        {
+            var release = Environment.GetEnvironmentVariable(
+                "WINARD_REMOTE_SMOKE_POINTER_SEND_RELEASE");
+            if (string.IsNullOrWhiteSpace(release))
+            {
+                return;
+            }
+
+            while (!File.Exists(release))
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(50), cancellationToken);
+            }
+        }
 
         public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) =>
             ValueTask.CompletedTask;
@@ -146,6 +188,33 @@ public partial class App : Microsoft.UI.Xaml.Application
             ValueTask.CompletedTask;
 
         public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+
+        private static RemoteCursorUpdate VisibleCursor()
+        {
+            var pixels = new byte[3 * 3 * 4];
+            for (var index = 0; index < pixels.Length; index += 4)
+            {
+                pixels[index] = 32;
+                pixels[index + 1] = 220;
+                pixels[index + 2] = 255;
+                pixels[index + 3] = 255;
+            }
+
+            return new RemoteCursorUpdate(1, 1, 3, 3, pixels);
+        }
+    }
+
+    private sealed class SmokeFailingPresenter : Rendering.IFramePresenter
+    {
+        public void Resize(int width, int height) { }
+
+        public void Present(
+            ReadOnlySpan<byte> bgra32,
+            int stride,
+            IReadOnlyList<RemoteRectangle> dirtyRectangles) =>
+            throw new InvalidOperationException("sensitive smoke presenter failure");
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class SmokeSessionOwnership : IAsyncDisposable

@@ -1,0 +1,3 @@
+#define IDC_TRANSPARENT 101
+
+IDC_TRANSPARENT CURSOR "TransparentCursor.cur"

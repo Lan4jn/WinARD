@@ -31,6 +31,52 @@ public sealed class RemoteInputOperationRunnerTests
         Assert.Equal(1, closes);
     }
 
+    [Fact]
+    public void Cursor_visibility_controller_hides_host_cursor_only_while_remote_cursor_is_visible()
+    {
+        var hostCursorStates = new List<bool>();
+        var overlayStates = new List<bool>();
+        var controller = new RemoteCursorVisibilityController(
+            hidden => hostCursorStates.Add(hidden),
+            visible => overlayStates.Add(visible));
+
+        controller.SetRemoteCursorVisible(true);
+        controller.SetRemoteCursorVisible(false);
+        controller.Reset();
+
+        Assert.Equal([true, false, false], hostCursorStates);
+        Assert.Equal([true, false, false], overlayStates);
+    }
+
+    [Fact]
+    public async Task Pointer_dispatch_updates_local_overlay_before_waiting_for_blocked_sender()
+    {
+        var senderStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSender = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var localUpdated = false;
+        var runner = new RemoteInputOperationRunner(
+            new TrackingDispatcher(),
+            () => Task.CompletedTask,
+            () => Task.CompletedTask,
+            () => false);
+
+        var pending = RemotePointerDispatch.RunAsync(
+            () => localUpdated = true,
+            runner,
+            async () =>
+            {
+                Assert.True(localUpdated);
+                senderStarted.TrySetResult();
+                await releaseSender.Task;
+            });
+
+        Assert.True(localUpdated);
+        await senderStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(pending.IsCompleted);
+        releaseSender.TrySetResult();
+        await pending;
+    }
+
     private sealed class TrackingDispatcher : IUiDispatcher
     {
         public bool IsDispatching { get; private set; }

@@ -211,6 +211,242 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal(new RemoteFramebufferSize(2, 3), viewModel.FramebufferSize);
     }
 
+    [Fact]
+    public async Task Cursor_only_update_is_published_and_requests_the_next_incremental_update()
+    {
+        var owner = new TrackingMemoryOwner([1, 2, 3, 4]);
+        var runtime = new ScriptedRuntime(
+            new RemoteCursorMessage(new RemoteCursorUpdate(0, 0, 1, 1, owner, 4)));
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.MessagesConsumed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.NotNull(viewModel.RemoteCursor);
+        Assert.Equal([1, 2, 3, 4], viewModel.RemoteCursor.Bgra32.ToArray());
+        Assert.False(owner.IsDisposed);
+        Assert.Equal([(false, 0), (true, 1)], runtime.UpdateRequests);
+    }
+
+    [Fact]
+    public async Task Hidden_cursor_releases_the_previous_cursor_and_clears_ui_state()
+    {
+        var visibleOwner = new TrackingMemoryOwner([1, 2, 3, 4]);
+        var hiddenOwner = new TrackingMemoryOwner([]);
+        var runtime = new ScriptedRuntime(
+            new RemoteCursorMessage(new RemoteCursorUpdate(0, 0, 1, 1, visibleOwner, 4)),
+            new RemoteCursorMessage(new RemoteCursorUpdate(0, 0, 0, 0, hiddenOwner, 0)));
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.MessagesConsumed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Null(viewModel.RemoteCursor);
+        Assert.True(visibleOwner.IsDisposed);
+        Assert.True(hiddenOwner.IsDisposed);
+    }
+
+    [Fact]
+    public async Task Dispose_releases_the_current_cursor_once()
+    {
+        var owner = new TrackingMemoryOwner([1, 2, 3, 4]);
+        var runtime = new ScriptedRuntime(
+            new RemoteCursorMessage(new RemoteCursorUpdate(0, 0, 1, 1, owner, 4)));
+        var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.MessagesConsumed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.WhenAll(viewModel.DisposeAsync().AsTask(), viewModel.DisposeAsync().AsTask());
+
+        Assert.True(owner.IsDisposed);
+        Assert.Equal(1, owner.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Permanent_presenter_failure_cancels_receive_releases_transport_and_completes()
+    {
+        var frameOwner = new TrackingMemoryOwner([0, 0, 0, 255]);
+        var runtime = new SingleFrameThenBlockingRuntime(frameOwner);
+        var lifetime = new TrackingLifetime();
+        var presenter = new PermanentlyFailingPresenter();
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            lifetime,
+            presenter,
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(viewModel.Completion.IsCompletedSuccessfully);
+        Assert.Equal("画面呈现失败，会话正在关闭。", viewModel.StatusMessage);
+        Assert.Equal(1, presenter.PresentCount);
+        Assert.Equal(2, runtime.ReceiveCount);
+        Assert.True(runtime.ReceiveCancelled);
+        Assert.Equal(1, lifetime.DisposeCount);
+        Assert.True(frameOwner.IsDisposed);
+        Assert.Equal(1, frameOwner.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Presenter_failure_still_terminates_when_status_dispatcher_fails()
+    {
+        var frameOwner = new TrackingMemoryOwner([0, 0, 0, 255]);
+        var runtime = new SingleFrameThenBlockingRuntime(frameOwner);
+        var lifetime = new TrackingLifetime();
+        var presenter = new PermanentlyFailingPresenter();
+        var dispatcher = new PresentationThenFailingDispatcher();
+        var viewModel = new RemoteSessionViewModel(
+            runtime,
+            lifetime,
+            presenter,
+            dispatcher,
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(viewModel.Completion.IsCompletedSuccessfully);
+        Assert.True(runtime.ReceiveCancelled);
+        Assert.Equal(1, lifetime.DisposeCount);
+        Assert.Equal(1, presenter.PresentCount);
+        Assert.True(frameOwner.IsDisposed);
+
+        _ = await Assert.ThrowsAsync<AggregateException>(
+            () => viewModel.DisposeAsync().AsTask());
+        Assert.Equal(1, lifetime.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Hidden_cursor_owner_is_released_once_when_ui_dispatch_fails()
+    {
+        var cursorOwner = new TrackingMemoryOwner([]);
+        var lifetime = new TrackingLifetime();
+        var viewModel = new RemoteSessionViewModel(
+            new ScriptedRuntime(
+                new RemoteCursorMessage(new RemoteCursorUpdate(0, 0, 0, 0, cursorOwner, 0))),
+            lifetime,
+            new TrackingPresenter(),
+            new FailingDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, cursorOwner.DisposeCount);
+        Assert.Equal(1, lifetime.DisposeCount);
+
+        _ = await Assert.ThrowsAsync<AggregateException>(
+            () => viewModel.DisposeAsync().AsTask());
+        Assert.Equal(1, cursorOwner.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Mixed_update_releases_cursor_when_framebuffer_size_dispatch_fails()
+    {
+        var frameOwner = new TrackingMemoryOwner(new byte[8]);
+        var cursorOwner = new TrackingMemoryOwner([1, 2, 3, 4]);
+        var runtime = new ScriptedRuntime(
+            new RemoteFramebufferMessage(
+                new RemoteFramebufferSize(2, 1),
+                frameOwner,
+                8,
+                8,
+                [new RemoteRectangle(0, 0, 2, 1)],
+                new RemoteCursorUpdate(0, 0, 1, 1, cursorOwner, 4)));
+        var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new FailingDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, cursorOwner.DisposeCount);
+        Assert.Equal(1, frameOwner.DisposeCount);
+
+        _ = await Assert.ThrowsAsync<AggregateException>(
+            () => viewModel.DisposeAsync().AsTask());
+    }
+
+    [Fact]
+    public async Task Mixed_update_releases_cursor_when_frame_packet_validation_fails()
+    {
+        var frameOwner = new TrackingMemoryOwner(new byte[4]);
+        var cursorOwner = new TrackingMemoryOwner([1, 2, 3, 4]);
+        var runtime = new ScriptedRuntime(
+            new RemoteFramebufferMessage(
+                new RemoteFramebufferSize(1, 1),
+                frameOwner,
+                4,
+                1,
+                [new RemoteRectangle(0, 0, 1, 1)],
+                new RemoteCursorUpdate(0, 0, 1, 1, cursorOwner, 4)));
+        var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, cursorOwner.DisposeCount);
+        Assert.Equal(1, frameOwner.DisposeCount);
+
+        await viewModel.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Mixed_update_keeps_cursor_owner_when_dispatch_action_transfers_before_task_cancels()
+    {
+        var frameOwner = new TrackingMemoryOwner([0, 0, 0, 255]);
+        var cursorOwner = new TrackingMemoryOwner([1, 2, 3, 4]);
+        var runtime = new ScriptedRuntime(
+            new RemoteFramebufferMessage(
+                new RemoteFramebufferSize(1, 1),
+                frameOwner,
+                4,
+                4,
+                [new RemoteRectangle(0, 0, 1, 1)],
+                new RemoteCursorUpdate(0, 0, 1, 1, cursorOwner, 4)));
+        var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new ActionThenCanceledDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.NotNull(viewModel.RemoteCursor);
+        Assert.False(cursorOwner.IsDisposed);
+
+        _ = await Assert.ThrowsAsync<AggregateException>(
+            () => viewModel.DisposeAsync().AsTask());
+        Assert.Equal(1, cursorOwner.DisposeCount);
+    }
+
     private sealed class BlockingRuntime : IRemoteSessionRuntime
     {
         private int _receives;
@@ -330,10 +566,65 @@ public sealed class RemoteSessionViewModelTests
         public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
     }
 
+    private sealed class SingleFrameThenBlockingRuntime(System.Buffers.IMemoryOwner<byte> owner) : IRemoteSessionRuntime
+    {
+        public int ReceiveCount { get; private set; }
+        public bool ReceiveCancelled { get; private set; }
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            ReceiveCount++;
+            if (ReceiveCount == 1)
+            {
+                return new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1),
+                    owner,
+                    4,
+                    4,
+                    [new RemoteRectangle(0, 0, 1, 1)]);
+            }
+
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                throw new InvalidOperationException();
+            }
+            catch (OperationCanceledException)
+            {
+                ReceiveCancelled = true;
+                throw;
+            }
+        }
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
     private sealed class TrackingLifetime : IAsyncDisposable
     {
         public int DisposeCount { get; private set; }
         public ValueTask DisposeAsync() { DisposeCount++; return ValueTask.CompletedTask; }
+    }
+
+    private sealed class TrackingMemoryOwner(byte[] bytes) : System.Buffers.IMemoryOwner<byte>
+    {
+        private byte[]? _bytes = bytes;
+
+        public bool IsDisposed => _bytes is null;
+        public int DisposeCount { get; private set; }
+        public Memory<byte> Memory => _bytes ?? throw new ObjectDisposedException(nameof(TrackingMemoryOwner));
+
+        public void Dispose()
+        {
+            DisposeCount++;
+            _bytes = null;
+        }
     }
 
     private sealed class SignalingLifetime(TaskCompletionSource receiveReleased) : IAsyncDisposable
@@ -372,6 +663,23 @@ public sealed class RemoteSessionViewModelTests
         public void Resize(int width, int height) { }
         public void Present(ReadOnlySpan<byte> bgra32, int stride, IReadOnlyList<RemoteRectangle> dirtyRectangles) { }
         public ValueTask DisposeAsync() => ValueTask.FromException(new InvalidOperationException("presenter cleanup failed"));
+    }
+
+    private sealed class PermanentlyFailingPresenter : IFramePresenter
+    {
+        public int PresentCount { get; private set; }
+        public void Resize(int width, int height) { }
+
+        public void Present(
+            ReadOnlySpan<byte> bgra32,
+            int stride,
+            IReadOnlyList<RemoteRectangle> dirtyRectangles)
+        {
+            PresentCount++;
+            throw new InvalidOperationException("sensitive GPU failure");
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class DispatcherBoundPresenter(Func<bool> isDispatching) : IFramePresenter
@@ -427,5 +735,33 @@ public sealed class RemoteSessionViewModelTests
     {
         public Task InvokeAsync(Action action, CancellationToken cancellationToken = default) =>
             Task.FromException(new InvalidOperationException("dispatcher unavailable"));
+    }
+
+    private sealed class PresentationThenFailingDispatcher : IUiDispatcher
+    {
+        private int _invocationCount;
+
+        public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Interlocked.Increment(ref _invocationCount) == 1)
+            {
+                action();
+                return Task.CompletedTask;
+            }
+
+            return Task.FromException(new InvalidOperationException("status dispatcher unavailable"));
+        }
+    }
+
+    private sealed class ActionThenCanceledDispatcher : IUiDispatcher
+    {
+        public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            action();
+            using var cancellation = new CancellationTokenSource();
+            cancellation.Cancel();
+            return Task.FromCanceled(cancellation.Token);
+        }
     }
 }

@@ -179,6 +179,140 @@ public sealed class ClipboardBridgeTests
         Assert.Empty(sent);
     }
 
+    [Fact]
+    public async Task Disabling_bridge_invalidates_an_already_queued_remote_write()
+    {
+        var adapter = new TestClipboardAdapter();
+        var dispatcher = new ControllableDispatcher();
+        await using var bridge = new WindowsClipboardBridge(
+            adapter,
+            dispatcher,
+            (_, _) => ValueTask.CompletedTask);
+
+        dispatcher.QueueNextInvocation();
+        var pendingWrite = bridge.SetRemoteTextAsync("A", CancellationToken.None).AsTask();
+        await dispatcher.InvocationQueued.WaitAsync(TimeSpan.FromSeconds(2));
+
+        bridge.IsEnabled = false;
+        dispatcher.RunQueuedInvocation();
+        await pendingWrite;
+
+        Assert.Equal(string.Empty, adapter.Text);
+    }
+
+    [Fact]
+    public async Task Disable_enable_toggles_do_not_revive_an_already_queued_remote_write()
+    {
+        var adapter = new TestClipboardAdapter();
+        var dispatcher = new ControllableDispatcher();
+        await using var bridge = new WindowsClipboardBridge(
+            adapter,
+            dispatcher,
+            (_, _) => ValueTask.CompletedTask);
+
+        dispatcher.QueueNextInvocation();
+        var pendingWrite = bridge.SetRemoteTextAsync("A", CancellationToken.None).AsTask();
+        await dispatcher.InvocationQueued.WaitAsync(TimeSpan.FromSeconds(2));
+
+        bridge.IsEnabled = false;
+        bridge.IsEnabled = true;
+        bridge.IsEnabled = false;
+        bridge.IsEnabled = true;
+        dispatcher.RunQueuedInvocation();
+        await pendingWrite;
+
+        Assert.Equal(string.Empty, adapter.Text);
+    }
+
+    [Fact]
+    public async Task Dispose_invalidates_an_already_queued_remote_write()
+    {
+        var adapter = new TestClipboardAdapter();
+        var dispatcher = new ControllableDispatcher();
+        var bridge = new WindowsClipboardBridge(
+            adapter,
+            dispatcher,
+            (_, _) => ValueTask.CompletedTask);
+
+        dispatcher.QueueNextInvocation();
+        var pendingWrite = bridge.SetRemoteTextAsync("A", CancellationToken.None).AsTask();
+        await dispatcher.InvocationQueued.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await bridge.DisposeAsync();
+        dispatcher.RunQueuedInvocation();
+        await pendingWrite;
+
+        Assert.Equal(string.Empty, adapter.Text);
+    }
+
+    [Fact]
+    public async Task Failed_remote_write_does_not_suppress_a_later_local_copy_of_the_same_text()
+    {
+        var adapter = new FailingSetClipboardAdapter();
+        var sent = new List<string>();
+        await using var bridge = new WindowsClipboardBridge(
+            adapter,
+            new InlineDispatcher(),
+            (text, _) => { sent.Add(text); return ValueTask.CompletedTask; });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => bridge.SetRemoteTextAsync("A", CancellationToken.None).AsTask());
+        Assert.Equal("write failed", exception.Message);
+
+        adapter.SetExternalText("A");
+        await bridge.WhenIdleAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(["A"], sent);
+    }
+
+    [Fact]
+    public async Task Canceled_remote_write_does_not_suppress_a_later_local_copy_of_the_same_text()
+    {
+        var adapter = new TestClipboardAdapter();
+        var dispatcher = new ControllableDispatcher();
+        var sent = new List<string>();
+        await using var bridge = new WindowsClipboardBridge(
+            adapter,
+            dispatcher,
+            (text, _) => { sent.Add(text); return ValueTask.CompletedTask; });
+        using var cancellation = new CancellationTokenSource();
+
+        dispatcher.QueueNextInvocation();
+        var pendingWrite = bridge.SetRemoteTextAsync("A", cancellation.Token).AsTask();
+        await dispatcher.InvocationQueued.WaitAsync(TimeSpan.FromSeconds(2));
+        cancellation.Cancel();
+        dispatcher.RunQueuedInvocation();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pendingWrite);
+
+        adapter.SetExternalText("A");
+        await bridge.WhenIdleAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(["A"], sent);
+    }
+
+    [Fact]
+    public async Task Successful_remote_write_only_suppresses_its_matching_callback()
+    {
+        var adapter = new BlockingClipboardAdapter();
+        var sent = new List<string>();
+        await using var bridge = new WindowsClipboardBridge(
+            adapter,
+            new InlineDispatcher(),
+            (text, _) => { sent.Add(text); return ValueTask.CompletedTask; });
+
+        await bridge.SetRemoteTextAsync("A", CancellationToken.None);
+        await adapter.ReadStarted.WaitAsync(TimeSpan.FromSeconds(2));
+        adapter.SetExternalText("B");
+        adapter.ReleaseRead();
+        await bridge.WhenIdleAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        adapter.SetExternalText("A");
+        await bridge.WhenIdleAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Contains("B", sent);
+        Assert.Equal("A", sent[^1]);
+    }
+
     private sealed class TestClipboardAdapter : IWindowsClipboardAdapter
     {
         private EventHandler<object>? _changed;
@@ -295,6 +429,29 @@ public sealed class ClipboardBridgeTests
         public void SetExternalText(string text) => SetText(text);
     }
 
+    private sealed class FailingSetClipboardAdapter : IWindowsClipboardAdapter
+    {
+        private EventHandler<object>? _changed;
+        private string _text = string.Empty;
+
+        public event EventHandler<object>? Changed
+        {
+            add => _changed += value;
+            remove => _changed -= value;
+        }
+
+        public ValueTask<string?> GetTextAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromResult<string?>(_text);
+
+        public void SetText(string text) => throw new InvalidOperationException("write failed");
+
+        public void SetExternalText(string text)
+        {
+            _text = text;
+            _changed?.Invoke(this, new object());
+        }
+    }
+
     private sealed class ThreadRecordingClipboardAdapter : IWindowsClipboardAdapter
     {
         private readonly List<int> _readThreadIds = [];
@@ -371,6 +528,61 @@ public sealed class ClipboardBridgeTests
 
             action();
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class ControllableDispatcher : IUiDispatcher
+    {
+        private readonly TaskCompletionSource _invocationQueued =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private Action? _queuedAction;
+        private CancellationToken _queuedCancellationToken;
+        private TaskCompletionSource? _queuedCompletion;
+        private bool _queueNextInvocation;
+
+        public Task InvocationQueued => _invocationQueued.Task;
+
+        public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!_queueNextInvocation)
+            {
+                action();
+                return Task.CompletedTask;
+            }
+
+            _queueNextInvocation = false;
+            _queuedAction = action;
+            _queuedCancellationToken = cancellationToken;
+            _queuedCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _invocationQueued.TrySetResult();
+            return _queuedCompletion.Task;
+        }
+
+        public void QueueNextInvocation() => _queueNextInvocation = true;
+
+        public void RunQueuedInvocation()
+        {
+            var action = _queuedAction ?? throw new InvalidOperationException("No invocation is queued.");
+            var completion = _queuedCompletion ?? throw new InvalidOperationException("No completion is queued.");
+            _queuedAction = null;
+            _queuedCompletion = null;
+
+            if (_queuedCancellationToken.IsCancellationRequested)
+            {
+                completion.TrySetCanceled(_queuedCancellationToken);
+                return;
+            }
+
+            try
+            {
+                action();
+                completion.TrySetResult();
+            }
+            catch (Exception exception)
+            {
+                completion.TrySetException(exception);
+            }
         }
     }
 
