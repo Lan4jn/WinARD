@@ -9,8 +9,10 @@ using WinARD.Application.Ports;
 using WinARD.Desktop.Clipboard;
 using WinARD.Desktop.Input;
 using WinARD.Desktop.Rendering;
+using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
+using WinARD.Infrastructure.Diagnostics;
 using WinRT.Interop;
 
 namespace WinARD.Desktop.Views;
@@ -25,6 +27,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly RemoteCursorVisibilityController _cursorVisibility;
     private readonly RemoteTextInputBuffer _textInput = new();
     private readonly AppWindow _appWindow;
+    private readonly DiagnosticExportService? _diagnosticExportService;
     private RemoteFramebufferSize _remoteSize;
     private Task? _closeTask;
     private ViewportScaleMode _scaleMode = ViewportScaleMode.Fit;
@@ -37,11 +40,15 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         IRemoteSessionRuntime session,
         IAsyncDisposable ownership,
         IUiDispatcher dispatcher,
-        IFramePresenter? presenter = null)
+        IFramePresenter? presenter = null,
+        ISafeDiagnosticSink? diagnosticSink = null,
+        DiagnosticExportService? diagnosticExportService = null,
+        ConnectionErrorViewModel? initialError = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(ownership);
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        _diagnosticExportService = diagnosticExportService;
         InitializeComponent();
         _remoteSize = session.FramebufferSize;
         presenter ??= new D3DFramePresenter(FramePanel);
@@ -51,12 +58,16 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             ownership,
             presenter,
             dispatcher,
-            _clipboardBridge);
+            _clipboardBridge,
+            diagnosticSink);
+        SessionErrorCard.ActionRequested += OnErrorActionRequested;
+        SessionErrorCard.ViewModel = initialError;
         _inputOperations = new RemoteInputOperationRunner(
             dispatcher,
             ViewModel.ReportInputFailureAsync,
             CloseSessionAsync,
-            () => _lifetime.IsCancellationRequested);
+            () => _lifetime.IsCancellationRequested,
+            ViewModel.ObserveInputFailure);
         _cursorVisibility = new RemoteCursorVisibilityController(
             InputSurface.SetHostCursorHidden,
             visible => RemoteCursorOverlay.Visibility = visible
@@ -393,6 +404,56 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         {
             WriteSmokeMarker("WINARD_REMOTE_SMOKE_STATUS_MARKER", ViewModel.StatusMessage);
         }
+        else if (args.PropertyName == nameof(RemoteSessionViewModel.Error))
+        {
+            SessionErrorCard.ViewModel = ViewModel.Error is null
+                ? null
+                : ConnectionErrorViewModel.FromError(ViewModel.Error);
+        }
+    }
+
+    private async void OnErrorActionRequested(object? sender, ConnectionErrorActionKind action)
+    {
+        try
+        {
+            switch (action)
+            {
+                case ConnectionErrorActionKind.CopyCorrelationId:
+                    if (SessionErrorCard.ViewModel is { } card)
+                    {
+                        var package = new Windows.ApplicationModel.DataTransfer.DataPackage();
+                        package.SetText(card.CorrelationId);
+                        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);
+                    }
+                    break;
+                case ConnectionErrorActionKind.ExportDiagnostics:
+                    if (_diagnosticExportService is not null)
+                    {
+                        var path = await _diagnosticExportService.ExportAsync(
+                            this,
+                            DesktopDiagnosticContextFactory.Create(),
+                            _lifetime.Token);
+                        if (path is not null)
+                        {
+                            StatusText.Text = $"诊断已导出：{path}";
+                        }
+                    }
+                    break;
+                case ConnectionErrorActionKind.Disconnect:
+                case ConnectionErrorActionKind.Cancel:
+                    await CloseSessionAsync();
+                    break;
+                default:
+                    break;
+            }
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            StatusText.Text = "错误操作未能完成。";
+        }
     }
 
     private void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
@@ -518,6 +579,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     {
         _appWindow.Closing -= OnClosing;
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        SessionErrorCard.ActionRequested -= OnErrorActionRequested;
         _cursorVisibility.Reset();
         InputSurface.Dispose();
         _lifetime.Dispose();

@@ -4,6 +4,8 @@ using WinARD.Desktop.Clipboard;
 using WinARD.Desktop.Input;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Threading;
+using WinARD.Domain.Errors;
+using WinARD.Infrastructure.Diagnostics;
 
 namespace WinARD.Desktop.ViewModels;
 
@@ -18,6 +20,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private readonly LatestFrameMailbox _frames = new();
     private readonly CancellationTokenSource _lifetime = new();
     private readonly WindowsInputMapper _inputMapper;
+    private readonly ISafeDiagnosticSink? _diagnosticSink;
     private readonly TaskCompletionSource _completion =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Task? _receiveTask;
@@ -29,19 +32,22 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private RemoteFramebufferSize _framebufferSize;
     private RemoteCursorUpdate? _remoteCursor;
     private string _statusMessage = "已连接。";
+    private WinArdError? _error;
 
     public RemoteSessionViewModel(
         IRemoteSessionRuntime session,
         IAsyncDisposable ownership,
         IFramePresenter presenter,
         IUiDispatcher dispatcher,
-        WindowsClipboardBridge? clipboardBridge)
+        WindowsClipboardBridge? clipboardBridge,
+        ISafeDiagnosticSink? diagnosticSink = null)
     {
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _ownership = ownership ?? throw new ArgumentNullException(nameof(ownership));
         _presenter = presenter ?? throw new ArgumentNullException(nameof(presenter));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _clipboardBridge = clipboardBridge;
+        _diagnosticSink = diagnosticSink;
         _inputMapper = new WindowsInputMapper(_session.SendKeyAsync);
         _framebufferSize = session.FramebufferSize;
     }
@@ -69,6 +75,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 previous?.Dispose();
             }
         }
+    }
+
+    public WinArdError? Error
+    {
+        get => _error;
+        private set => SetProperty(ref _error, value);
     }
 
     public Task Completion => _completion.Task;
@@ -129,6 +141,24 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _dispatcher.InvokeAsync(
             () => StatusMessage = "输入发送失败，会话正在关闭。",
             CancellationToken.None);
+
+    public void ObserveInputFailure(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        var error = WinArdError.Create(
+            ConnectionStage.Connected,
+            "REMOTE_INPUT_FAILED",
+            "远程输入发送失败。",
+            Guid.NewGuid().ToString("N"));
+        _diagnosticSink?.Write(new SafeDiagnosticEventInput(
+            error.Code,
+            error.CorrelationId,
+            "Remote input operation failed.",
+            Exception: exception));
+        _ = _dispatcher.InvokeAsync(
+            () => Error = error,
+            CancellationToken.None);
+    }
 
     public ValueTask DisposeAsync()
     {
@@ -321,13 +351,31 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             var ownershipDisposal = DisposeOwnershipOnceAsync();
             if (wasTerminalFailure)
             {
+                var exception = completed.Exception?.GetBaseException() ??
+                    new InvalidOperationException("Remote session terminated unexpectedly.");
+                var error = WinArdError.Create(
+                    ConnectionStage.Connected,
+                    ReferenceEquals(completed, present)
+                        ? "REMOTE_PRESENTATION_FAILED"
+                        : "REMOTE_SESSION_INTERRUPTED",
+                    "远程会话已中断。",
+                    Guid.NewGuid().ToString("N"));
+                _diagnosticSink?.Write(new SafeDiagnosticEventInput(
+                    error.Code,
+                    error.CorrelationId,
+                    "Remote session loop failed.",
+                    Exception: exception));
                 var status = ReferenceEquals(completed, present)
                     ? "画面呈现失败，会话正在关闭。"
                     : "连接已中断。";
                 try
                 {
                     await _dispatcher.InvokeAsync(
-                        () => StatusMessage = status,
+                        () =>
+                        {
+                            StatusMessage = status;
+                            Error = error;
+                        },
                         CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (Exception)

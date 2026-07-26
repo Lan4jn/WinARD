@@ -92,6 +92,11 @@
                     </Canvas>
                 </Grid>
             </ScrollViewer>
+            <views:ConnectionErrorCard
+                x:Name="SessionErrorCard"
+                Margin="24"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Top" />
         </Grid>
 
         <Grid Grid.Row="2" Padding="12,8" ColumnSpacing="16">

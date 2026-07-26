@@ -4,6 +4,7 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Windows.ApplicationModel.DataTransfer;
 using WinARD.Application.Ports;
 using WinARD.Application.Sessions;
 using WinARD.Desktop.Threading;
@@ -11,8 +12,10 @@ using WinARD.Desktop.ViewModels;
 using WinARD.Desktop.Services;
 using WinARD.Desktop.Views;
 using WinARD.Domain.Connections;
+using WinARD.Domain.Errors;
 using WinARD.Domain.Sessions;
 using WinARD.Infrastructure.Database;
+using WinARD.Infrastructure.Diagnostics;
 using WinARD.Security.Secrets;
 using WinRT.Interop;
 
@@ -42,6 +45,10 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly TextBlock _detailName = new();
     private readonly TextBlock _detailSource = new();
     private readonly TextBlock _detailEndpoint = new();
+    private readonly ConnectionErrorCard _connectionErrorCard = new();
+    private readonly ISafeDiagnosticSink _diagnosticSink;
+    private readonly DiagnosticExportService _diagnosticExportService;
+    private readonly SecretRedactor _secretRedactor;
     private Task? _shutdownTask;
     private RemoteSessionWindow? _remoteSessionWindow;
     private bool _allowClose;
@@ -56,7 +63,10 @@ public sealed partial class MainWindow : Window, IDisposable
         IUiDispatcher dispatcher,
         VaultCredentialStoreSession vaultSession,
         CredentialPromptService credentialPromptService,
-        SshHostKeyPromptService hostKeyPromptService)
+        SshHostKeyPromptService hostKeyPromptService,
+        ISafeDiagnosticSink diagnosticSink,
+        DiagnosticExportService diagnosticExportService,
+        SecretRedactor secretRedactor)
     {
         ViewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         _database = database ?? throw new ArgumentNullException(nameof(database));
@@ -66,6 +76,9 @@ public sealed partial class MainWindow : Window, IDisposable
         _vaultSession = vaultSession ?? throw new ArgumentNullException(nameof(vaultSession));
         _credentialPromptService = credentialPromptService ?? throw new ArgumentNullException(nameof(credentialPromptService));
         _hostKeyPromptService = hostKeyPromptService ?? throw new ArgumentNullException(nameof(hostKeyPromptService));
+        _diagnosticSink = diagnosticSink ?? throw new ArgumentNullException(nameof(diagnosticSink));
+        _diagnosticExportService = diagnosticExportService ?? throw new ArgumentNullException(nameof(diagnosticExportService));
+        _secretRedactor = secretRedactor ?? throw new ArgumentNullException(nameof(secretRedactor));
         InitializeComponent();
         BuildDeviceLibrary();
         var windowHandle = WindowNative.GetWindowHandle(this);
@@ -223,6 +236,8 @@ public sealed partial class MainWindow : Window, IDisposable
         details.Children.Add(_detailName);
         details.Children.Add(_detailSource);
         details.Children.Add(_detailEndpoint);
+        _connectionErrorCard.ActionRequested += OnConnectionErrorActionRequested;
+        details.Children.Add(_connectionErrorCard);
         _connectionStatus.Text = "未连接。";
         _connectionStatus.TextWrapping = TextWrapping.Wrap;
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
@@ -297,10 +312,15 @@ public sealed partial class MainWindow : Window, IDisposable
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
         }
-        catch (Exception)
+        catch (Exception exception)
         {
             if (!_shutdown.IsCancellationRequested)
             {
+                _diagnosticSink.Write(new SafeDiagnosticEventInput(
+                    "DEVICE_LIBRARY_INIT_FAILED",
+                    Guid.NewGuid().ToString("N"),
+                    "Device library initialization failed.",
+                    Exception: exception));
                 await ShowStartupErrorAsync();
             }
         }
@@ -335,7 +355,14 @@ public sealed partial class MainWindow : Window, IDisposable
                     secret,
                     hostKeyPrompt,
                     cancellationToken));
-        using var dialog = new ConnectionEditorDialog(viewModel, _vaultSession, hostKeyPrompt)
+        using var dialog = new ConnectionEditorDialog(
+            viewModel,
+            _vaultSession,
+            hostKeyPrompt,
+            _diagnosticSink,
+            _diagnosticExportService,
+            this,
+            _secretRedactor)
         {
             XamlRoot = ShellRoot.XamlRoot,
         };
@@ -464,6 +491,7 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         SetSessionBusy(true);
+        _connectionErrorCard.ViewModel = null;
         _connectionStatus.Text = "正在连接…";
         try
         {
@@ -474,7 +502,10 @@ public sealed partial class MainWindow : Window, IDisposable
                 var remoteWindow = new RemoteSessionWindow(
                     ownership.Session,
                     ownership,
-                    _dispatcher);
+                    _dispatcher,
+                    presenter: null,
+                    diagnosticSink: _diagnosticSink,
+                    diagnosticExportService: _diagnosticExportService);
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
                 _remoteSessionWindow = remoteWindow;
                 remoteWindow.Activate();
@@ -490,15 +521,36 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         catch (ConnectionFailedException exception)
         {
-            _connectionStatus.Text = exception.Result.Error?.UserMessage ?? "连接失败。";
+            var error = exception.Result.Error ?? WinArdError.Create(
+                ConnectionStage.Connecting,
+                "UNEXPECTED_CONNECTION_ERROR",
+                "连接失败。",
+                Guid.NewGuid().ToString("N"));
+            _diagnosticSink.Write(new SafeDiagnosticEventInput(
+                error.Code,
+                error.CorrelationId,
+                "Connection attempt failed.",
+                [new("stage", error.Stage.ToString())],
+                exception));
+            ShowConnectionError(error);
         }
         catch (SessionAlreadyActiveException)
         {
             _connectionStatus.Text = "已有活动连接。";
         }
-        catch (Exception)
+        catch (Exception exception)
         {
-            _connectionStatus.Text = "连接失败。请检查设备与凭据后重试。";
+            var error = WinArdError.Create(
+                ConnectionStage.Connecting,
+                "UNEXPECTED_CONNECTION_ERROR",
+                "连接失败。",
+                Guid.NewGuid().ToString("N"));
+            _diagnosticSink.Write(new SafeDiagnosticEventInput(
+                error.Code,
+                error.CorrelationId,
+                "Unexpected connection failure.",
+                Exception: exception));
+            ShowConnectionError(error);
         }
         finally
         {
@@ -530,8 +582,13 @@ public sealed partial class MainWindow : Window, IDisposable
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            _diagnosticSink.Write(new SafeDiagnosticEventInput(
+                "DISCONNECT_FAILED",
+                Guid.NewGuid().ToString("N"),
+                "Session disconnect failed.",
+                Exception: exception));
             _connectionStatus.Text = "断开连接时出现错误。";
         }
         finally
@@ -567,6 +624,97 @@ public sealed partial class MainWindow : Window, IDisposable
         _disconnectButton.IsEnabled = !_sessionBusy && _sessionController.IsConnected;
         _editButton.IsEnabled = !_sessionBusy && !_sessionController.IsConnected;
         _deleteButton.IsEnabled = !_sessionBusy && !_sessionController.IsConnected && !ViewModel.IsDeleting;
+    }
+
+    private void ShowConnectionError(WinArdError error)
+    {
+        _connectionStatus.Text = "连接失败。请使用下方操作继续。";
+        _connectionErrorCard.ViewModel = ConnectionErrorViewModel.FromError(error);
+    }
+
+    private async void OnConnectionErrorActionRequested(
+        object? sender,
+        ConnectionErrorActionKind action)
+    {
+        try
+        {
+            switch (action)
+            {
+                case ConnectionErrorActionKind.Retry:
+                case ConnectionErrorActionKind.ReplaceHostKey:
+                    await _uiOperation.RunAsync(ConnectSelectedWithHandlingAsync, _shutdown.Token);
+                    break;
+                case ConnectionErrorActionKind.ReenterCredentials:
+                case ConnectionErrorActionKind.UnlockVault:
+                    if (ViewModel.SelectedDevice?.Profile is { } profile)
+                    {
+                        await _uiOperation.RunAsync(() => OpenConnectionEditorAsync(profile), _shutdown.Token);
+                    }
+                    break;
+                case ConnectionErrorActionKind.OpenHelp:
+                    await Windows.System.Launcher.LaunchUriAsync(
+                        new Uri("https://support.apple.com/guide/mac-help/control-access-to-screen-recording-mchld6aa7d23/mac"));
+                    break;
+                case ConnectionErrorActionKind.CopyCorrelationId:
+                    if (_connectionErrorCard.ViewModel is { } card)
+                    {
+                        var package = new DataPackage();
+                        package.SetText(card.CorrelationId);
+                        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);
+                    }
+                    break;
+                case ConnectionErrorActionKind.ExportDiagnostics:
+                    var path = await _diagnosticExportService.ExportAsync(
+                        this,
+                        CreateDiagnosticContext(),
+                        _shutdown.Token);
+                    if (path is not null)
+                    {
+                        _connectionStatus.Text = $"诊断已导出：{path}";
+                    }
+                    break;
+                case ConnectionErrorActionKind.Disconnect:
+                    await DisconnectWithHandlingAsync();
+                    break;
+                case ConnectionErrorActionKind.Cancel:
+                    _connectionErrorCard.ViewModel = null;
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(action));
+            }
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            var correlationId = Guid.NewGuid().ToString("N");
+            _diagnosticSink.Write(new SafeDiagnosticEventInput(
+                "ERROR_ACTION_FAILED",
+                correlationId,
+                "Connection error action failed.",
+                [new("action", action.ToString())],
+                exception));
+            _connectionStatus.Text = $"操作失败。关联 ID：{correlationId}";
+        }
+    }
+
+    private DiagnosticExportContext CreateDiagnosticContext()
+    {
+        var profile = ViewModel.SelectedDevice?.Profile;
+        var profiles = profile is null
+            ? Array.Empty<DiagnosticProfileSummary>()
+            : new[]
+            {
+                new DiagnosticProfileSummary(
+                    profile.DisplayName,
+                    profile.Host,
+                    profile.Port,
+                    profile.MacUsername,
+                    "RFB 3.x",
+                    "ARD-30"),
+            };
+        return DesktopDiagnosticContextFactory.Create(profiles);
     }
 
     private void OnConnectionProfileUpdated(ConnectionProfile profile) =>
@@ -711,6 +859,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _credentialPromptService.ClearReferenceHandler();
         _hostKeyPromptService.ClearHandler();
         _sessionController.ProfileUpdated -= OnConnectionProfileUpdated;
+        _connectionErrorCard.ActionRequested -= OnConnectionErrorActionRequested;
         _allowClose = true;
         try
         {

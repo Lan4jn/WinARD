@@ -26,7 +26,8 @@ public sealed record ConnectionProfileSaveResult(
 
 public sealed record ConnectionProfileTestResult(
     ConnectionProfile Profile,
-    IReadOnlyList<ConnectionTestStageResult> Stages);
+    IReadOnlyList<ConnectionTestStageResult> Stages,
+    WinArdError? Error = null);
 
 public sealed class ConnectionEditorViewModel : ObservableObject
 {
@@ -242,6 +243,8 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
     public ConnectionProfileSaveResult? LastSaveResult { get; private set; }
 
+    public WinArdError? LastTestError { get; private set; }
+
     public async Task<ConnectionProfile> SaveAsync(ISecret? secret, CancellationToken cancellationToken)
     {
         EnterBusy();
@@ -277,11 +280,13 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             }
 
             TestResults = [];
+            LastTestError = null;
             var result = await _test(BuildProfile(), CredentialSaveMode, secret, cancellationToken)
                 .ConfigureAwait(false);
             _hostKeyPin = result.Profile.SshProfile?.HostKeyPin;
             var results = result.Stages;
             TestResults = results;
+            LastTestError = result.Error;
             StatusMessage = results.Count == 0
                 ? "测试连接未返回结果。"
                 : results[^1].Message;

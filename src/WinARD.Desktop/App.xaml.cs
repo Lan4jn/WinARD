@@ -11,6 +11,7 @@ using WinARD.Desktop.Views;
 using WinARD.Infrastructure.Database;
 using WinARD.Infrastructure.Devices;
 using WinARD.Infrastructure.Discovery;
+using WinARD.Infrastructure.Diagnostics;
 using WinARD.Security.WindowsCredentials;
 using WinARD.Security.Vault;
 
@@ -35,16 +36,32 @@ public partial class App : Microsoft.UI.Xaml.Application
         var isPresenterFailureSmoke = commandLine.Contains(
             "--remote-session-smoke-presenter-failure",
             StringComparer.Ordinal);
-        if (isRemoteSessionSmoke || isPresenterFailureSmoke)
+        var isConnectionErrorSmoke = commandLine.Contains(
+            "--connection-error-smoke",
+            StringComparer.Ordinal);
+        if (isRemoteSessionSmoke || isPresenterFailureSmoke || isConnectionErrorSmoke)
         {
             var dispatcher = new DispatcherQueueUiDispatcher(
                 DispatcherQueue.GetForCurrentThread() ??
                 throw new InvalidOperationException("The WinUI dispatcher is unavailable."));
+            var redactor = new SecretRedactor();
+            var sink = new InMemorySafeDiagnosticSink(redactor);
+            var exporter = new DiagnosticExporter(sink, redactor);
+            var exportService = new DiagnosticExportService(exporter);
             _window = new RemoteSessionWindow(
                 new SmokeRemoteSessionRuntime(),
                 new SmokeSessionOwnership(),
                 dispatcher,
-                isPresenterFailureSmoke ? new SmokeFailingPresenter() : null);
+                isPresenterFailureSmoke ? new SmokeFailingPresenter() : null,
+                sink,
+                exportService,
+                isConnectionErrorSmoke
+                    ? ConnectionErrorViewModel.FromError(WinARD.Domain.Errors.WinArdError.Create(
+                        WinARD.Domain.Errors.ConnectionStage.Connecting,
+                        "TCP_CONNECTION_FAILED",
+                        "Smoke-only mapped message.",
+                        "smoke-correlation-123"))
+                    : null);
             _window.Activate();
             return;
         }
@@ -65,6 +82,11 @@ public partial class App : Microsoft.UI.Xaml.Application
                 "WinARD");
         }
         services.AddSingleton(new WinArdDatabase(Path.Combine(dataDirectory, "winard.db")));
+        services.AddSingleton<SecretRedactor>();
+        services.AddSingleton<ISafeDiagnosticSink>(provider => new InMemorySafeDiagnosticSink(
+            provider.GetRequiredService<SecretRedactor>()));
+        services.AddSingleton<DiagnosticExporter>();
+        services.AddSingleton<DiagnosticExportService>();
         services.AddSingleton<IDeviceRepository, SqliteDeviceRepository>();
         services.AddSingleton<IBonjourServiceWatcher, DnssdServiceWatcher>();
         services.AddSingleton<IDeviceDiscovery, BonjourDeviceDiscovery>();
@@ -82,7 +104,8 @@ public partial class App : Microsoft.UI.Xaml.Application
             provider.GetRequiredService<WindowsCredentialStore>(),
             provider.GetRequiredService<VaultCredentialStoreSession>(),
             provider.GetRequiredService<TransientCredentialStore>(),
-            provider.GetRequiredService<CredentialPromptService>()));
+            provider.GetRequiredService<CredentialPromptService>(),
+            provider.GetRequiredService<SecretRedactor>()));
         services.AddSingleton<IUiDispatcher>(_ => new DispatcherQueueUiDispatcher(
             DispatcherQueue.GetForCurrentThread() ??
             throw new InvalidOperationException("The WinUI dispatcher is unavailable.")));

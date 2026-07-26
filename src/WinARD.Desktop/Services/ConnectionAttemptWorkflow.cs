@@ -1,6 +1,7 @@
 using WinARD.Application.Sessions;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
+using WinARD.Infrastructure.Diagnostics;
 using WinARD.Transport.Ssh;
 
 namespace WinARD.Desktop.Services;
@@ -11,12 +12,14 @@ public sealed record ConnectionAttemptOutcome(
 
 public sealed class ConnectionAttemptWorkflow(
     ConnectDeviceHandler handler,
-    ISshHostKeyPrompt hostKeyPrompt)
+    ISshHostKeyPrompt hostKeyPrompt,
+    ISafeDiagnosticSink? diagnosticSink = null)
 {
     private readonly ConnectDeviceHandler _handler = handler ??
         throw new ArgumentNullException(nameof(handler));
     private readonly ISshHostKeyPrompt _hostKeyPrompt = hostKeyPrompt ??
         throw new ArgumentNullException(nameof(hostKeyPrompt));
+    private readonly ISafeDiagnosticSink? _diagnosticSink = diagnosticSink;
 
     public async Task<ConnectionAttemptOutcome> AttemptAsync(
         ConnectionProfile profile,
@@ -47,6 +50,16 @@ public sealed class ConnectionAttemptWorkflow(
                 stageChanged,
                 exception => failure = exception,
                 cancellationToken).ConfigureAwait(false);
+            if (result.Error is { } error && failure is not null)
+            {
+                _diagnosticSink?.Write(new SafeDiagnosticEventInput(
+                    error.Code,
+                    error.CorrelationId,
+                    "Connection attempt stage failed.",
+                    [new("stage", error.Stage.ToString())],
+                    failure));
+            }
+
             if (result.Session is not null || hostKeyRetried ||
                 !TryGetHostKeyFailure(failure, profile, out var verification, out var request))
             {

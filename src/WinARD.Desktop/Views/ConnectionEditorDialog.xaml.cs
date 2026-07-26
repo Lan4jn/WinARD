@@ -7,6 +7,8 @@ using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
+using WinARD.Domain.Errors;
+using WinARD.Infrastructure.Diagnostics;
 using WinARD.Security.Secrets;
 
 namespace WinARD.Desktop.Views;
@@ -17,16 +19,28 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
     private readonly AsyncUiOperation _operations = new();
     private readonly VaultCredentialStoreSession? _vaultSession;
     private readonly ConnectionEditorHostKeyPrompt? _hostKeyPrompt;
+    private readonly ISafeDiagnosticSink? _diagnosticSink;
+    private readonly DiagnosticExportService? _diagnosticExportService;
+    private readonly Window? _owner;
+    private readonly SecretRedactor? _redactor;
     private bool _saved;
 
     public ConnectionEditorDialog(
         ConnectionEditorViewModel viewModel,
         VaultCredentialStoreSession? vaultSession = null,
-        ConnectionEditorHostKeyPrompt? hostKeyPrompt = null)
+        ConnectionEditorHostKeyPrompt? hostKeyPrompt = null,
+        ISafeDiagnosticSink? diagnosticSink = null,
+        DiagnosticExportService? diagnosticExportService = null,
+        Window? owner = null,
+        SecretRedactor? redactor = null)
     {
         ViewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         _vaultSession = vaultSession;
         _hostKeyPrompt = hostKeyPrompt;
+        _diagnosticSink = diagnosticSink;
+        _diagnosticExportService = diagnosticExportService;
+        _owner = owner;
+        _redactor = redactor;
         InitializeComponent();
         DisplayNameBox.Text = viewModel.DisplayName;
         HostBox.Text = viewModel.Host;
@@ -42,6 +56,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
             ? -1
             : (int)viewModel.CredentialSaveMode;
         WireFieldChanges();
+        ErrorCard.ActionRequested += OnErrorActionRequested;
         PrimaryButtonClick += OnSaveClicked;
         Closing += OnClosing;
         if (_hostKeyPrompt is not null)
@@ -118,7 +133,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
             }
             catch (Exception exception)
             {
-                StatusText.Text = SafeMessage(exception);
+                ShowError(exception);
             }
             finally
             {
@@ -139,13 +154,16 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
                 await ViewModel.TestConnectionAsync(secret?.Clone(), _lifetime.Token);
                 StatusText.Text = ViewModel.StatusMessage;
                 StageResults.ItemsSource = ViewModel.TestResults;
+                ErrorCard.ViewModel = ViewModel.LastTestError is null
+                    ? null
+                    : ConnectionErrorViewModel.FromError(ViewModel.LastTestError);
             }
             catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
             {
             }
             catch (Exception exception)
             {
-                StatusText.Text = SafeMessage(exception);
+                ShowError(exception);
             }
             finally
             {
@@ -251,7 +269,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
             return null;
         }
 
-        return new ConnectionEditorSecretPackage(mac, ssh);
+        return new ConnectionEditorSecretPackage(mac, ssh, _redactor);
     }
 
     private static string SafeMessage(Exception exception) => exception switch
@@ -260,6 +278,93 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         CryptographicException => "加密库主密码不正确，仍保持锁定。",
         _ => "操作失败。请检查连接信息和凭据后重试。",
     };
+
+    private void ShowError(Exception exception)
+    {
+        var error = exception switch
+        {
+            ConnectionFailedException failed when failed.Result.Error is not null => failed.Result.Error,
+            WinARD.Security.Vault.VaultLockedException or CryptographicException => WinArdError.Create(
+                ConnectionStage.Authenticating,
+                "VAULT_LOCKED",
+                "加密库已锁定。",
+                Guid.NewGuid().ToString("N")),
+            _ => WinArdError.Create(
+                ConnectionStage.Connecting,
+                "UNEXPECTED_CONNECTION_ERROR",
+                "操作失败。",
+                Guid.NewGuid().ToString("N")),
+        };
+        _diagnosticSink?.Write(new SafeDiagnosticEventInput(
+            error.Code,
+            error.CorrelationId,
+            "Connection editor operation failed.",
+            Exception: exception));
+        StatusText.Text = SafeMessage(exception);
+        ErrorCard.ViewModel = ConnectionErrorViewModel.FromError(error);
+    }
+
+    private async void OnErrorActionRequested(object? sender, ConnectionErrorActionKind action)
+    {
+        try
+        {
+            switch (action)
+            {
+                case ConnectionErrorActionKind.Retry:
+                    OnTestClicked(TestButton, new RoutedEventArgs());
+                    break;
+                case ConnectionErrorActionKind.ReenterCredentials:
+                    MacPasswordBox.Focus(FocusState.Programmatic);
+                    break;
+                case ConnectionErrorActionKind.UnlockVault:
+                    VaultMasterPasswordBox.Focus(FocusState.Programmatic);
+                    break;
+                case ConnectionErrorActionKind.CopyCorrelationId:
+                    if (ErrorCard.ViewModel is { } card)
+                    {
+                        var package = new Windows.ApplicationModel.DataTransfer.DataPackage();
+                        package.SetText(card.CorrelationId);
+                        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);
+                    }
+                    break;
+                case ConnectionErrorActionKind.ExportDiagnostics:
+                    if (_diagnosticExportService is not null && _owner is not null)
+                    {
+                        var path = await _diagnosticExportService.ExportAsync(
+                            _owner,
+                            DesktopDiagnosticContextFactory.Create(),
+                            _lifetime.Token);
+                        if (path is not null)
+                        {
+                            StatusText.Text = $"诊断已导出：{path}";
+                        }
+                    }
+                    break;
+                case ConnectionErrorActionKind.Cancel:
+                    ErrorCard.ViewModel = null;
+                    break;
+                case ConnectionErrorActionKind.OpenHelp:
+                    await Windows.System.Launcher.LaunchUriAsync(
+                        new Uri("https://support.apple.com/guide/mac-help/control-access-to-screen-recording-mchld6aa7d23/mac"));
+                    break;
+                case ConnectionErrorActionKind.ReplaceHostKey:
+                    _hostKeyPrompt?.Replace();
+                    break;
+                case ConnectionErrorActionKind.Disconnect:
+                    Hide();
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(action));
+            }
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            ShowError(exception);
+        }
+    }
 
     private void ClearPasswords()
     {
@@ -284,7 +389,27 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
 
         using var master = CaptureAndClear(VaultMasterPasswordBox) ??
             throw new WinARD.Security.Vault.VaultLockedException();
+        using var registration = RegisterSecret(master);
         await _vaultSession.UnlockAsync(master, _lifetime.Token);
+    }
+
+    private IDisposable? RegisterSecret(SecretBuffer secret)
+    {
+        if (_redactor is null)
+        {
+            return null;
+        }
+
+        var bytes = new byte[secret.Length];
+        try
+        {
+            secret.CopyTo(bytes);
+            return _redactor.Register(bytes);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(bytes);
+        }
     }
 
     public void Dispose()
@@ -296,6 +421,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         }
 
         _lifetime.Cancel();
+        ErrorCard.ActionRequested -= OnErrorActionRequested;
         ClearPasswords();
         _lifetime.Dispose();
         GC.SuppressFinalize(this);

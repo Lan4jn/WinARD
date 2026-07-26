@@ -6,7 +6,8 @@ internal sealed class RemoteInputOperationRunner(
     IUiDispatcher dispatcher,
     Func<Task> reportFailure,
     Func<Task> closeSession,
-    Func<bool> isClosing)
+    Func<bool> isClosing,
+    Action<Exception>? observeFailure = null)
 {
     public async Task RunAsync(Func<Task> operation)
     {
@@ -18,11 +19,19 @@ internal sealed class RemoteInputOperationRunner(
         catch (OperationCanceledException) when (isClosing())
         {
         }
-        catch (Exception)
+        catch (Exception exception)
         {
             if (isClosing())
             {
                 return;
+            }
+
+            try
+            {
+                observeFailure?.Invoke(exception);
+            }
+            catch (Exception)
+            {
             }
 
             try

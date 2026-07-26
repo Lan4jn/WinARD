@@ -1,5 +1,6 @@
 using WinARD.Application.Ports;
 using WinARD.Domain.Security;
+using WinARD.Infrastructure.Diagnostics;
 
 namespace WinARD.Desktop.Services;
 
@@ -7,14 +8,17 @@ public sealed class RoutedCredentialStore : IPurposeAwareCredentialStore, IAsync
 {
     private readonly IReadOnlyDictionary<string, ICredentialStore> _stores;
     private readonly CredentialPromptService _promptService;
+    private readonly SecretRedactor? _redactor;
 
     public RoutedCredentialStore(
         ICredentialStore windowsStore,
         ICredentialStore vaultStore,
         TransientCredentialStore transientStore,
-        CredentialPromptService promptService)
+        CredentialPromptService promptService,
+        SecretRedactor? redactor = null)
     {
         _promptService = promptService ?? throw new ArgumentNullException(nameof(promptService));
+        _redactor = redactor;
         _stores = new Dictionary<string, ICredentialStore>(StringComparer.OrdinalIgnoreCase)
         {
             ["windows"] = windowsStore ?? throw new ArgumentNullException(nameof(windowsStore)),
@@ -35,7 +39,7 @@ public sealed class RoutedCredentialStore : IPurposeAwareCredentialStore, IAsync
                 "每次询问的凭据读取必须指定提示用途。");
         }
 
-        return await Store(reference).ReadAsync(reference, cancellationToken).ConfigureAwait(false);
+        return Register(await Store(reference).ReadAsync(reference, cancellationToken).ConfigureAwait(false));
     }
 
     public async ValueTask<ISecret?> ReadForPromptAsync(
@@ -45,13 +49,13 @@ public sealed class RoutedCredentialStore : IPurposeAwareCredentialStore, IAsync
         ArgumentNullException.ThrowIfNull(request);
         if (string.Equals(request.Reference.Store, "ask", StringComparison.OrdinalIgnoreCase))
         {
-            return await _promptService.PromptReferenceAsync(request, cancellationToken)
-                .ConfigureAwait(false);
+            return Register(await _promptService.PromptReferenceAsync(request, cancellationToken)
+                .ConfigureAwait(false));
         }
 
-        return await Store(request.Reference)
+        return Register(await Store(request.Reference)
             .ReadAsync(request.Reference, cancellationToken)
-            .ConfigureAwait(false);
+            .ConfigureAwait(false));
     }
 
     public ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(CredentialReference reference, CancellationToken cancellationToken) =>
@@ -105,6 +109,10 @@ public sealed class RoutedCredentialStore : IPurposeAwareCredentialStore, IAsync
             ? store
             : throw new InvalidOperationException("连接配置引用了不受支持的凭据存储。");
     }
+
+    private ISecret? Register(ISecret? secret) => secret is null || _redactor is null
+        ? secret
+        : new RegisteredSecret(secret, _redactor);
 }
 
 public interface ITransientCredentialStore : ICredentialStore

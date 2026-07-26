@@ -254,7 +254,7 @@ public sealed class ConnectionEditorService(
 
             var error = result.Error ?? throw new InvalidOperationException("连接失败但未返回错误信息。");
             completed.Add(new ConnectionTestStageResult(error.Stage, false, timer.Elapsed, error.UserMessage));
-            return new ConnectionProfileTestResult(updatedDraft, completed);
+            return new ConnectionProfileTestResult(updatedDraft, completed, error);
         }
         finally
         {
