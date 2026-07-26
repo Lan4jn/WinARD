@@ -143,6 +143,20 @@ public sealed class WindowsCredentialStore : ICredentialStore
         ISecret? replacement,
         CancellationToken cancellationToken)
     {
+        using var write = await CompareExchangeWithVersionAsync(
+            reference,
+            expectedVersion,
+            replacement,
+            cancellationToken).ConfigureAwait(false);
+        return write.Result;
+    }
+
+    public async ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+        CredentialReference reference,
+        CredentialStoreVersion? expectedVersion,
+        ISecret? replacement,
+        CancellationToken cancellationToken)
+    {
         EnsureWindows();
         ArgumentNullException.ThrowIfNull(reference);
         cancellationToken.ThrowIfCancellationRequested();
@@ -159,7 +173,9 @@ public sealed class WindowsCredentialStore : ICredentialStore
                 : expectedVersion is not null && VersionMatches(current, expectedVersion);
             if (!matches)
             {
-                return CredentialStoreCompareExchangeResult.Conflict;
+                return new CredentialStoreWriteResult(
+                    CredentialStoreCompareExchangeResult.Conflict,
+                    writtenVersion: null);
             }
 
             if (replacement is null)
@@ -172,7 +188,13 @@ public sealed class WindowsCredentialStore : ICredentialStore
                 _native.Write(target, replacementBytes);
             }
 
-            return CredentialStoreCompareExchangeResult.Succeeded;
+            var writtenVersion = replacementBytes is null
+                ? null
+                : CredentialStoreVersion.CopyFrom(
+                    replacementBytes.AsSpan(RevisionOffset, RevisionSize));
+            return new CredentialStoreWriteResult(
+                CredentialStoreCompareExchangeResult.Succeeded,
+                writtenVersion);
         }
         finally
         {

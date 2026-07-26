@@ -11,15 +11,22 @@ namespace WinARD.Desktop.Services;
 public sealed class ConnectionEditorService(
     IDeviceRepository repository,
     ICredentialStore credentialStore,
-    TransientCredentialStore transientStore,
+    ITransientCredentialStore transientStore,
     ConnectDeviceHandler connectHandler)
 {
     private readonly IDeviceRepository _repository = repository ?? throw new ArgumentNullException(nameof(repository));
     private readonly ICredentialStore _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
-    private readonly TransientCredentialStore _transientStore = transientStore ?? throw new ArgumentNullException(nameof(transientStore));
+    private readonly ITransientCredentialStore _transientStore = transientStore ?? throw new ArgumentNullException(nameof(transientStore));
     private readonly ConnectDeviceHandler _connectHandler = connectHandler ?? throw new ArgumentNullException(nameof(connectHandler));
 
     public async Task<ConnectionProfile> SaveAsync(
+        ConnectionProfile profile,
+        CredentialSaveMode mode,
+        ISecret? secret,
+        CancellationToken cancellationToken) =>
+        (await SaveWithResultAsync(profile, mode, secret, cancellationToken).ConfigureAwait(false)).Profile;
+
+    public async Task<ConnectionProfileSaveResult> SaveWithResultAsync(
         ConnectionProfile profile,
         CredentialSaveMode mode,
         ISecret? secret,
@@ -27,19 +34,19 @@ public sealed class ConnectionEditorService(
     {
         ArgumentNullException.ThrowIfNull(profile);
         var oldProfile = await _repository.GetAsync(profile.Id, cancellationToken).ConfigureAwait(false);
-        var reference = ReferenceFor(profile.Id, mode);
-        var savedProfile = profile.WithCredential(reference);
         var package = secret as ConnectionEditorSecretPackage;
         using var macSecret = package?.HasMacSecret == true ? package.CloneMacSecret() : secret?.Clone();
         using var sshSecret = package?.HasSshSecret == true ? package.CloneSshSecret() : null;
+        var reference = macSecret is null && profile.CredentialReference is not null
+            ? profile.CredentialReference
+            : ReferenceFor(profile.Id, mode);
+        var savedProfile = profile.WithCredential(reference);
         savedProfile = WithSshCredentialReference(savedProfile, mode, sshSecret is not null);
 
         if (mode == CredentialSaveMode.AskEveryTime)
         {
             await _repository.SaveAsync(savedProfile, cancellationToken).ConfigureAwait(false);
-            await DeleteUnsharedOldReferencesAsync(oldProfile, savedProfile, cancellationToken)
-                .ConfigureAwait(false);
-            return savedProfile;
+            return await CompleteCommittedSaveAsync(oldProfile, savedProfile).ConfigureAwait(false);
         }
 
         if (macSecret is null)
@@ -47,7 +54,7 @@ public sealed class ConnectionEditorService(
             if (oldProfile?.CredentialReference == reference)
             {
                 await _repository.SaveAsync(savedProfile, cancellationToken).ConfigureAwait(false);
-                return savedProfile;
+                return await CompleteCommittedSaveAsync(oldProfile, savedProfile).ConfigureAwait(false);
             }
 
             throw new InvalidOperationException("请选择密码后再保存到所选凭据存储。");
@@ -65,12 +72,24 @@ public sealed class ConnectionEditorService(
         using var previousSsh = sshReference is null
             ? null
             : await _credentialStore.ReadSnapshotAsync(sshReference, cancellationToken).ConfigureAwait(false);
+        CredentialStoreWriteResult? macWrite = null;
+        CredentialStoreWriteResult? sshWrite = null;
         try
         {
-            await _credentialStore.SaveAsync(reference, macSecret, cancellationToken).ConfigureAwait(false);
+            macWrite = await _credentialStore.CompareExchangeWithVersionAsync(
+                reference,
+                previous?.Version,
+                macSecret,
+                cancellationToken).ConfigureAwait(false);
+            EnsureWritten(macWrite);
             if (sshReference is not null && sshSecret is not null)
             {
-                await _credentialStore.SaveAsync(sshReference, sshSecret, cancellationToken).ConfigureAwait(false);
+                sshWrite = await _credentialStore.CompareExchangeWithVersionAsync(
+                    sshReference,
+                    previousSsh?.Version,
+                    sshSecret,
+                    cancellationToken).ConfigureAwait(false);
+                EnsureWritten(sshWrite);
             }
 
             await _repository.SaveAsync(savedProfile, cancellationToken).ConfigureAwait(false);
@@ -78,10 +97,22 @@ public sealed class ConnectionEditorService(
         catch (Exception saveException)
         {
             var rollbackErrors = new List<Exception>();
-            await RestoreCredentialAsync(reference, previous, rollbackErrors).ConfigureAwait(false);
-            if (sshReference is not null)
+            if (macWrite?.WrittenVersion is not null)
             {
-                await RestoreCredentialAsync(sshReference, previousSsh, rollbackErrors).ConfigureAwait(false);
+                await RestoreCredentialAsync(
+                    reference,
+                    macWrite.WrittenVersion,
+                    previous,
+                    rollbackErrors).ConfigureAwait(false);
+            }
+
+            if (sshReference is not null && sshWrite?.WrittenVersion is not null)
+            {
+                await RestoreCredentialAsync(
+                    sshReference,
+                    sshWrite.WrittenVersion,
+                    previousSsh,
+                    rollbackErrors).ConfigureAwait(false);
             }
 
             if (rollbackErrors.Count > 0)
@@ -92,10 +123,13 @@ public sealed class ConnectionEditorService(
 
             throw;
         }
+        finally
+        {
+            macWrite?.Dispose();
+            sshWrite?.Dispose();
+        }
 
-        await DeleteUnsharedOldReferencesAsync(oldProfile, savedProfile, cancellationToken)
-            .ConfigureAwait(false);
-        return savedProfile;
+        return await CompleteCommittedSaveAsync(oldProfile, savedProfile).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<ConnectionTestStageResult>> TestAsync(
@@ -113,18 +147,7 @@ public sealed class ConnectionEditorService(
             throw new InvalidOperationException("测试连接需要临时密码。");
         }
 
-        var reference = CredentialReference.Create("transient", Guid.NewGuid().ToString("N"));
-        await _transientStore.SaveAsync(reference, macSecret, cancellationToken).ConfigureAwait(false);
-        var testProfile = profile.WithCredential(reference);
-        CredentialReference? sshReference = null;
-        if (sshSecret is not null && testProfile.SshProfile is { } testSsh)
-        {
-            sshReference = CredentialReference.Create("transient", Guid.NewGuid().ToString("N"));
-            await _transientStore.SaveAsync(sshReference, sshSecret, cancellationToken).ConfigureAwait(false);
-            testProfile = testProfile.WithSsh(testSsh.PrivateKeyPath is null
-                ? testSsh.WithAuthenticationCredentials(sshReference, null)
-                : testSsh.WithAuthenticationCredentials(null, sshReference));
-        }
+        var writtenReferences = new List<CredentialReference>();
         var timer = Stopwatch.StartNew();
         var completed = new List<ConnectionTestStageResult>();
         ConnectionStage? activeStage = null;
@@ -144,6 +167,20 @@ public sealed class ConnectionEditorService(
         }
         try
         {
+            var reference = CredentialReference.Create("transient", Guid.NewGuid().ToString("N"));
+            await _transientStore.SaveAsync(reference, macSecret, cancellationToken).ConfigureAwait(false);
+            writtenReferences.Add(reference);
+            var testProfile = profile.WithCredential(reference);
+            if (sshSecret is not null && testProfile.SshProfile is { } testSsh)
+            {
+                var sshReference = CredentialReference.Create("transient", Guid.NewGuid().ToString("N"));
+                await _transientStore.SaveAsync(sshReference, sshSecret, cancellationToken).ConfigureAwait(false);
+                writtenReferences.Add(sshReference);
+                testProfile = testProfile.WithSsh(testSsh.PrivateKeyPath is null
+                    ? testSsh.WithAuthenticationCredentials(sshReference, null)
+                    : testSsh.WithAuthenticationCredentials(null, sshReference));
+            }
+
             var result = await _connectHandler.HandleAsync(testProfile, StageChanged, cancellationToken)
                 .ConfigureAwait(false);
             if (result.Session is not null)
@@ -167,11 +204,37 @@ public sealed class ConnectionEditorService(
         }
         finally
         {
-            await _transientStore.DeleteAsync(reference, CancellationToken.None).ConfigureAwait(false);
-            if (sshReference is not null)
+            foreach (var writtenReference in writtenReferences.AsEnumerable().Reverse())
             {
-                await _transientStore.DeleteAsync(sshReference, CancellationToken.None).ConfigureAwait(false);
+                await _transientStore.DeleteAsync(writtenReference, CancellationToken.None).ConfigureAwait(false);
             }
+        }
+    }
+
+    private async Task<ConnectionProfileSaveResult> CompleteCommittedSaveAsync(
+        ConnectionProfile? oldProfile,
+        ConnectionProfile savedProfile)
+    {
+        try
+        {
+            await DeleteUnsharedOldReferencesAsync(oldProfile, savedProfile, CancellationToken.None)
+                .ConfigureAwait(false);
+            return new ConnectionProfileSaveResult(savedProfile);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and
+            not StackOverflowException and not AccessViolationException)
+        {
+            return new ConnectionProfileSaveResult(
+                savedProfile,
+                "连接已保存，但旧凭据未能清理。");
+        }
+    }
+
+    private static void EnsureWritten(CredentialStoreWriteResult write)
+    {
+        if (write.Result != CredentialStoreCompareExchangeResult.Succeeded || write.WrittenVersion is null)
+        {
+            throw new InvalidOperationException("凭据已被其他操作修改，请重新载入后再试。");
         }
     }
 
@@ -198,16 +261,15 @@ public sealed class ConnectionEditorService(
 
     private async Task RestoreCredentialAsync(
         CredentialReference reference,
+        CredentialStoreVersion writtenVersion,
         CredentialStoreSnapshot? previous,
         List<Exception> errors)
     {
         try
         {
-            using var current = await _credentialStore.ReadSnapshotAsync(reference, CancellationToken.None)
-                .ConfigureAwait(false);
             var result = await _credentialStore.CompareExchangeAsync(
                 reference,
-                current?.Version,
+                writtenVersion,
                 previous?.Secret,
                 CancellationToken.None).ConfigureAwait(false);
             if (result != CredentialStoreCompareExchangeResult.Succeeded)

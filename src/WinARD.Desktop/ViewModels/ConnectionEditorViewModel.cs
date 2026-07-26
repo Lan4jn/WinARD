@@ -19,10 +19,14 @@ public sealed record ConnectionTestStageResult(
     TimeSpan Duration,
     string Message);
 
+public sealed record ConnectionProfileSaveResult(
+    ConnectionProfile Profile,
+    string? Warning = null);
+
 public sealed class ConnectionEditorViewModel : ObservableObject
 {
     private readonly ConnectionProfile? _original;
-    private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfile>> _save;
+    private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> _save;
     private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<IReadOnlyList<ConnectionTestStageResult>>> _test;
     private string _displayName = string.Empty;
     private string _host = string.Empty;
@@ -34,6 +38,8 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     private string _sshUsername = string.Empty;
     private string _privateKeyPath = string.Empty;
     private bool _hasSshAuthenticationSecret;
+    private bool _hasUnsupportedCredentialReference;
+    private bool _credentialModeChanged;
     private CredentialSaveMode _credentialSaveMode;
     private IReadOnlyList<ConnectionTestStageResult> _testResults = [];
     private string _statusMessage = string.Empty;
@@ -42,6 +48,18 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public ConnectionEditorViewModel(
         ConnectionProfile? profile,
         Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfile>> save,
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<IReadOnlyList<ConnectionTestStageResult>>> test)
+        : this(
+            profile,
+            async (candidate, mode, secret, cancellationToken) => new ConnectionProfileSaveResult(
+                await save(candidate, mode, secret, cancellationToken).ConfigureAwait(false)),
+            test)
+    {
+    }
+
+    public ConnectionEditorViewModel(
+        ConnectionProfile? profile,
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> save,
         Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<IReadOnlyList<ConnectionTestStageResult>>> test)
     {
         _original = profile;
@@ -64,7 +82,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         _port = profile.Port;
         _macUsername = profile.MacUsername;
         _useSsh = profile.TransportMode == TransportMode.Ssh;
-        _credentialSaveMode = ModeFromProfile(profile);
+        (_credentialSaveMode, _hasUnsupportedCredentialReference) = ModeFromProfile(profile);
         if (profile.SshProfile is { } ssh)
         {
             _sshHost = ssh.Host;
@@ -141,8 +159,22 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public CredentialSaveMode CredentialSaveMode
     {
         get => _credentialSaveMode;
-        set => SetValidated(ref _credentialSaveMode, value);
+        set
+        {
+            _credentialModeChanged = true;
+            if (_hasUnsupportedCredentialReference)
+            {
+                _hasUnsupportedCredentialReference = false;
+                OnPropertyChanged(nameof(HasUnsupportedCredentialReference));
+            }
+
+            SetValidated(ref _credentialSaveMode, value);
+        }
     }
+
+    public bool HasUnsupportedCredentialReference => _hasUnsupportedCredentialReference;
+
+    public bool CredentialModeChanged => _credentialModeChanged;
 
     public IReadOnlyList<CredentialSaveMode> CredentialSaveModes { get; } =
         Enum.GetValues<CredentialSaveMode>();
@@ -167,9 +199,9 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         try
         {
             var profile = BuildProfile();
-            var saved = await _save(profile, CredentialSaveMode, secret, cancellationToken).ConfigureAwait(false);
-            StatusMessage = $"已保存“{saved.DisplayName}”。";
-            return saved;
+            var result = await _save(profile, CredentialSaveMode, secret, cancellationToken).ConfigureAwait(false);
+            StatusMessage = result.Warning ?? $"已保存“{result.Profile.DisplayName}”。";
+            return result.Profile;
         }
         finally
         {
@@ -212,7 +244,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
         var profile = ConnectionProfile.Create(
             _original?.Id ?? Guid.NewGuid(), DisplayName, Host, Port, MacUsername);
-        if (_original?.CredentialReference is { } macReference)
+        if (!_credentialModeChanged && _original?.CredentialReference is { } macReference)
         {
             profile = profile.WithCredential(macReference);
         }
@@ -230,12 +262,15 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             string.IsNullOrWhiteSpace(PrivateKeyPath) ? null : PrivateKeyPath,
             Host,
             Port,
-            originalSsh?.CredentialReference,
+            credentialReference: null,
             originalSsh?.PinnedHostKeyAlgorithm,
             originalSsh?.PinnedHostKeySha256);
-        ssh = ssh.WithAuthenticationCredentials(
-            originalSsh?.PasswordCredentialReference,
-            originalSsh?.PrivateKeyPassphraseCredentialReference);
+        if (!_credentialModeChanged)
+        {
+            ssh = ssh.WithAuthenticationCredentials(
+                originalSsh?.PasswordCredentialReference,
+                originalSsh?.PrivateKeyPassphraseCredentialReference);
+        }
         if (originalSsh?.HostKeyPin is { } pin)
         {
             ssh = ssh.WithHostKeyPin(pin);
@@ -248,7 +283,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
     private bool FieldsAreValid()
     {
-        if (string.IsNullOrWhiteSpace(DisplayName) || !ValidHost(Host) ||
+        if (_hasUnsupportedCredentialReference || string.IsNullOrWhiteSpace(DisplayName) || !ValidHost(Host) ||
             Port is < 1 or > 65535 || string.IsNullOrWhiteSpace(MacUsername))
         {
             return false;
@@ -259,17 +294,13 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             return true;
         }
 
-        var hasExistingSshCredential = _original?.SshProfile is
-        {
-            PasswordCredentialReference: not null
-        } or
-        {
-            PrivateKeyPassphraseCredentialReference: not null
-        };
+        var hasCurrentCredential = string.IsNullOrWhiteSpace(PrivateKeyPath)
+            ? _original?.SshProfile?.PasswordCredentialReference is not null
+            : _original?.SshProfile?.PrivateKeyPassphraseCredentialReference is not null;
         return ValidHost(SshHost) && SshPort is >= 1 and <= 65535 &&
             !string.IsNullOrWhiteSpace(SshUsername) &&
             (!string.IsNullOrWhiteSpace(PrivateKeyPath) || HasSshAuthenticationSecret ||
-             hasExistingSshCredential || CredentialSaveMode == CredentialSaveMode.AskEveryTime);
+             (!_credentialModeChanged && hasCurrentCredential) || CredentialSaveMode == CredentialSaveMode.AskEveryTime);
     }
 
     private static bool ValidHost(string value)
@@ -288,16 +319,17 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         return Uri.CheckHostName(host) != UriHostNameType.Unknown;
     }
 
-    private static CredentialSaveMode ModeFromProfile(ConnectionProfile profile)
+    private static (CredentialSaveMode Mode, bool Unsupported) ModeFromProfile(ConnectionProfile profile)
     {
         var store = profile.CredentialReference?.Store ??
             profile.SshProfile?.PasswordCredentialReference?.Store ??
             profile.SshProfile?.PrivateKeyPassphraseCredentialReference?.Store;
         return store?.ToLowerInvariant() switch
         {
-            "vault" => CredentialSaveMode.EncryptedVault,
-            "ask" => CredentialSaveMode.AskEveryTime,
-            _ => CredentialSaveMode.WindowsCredentialManager,
+            null or "windows" => (CredentialSaveMode.WindowsCredentialManager, false),
+            "vault" => (CredentialSaveMode.EncryptedVault, false),
+            "ask" => (CredentialSaveMode.AskEveryTime, false),
+            _ => (CredentialSaveMode.WindowsCredentialManager, true),
         };
     }
 

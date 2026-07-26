@@ -35,6 +35,25 @@ public sealed class ConnectDeviceHandler
     public async Task<ConnectResult> HandleAsync(
         ConnectionProfile profile,
         Action<ConnectionStage>? stageChanged,
+        CancellationToken cancellationToken) =>
+        await HandleCoreAsync(profile, stageChanged, failureObserved: null, cancellationToken)
+            .ConfigureAwait(false);
+
+    internal async Task<ConnectResult> HandleWithFailureObservationAsync(
+        ConnectionProfile profile,
+        Action<ConnectionStage>? stageChanged,
+        Action<Exception> failureObserved,
+        CancellationToken cancellationToken) =>
+        await HandleCoreAsync(
+            profile,
+            stageChanged,
+            failureObserved ?? throw new ArgumentNullException(nameof(failureObserved)),
+            cancellationToken).ConfigureAwait(false);
+
+    private async Task<ConnectResult> HandleCoreAsync(
+        ConnectionProfile profile,
+        Action<ConnectionStage>? stageChanged,
+        Action<Exception>? failureObserved,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -88,6 +107,7 @@ public sealed class ConnectDeviceHandler
             var failedAt = ToConnectionStage(stateMachine.Current);
             await CleanupAsync(client, transport, secret).ConfigureAwait(false);
             stateMachine.MoveTo(SessionState.Failed);
+            failureObserved?.Invoke(exception);
             return new ConnectResult(
                 stateMachine.Current,
                 null,

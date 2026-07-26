@@ -86,6 +86,30 @@ public enum CredentialStoreCompareExchangeResult
     Conflict,
 }
 
+public sealed class CredentialStoreWriteResult : IDisposable
+{
+    private CredentialStoreVersion? _writtenVersion;
+
+    public CredentialStoreWriteResult(
+        CredentialStoreCompareExchangeResult result,
+        CredentialStoreVersion? writtenVersion)
+    {
+        if (result == CredentialStoreCompareExchangeResult.Conflict && writtenVersion is not null)
+        {
+            throw new ArgumentException("A conflicting write cannot have a written version.", nameof(writtenVersion));
+        }
+
+        Result = result;
+        _writtenVersion = writtenVersion;
+    }
+
+    public CredentialStoreCompareExchangeResult Result { get; }
+
+    public CredentialStoreVersion? WrittenVersion => _writtenVersion;
+
+    public void Dispose() => Interlocked.Exchange(ref _writtenVersion, null)?.Dispose();
+}
+
 public interface ICredentialStore
 {
     ValueTask SaveAsync(
@@ -106,6 +130,26 @@ public interface ICredentialStore
         CredentialStoreVersion? expectedVersion,
         ISecret? replacement,
         CancellationToken cancellationToken);
+
+    async ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+        CredentialReference reference,
+        CredentialStoreVersion? expectedVersion,
+        ISecret? replacement,
+        CancellationToken cancellationToken)
+    {
+        var result = await CompareExchangeAsync(
+            reference,
+            expectedVersion,
+            replacement,
+            cancellationToken).ConfigureAwait(false);
+        if (result != CredentialStoreCompareExchangeResult.Succeeded || replacement is null)
+        {
+            return new CredentialStoreWriteResult(result, writtenVersion: null);
+        }
+
+        using var snapshot = await ReadSnapshotAsync(reference, cancellationToken).ConfigureAwait(false);
+        return new CredentialStoreWriteResult(result, snapshot?.Version.Clone());
+    }
 
     ValueTask DeleteAsync(
         CredentialReference reference,

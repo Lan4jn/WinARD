@@ -47,7 +47,8 @@ public sealed class SshHostKeyVerifierTests
         var changed = SshHostKeyVerifier.Verify(endpoint, "ssh-ed25519", [3, 2, 1], pin);
 
         Assert.Equal(SshHostKeyStatus.Changed, changed.Status);
-        Assert.Throws<SshHostKeyChangedException>(() => SshHostKeyVerifier.Confirm(changed));
+        var exception = Assert.Throws<SshHostKeyChangedException>(() => SshHostKeyVerifier.Confirm(changed));
+        Assert.Equal(changed, exception.Verification);
     }
 
     [Fact]

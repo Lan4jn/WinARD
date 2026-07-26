@@ -49,11 +49,14 @@ public partial class App : Microsoft.UI.Xaml.Application
             TimeProvider.System,
             TimeSpan.FromMinutes(15)));
         services.AddSingleton<TransientCredentialStore>();
+        services.AddSingleton<ITransientCredentialStore>(provider =>
+            provider.GetRequiredService<TransientCredentialStore>());
         services.AddSingleton<CredentialPromptService>();
         services.AddSingleton<ICredentialStore>(provider => new RoutedCredentialStore(
             provider.GetRequiredService<WindowsCredentialStore>(),
             provider.GetRequiredService<VaultCredentialStoreSession>(),
-            provider.GetRequiredService<TransientCredentialStore>()));
+            provider.GetRequiredService<TransientCredentialStore>(),
+            provider.GetRequiredService<CredentialPromptService>()));
         services.AddSingleton<IUiDispatcher>(_ => new DispatcherQueueUiDispatcher(
             DispatcherQueue.GetForCurrentThread() ??
             throw new InvalidOperationException("The WinUI dispatcher is unavailable.")));
@@ -62,6 +65,11 @@ public partial class App : Microsoft.UI.Xaml.Application
         services.AddSingleton<IRfbClientFactory, RfbClientFactory>();
         services.AddSingleton<IErrorMapper, ErrorMapper>();
         services.AddSingleton<ConnectDeviceHandler>();
+        services.AddSingleton<ActiveSessionCoordinator>();
+        services.AddSingleton<SshHostKeyPromptService>();
+        services.AddSingleton<ISshHostKeyPrompt>(provider =>
+            provider.GetRequiredService<SshHostKeyPromptService>());
+        services.AddSingleton<ConnectionSessionController>();
         services.AddSingleton<ConnectionEditorService>();
         services.AddSingleton<MainWindowViewModel>();
         services.AddSingleton<MainWindow>();

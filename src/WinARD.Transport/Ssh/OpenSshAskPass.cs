@@ -129,8 +129,8 @@ public sealed class OpenSshAskPassBroker : IOpenSshAskPassBroker
 
     private static CredentialReference? SelectReference(SshProfile profile) =>
         profile.PrivateKeyPath is null
-            ? profile.PasswordCredentialReference ?? profile.CredentialReference
-            : profile.PrivateKeyPassphraseCredentialReference ?? profile.CredentialReference;
+            ? profile.PasswordCredentialReference
+            : profile.PrivateKeyPassphraseCredentialReference;
 
     private static void ValidateSecret(ISecret secret)
     {

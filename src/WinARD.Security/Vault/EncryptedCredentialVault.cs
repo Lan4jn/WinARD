@@ -644,6 +644,20 @@ public sealed class EncryptedCredentialVault :
         ISecret? replacement,
         CancellationToken cancellationToken)
     {
+        using var write = await CompareExchangeWithVersionAsync(
+            reference,
+            expectedVersion,
+            replacement,
+            cancellationToken).ConfigureAwait(false);
+        return write.Result;
+    }
+
+    public async ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+        CredentialReference reference,
+        CredentialStoreVersion? expectedVersion,
+        ISecret? replacement,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(reference);
         if (replacement?.Length > VaultFileFormat.MaximumSecretBytes)
         {
@@ -662,7 +676,9 @@ public sealed class EncryptedCredentialVault :
                 (current is not null && !EntryVersionMatches(current, expectedVersion!)))
             {
                 Touch();
-                return CredentialStoreCompareExchangeResult.Conflict;
+                return new CredentialStoreWriteResult(
+                    CredentialStoreCompareExchangeResult.Conflict,
+                    writtenVersion: null);
             }
 
             var next = new Dictionary<string, VaultEntry>(_entries, StringComparer.Ordinal);
@@ -697,7 +713,9 @@ public sealed class EncryptedCredentialVault :
                     if (!write.Written || write.Version is null)
                     {
                         Touch();
-                        return CredentialStoreCompareExchangeResult.Conflict;
+                        return new CredentialStoreWriteResult(
+                            CredentialStoreCompareExchangeResult.Conflict,
+                            writtenVersion: null);
                     }
 
                     _storageVersion = write.Version;
@@ -724,8 +742,13 @@ public sealed class EncryptedCredentialVault :
                     encryptedReplacement = null;
                 }
 
+                var writtenVersion = replacement is null
+                    ? null
+                    : CreateEntryVersion(_entries[referenceText]);
                 Touch();
-                return CredentialStoreCompareExchangeResult.Succeeded;
+                return new CredentialStoreWriteResult(
+                    CredentialStoreCompareExchangeResult.Succeeded,
+                    writtenVersion);
             }
             finally
             {

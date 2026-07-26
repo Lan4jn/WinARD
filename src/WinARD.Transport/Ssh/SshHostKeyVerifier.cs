@@ -98,7 +98,7 @@ public sealed class SshHostKeyVerifier
         ArgumentNullException.ThrowIfNull(verification);
         if (verification.Status == SshHostKeyStatus.Changed)
         {
-            throw new SshHostKeyChangedException(verification.Endpoint);
+            throw new SshHostKeyChangedException(verification);
         }
 
         return verification.ToPin();
@@ -256,5 +256,14 @@ public sealed class SshHostKeyChangedException : Exception
         Endpoint = endpoint;
     }
 
+    public SshHostKeyChangedException(SshHostKeyVerification verification)
+        : base($"The SSH host key for {verification.Endpoint.Host}:{verification.Endpoint.Port} has changed.")
+    {
+        Verification = verification ?? throw new ArgumentNullException(nameof(verification));
+        Endpoint = verification.Endpoint;
+    }
+
     public SshHostKeyEndpoint Endpoint { get; }
+
+    public SshHostKeyVerification? Verification { get; }
 }

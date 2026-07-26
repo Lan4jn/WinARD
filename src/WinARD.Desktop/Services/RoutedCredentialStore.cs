@@ -7,12 +7,15 @@ namespace WinARD.Desktop.Services;
 public sealed class RoutedCredentialStore : ICredentialStore, IAsyncDisposable
 {
     private readonly IReadOnlyDictionary<string, ICredentialStore> _stores;
+    private readonly CredentialPromptService _promptService;
 
     public RoutedCredentialStore(
         ICredentialStore windowsStore,
         ICredentialStore vaultStore,
-        TransientCredentialStore transientStore)
+        TransientCredentialStore transientStore,
+        CredentialPromptService promptService)
     {
+        _promptService = promptService ?? throw new ArgumentNullException(nameof(promptService));
         _stores = new Dictionary<string, ICredentialStore>(StringComparer.OrdinalIgnoreCase)
         {
             ["windows"] = windowsStore ?? throw new ArgumentNullException(nameof(windowsStore)),
@@ -24,8 +27,17 @@ public sealed class RoutedCredentialStore : ICredentialStore, IAsyncDisposable
     public ValueTask SaveAsync(CredentialReference reference, ISecret secret, CancellationToken cancellationToken) =>
         Store(reference).SaveAsync(reference, secret, cancellationToken);
 
-    public ValueTask<ISecret?> ReadAsync(CredentialReference reference, CancellationToken cancellationToken) =>
-        Store(reference).ReadAsync(reference, cancellationToken);
+    public async ValueTask<ISecret?> ReadAsync(CredentialReference reference, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        if (string.Equals(reference.Store, "ask", StringComparison.OrdinalIgnoreCase))
+        {
+            return await _promptService.PromptReferenceAsync(reference, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return await Store(reference).ReadAsync(reference, cancellationToken).ConfigureAwait(false);
+    }
 
     public ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(CredentialReference reference, CancellationToken cancellationToken) =>
         Store(reference).ReadSnapshotAsync(reference, cancellationToken);
@@ -36,6 +48,17 @@ public sealed class RoutedCredentialStore : ICredentialStore, IAsyncDisposable
         ISecret? replacement,
         CancellationToken cancellationToken) =>
         Store(reference).CompareExchangeAsync(reference, expectedVersion, replacement, cancellationToken);
+
+    public ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+        CredentialReference reference,
+        CredentialStoreVersion? expectedVersion,
+        ISecret? replacement,
+        CancellationToken cancellationToken) =>
+        Store(reference).CompareExchangeWithVersionAsync(
+            reference,
+            expectedVersion,
+            replacement,
+            cancellationToken);
 
     public ValueTask DeleteAsync(CredentialReference reference, CancellationToken cancellationToken) =>
         Store(reference).DeleteAsync(reference, cancellationToken);
@@ -69,7 +92,11 @@ public sealed class RoutedCredentialStore : ICredentialStore, IAsyncDisposable
     }
 }
 
-public sealed class TransientCredentialStore : ICredentialStore, IDisposable
+public interface ITransientCredentialStore : ICredentialStore
+{
+}
+
+public sealed class TransientCredentialStore : ITransientCredentialStore, IDisposable
 {
     private readonly ConcurrentDictionary<CredentialReference, ISecret> _secrets = new();
 

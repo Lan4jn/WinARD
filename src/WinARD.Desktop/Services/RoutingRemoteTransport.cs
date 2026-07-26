@@ -28,15 +28,6 @@ public sealed class RoutingRemoteTransport : IRemoteTransportFactory
             return await _tcp.ConnectAsync(profile, cancellationToken).ConfigureAwait(false);
         }
 
-        if (profile.SshProfile?.HostKeyPin is { } pin)
-        {
-            var confirmation = await _pins.ConfirmUnknownAsync(pin, cancellationToken).ConfigureAwait(false);
-            if (confirmation == SshHostKeyPinConfirmation.Conflict)
-            {
-                throw new SshHostKeyChangedException(pin.Endpoint);
-            }
-        }
-
         return await _ssh.ConnectAsync(profile, cancellationToken).ConfigureAwait(false);
     }
 }

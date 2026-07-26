@@ -5,11 +5,13 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using WinARD.Application.Ports;
+using WinARD.Application.Sessions;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using WinARD.Desktop.Services;
 using WinARD.Desktop.Views;
 using WinARD.Domain.Connections;
+using WinARD.Domain.Sessions;
 using WinARD.Infrastructure.Database;
 using WinARD.Security.Secrets;
 using WinRT.Interop;
@@ -27,28 +29,39 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly StackPanel _emptyState = new();
     private readonly Button _deleteButton = new();
     private readonly Button _editButton = new();
+    private readonly Button _connectButton = new();
+    private readonly Button _disconnectButton = new();
+    private readonly TextBlock _connectionStatus = new();
+    private readonly ListView _connectionStages = new();
     private readonly ConnectionEditorService _connectionEditorService;
+    private readonly ConnectionSessionController _sessionController;
     private readonly VaultCredentialStoreSession _vaultSession;
     private readonly CredentialPromptService _credentialPromptService;
+    private readonly SshHostKeyPromptService _hostKeyPromptService;
     private readonly TextBlock _detailName = new();
     private readonly TextBlock _detailSource = new();
     private readonly TextBlock _detailEndpoint = new();
     private Task? _shutdownTask;
     private bool _allowClose;
+    private bool _sessionBusy;
     private int _disposed;
 
     public MainWindow(
         MainWindowViewModel viewModel,
         WinArdDatabase database,
         ConnectionEditorService connectionEditorService,
+        ConnectionSessionController sessionController,
         VaultCredentialStoreSession vaultSession,
-        CredentialPromptService credentialPromptService)
+        CredentialPromptService credentialPromptService,
+        SshHostKeyPromptService hostKeyPromptService)
     {
         ViewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _connectionEditorService = connectionEditorService ?? throw new ArgumentNullException(nameof(connectionEditorService));
+        _sessionController = sessionController ?? throw new ArgumentNullException(nameof(sessionController));
         _vaultSession = vaultSession ?? throw new ArgumentNullException(nameof(vaultSession));
         _credentialPromptService = credentialPromptService ?? throw new ArgumentNullException(nameof(credentialPromptService));
+        _hostKeyPromptService = hostKeyPromptService ?? throw new ArgumentNullException(nameof(hostKeyPromptService));
         InitializeComponent();
         BuildDeviceLibrary();
         var windowHandle = WindowNative.GetWindowHandle(this);
@@ -60,6 +73,9 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.AddDeviceRequested += OnAddDeviceRequested;
         ViewModel.EditDeviceRequested += OnEditDeviceRequested;
         _credentialPromptService.SetHandler(PromptForCredentialAsync);
+        _credentialPromptService.SetReferenceHandler(PromptForReferenceCredentialAsync);
+        _hostKeyPromptService.SetHandler(PromptForHostKeyAsync);
+        _sessionController.ProfileUpdated += OnConnectionProfileUpdated;
         ResizeWindow();
         _initializationTask = _uiOperation.RunAsync(InitializeWithErrorHandlingAsync, _shutdown.Token);
     }
@@ -203,15 +219,44 @@ public sealed partial class MainWindow : Window, IDisposable
         details.Children.Add(_detailName);
         details.Children.Add(_detailSource);
         details.Children.Add(_detailEndpoint);
-        details.Children.Add(new InfoBar
+        _connectionStatus.Text = "未连接。";
+        _connectionStatus.TextWrapping = TextWrapping.Wrap;
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+            _connectionStatus,
+            "ConnectionStatus");
+        details.Children.Add(_connectionStatus);
+        details.Children.Add(new TextBlock
         {
-            IsOpen = true,
-            IsClosable = false,
-            Severity = InfoBarSeverity.Informational,
-            Title = "设备库 MVP",
-            Message = "远程画面与交互连接将在后续阶段提供。",
+            Text = "阶段 / 用时 / 消息",
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
         });
-        details.Children.Add(new Button { Content = "连接", IsEnabled = false });
+        _connectionStages.MaxHeight = 180;
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+            _connectionStages,
+            "ConnectionStageResults");
+        details.Children.Add(_connectionStages);
+        var connectionActions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+        };
+        _connectButton.Content = "连接";
+        _connectButton.IsEnabled = false;
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+            _connectButton,
+            "ConnectButton");
+        _connectButton.Click += (_, _) =>
+            _ = _uiOperation.RunAsync(ConnectSelectedWithHandlingAsync, _shutdown.Token);
+        connectionActions.Children.Add(_connectButton);
+        _disconnectButton.Content = "断开连接";
+        _disconnectButton.IsEnabled = false;
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+            _disconnectButton,
+            "DisconnectButton");
+        _disconnectButton.Click += (_, _) =>
+            _ = _uiOperation.RunAsync(DisconnectWithHandlingAsync, _shutdown.Token);
+        connectionActions.Children.Add(_disconnectButton);
+        details.Children.Add(connectionActions);
         card.Child = details;
         _detailsHost.Children.Add(card);
         body.Children.Add(_detailsHost);
@@ -277,7 +322,7 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         var viewModel = new ConnectionEditorViewModel(
             profile,
-            _connectionEditorService.SaveAsync,
+            _connectionEditorService.SaveWithResultAsync,
             _connectionEditorService.TestAsync);
         using var dialog = new ConnectionEditorDialog(viewModel, _vaultSession)
         {
@@ -293,19 +338,40 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async ValueTask<ISecret> PromptForCredentialAsync(
         ConnectionProfile profile,
+        CancellationToken cancellationToken) =>
+        await PromptForSecretAsync(
+            $"“{profile.DisplayName}”的 Mac 密码",
+            "输入连接凭据",
+            cancellationToken);
+
+    private async ValueTask<ISecret> PromptForReferenceCredentialAsync(
+        WinARD.Domain.Security.CredentialReference reference,
+        CancellationToken cancellationToken)
+    {
+        var header = reference.Key.EndsWith("/ssh-passphrase", StringComparison.OrdinalIgnoreCase)
+            ? "SSH 私钥口令"
+            : reference.Key.EndsWith("/ssh-password", StringComparison.OrdinalIgnoreCase)
+                ? "SSH 密码"
+                : "连接密码";
+        return await PromptForSecretAsync(header, "输入 SSH 凭据", cancellationToken);
+    }
+
+    private async ValueTask<ISecret> PromptForSecretAsync(
+        string header,
+        string title,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var passwordBox = new PasswordBox
         {
-            Header = $"“{profile.DisplayName}”的 Mac 密码",
+            Header = header,
         };
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
             passwordBox,
             "CredentialPromptPassword");
         var dialog = new ContentDialog
         {
-            Title = "输入连接凭据",
+            Title = title,
             Content = passwordBox,
             PrimaryButtonText = "继续",
             CloseButtonText = "取消",
@@ -334,6 +400,146 @@ public sealed partial class MainWindow : Window, IDisposable
             CryptographicOperations.ZeroMemory(bytes);
         }
     }
+
+    private async ValueTask<SshHostKeyPromptDecision> PromptForHostKeyAsync(
+        SshHostKeyPromptRequest request,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var message = new StringBuilder()
+            .AppendLine(System.Globalization.CultureInfo.InvariantCulture,
+                $"端点：{request.Endpoint.Host}:{request.Endpoint.Port}")
+            .AppendLine(System.Globalization.CultureInfo.InvariantCulture,
+                $"算法：{request.Algorithm}");
+        if (request.IsChanged && request.PreviousFingerprint is not null)
+        {
+            message.AppendLine(System.Globalization.CultureInfo.InvariantCulture,
+                $"原 SHA256：{request.PreviousFingerprint}");
+        }
+
+        message.Append(System.Globalization.CultureInfo.InvariantCulture,
+            $"新 SHA256：{request.NewFingerprint}");
+        var dialog = new ContentDialog
+        {
+            Title = request.IsChanged ? "SSH 主机密钥已更改" : "信任 SSH 主机密钥？",
+            Content = new TextBlock
+            {
+                Text = message.ToString(),
+                IsTextSelectionEnabled = true,
+                TextWrapping = TextWrapping.Wrap,
+            },
+            PrimaryButtonText = request.IsChanged ? "替换并连接" : "信任并连接",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = ShellRoot.XamlRoot,
+        };
+        var result = await dialog.ShowAsync();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (result != ContentDialogResult.Primary)
+        {
+            return SshHostKeyPromptDecision.Cancel;
+        }
+
+        return request.IsChanged
+            ? SshHostKeyPromptDecision.Replace
+            : SshHostKeyPromptDecision.Trust;
+    }
+
+    private async Task ConnectSelectedWithHandlingAsync()
+    {
+        var profile = ViewModel.SelectedDevice?.Profile;
+        if (profile is null || _sessionBusy || _sessionController.IsConnected)
+        {
+            return;
+        }
+
+        SetSessionBusy(true);
+        _connectionStatus.Text = "正在连接…";
+        try
+        {
+            await _sessionController.ConnectAsync(profile, _shutdown.Token);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
+        catch (ConnectionFailedException exception)
+        {
+            _connectionStatus.Text = exception.Result.Error?.UserMessage ?? "连接失败。";
+        }
+        catch (SessionAlreadyActiveException)
+        {
+            _connectionStatus.Text = "已有活动连接。";
+        }
+        catch (Exception)
+        {
+            _connectionStatus.Text = "连接失败。请检查设备与凭据后重试。";
+        }
+        finally
+        {
+            SetSessionBusy(false);
+            RefreshConnectionPresentation();
+        }
+    }
+
+    private async Task DisconnectWithHandlingAsync()
+    {
+        if (_sessionBusy || !_sessionController.IsConnected)
+        {
+            return;
+        }
+
+        SetSessionBusy(true);
+        _connectionStatus.Text = "正在断开…";
+        try
+        {
+            await _sessionController.DisconnectAsync(_shutdown.Token);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            _connectionStatus.Text = "断开连接时出现错误。";
+        }
+        finally
+        {
+            SetSessionBusy(false);
+            RefreshConnectionPresentation();
+        }
+    }
+
+    private void SetSessionBusy(bool value)
+    {
+        _sessionBusy = value;
+        UpdateConnectionActions();
+    }
+
+    private void RefreshConnectionPresentation()
+    {
+        _connectionStatus.Text = _sessionController.StatusMessage.Length == 0
+            ? (_sessionController.IsConnected ? "已连接。" : "未连接。")
+            : _sessionController.StatusMessage;
+        _connectionStages.ItemsSource = _sessionController.StageResults
+            .Select(result => string.Create(
+                System.Globalization.CultureInfo.InvariantCulture,
+                $"{result.Stage} / {result.Duration.TotalMilliseconds:F0} ms / {result.Message}"))
+            .ToArray();
+        UpdateConnectionActions();
+    }
+
+    private void UpdateConnectionActions()
+    {
+        var hasSavedProfile = ViewModel.SelectedDevice?.Profile is not null;
+        _connectButton.IsEnabled = hasSavedProfile && !_sessionBusy && !_sessionController.IsConnected;
+        _disconnectButton.IsEnabled = !_sessionBusy && _sessionController.IsConnected;
+        _editButton.IsEnabled = !_sessionBusy && !_sessionController.IsConnected;
+        _deleteButton.IsEnabled = !_sessionBusy && !_sessionController.IsConnected && !ViewModel.IsDeleting;
+    }
+
+    private void OnConnectionProfileUpdated(ConnectionProfile profile) =>
+        _ = _uiOperation.RunAsync(
+            () => ViewModel.ApplySavedProfileAsync(profile, _shutdown.Token),
+            _shutdown.Token);
 
     private async void OnDeleteClicked(object sender, RoutedEventArgs args)
     {
@@ -386,7 +592,7 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         if (args.PropertyName == nameof(MainWindowViewModel.IsDeleting))
         {
-            _deleteButton.IsEnabled = !ViewModel.IsDeleting;
+            UpdateConnectionActions();
             return;
         }
 
@@ -402,6 +608,7 @@ public sealed partial class MainWindow : Window, IDisposable
             _emptyState.Visibility = Visibility.Visible;
             _deleteButton.Visibility = Visibility.Collapsed;
             _editButton.Visibility = Visibility.Collapsed;
+            UpdateConnectionActions();
             return;
         }
 
@@ -412,6 +619,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _emptyState.Visibility = Visibility.Collapsed;
         _deleteButton.Visibility = item.Profile is null ? Visibility.Collapsed : Visibility.Visible;
         _editButton.Visibility = item.Profile is null ? Visibility.Collapsed : Visibility.Visible;
+        UpdateConnectionActions();
     }
 
     private async Task ShowStartupErrorAsync()
@@ -442,12 +650,16 @@ public sealed partial class MainWindow : Window, IDisposable
         _shutdown.Cancel();
         await _initializationTask;
         await _uiOperation.WhenIdleAsync();
+        await _sessionController.DisposeAsync();
         await _uiOperation.RunAsync(() => ViewModel.DisposeAsync().AsTask());
         await _uiOperation.RunAsync(() => _database.DisposeAsync().AsTask());
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
         ViewModel.AddDeviceRequested -= OnAddDeviceRequested;
         ViewModel.EditDeviceRequested -= OnEditDeviceRequested;
         _credentialPromptService.ClearHandler();
+        _credentialPromptService.ClearReferenceHandler();
+        _hostKeyPromptService.ClearHandler();
+        _sessionController.ProfileUpdated -= OnConnectionProfileUpdated;
         _allowClose = true;
         try
         {

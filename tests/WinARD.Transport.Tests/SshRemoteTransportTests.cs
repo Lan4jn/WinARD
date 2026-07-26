@@ -34,9 +34,12 @@ public sealed class SshRemoteTransportTests
         await fixture.Store.ConfirmUnknownAsync(originalPin, CancellationToken.None);
         fixture.KeyScan.Output = fixture.KeyScanLine([9, 9, 9]);
 
-        await Assert.ThrowsAsync<SshHostKeyChangedException>(
+        var exception = await Assert.ThrowsAsync<SshHostKeyChangedException>(
             () => fixture.Transport.ConnectAsync(fixture.Profile, CancellationToken.None));
 
+        Assert.NotNull(exception.Verification);
+        Assert.Equal(SshHostKeyStatus.Changed, exception.Verification!.Status);
+        Assert.NotEqual(originalPin.Fingerprint, exception.Verification.Fingerprint);
         Assert.Equal(originalPin, await fixture.Store.FindAsync(fixture.Endpoint, CancellationToken.None));
         Assert.Equal(0, fixture.Launcher.LaunchCount);
     }

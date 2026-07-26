@@ -189,6 +189,27 @@ public sealed class WindowsCredentialStoreTests
     }
 
     [Fact]
+    public async Task Versioned_compare_exchange_returns_exact_written_revision()
+    {
+        using var native = new FakeWindowsCredentialApi();
+        var store = new WindowsCredentialStore(native);
+        var reference = CredentialReference.Create("windows", "cas-written-version");
+        using var replacement = SecretBuffer.CopyFrom([7, 8, 9]);
+
+        using var write = await store.CompareExchangeWithVersionAsync(
+            reference,
+            expectedVersion: null,
+            replacement,
+            CancellationToken.None);
+
+        Assert.Equal(CredentialStoreCompareExchangeResult.Succeeded, write.Result);
+        Assert.NotNull(write.WrittenVersion);
+        using var snapshot = await store.ReadSnapshotAsync(reference, CancellationToken.None);
+        Assert.NotNull(snapshot);
+        Assert.True(write.WrittenVersion!.FixedTimeEquals(snapshot!.Version));
+    }
+
+    [Fact]
     public async Task Stale_snapshot_conflicts_across_store_instances_and_preserves_winner()
     {
         using var native = new FakeWindowsCredentialApi();

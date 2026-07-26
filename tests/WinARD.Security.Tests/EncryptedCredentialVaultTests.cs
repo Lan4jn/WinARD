@@ -196,6 +196,32 @@ public sealed class EncryptedCredentialVaultTests
     }
 
     [Fact]
+    public async Task Versioned_credential_compare_exchange_returns_exact_written_revision()
+    {
+        var storage = new InMemoryVaultStorage();
+        using var master = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.CreateAsync(
+            storage,
+            master,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            CancellationToken.None);
+        using var replacement = Utf8("replacement-38c4");
+
+        using var write = await vault.CompareExchangeWithVersionAsync(
+            Reference,
+            expectedVersion: null,
+            replacement,
+            CancellationToken.None);
+
+        Assert.Equal(CredentialStoreCompareExchangeResult.Succeeded, write.Result);
+        Assert.NotNull(write.WrittenVersion);
+        using var snapshot = await vault.ReadSnapshotAsync(Reference, CancellationToken.None);
+        Assert.NotNull(snapshot);
+        Assert.True(write.WrittenVersion!.FixedTimeEquals(snapshot!.Version));
+    }
+
+    [Fact]
     public async Task Stale_credential_snapshot_conflicts_and_preserves_winner()
     {
         var storage = new InMemoryVaultStorage();

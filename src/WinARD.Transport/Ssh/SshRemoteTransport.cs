@@ -269,7 +269,8 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             }
         }
 
-        throw new SshHostKeyChangedException(endpoint);
+        throw new SshHostKeyChangedException(
+            SshHostKeyVerifier.Verify(candidates[0], pin));
     }
 
     private static SshHostKeyPin? EndpointPin(

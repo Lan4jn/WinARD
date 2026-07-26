@@ -155,6 +155,48 @@ public sealed class ConnectionEditorViewModelTests
         Assert.Equal(1, calls);
     }
 
+    [Fact]
+    public void UnknownCredentialStoreBlocksSaveUntilUserChoosesMode()
+    {
+        var profile = ConnectionProfile.Create(
+                Guid.NewGuid(), "Legacy", "legacy.local", 5900, "operator")
+            .WithCredential(CredentialReference.Create("custom-store", "shared/key"));
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (saved, _, _, _) => Task.FromResult(saved),
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+
+        Assert.False(sut.SaveCommand.CanExecute(null));
+        Assert.True(sut.HasUnsupportedCredentialReference);
+
+        sut.CredentialSaveMode = CredentialSaveMode.AskEveryTime;
+
+        Assert.True(sut.SaveCommand.CanExecute(null));
+        Assert.False(sut.HasUnsupportedCredentialReference);
+    }
+
+    [Fact]
+    public void SwitchingFromPrivateKeyToPasswordDoesNotReusePassphraseReference()
+    {
+        var passphrase = CredentialReference.Create("vault", "ssh/passphrase");
+        var profile = ConnectionProfile.Create(
+                Guid.NewGuid(), "Key Mac", "key.local", 5900, "operator")
+            .WithSsh(SshProfile.Create(
+                    "jump.local", 22, "ssh-user", "C:\\Keys\\id_ed25519",
+                    "key.local", 5900, null, null, null)
+                .WithAuthenticationCredentials(null, passphrase));
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (saved, _, _, _) => Task.FromResult(saved),
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+
+        sut.PrivateKeyPath = string.Empty;
+
+        Assert.False(sut.SaveCommand.CanExecute(null));
+        sut.HasSshAuthenticationSecret = true;
+        Assert.Null(sut.BuildProfile().SshProfile!.PasswordCredentialReference);
+    }
+
     private static ConnectionEditorViewModel CreateViewModel() => new(
         null,
         (profile, _, _, _) => Task.FromResult(profile),

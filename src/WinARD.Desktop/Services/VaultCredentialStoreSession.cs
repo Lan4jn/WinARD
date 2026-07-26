@@ -130,6 +130,27 @@ public sealed class VaultCredentialStoreSession : ICredentialStore, IAsyncDispos
         }
     }
 
+    public async ValueTask<CredentialStoreWriteResult> CompareExchangeWithVersionAsync(
+        CredentialReference reference,
+        CredentialStoreVersion? expectedVersion,
+        ISecret? replacement,
+        CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await Vault.CompareExchangeWithVersionAsync(
+                reference,
+                expectedVersion,
+                replacement,
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public async ValueTask DeleteAsync(CredentialReference reference, CancellationToken cancellationToken)
     {
         try

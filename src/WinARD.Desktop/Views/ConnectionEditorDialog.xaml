@@ -36,10 +36,15 @@
             <Button x:Name="TestButton" Content="测试连接" Click="OnTestClicked" HorizontalAlignment="Left" AutomationProperties.AutomationId="TestConnectionButton" />
             <ProgressRing x:Name="BusyIndicator" IsActive="False" Width="24" Height="24" HorizontalAlignment="Left" />
             <TextBlock x:Name="StatusText" TextWrapping="Wrap" AutomationProperties.AutomationId="ConnectionEditorStatus" />
+            <TextBlock Text="阶段 / 用时 / 消息" FontWeight="SemiBold" />
             <ItemsControl x:Name="StageResults">
                 <ItemsControl.ItemTemplate>
                     <DataTemplate>
-                        <TextBlock Text="{Binding Message}" TextWrapping="Wrap" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="{Binding Stage}" />
+                            <TextBlock Text="{Binding Duration}" />
+                            <TextBlock Text="{Binding Message}" TextWrapping="Wrap" />
+                        </StackPanel>
                     </DataTemplate>
                 </ItemsControl.ItemTemplate>
             </ItemsControl>
