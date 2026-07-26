@@ -4,7 +4,9 @@ namespace WinARD.Infrastructure.Database.Migrations;
 
 public sealed class Migration001Initial : IDatabaseMigration
 {
-    public int Version => 1;
+    public int FromVersion => 0;
+
+    public int ToVersion => 1;
 
     public async Task ApplyAsync(
         SqliteConnection connection,
@@ -22,7 +24,7 @@ public sealed class Migration001Initial : IDatabaseMigration
                 host TEXT NOT NULL,
                 port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
                 mac_username TEXT NOT NULL,
-                transport_mode INTEGER NOT NULL,
+                transport_mode INTEGER NOT NULL CHECK(transport_mode IN (0, 1)),
                 credential_store TEXT NULL,
                 credential_key TEXT NULL,
                 created_utc TEXT NOT NULL,
@@ -59,10 +61,6 @@ public sealed class Migration001Initial : IDatabaseMigration
                 setting_value TEXT NOT NULL
             );
 
-            CREATE TABLE schema_version (
-                version INTEGER NOT NULL
-            );
-            INSERT INTO schema_version(version) VALUES (1);
             """;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

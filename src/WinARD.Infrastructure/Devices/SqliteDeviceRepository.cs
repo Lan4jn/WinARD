@@ -207,6 +207,19 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
 
     private static ConnectionProfile ReadProfile(SqliteDataReader reader)
     {
+        var transportModeValue = reader.GetInt32(5);
+        var transportMode = transportModeValue switch
+        {
+            (int)TransportMode.Direct => TransportMode.Direct,
+            (int)TransportMode.Ssh => TransportMode.Ssh,
+            _ => throw new InvalidDataException($"Unsupported persisted transport mode {transportModeValue}."),
+        };
+        var hasSshProfile = !reader.IsDBNull(8);
+        if ((transportMode == TransportMode.Ssh) != hasSshProfile)
+        {
+            throw new InvalidDataException("Persisted transport mode does not match the SSH profile row.");
+        }
+
         var profile = ConnectionProfile.Create(
             Guid.Parse(reader.GetString(0)),
             reader.GetString(1),
@@ -219,7 +232,7 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
             profile = profile.WithCredential(macCredential);
         }
 
-        if (!reader.IsDBNull(8))
+        if (hasSshProfile)
         {
             var ssh = SshProfile.Create(
                     reader.GetString(8),

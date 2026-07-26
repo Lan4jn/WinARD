@@ -135,6 +135,108 @@ public sealed class DnssdServiceWatcherTests
     }
 
     [Fact]
+    public async Task Txt_attributes_over_255_utf8_bytes_are_rejected()
+    {
+        var factory = new FakeDeviceWatcherFactory();
+        await using var watcher = new DnssdServiceWatcher(factory);
+        var changes = new List<BonjourServiceChange>();
+        watcher.Changed += (_, change) => changes.Add(change);
+        await watcher.StartAsync(CancellationToken.None);
+        var properties = CompleteProperties("Mac", "mac.local", 5900);
+        properties[DnssdServiceWatcher.TextAttributesProperty] = new[] { $"name={new string('\u754c', 128)}" };
+
+        factory.Watcher.PublishAdded("service", properties);
+
+        Assert.Empty(changes);
+    }
+
+    [Fact]
+    public async Task Events_queued_by_an_old_watcher_generation_do_not_touch_the_new_generation()
+    {
+        var factory = new FakeDeviceWatcherFactory();
+        await using var source = new DnssdServiceWatcher(factory);
+        await using var discovery = new BonjourDeviceDiscovery(source, TimeProvider.System);
+        await discovery.StartAsync(CancellationToken.None);
+        var oldWatcher = factory.Watcher;
+        var oldAdded = oldWatcher.CaptureAdded("old", CompleteProperties("Old", "old.local", 5900));
+        var oldUpdated = oldWatcher.CaptureUpdated("new", new Dictionary<string, object?>
+        {
+            [DnssdServiceWatcher.InstanceNameProperty] = "Corrupted",
+        });
+        var oldRemoved = oldWatcher.CaptureRemoved("new");
+        var oldEnumerationCompleted = oldWatcher.CaptureEnumerationCompleted();
+        var oldStopped = oldWatcher.CaptureStopped();
+
+        await discovery.StopAsync(CancellationToken.None);
+        await discovery.StartAsync(CancellationToken.None);
+        factory.Watcher.PublishAdded("new", CompleteProperties("New", "new.local", 5900));
+
+        oldAdded();
+        oldUpdated();
+        oldRemoved();
+        oldEnumerationCompleted();
+        oldStopped();
+
+        var current = Assert.Single(discovery.Current);
+        Assert.Equal("New", current.DisplayName);
+        Assert.Equal("new.local", current.Host);
+    }
+
+    [Fact]
+    public async Task Interface_changes_remove_the_old_identity_before_publishing_the_new_one()
+    {
+        var factory = new FakeDeviceWatcherFactory();
+        await using var watcher = new DnssdServiceWatcher(factory);
+        var changes = new List<BonjourServiceChange>();
+        watcher.Changed += (_, change) => changes.Add(change);
+        await watcher.StartAsync(CancellationToken.None);
+        var properties = CompleteProperties("Mac", "mac.local", 5900);
+        properties[DnssdServiceWatcher.NetworkAdapterIdProperty] = Guid.Parse("11111111-1111-1111-1111-111111111111");
+        factory.Watcher.PublishAdded("service", properties);
+        var firstInterface = Assert.Single(changes).InterfaceIndex;
+
+        factory.Watcher.PublishUpdated("service", new Dictionary<string, object?>
+        {
+            [DnssdServiceWatcher.NetworkAdapterIdProperty] = Guid.Parse("22222222-2222-2222-2222-222222222222"),
+        });
+        factory.Watcher.PublishUpdated("service", new Dictionary<string, object?>
+        {
+            [DnssdServiceWatcher.NetworkAdapterIdProperty] = Guid.Parse("33333333-3333-3333-3333-333333333333"),
+        });
+
+        Assert.Equal(BonjourServiceChangeKind.Removed, changes[1].Kind);
+        Assert.Equal(firstInterface, changes[1].InterfaceIndex);
+        Assert.Equal(BonjourServiceChangeKind.Updated, changes[2].Kind);
+        Assert.Equal(BonjourServiceChangeKind.Removed, changes[3].Kind);
+        Assert.Equal(changes[2].InterfaceIndex, changes[3].InterfaceIndex);
+        Assert.Equal(BonjourServiceChangeKind.Updated, changes[4].Kind);
+    }
+
+    [Fact]
+    public async Task Rapid_interface_changes_then_remove_leave_no_ghost_device()
+    {
+        var factory = new FakeDeviceWatcherFactory();
+        await using var source = new DnssdServiceWatcher(factory);
+        await using var discovery = new BonjourDeviceDiscovery(source, TimeProvider.System);
+        await discovery.StartAsync(CancellationToken.None);
+        var properties = CompleteProperties("Mac", "mac.local", 5900);
+        properties[DnssdServiceWatcher.NetworkAdapterIdProperty] = Guid.Parse("11111111-1111-1111-1111-111111111111");
+        factory.Watcher.PublishAdded("service", properties);
+        factory.Watcher.PublishUpdated("service", new Dictionary<string, object?>
+        {
+            [DnssdServiceWatcher.NetworkAdapterIdProperty] = Guid.Parse("22222222-2222-2222-2222-222222222222"),
+        });
+        factory.Watcher.PublishUpdated("service", new Dictionary<string, object?>
+        {
+            [DnssdServiceWatcher.NetworkAdapterIdProperty] = Guid.Parse("33333333-3333-3333-3333-333333333333"),
+        });
+
+        factory.Watcher.PublishRemoved("service");
+
+        Assert.Empty(discovery.Current);
+    }
+
+    [Fact]
     public void Production_source_has_no_hidden_compile_gate_or_missing_dnssd_instance_api()
     {
         var sourcePath = Path.GetFullPath(Path.Combine(
@@ -162,7 +264,9 @@ public sealed class DnssdServiceWatcherTests
 
     private sealed class FakeDeviceWatcherFactory : IWindowsDeviceWatcherFactory
     {
-        public FakeWindowsDeviceWatcher Watcher { get; } = new();
+        private readonly List<FakeWindowsDeviceWatcher> _watchers = [];
+
+        public FakeWindowsDeviceWatcher Watcher => _watchers[^1];
         public string Aqs { get; private set; } = string.Empty;
         public IReadOnlyList<string> Properties { get; private set; } = [];
         public WindowsDeviceInformationKind Kind { get; private set; }
@@ -175,7 +279,9 @@ public sealed class DnssdServiceWatcherTests
             Aqs = aqs;
             Properties = requestedProperties;
             Kind = kind;
-            return Watcher;
+            var watcher = new FakeWindowsDeviceWatcher();
+            _watchers.Add(watcher);
+            return watcher;
         }
     }
 
@@ -206,6 +312,36 @@ public sealed class DnssdServiceWatcherTests
         public void PublishStopped() => Stopped?.Invoke(this, EventArgs.Empty);
 
         public void PublishEnumerationCompleted() => EnumerationCompleted?.Invoke(this, EventArgs.Empty);
+
+        public Action CaptureAdded(string id, IReadOnlyDictionary<string, object?> properties)
+        {
+            var handler = Added;
+            return () => handler?.Invoke(this, new WindowsDeviceProperties(id, properties));
+        }
+
+        public Action CaptureUpdated(string id, IReadOnlyDictionary<string, object?> properties)
+        {
+            var handler = Updated;
+            return () => handler?.Invoke(this, new WindowsDeviceProperties(id, properties));
+        }
+
+        public Action CaptureRemoved(string id)
+        {
+            var handler = Removed;
+            return () => handler?.Invoke(this, id);
+        }
+
+        public Action CaptureEnumerationCompleted()
+        {
+            var handler = EnumerationCompleted;
+            return () => handler?.Invoke(this, EventArgs.Empty);
+        }
+
+        public Action CaptureStopped()
+        {
+            var handler = Stopped;
+            return () => handler?.Invoke(this, EventArgs.Empty);
+        }
 
         public void Dispose()
         {

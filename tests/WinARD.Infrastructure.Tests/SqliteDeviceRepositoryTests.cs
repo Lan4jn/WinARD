@@ -38,10 +38,12 @@ public sealed class SqliteDeviceRepositoryTests
         var loaded = await repository.GetAsync(profile.Id, CancellationToken.None);
 
         Assert.Equal(profile, loaded);
-        var raw = fixture.ReadRawBytes();
-        Assert.False(ContainsSequence(raw, Encoding.UTF8.GetBytes("correct horse battery staple")));
-        Assert.False(ContainsSequence(raw, Encoding.UTF8.GetBytes("AskPass-token-fixture")));
-        Assert.False(ContainsSequence(raw, Encoding.UTF8.GetBytes("private-key-passphrase-secret")));
+        foreach (var raw in fixture.ReadRawDatabaseFiles())
+        {
+            Assert.False(ContainsSequence(raw, Encoding.UTF8.GetBytes("correct horse battery staple")));
+            Assert.False(ContainsSequence(raw, Encoding.UTF8.GetBytes("AskPass-token-fixture")));
+            Assert.False(ContainsSequence(raw, Encoding.UTF8.GetBytes("private-key-passphrase-secret")));
+        }
     }
 
     [Fact]
@@ -77,6 +79,31 @@ public sealed class SqliteDeviceRepositoryTests
             CancellationToken.None));
     }
 
+    [Fact]
+    public async Task Invalid_persisted_transport_mode_is_rejected_on_read()
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database, new FixedTimeProvider());
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex");
+        await repository.SaveAsync(profile, CancellationToken.None);
+        await fixture.ExecuteAsync($"PRAGMA ignore_check_constraints=ON; UPDATE devices SET transport_mode=99 WHERE id='{profile.Id:D}';");
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => repository.GetAsync(profile.Id, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Persisted_transport_mode_must_match_the_ssh_row()
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database, new FixedTimeProvider());
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex")
+            .WithSsh(SshProfile.Create("jump.local", 22, "jump", null, "mac.local", 5900, null, null, null));
+        await repository.SaveAsync(profile, CancellationToken.None);
+        await fixture.ExecuteAsync($"UPDATE devices SET transport_mode=0 WHERE id='{profile.Id:D}';");
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => repository.GetAsync(profile.Id, CancellationToken.None));
+    }
+
     private sealed class FixedTimeProvider : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => new(2026, 7, 26, 1, 2, 3, TimeSpan.Zero);
@@ -107,12 +134,24 @@ public sealed class SqliteDeviceRepositoryTests
             return new DatabaseFixture(directory, path, database);
         }
 
-        public byte[] ReadRawBytes()
+        public IEnumerable<byte[]> ReadRawDatabaseFiles()
         {
-            using var stream = new FileStream(Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var memory = new MemoryStream();
-            stream.CopyTo(memory);
-            return memory.ToArray();
+            foreach (var path in new[] { Path, Path + "-wal", Path + "-shm" })
+            {
+                if (File.Exists(path))
+                {
+                    yield return File.ReadAllBytes(path);
+                }
+            }
+        }
+
+        public async Task ExecuteAsync(string sql)
+        {
+            await using var connection = Database.CreateConnection();
+            await connection.OpenAsync();
+            var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await command.ExecuteNonQueryAsync();
         }
 
         public async ValueTask DisposeAsync()

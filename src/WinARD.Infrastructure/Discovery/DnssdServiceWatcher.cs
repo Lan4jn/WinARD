@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Collections;
 using System.Globalization;
+using System.Text;
 
 namespace WinARD.Infrastructure.Discovery;
 
@@ -37,7 +38,8 @@ public sealed class DnssdServiceWatcher : IBonjourServiceWatcher
     private readonly object _gate = new();
     private readonly IWindowsDeviceWatcherFactory _factory;
     private readonly Dictionary<string, CachedService> _services = new(StringComparer.Ordinal);
-    private IWindowsDeviceWatcher? _watcher;
+    private WatcherRegistration? _registration;
+    private long _generation;
     private bool _disposed;
 
     public DnssdServiceWatcher()
@@ -55,41 +57,43 @@ public sealed class DnssdServiceWatcher : IBonjourServiceWatcher
     public Task StartAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        IWindowsDeviceWatcher watcher;
+        WatcherRegistration registration;
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_watcher is not null)
+            if (_registration is not null)
             {
                 return Task.CompletedTask;
             }
 
-            watcher = _factory.Create(
+            var watcher = _factory.Create(
                 Aqs,
                 RequestedPropertyNames,
                 WindowsDeviceInformationKind.AssociationEndpointService);
-            Attach(watcher);
-            _watcher = watcher;
+            registration = CreateRegistration(watcher, ++_generation);
+            Attach(registration);
+            _registration = registration;
         }
 
         try
         {
-            watcher.Start();
+            registration.Watcher.Start();
             return Task.CompletedTask;
         }
         catch
         {
             lock (_gate)
             {
-                if (ReferenceEquals(_watcher, watcher))
+                if (IsCurrent(registration))
                 {
-                    _watcher = null;
+                    _registration = null;
+                    _generation++;
                 }
 
-                Detach(watcher);
+                Detach(registration);
             }
 
-            watcher.Dispose();
+            registration.Watcher.Dispose();
             throw;
         }
     }
@@ -97,22 +101,23 @@ public sealed class DnssdServiceWatcher : IBonjourServiceWatcher
     public Task StopAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        IWindowsDeviceWatcher? watcher;
+        WatcherRegistration? registration;
         lock (_gate)
         {
-            watcher = _watcher;
-            _watcher = null;
+            registration = _registration;
+            _registration = null;
+            _generation++;
             _services.Clear();
-            if (watcher is not null)
+            if (registration is not null)
             {
-                Detach(watcher);
+                Detach(registration);
             }
         }
 
-        if (watcher is not null)
+        if (registration is not null)
         {
-            watcher.StopWatching();
-            watcher.Dispose();
+            registration.Watcher.StopWatching();
+            registration.Watcher.Dispose();
         }
 
         return Task.CompletedTask;
@@ -134,16 +139,11 @@ public sealed class DnssdServiceWatcher : IBonjourServiceWatcher
         Changed = null;
     }
 
-    private void OnAdded(object? sender, WindowsDeviceProperties update) => Apply(update);
-
-    private void OnUpdated(object? sender, WindowsDeviceProperties update) => Apply(update);
-
-    private void Apply(WindowsDeviceProperties update)
+    private void Apply(WatcherRegistration registration, WindowsDeviceProperties update)
     {
-        BonjourServiceChange? notification = null;
         lock (_gate)
         {
-            if (_disposed || _watcher is null || string.IsNullOrWhiteSpace(update.Id) || update.Id.Length > 1024)
+            if (!IsCurrent(registration) || string.IsNullOrWhiteSpace(update.Id) || update.Id.Length > 1024)
             {
                 return;
             }
@@ -170,70 +170,84 @@ public sealed class DnssdServiceWatcher : IBonjourServiceWatcher
             _services[update.Id] = cached with { Service = service };
             if (service is not null)
             {
-                notification = previousService is null
-                    ? BonjourServiceChange.Added(service)
-                    : BonjourServiceChange.Updated(service);
+                if (previousService is not null && previousService.InterfaceIndex != service.InterfaceIndex)
+                {
+                    Changed?.Invoke(
+                        this,
+                        BonjourServiceChange.Removed(update.Id, previousService.InterfaceIndex));
+                }
+
+                Changed?.Invoke(
+                    this,
+                    previousService is null
+                        ? BonjourServiceChange.Added(service)
+                        : BonjourServiceChange.Updated(service));
             }
             else if (previousService is not null)
             {
-                notification = BonjourServiceChange.Removed(update.Id, previousService.InterfaceIndex);
+                Changed?.Invoke(
+                    this,
+                    BonjourServiceChange.Removed(update.Id, previousService.InterfaceIndex));
             }
-        }
-
-        if (notification is not null)
-        {
-            Changed?.Invoke(this, notification);
         }
     }
 
-    private void OnRemoved(object? sender, string id)
+    private void OnRemoved(WatcherRegistration registration, string id)
     {
-        BonjourServiceChange? notification = null;
         lock (_gate)
         {
+            if (!IsCurrent(registration))
+            {
+                return;
+            }
+
             if (_services.Remove(id, out var cached) && cached.Service is not null)
             {
-                notification = BonjourServiceChange.Removed(id, cached.Service.InterfaceIndex);
+                Changed?.Invoke(
+                    this,
+                    BonjourServiceChange.Removed(id, cached.Service.InterfaceIndex));
             }
         }
-
-        if (notification is not null)
-        {
-            Changed?.Invoke(this, notification);
-        }
     }
 
-    private void OnEnumerationCompleted(object? sender, EventArgs args)
+    private void OnEnumerationCompleted(WatcherRegistration registration)
     {
-        // Enumeration remains live; subsequent updates and removals continue through DeviceWatcher.
-    }
-
-    private void OnStopped(object? sender, EventArgs args)
-    {
-        BonjourServiceChange[] notifications;
-        IWindowsDeviceWatcher? stoppedWatcher = null;
         lock (_gate)
         {
-            if (sender is IWindowsDeviceWatcher watcher && ReferenceEquals(_watcher, watcher))
+            if (!IsCurrent(registration))
             {
-                stoppedWatcher = watcher;
-                _watcher = null;
-                Detach(watcher);
+                return;
             }
 
-            notifications = _services
+            // Enumeration remains live; subsequent updates and removals continue through DeviceWatcher.
+        }
+    }
+
+    private void OnStopped(WatcherRegistration registration)
+    {
+        lock (_gate)
+        {
+            if (!IsCurrent(registration))
+            {
+                return;
+            }
+
+            _registration = null;
+            _generation++;
+            Detach(registration);
+            var notifications = _services
                 .Where(static pair => pair.Value.Service is not null)
                 .Select(static pair => BonjourServiceChange.Removed(pair.Key, pair.Value.Service!.InterfaceIndex))
                 .ToArray();
             _services.Clear();
+
+            foreach (var notification in notifications)
+            {
+                Changed?.Invoke(this, notification);
+            }
         }
 
-        foreach (var notification in notifications)
-        {
-            Changed?.Invoke(this, notification);
-        }
-
-        stoppedWatcher?.Dispose();
+        registration.Watcher.Dispose();
     }
 
     private static BonjourService? TryParse(string id, IReadOnlyDictionary<string, object?> properties)
@@ -319,17 +333,18 @@ public sealed class DnssdServiceWatcher : IBonjourServiceWatcher
         var total = 0;
         foreach (var attribute in Strings(value))
         {
-            if (attribute.Length > 255)
+            var attributeBytes = Encoding.UTF8.GetByteCount(attribute);
+            if (attributeBytes > 255)
             {
                 records = result;
                 return false;
             }
 
-            total += attribute.Length;
+            total += attributeBytes;
             var separator = attribute.IndexOf('=');
             var key = separator < 0 ? attribute : attribute[..separator];
             var text = separator < 0 ? string.Empty : attribute[(separator + 1)..];
-            if (string.IsNullOrEmpty(key) || key.Length > 255 || text.Length > 255 || total > 1300 || result.Count >= 64)
+            if (string.IsNullOrEmpty(key) || total > 1300 || result.Count >= 64)
             {
                 records = result;
                 return false;
@@ -403,25 +418,58 @@ public sealed class DnssdServiceWatcher : IBonjourServiceWatcher
         return value.Length > 0;
     }
 
-    private void Attach(IWindowsDeviceWatcher watcher)
+    private WatcherRegistration CreateRegistration(IWindowsDeviceWatcher watcher, long generation)
     {
-        watcher.Added += OnAdded;
-        watcher.Updated += OnUpdated;
-        watcher.Removed += OnRemoved;
-        watcher.EnumerationCompleted += OnEnumerationCompleted;
-        watcher.Stopped += OnStopped;
+        WatcherRegistration? registration = null;
+        EventHandler<WindowsDeviceProperties> added = (_, update) => Apply(registration!, update);
+        EventHandler<WindowsDeviceProperties> updated = (_, update) => Apply(registration!, update);
+        EventHandler<string> removed = (_, id) => OnRemoved(registration!, id);
+        EventHandler enumerationCompleted = (_, _) => OnEnumerationCompleted(registration!);
+        EventHandler stopped = (_, _) => OnStopped(registration!);
+        registration = new WatcherRegistration(
+            watcher,
+            generation,
+            added,
+            updated,
+            removed,
+            enumerationCompleted,
+            stopped);
+        return registration;
     }
 
-    private void Detach(IWindowsDeviceWatcher watcher)
+    private static void Attach(WatcherRegistration registration)
     {
-        watcher.Added -= OnAdded;
-        watcher.Updated -= OnUpdated;
-        watcher.Removed -= OnRemoved;
-        watcher.EnumerationCompleted -= OnEnumerationCompleted;
-        watcher.Stopped -= OnStopped;
+        registration.Watcher.Added += registration.Added;
+        registration.Watcher.Updated += registration.Updated;
+        registration.Watcher.Removed += registration.Removed;
+        registration.Watcher.EnumerationCompleted += registration.EnumerationCompleted;
+        registration.Watcher.Stopped += registration.Stopped;
     }
+
+    private static void Detach(WatcherRegistration registration)
+    {
+        registration.Watcher.Added -= registration.Added;
+        registration.Watcher.Updated -= registration.Updated;
+        registration.Watcher.Removed -= registration.Removed;
+        registration.Watcher.EnumerationCompleted -= registration.EnumerationCompleted;
+        registration.Watcher.Stopped -= registration.Stopped;
+    }
+
+    private bool IsCurrent(WatcherRegistration registration) =>
+        !_disposed &&
+        ReferenceEquals(_registration, registration) &&
+        _generation == registration.Generation;
 
     private sealed record CachedService(
         Dictionary<string, object?> Properties,
         BonjourService? Service);
+
+    private sealed record WatcherRegistration(
+        IWindowsDeviceWatcher Watcher,
+        long Generation,
+        EventHandler<WindowsDeviceProperties> Added,
+        EventHandler<WindowsDeviceProperties> Updated,
+        EventHandler<string> Removed,
+        EventHandler EnumerationCompleted,
+        EventHandler Stopped);
 }

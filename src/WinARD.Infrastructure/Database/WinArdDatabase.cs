@@ -39,7 +39,8 @@ public sealed class WinArdDatabase : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ArgumentNullException.ThrowIfNull(migrations);
-        ValidateMigrations(migrations);
+        var migrationChain = migrations.ToArray();
+        ValidateMigrations(migrationChain);
         Directory.CreateDirectory(Path.GetDirectoryName(_databasePath)!);
 
         await using var connection = CreateConnection();
@@ -48,20 +49,20 @@ public sealed class WinArdDatabase : IAsyncDisposable
         await using var transaction = connection.BeginTransaction(IsolationLevel.Serializable, deferred: false);
         try
         {
+            await EnsureVersionTableAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
             var currentVersion = await ReadVersionAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-            var supportedVersion = migrations.Count == 0 ? 0 : migrations.Max(static migration => migration.Version);
+            var supportedVersion = migrationChain.Length == 0 ? 0 : migrationChain[^1].ToVersion;
             if (currentVersion > supportedVersion)
             {
                 throw new UnsupportedSchemaVersionException(currentVersion, supportedVersion);
             }
 
-            foreach (var migration in migrations.OrderBy(static migration => migration.Version))
+            var pending = GetPendingMigrations(migrationChain, currentVersion, supportedVersion);
+            foreach (var migration in pending)
             {
-                if (migration.Version > currentVersion)
-                {
-                    await migration.ApplyAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-                    currentVersion = migration.Version;
-                }
+                await migration.ApplyAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+                await AdvanceVersionAsync(connection, transaction, migration.ToVersion, cancellationToken).ConfigureAwait(false);
+                currentVersion = migration.ToVersion;
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -94,12 +95,95 @@ public sealed class WinArdDatabase : IAsyncDisposable
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static void ValidateMigrations(IReadOnlyCollection<IDatabaseMigration> migrations)
+    private static void ValidateMigrations(IDatabaseMigration[] migrations)
     {
-        if (migrations.Any(static migration => migration.Version <= 0) ||
-            migrations.Select(static migration => migration.Version).Distinct().Count() != migrations.Count)
+        for (var index = 0; index < migrations.Length; index++)
         {
-            throw new ArgumentException("Migration versions must be positive and unique.", nameof(migrations));
+            var migration = migrations[index] ?? throw new ArgumentException("Migrations cannot contain null entries.", nameof(migrations));
+            if (migration.FromVersion < 0 || migration.ToVersion <= migration.FromVersion)
+            {
+                throw new ArgumentException("Migration transitions must advance from a non-negative version.", nameof(migrations));
+            }
+
+            if (index > 0 && migration.FromVersion != migrations[index - 1].ToVersion)
+            {
+                throw new ArgumentException("Migrations must be supplied as one continuous, ordered chain.", nameof(migrations));
+            }
+        }
+    }
+
+    private static IDatabaseMigration[] GetPendingMigrations(
+        IDatabaseMigration[] migrations,
+        int currentVersion,
+        int supportedVersion)
+    {
+        if (currentVersion == supportedVersion)
+        {
+            return [];
+        }
+
+        var startIndex = -1;
+        for (var index = 0; index < migrations.Length; index++)
+        {
+            if (migrations[index].FromVersion == currentVersion)
+            {
+                startIndex = index;
+                break;
+            }
+        }
+
+        if (startIndex < 0)
+        {
+            throw new InvalidOperationException($"No migration starts at schema version {currentVersion}.");
+        }
+
+        return migrations.Skip(startIndex).ToArray();
+    }
+
+    private static async Task EnsureVersionTableAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var existsCommand = connection.CreateCommand();
+        existsCommand.Transaction = transaction;
+        existsCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version';";
+        var exists = Convert.ToInt64(
+            await existsCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
+            System.Globalization.CultureInfo.InvariantCulture) == 1;
+        if (exists)
+        {
+            return;
+        }
+
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            CREATE TABLE schema_version(version INTEGER NOT NULL);
+            INSERT INTO schema_version(version) VALUES (0);
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task AdvanceVersionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int version,
+        CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "UPDATE schema_version SET version = $to;";
+        command.Parameters.AddWithValue("$to", version);
+        if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+        {
+            throw new InvalidOperationException("schema_version must contain exactly one version row.");
+        }
+
+        var actualVersion = await ReadVersionAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        if (actualVersion != version)
+        {
+            throw new InvalidOperationException($"Expected schema version {version}, but found {actualVersion}.");
         }
     }
 
@@ -108,17 +192,6 @@ public sealed class WinArdDatabase : IAsyncDisposable
         SqliteTransaction transaction,
         CancellationToken cancellationToken)
     {
-        var tableCommand = connection.CreateCommand();
-        tableCommand.Transaction = transaction;
-        tableCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version';";
-        var exists = Convert.ToInt64(
-            await tableCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
-            System.Globalization.CultureInfo.InvariantCulture) == 1;
-        if (!exists)
-        {
-            return 0;
-        }
-
         var versionCommand = connection.CreateCommand();
         versionCommand.Transaction = transaction;
         versionCommand.CommandText = "SELECT COUNT(*), MIN(version), MAX(version) FROM schema_version;";
@@ -130,6 +203,12 @@ public sealed class WinArdDatabase : IAsyncDisposable
             throw new InvalidOperationException("schema_version must contain exactly one version row.");
         }
 
-        return reader.GetInt32(1);
+        var version = reader.GetInt32(1);
+        if (version < 0)
+        {
+            throw new InvalidOperationException("schema_version cannot be negative.");
+        }
+
+        return version;
     }
 }

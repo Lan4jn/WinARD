@@ -4,7 +4,9 @@ namespace WinARD.Infrastructure.Database;
 
 public interface IDatabaseMigration
 {
-    int Version { get; }
+    int FromVersion { get; }
+
+    int ToVersion { get; }
 
     Task ApplyAsync(
         SqliteConnection connection,

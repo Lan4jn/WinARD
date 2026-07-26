@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Text;
 using WinARD.Application.Ports;
 using WinARD.Infrastructure.Devices;
 
@@ -8,13 +9,17 @@ public sealed class BonjourDeviceDiscovery : IDeviceDiscovery
 {
     private static readonly TimeSpan SweepInterval = TimeSpan.FromSeconds(30);
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly IBonjourServiceWatcher _watcher;
     private readonly TimeProvider _timeProvider;
     private readonly Dictionary<ServiceKey, ServiceEntry> _services = [];
     private readonly Dictionary<EndpointKey, DiscoveredDevice> _devices = [];
     private ITimer? _timer;
-    private bool _started;
-    private bool _disposed;
+    private EventHandler<BonjourServiceChange>? _watcherHandler;
+    private LifecycleState _state;
+    private long _generation;
+    private bool _disposeRequested;
+    private Task? _disposeTask;
 
     public BonjourDeviceDiscovery(IBonjourServiceWatcher watcher, TimeProvider? timeProvider = null)
     {
@@ -37,88 +42,177 @@ public sealed class BonjourDeviceDiscovery : IDeviceDiscovery
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        lock (_gate)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_started)
-            {
-                return;
-            }
-
-            _started = true;
-            _watcher.Changed += OnWatcherChanged;
-            _timer = _timeProvider.CreateTimer(OnSweep, null, SweepInterval, SweepInterval);
-        }
-
+        await _lifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await _watcher.StartAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
+            long generation;
+            EventHandler<BonjourServiceChange> handler;
             lock (_gate)
             {
-                _started = false;
-                _watcher.Changed -= OnWatcherChanged;
-                _timer?.Dispose();
-                _timer = null;
+                ObjectDisposedException.ThrowIf(_disposeRequested || _state == LifecycleState.Disposed, this);
+                if (_state == LifecycleState.Started)
+                {
+                    return;
+                }
+
+                _state = LifecycleState.Starting;
+                generation = ++_generation;
+                handler = (_, change) => OnWatcherChanged(generation, change);
+                _watcherHandler = handler;
+                _watcher.Changed += handler;
+                _timer = _timeProvider.CreateTimer(OnSweep, generation, SweepInterval, SweepInterval);
             }
 
-            throw;
+            try
+            {
+                await _watcher.StartAsync(cancellationToken).ConfigureAwait(false);
+                lock (_gate)
+                {
+                    if (_generation == generation && _state == LifecycleState.Starting)
+                    {
+                        _state = LifecycleState.Started;
+                    }
+                }
+            }
+            catch
+            {
+                lock (_gate)
+                {
+                    InvalidateGeneration(handler);
+                    _state = LifecycleState.Idle;
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
         }
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
-        lock (_gate)
+        await _lifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            if (!_started)
+            lock (_gate)
             {
-                return;
+                if (_state != LifecycleState.Started)
+                {
+                    return;
+                }
+
+                _state = LifecycleState.Stopping;
+                InvalidateGeneration(_watcherHandler);
+                _services.Clear();
+                _devices.Clear();
             }
 
-            _started = false;
-            _watcher.Changed -= OnWatcherChanged;
-            _timer?.Dispose();
-            _timer = null;
-            _services.Clear();
-            _devices.Clear();
+            try
+            {
+                await _watcher.StopAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (_gate)
+                {
+                    _state = LifecycleState.Idle;
+                }
+            }
         }
-
-        await _watcher.StopAsync(cancellationToken).ConfigureAwait(false);
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
+    {
+        TaskCompletionSource? completion = null;
+        Task disposeTask;
+        lock (_gate)
+        {
+            _disposeRequested = true;
+            if (_disposeTask is null)
+            {
+                completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _disposeTask = completion.Task;
+            }
+
+            disposeTask = _disposeTask;
+        }
+
+        if (completion is not null)
+        {
+            _ = CompleteDisposeAsync(completion);
+        }
+
+        return new ValueTask(disposeTask);
+    }
+
+    private async Task CompleteDisposeAsync(TaskCompletionSource completion)
+    {
+        try
+        {
+            await DisposeCoreAsync().ConfigureAwait(false);
+            completion.SetResult();
+        }
+        catch (Exception exception)
+        {
+            completion.SetException(exception);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var stop = false;
+            lock (_gate)
+            {
+                stop = _state == LifecycleState.Started;
+                _state = LifecycleState.Stopping;
+                InvalidateGeneration(_watcherHandler);
+                _services.Clear();
+                _devices.Clear();
+            }
+
+            try
+            {
+                if (stop)
+                {
+                    await _watcher.StopAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                await _watcher.DisposeAsync().ConfigureAwait(false);
+                lock (_gate)
+                {
+                    _state = LifecycleState.Disposed;
+                    Changed = null;
+                }
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
+    private void OnWatcherChanged(long generation, BonjourServiceChange change)
     {
         lock (_gate)
         {
-            if (_disposed)
+            if (_state != LifecycleState.Started || generation != _generation)
             {
                 return;
             }
 
-            _disposed = true;
+            Publish(ApplyChange(change));
         }
-
-        await StopAsync(CancellationToken.None).ConfigureAwait(false);
-        await _watcher.DisposeAsync().ConfigureAwait(false);
-        Changed = null;
-    }
-
-    private void OnWatcherChanged(object? sender, BonjourServiceChange change)
-    {
-        List<DiscoveryChange> notifications;
-        lock (_gate)
-        {
-            if (!_started || _disposed)
-            {
-                return;
-            }
-
-            notifications = ApplyChange(change);
-        }
-
-        Publish(notifications);
     }
 
     private List<DiscoveryChange> ApplyChange(BonjourServiceChange change)
@@ -222,12 +316,18 @@ public sealed class BonjourDeviceDiscovery : IDeviceDiscovery
         var total = 0;
         foreach (var pair in records)
         {
-            if (string.IsNullOrEmpty(pair.Key) || pair.Key.Length > 255 || pair.Value.Length > 255)
+            if (string.IsNullOrEmpty(pair.Key))
             {
                 return false;
             }
 
-            total += pair.Key.Length + pair.Value.Length;
+            var entryBytes = Encoding.UTF8.GetByteCount(pair.Key) + 1 + Encoding.UTF8.GetByteCount(pair.Value);
+            if (entryBytes > 255)
+            {
+                return false;
+            }
+
+            total += entryBytes;
             if (total > 1300)
             {
                 return false;
@@ -239,10 +339,10 @@ public sealed class BonjourDeviceDiscovery : IDeviceDiscovery
 
     private void OnSweep(object? state)
     {
-        List<DiscoveryChange> notifications;
+        var generation = (long)state!;
         lock (_gate)
         {
-            if (!_started || _disposed)
+            if (_state != LifecycleState.Started || generation != _generation)
             {
                 return;
             }
@@ -256,10 +356,21 @@ public sealed class BonjourDeviceDiscovery : IDeviceDiscovery
                 _services.Remove(key);
             }
 
-            notifications = Rebuild(affected);
+            Publish(Rebuild(affected));
+        }
+    }
+
+    private void InvalidateGeneration(EventHandler<BonjourServiceChange>? handler)
+    {
+        _generation++;
+        if (handler is not null)
+        {
+            _watcher.Changed -= handler;
         }
 
-        Publish(notifications);
+        _watcherHandler = null;
+        _timer?.Dispose();
+        _timer = null;
     }
 
     private void Publish(IEnumerable<DiscoveryChange> notifications)
@@ -282,4 +393,13 @@ public sealed class BonjourDeviceDiscovery : IDeviceDiscovery
         string DisplayName,
         IReadOnlyDictionary<string, string> TxtRecords,
         DateTimeOffset ExpiresUtc);
+
+    private enum LifecycleState
+    {
+        Idle,
+        Starting,
+        Started,
+        Stopping,
+        Disposed,
+    }
 }
