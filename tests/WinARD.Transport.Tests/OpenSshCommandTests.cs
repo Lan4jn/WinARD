@@ -1,4 +1,5 @@
 using WinARD.Domain.Connections;
+using WinARD.Domain.Security;
 using WinARD.Transport.Ssh;
 using Xunit;
 
@@ -63,6 +64,32 @@ public sealed class OpenSshCommandTests
         Assert.DoesNotContain("-i", start.Arguments);
         Assert.Contains("IdentitiesOnly=no", start.Arguments);
         Assert.Contains("PreferredAuthentications=publickey", start.Arguments);
+    }
+
+    [Fact]
+    public void Password_credential_forces_askpass_without_putting_secret_in_arguments()
+    {
+        var profile = SshProfile.Create(
+            "jump.example",
+            22,
+            "ssh-user",
+            privateKeyPath: null,
+            targetHost: "127.0.0.1",
+            targetPort: 5900,
+            CredentialReference.Create("windows", "password-reference"),
+            pinnedHostKeyAlgorithm: null,
+            pinnedHostKeySha256: null);
+
+        var start = OpenSshCommandBuilder.BuildTunnel(
+            Path.GetFullPath(@"C:\Windows\System32\OpenSSH\ssh.exe"),
+            profile,
+            @"C:\Temp\known_hosts");
+
+        Assert.Contains("BatchMode=no", start.Arguments);
+        Assert.Contains(
+            "PreferredAuthentications=password,keyboard-interactive",
+            start.Arguments);
+        Assert.DoesNotContain("password-reference", start.Arguments);
     }
 
     [Theory]

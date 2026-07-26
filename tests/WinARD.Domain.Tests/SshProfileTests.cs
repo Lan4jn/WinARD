@@ -1,4 +1,5 @@
 using WinARD.Domain.Connections;
+using WinARD.Domain.Security;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -53,5 +54,18 @@ public sealed class SshProfileTests
 
         Assert.Equal("ssh-ed25519", ssh.PinnedHostKeyAlgorithm);
         Assert.Equal("SHA256:value", ssh.PinnedHostKeySha256);
+    }
+
+    [Fact]
+    public void Authentication_credentials_can_distinguish_password_and_key_passphrase()
+    {
+        var password = CredentialReference.Create("windows", "ssh-password");
+        var passphrase = CredentialReference.Create("vault", "key-passphrase");
+        var ssh = SshProfile
+            .Create("bastion", 22, "jump", "key.pem", "mac", 5900, null, null, null)
+            .WithAuthenticationCredentials(password, passphrase);
+
+        Assert.Equal(password, ssh.PasswordCredentialReference);
+        Assert.Equal(passphrase, ssh.PrivateKeyPassphraseCredentialReference);
     }
 }

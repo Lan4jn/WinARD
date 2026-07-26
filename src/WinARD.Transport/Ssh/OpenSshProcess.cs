@@ -105,6 +105,21 @@ public sealed class SystemOpenSshProcessLauncher : IOpenSshProcessLauncher
         {
             startInfo.ArgumentList.Add(argument);
         }
+        if (start.Environment is not null)
+        {
+            foreach (var pair in start.Environment)
+            {
+                if (pair.Key.Contains('=', StringComparison.Ordinal) ||
+                    pair.Key.Any(char.IsControl) ||
+                    pair.Value.Contains('\0', StringComparison.Ordinal))
+                {
+                    throw new OpenSshExecutableConfigurationException(
+                        "An OpenSSH environment entry is invalid.");
+                }
+
+                startInfo.Environment[pair.Key] = pair.Value;
+            }
+        }
 
         var process = new Process
         {

@@ -12,6 +12,8 @@ public sealed record SshProfile
         string targetHost,
         int targetPort,
         CredentialReference? credentialReference,
+        CredentialReference? passwordCredentialReference,
+        CredentialReference? privateKeyPassphraseCredentialReference,
         string? pinnedHostKeyAlgorithm,
         string? pinnedHostKeySha256,
         SshHostKeyPin? hostKeyPin)
@@ -23,6 +25,8 @@ public sealed record SshProfile
         TargetHost = targetHost;
         TargetPort = targetPort;
         CredentialReference = credentialReference;
+        PasswordCredentialReference = passwordCredentialReference;
+        PrivateKeyPassphraseCredentialReference = privateKeyPassphraseCredentialReference;
         PinnedHostKeyAlgorithm = pinnedHostKeyAlgorithm;
         PinnedHostKeySha256 = pinnedHostKeySha256;
         HostKeyPin = hostKeyPin;
@@ -42,6 +46,10 @@ public sealed record SshProfile
 
     public CredentialReference? CredentialReference { get; }
 
+    public CredentialReference? PasswordCredentialReference { get; }
+
+    public CredentialReference? PrivateKeyPassphraseCredentialReference { get; }
+
     public string? PinnedHostKeyAlgorithm { get; }
 
     public string? PinnedHostKeySha256 { get; }
@@ -59,6 +67,7 @@ public sealed record SshProfile
         string? pinnedHostKeyAlgorithm,
         string? pinnedHostKeySha256)
     {
+        var normalizedPrivateKeyPath = OptionalTrimmed(privateKeyPath);
         var normalizedPinnedHostKeyAlgorithm = OptionalTrimmed(pinnedHostKeyAlgorithm);
         var normalizedPinnedHostKeySha256 = OptionalTrimmed(pinnedHostKeySha256);
         if ((normalizedPinnedHostKeyAlgorithm is null) != (normalizedPinnedHostKeySha256 is null))
@@ -72,10 +81,12 @@ public sealed record SshProfile
             RequiredTrimmed(host, nameof(host)),
             ValidPort(port, nameof(port)),
             RequiredTrimmed(username, nameof(username)),
-            OptionalTrimmed(privateKeyPath),
+            normalizedPrivateKeyPath,
             RequiredTrimmed(targetHost, nameof(targetHost)),
             ValidPort(targetPort, nameof(targetPort)),
             credentialReference,
+            normalizedPrivateKeyPath is null ? credentialReference : null,
+            normalizedPrivateKeyPath is null ? null : credentialReference,
             normalizedPinnedHostKeyAlgorithm,
             normalizedPinnedHostKeySha256,
             hostKeyPin: null);
@@ -92,6 +103,8 @@ public sealed record SshProfile
             TargetHost,
             TargetPort,
             CredentialReference,
+            PasswordCredentialReference,
+            PrivateKeyPassphraseCredentialReference,
             pin.Algorithm,
             pin.Fingerprint,
             pin);
@@ -106,6 +119,25 @@ public sealed record SshProfile
             TargetHost,
             TargetPort,
             CredentialReference,
+            PasswordCredentialReference,
+            PrivateKeyPassphraseCredentialReference,
+            PinnedHostKeyAlgorithm,
+            PinnedHostKeySha256,
+            HostKeyPin);
+
+    public SshProfile WithAuthenticationCredentials(
+        CredentialReference? password,
+        CredentialReference? privateKeyPassphrase) =>
+        new(
+            Host,
+            Port,
+            Username,
+            PrivateKeyPath,
+            TargetHost,
+            TargetPort,
+            password ?? privateKeyPassphrase,
+            password,
+            privateKeyPassphrase,
             PinnedHostKeyAlgorithm,
             PinnedHostKeySha256,
             HostKeyPin);

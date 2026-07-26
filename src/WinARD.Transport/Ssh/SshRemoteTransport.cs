@@ -37,6 +37,24 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
     }
 
     public SshRemoteTransport(
+        ISshHostKeyPinStore pinStore,
+        ICredentialStore credentialStore,
+        TransportTimeouts? timeouts = null,
+        TimeProvider? timeProvider = null)
+        : this(
+            new SystemOpenSshProcessLauncher(),
+            new SystemOpenSshKeyScanLauncher(),
+            pinStore,
+            new OpenSshAskPassBroker(credentialStore),
+            new TemporaryOpenSshKnownHostsFileFactory(),
+            new WindowsOpenSshExecutableResolver(),
+            timeouts ?? TransportTimeouts.Default,
+            timeProvider ?? TimeProvider.System,
+            OpenSshTunnelCleanupOptions.Default)
+    {
+    }
+
+    public SshRemoteTransport(
         IOpenSshProcessLauncher processLauncher,
         IOpenSshKeyScanLauncher keyScanLauncher,
         ISshHostKeyPinStore pinStore,
@@ -117,12 +135,17 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             .CreateAsync(trustedCandidate.ToPin(), cancellationToken)
             .ConfigureAwait(false);
         IOpenSshProcess? process = null;
+        IOpenSshAskPassSession? askPassSession = null;
         try
         {
+            askPassSession = await _askPassBroker
+                .PrepareAsync(sshProfile, cancellationToken)
+                .ConfigureAwait(false);
             var processStart = OpenSshCommandBuilder.BuildTunnel(
                 _executables.SshPath,
                 sshProfile,
                 knownHosts.Path);
+            processStart = askPassSession.Configure(processStart);
             process = await _processLauncher
                 .LaunchAsync(processStart, cancellationToken)
                 .ConfigureAwait(false);
@@ -135,6 +158,20 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
                 try
                 {
                     await process.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception cleanupException)
+                {
+                    TemporaryOpenSshKnownHostsFile.AddException(
+                        ref cleanupFailures,
+                        cleanupException);
+                }
+            }
+
+            if (askPassSession is not null)
+            {
+                try
+                {
+                    await askPassSession.DisposeAsync().ConfigureAwait(false);
                 }
                 catch (Exception cleanupException)
                 {
@@ -167,7 +204,8 @@ public sealed class SshRemoteTransport : IRemoteTransportFactory
             knownHosts,
             diagnostics,
             _cleanupOptions,
-            _timeProvider);
+            _timeProvider,
+            askPassSession);
         try
         {
             var firstByte = new byte[1];
@@ -259,6 +297,12 @@ public interface IOpenSshAskPassBroker
     ValueTask EnsureSupportedAsync(
         SshProfile profile,
         CancellationToken cancellationToken);
+
+    ValueTask<IOpenSshAskPassSession> PrepareAsync(
+        SshProfile profile,
+        CancellationToken cancellationToken) =>
+        ValueTask.FromResult<IOpenSshAskPassSession>(
+            NoOpenSshAskPassSession.Instance);
 }
 
 public sealed class UnsupportedOpenSshAskPassBroker : IOpenSshAskPassBroker
@@ -528,7 +572,8 @@ internal sealed class OpenSshTunnelLifetime(
     IOpenSshKnownHostsFile knownHosts,
     Task<string> diagnostics,
     OpenSshTunnelCleanupOptions cleanupOptions,
-    TimeProvider timeProvider) : IAsyncDisposable
+    TimeProvider timeProvider,
+    IOpenSshAskPassSession? askPassSession = null) : IAsyncDisposable
 {
     private readonly object _sync = new();
     private Task? _disposeTask;
@@ -593,6 +638,16 @@ internal sealed class OpenSshTunnelLifetime(
             suppressException: null,
             cleanupState,
             cleanupToken).ConfigureAwait(false);
+        if (askPassSession is not null)
+        {
+            await RunStepAsync(
+                _ => askPassSession.DisposeAsync().AsTask(),
+                ignoreOperationCancellation: false,
+                suppressException: null,
+                cleanupState,
+                cleanupToken).ConfigureAwait(false);
+        }
+
         await RunStepAsync(
             token => knownHosts.DeleteAsync(token).AsTask(),
             ignoreOperationCancellation: false,

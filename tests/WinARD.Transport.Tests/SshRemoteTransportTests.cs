@@ -325,6 +325,54 @@ public sealed class SshRemoteTransportTests
     }
 
     [Fact]
+    public async Task Askpass_session_configures_launch_and_is_disposed_with_tunnel()
+    {
+        var askPass = new RecordingAskPassBroker();
+        var fixture = new OpenSshFixture(askPassBroker: askPass);
+        await fixture.ConfirmAsync();
+        var current = fixture.Profile.SshProfile!;
+        var ssh = SshProfile.Create(
+            current.Host,
+            current.Port,
+            current.Username,
+            current.PrivateKeyPath,
+            current.TargetHost,
+            current.TargetPort,
+            CredentialReference.Create("windows", "ssh-secret"),
+            pinnedHostKeyAlgorithm: null,
+            pinnedHostKeySha256: null);
+        var profile = ConnectionProfile
+            .Create(Guid.NewGuid(), "Mac", "ignored.example", 5999, "operator")
+            .WithSsh(ssh);
+
+        await using var connection = await fixture.Transport.ConnectAsync(
+            profile,
+            CancellationToken.None);
+
+        Assert.Equal(1, askPass.PrepareCount);
+        Assert.Equal("configured", fixture.Launcher.LastStart!.Environment!["ASKPASS_TEST"]);
+        Assert.Equal(0, askPass.Session.DisposeCount);
+        await connection.DisposeAsync();
+        Assert.Equal(1, askPass.Session.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Launch_failure_disposes_prepared_askpass_session()
+    {
+        var askPass = new RecordingAskPassBroker();
+        var fixture = new OpenSshFixture(askPassBroker: askPass);
+        await fixture.ConfirmAsync();
+        fixture.Launcher.LaunchException = new IOException("launch failed");
+
+        await Assert.ThrowsAsync<IOException>(
+            () => fixture.Transport.ConnectAsync(
+                fixture.Profile,
+                CancellationToken.None));
+
+        Assert.Equal(1, askPass.Session.DisposeCount);
+    }
+
+    [Fact]
     public async Task Launch_failure_preserves_primary_and_all_known_hosts_cleanup_failures()
     {
         var fixture = new OpenSshFixture();
@@ -351,7 +399,8 @@ public sealed class SshRemoteTransportTests
     {
         public OpenSshFixture(
             TimeProvider? timeProvider = null,
-            TransportTimeouts? timeouts = null)
+            TransportTimeouts? timeouts = null,
+            IOpenSshAskPassBroker? askPassBroker = null)
         {
             Endpoint = new SshHostKeyEndpoint("jump.example", 2222);
             Candidate = SshHostKeyVerifier.CreateCandidate(
@@ -383,7 +432,7 @@ public sealed class SshRemoteTransportTests
                 Launcher,
                 KeyScan,
                 Store,
-                new UnsupportedOpenSshAskPassBroker(),
+                askPassBroker ?? new UnsupportedOpenSshAskPassBroker(),
                 KnownHosts,
                 new FakeExecutableResolver(),
                 timeouts ?? TransportTimeouts.Default,
@@ -413,6 +462,46 @@ public sealed class SshRemoteTransportTests
 
         public string KeyScanLine(byte[] key) =>
             $"[{Endpoint.Host}]:{Endpoint.Port} ssh-ed25519 {Convert.ToBase64String(key)}";
+    }
+
+    private sealed class RecordingAskPassBroker : IOpenSshAskPassBroker
+    {
+        public int PrepareCount { get; private set; }
+
+        public RecordingAskPassSession Session { get; } = new();
+
+        public ValueTask EnsureSupportedAsync(
+            SshProfile profile,
+            CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+
+        public ValueTask<IOpenSshAskPassSession> PrepareAsync(
+            SshProfile profile,
+            CancellationToken cancellationToken)
+        {
+            PrepareCount++;
+            return ValueTask.FromResult<IOpenSshAskPassSession>(Session);
+        }
+    }
+
+    private sealed class RecordingAskPassSession : IOpenSshAskPassSession
+    {
+        public int DisposeCount { get; private set; }
+
+        public OpenSshProcessStart Configure(OpenSshProcessStart start) =>
+            start with
+            {
+                Environment = new Dictionary<string, string>
+                {
+                    ["ASKPASS_TEST"] = "configured",
+                },
+            };
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class FakeExecutableResolver : IOpenSshExecutableResolver

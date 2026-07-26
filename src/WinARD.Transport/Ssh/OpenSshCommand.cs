@@ -6,7 +6,8 @@ namespace WinARD.Transport.Ssh;
 
 public sealed record OpenSshProcessStart(
     string FileName,
-    IReadOnlyList<string> Arguments);
+    IReadOnlyList<string> Arguments,
+    IReadOnlyDictionary<string, string>? Environment = null);
 
 internal static class OpenSshCommandBuilder
 {
@@ -36,7 +37,7 @@ internal static class OpenSshCommandBuilder
             "-F",
             "NUL",
             "-o",
-            "BatchMode=yes",
+            HasCredential(profile) ? "BatchMode=no" : "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
@@ -64,12 +65,20 @@ internal static class OpenSshCommandBuilder
             arguments.Add("-o");
             arguments.Add("IdentitiesOnly=no");
             arguments.Add("-o");
-            arguments.Add("PreferredAuthentications=publickey");
+            arguments.Add(
+                profile.PasswordCredentialReference is not null
+                    ? "PreferredAuthentications=password,keyboard-interactive"
+                    : "PreferredAuthentications=publickey");
         }
 
         arguments.Add($"{profile.Username}@{sshEndpoint.Host}");
         return new OpenSshProcessStart(sshPath, arguments);
     }
+
+    private static bool HasCredential(SshProfile profile) =>
+        profile.CredentialReference is not null ||
+        profile.PasswordCredentialReference is not null ||
+        profile.PrivateKeyPassphraseCredentialReference is not null;
 
     public static OpenSshProcessStart BuildKeyScan(
         string keyScanPath,
