@@ -7,7 +7,9 @@ namespace WinARD.Application.Sessions;
 public sealed class RemoteSession : IAsyncDisposable
 {
     private readonly object _disposeSync = new();
+    private readonly IRfbClient _client;
     private readonly SessionStateMachine _stateMachine;
+    private readonly TransportConnection _transport;
     private Task? _disposeTask;
 
     internal RemoteSession(
@@ -16,8 +18,8 @@ public sealed class RemoteSession : IAsyncDisposable
         IRfbClient client)
     {
         _stateMachine = stateMachine ?? throw new ArgumentNullException(nameof(stateMachine));
-        Transport = transport ?? throw new ArgumentNullException(nameof(transport));
-        Client = client ?? throw new ArgumentNullException(nameof(client));
+        _transport = transport ?? throw new ArgumentNullException(nameof(transport));
+        _client = client ?? throw new ArgumentNullException(nameof(client));
     }
 
     public SessionState State
@@ -30,10 +32,6 @@ public sealed class RemoteSession : IAsyncDisposable
             }
         }
     }
-
-    public TransportConnection Transport { get; }
-
-    public IRfbClient Client { get; }
 
     public void MarkFailed()
     {
@@ -50,23 +48,42 @@ public sealed class RemoteSession : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
+        TaskCompletionSource? completion = null;
         Task disposeTask;
         lock (_disposeSync)
         {
             if (_disposeTask is null)
             {
+                completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _disposeTask = completion.Task;
                 if (_stateMachine.Current == SessionState.Connected)
                 {
                     _stateMachine.MoveTo(SessionState.Disconnecting);
                 }
-
-                _disposeTask = DisposeCoreAsync();
             }
 
             disposeTask = _disposeTask;
         }
 
+        if (completion is not null)
+        {
+            _ = DisposeAndCompleteAsync(completion);
+        }
+
         return new ValueTask(disposeTask);
+    }
+
+    private async Task DisposeAndCompleteAsync(TaskCompletionSource completion)
+    {
+        try
+        {
+            await DisposeCoreAsync().ConfigureAwait(false);
+            completion.TrySetResult();
+        }
+        catch (Exception exception)
+        {
+            completion.TrySetException(exception);
+        }
     }
 
     private async Task DisposeCoreAsync()
@@ -74,7 +91,7 @@ public sealed class RemoteSession : IAsyncDisposable
         List<Exception>? failures = null;
         try
         {
-            await Client.DisposeAsync().ConfigureAwait(false);
+            await _client.DisposeAsync().ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -83,7 +100,7 @@ public sealed class RemoteSession : IAsyncDisposable
 
         try
         {
-            await Transport.DisposeAsync().ConfigureAwait(false);
+            await _transport.DisposeAsync().ConfigureAwait(false);
         }
         catch (Exception exception)
         {

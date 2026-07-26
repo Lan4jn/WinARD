@@ -173,6 +173,91 @@ public sealed class ConnectDeviceHandlerTests
     }
 
     [Fact]
+    public async Task Remote_session_synchronous_reentrant_dispose_reuses_published_completion()
+    {
+        var lifetime = new TestAsyncDisposable();
+        var client = new TestRfbClient();
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(lifetime),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            new ErrorMapper(() => "correlation-id"));
+        var result = await handler.HandleAsync(CreateProfile(), CancellationToken.None);
+        var session = Assert.IsType<RemoteSession>(result.Session);
+        Task? reentrantCompletion = null;
+        var reentered = 0;
+        client.DisposeCallback = () =>
+        {
+            if (Interlocked.Exchange(ref reentered, 1) == 0)
+            {
+                reentrantCompletion = session.DisposeAsync().AsTask();
+            }
+        };
+
+        var outerCompletion = session.DisposeAsync().AsTask();
+        await outerCompletion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Same(outerCompletion, reentrantCompletion);
+        Assert.Equal(1, client.DisposeCount);
+        Assert.Equal(1, lifetime.DisposeCount);
+        Assert.Equal(SessionState.Idle, session.State);
+    }
+
+    [Fact]
+    public async Task Remote_session_concurrent_dispose_calls_share_blocking_failure_and_cleanup_once()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blockedDispose = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lifetime = new TestAsyncDisposable();
+        var client = new TestRfbClient
+        {
+            DisposeCallback = () => entered.TrySetResult(),
+            DisposeTask = blockedDispose.Task,
+        };
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(lifetime),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            new ErrorMapper(() => "correlation-id"));
+        var result = await handler.HandleAsync(CreateProfile(), CancellationToken.None);
+        var session = Assert.IsType<RemoteSession>(result.Session);
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completions = new ConcurrentBag<Task>();
+        var callers = Enumerable.Range(0, 2).Select(_ => Task.Run(async () =>
+        {
+            await start.Task;
+            completions.Add(session.DisposeAsync().AsTask());
+        })).ToArray();
+
+        start.SetResult();
+        await Task.WhenAll(callers).WaitAsync(TimeSpan.FromSeconds(2));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var shared = completions.ToArray();
+        Assert.Equal(2, shared.Length);
+        Assert.Same(shared[0], shared[1]);
+        var primary = new InvalidOperationException("blocked client cleanup failed");
+        blockedDispose.SetException(primary);
+
+        var firstFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => shared[0].WaitAsync(TimeSpan.FromSeconds(2)));
+        var secondFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => shared[1].WaitAsync(TimeSpan.FromSeconds(2)));
+
+        Assert.Same(primary, firstFailure);
+        Assert.Same(firstFailure, secondFailure);
+        Assert.Equal(1, client.DisposeCount);
+        Assert.Equal(1, lifetime.DisposeCount);
+        Assert.Equal(SessionState.Idle, session.State);
+    }
+
+    [Fact]
+    public void Remote_session_does_not_expose_disposable_resources()
+    {
+        Assert.Null(typeof(RemoteSession).GetProperty("Client"));
+        Assert.Null(typeof(RemoteSession).GetProperty("Transport"));
+    }
+
+    [Fact]
     public async Task Precancelled_connection_does_not_invoke_dependencies()
     {
         using var cancellation = new CancellationTokenSource();
@@ -517,6 +602,10 @@ public sealed class ConnectDeviceHandlerTests
 
         public List<string>? Events { get; init; }
 
+        public Action? DisposeCallback { get; set; }
+
+        public Task? DisposeTask { get; init; }
+
         public CancellationTokenSource? CancellationAfterAuthenticate { get; init; }
 
         public int DisposeCount { get; private set; }
@@ -563,6 +652,12 @@ public sealed class ConnectDeviceHandlerTests
         {
             DisposeCount++;
             Events?.Add("client-dispose");
+            DisposeCallback?.Invoke();
+            if (DisposeTask is not null)
+            {
+                return new ValueTask(DisposeTask);
+            }
+
             return DisposeException is null
                 ? ValueTask.CompletedTask
                 : ValueTask.FromException(DisposeException);
