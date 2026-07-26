@@ -597,6 +597,155 @@ public sealed class EncryptedCredentialVault :
         }
     }
 
+    public async ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(
+        CredentialReference reference,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfUnavailable();
+            if (!_entries.TryGetValue(reference.ToString(), out var entry))
+            {
+                Touch();
+                return null;
+            }
+
+            var plaintext = Decrypt(entry, _key!, _kdf, _salt);
+            SecretBuffer? secret = null;
+            CredentialStoreVersion? version = null;
+            try
+            {
+                Touch();
+                secret = SecretBuffer.CopyFrom(plaintext);
+                version = CreateEntryVersion(entry);
+                var snapshot = new CredentialStoreSnapshot(secret, version);
+                secret = null;
+                version = null;
+                return snapshot;
+            }
+            finally
+            {
+                secret?.Dispose();
+                version?.Dispose();
+                CryptographicOperations.ZeroMemory(plaintext);
+            }
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    public async ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
+        CredentialReference reference,
+        CredentialStoreVersion? expectedVersion,
+        ISecret? replacement,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        if (replacement?.Length > VaultFileFormat.MaximumSecretBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(replacement),
+                "The secret exceeds the vault entry size limit.");
+        }
+
+        await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfUnavailable();
+            var referenceText = reference.ToString();
+            var hasCurrent = _entries.TryGetValue(referenceText, out var current);
+            if (hasCurrent != (expectedVersion is not null) ||
+                (current is not null && !EntryVersionMatches(current, expectedVersion!)))
+            {
+                Touch();
+                return CredentialStoreCompareExchangeResult.Conflict;
+            }
+
+            var next = new Dictionary<string, VaultEntry>(_entries, StringComparer.Ordinal);
+            byte[]? plaintext = null;
+            VaultEntry? encryptedReplacement = null;
+            try
+            {
+                if (replacement is null)
+                {
+                    next.Remove(referenceText);
+                }
+                else
+                {
+                    plaintext = new byte[replacement.Length];
+                    replacement.CopyTo(plaintext);
+                    encryptedReplacement = Encrypt(
+                        referenceText,
+                        plaintext,
+                        _key!,
+                        _entries.Values);
+                    next[referenceText] = encryptedReplacement;
+                }
+
+                var document = BuildDocument(next, checked(_revision + 1));
+                byte[]? bytes = null;
+                try
+                {
+                    bytes = VaultFileFormat.Serialize(document);
+                    var write = await _storage
+                        .CompareExchangeAsync(bytes, _storageVersion, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!write.Written || write.Version is null)
+                    {
+                        Touch();
+                        return CredentialStoreCompareExchangeResult.Conflict;
+                    }
+
+                    _storageVersion = write.Version;
+                    _revision = document.Revision;
+                }
+                finally
+                {
+                    if (bytes is not null)
+                    {
+                        CryptographicOperations.ZeroMemory(bytes);
+                    }
+
+                    ClearManifestData(document);
+                }
+
+                if (_entries.Remove(referenceText, out var removed))
+                {
+                    ClearEntry(removed);
+                }
+
+                if (encryptedReplacement is not null)
+                {
+                    _entries.Add(referenceText, encryptedReplacement);
+                    encryptedReplacement = null;
+                }
+
+                Touch();
+                return CredentialStoreCompareExchangeResult.Succeeded;
+            }
+            finally
+            {
+                if (plaintext is not null)
+                {
+                    CryptographicOperations.ZeroMemory(plaintext);
+                }
+
+                if (encryptedReplacement is not null)
+                {
+                    ClearEntry(encryptedReplacement);
+                }
+            }
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
     public async ValueTask DeleteAsync(
         CredentialReference reference,
         CancellationToken cancellationToken)
@@ -847,6 +996,51 @@ public sealed class EncryptedCredentialVault :
         finally
         {
             CryptographicOperations.ZeroMemory(associatedData);
+        }
+    }
+
+    private static CredentialStoreVersion CreateEntryVersion(VaultEntry entry)
+    {
+        var digest = CreateEntryVersionDigest(entry);
+        try
+        {
+            return CredentialStoreVersion.CopyFrom(digest);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(digest);
+        }
+    }
+
+    private static bool EntryVersionMatches(
+        VaultEntry entry,
+        CredentialStoreVersion expectedVersion)
+    {
+        var digest = CreateEntryVersionDigest(entry);
+        try
+        {
+            return expectedVersion.FixedTimeEquals(digest);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(digest);
+        }
+    }
+
+    private static byte[] CreateEntryVersionDigest(VaultEntry entry)
+    {
+        var material = new byte[
+            entry.Nonce.Length + entry.Ciphertext.Length + entry.Tag.Length];
+        try
+        {
+            entry.Nonce.CopyTo(material, 0);
+            entry.Ciphertext.CopyTo(material, entry.Nonce.Length);
+            entry.Tag.CopyTo(material, entry.Nonce.Length + entry.Ciphertext.Length);
+            return SHA256.HashData(material);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(material);
         }
     }
 

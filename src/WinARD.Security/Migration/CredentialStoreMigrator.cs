@@ -18,12 +18,17 @@ public sealed class MigrationSourceDeleteUncertainException : IOException
 
 public sealed class MigrationTargetWriteUncertainException : IOException
 {
-    public MigrationTargetWriteUncertainException(Exception innerException)
+    public MigrationTargetWriteUncertainException(
+        Exception innerException,
+        string safeCode = "MIGRATION_TARGET_WRITE_UNCERTAIN")
         : base(
             "The target credential write failed after its final state became uncertain.",
             innerException)
     {
+        SafeCode = safeCode;
     }
+
+    public string SafeCode { get; }
 }
 
 public sealed class CredentialStoreMigrator
@@ -51,7 +56,7 @@ public sealed class CredentialStoreMigrator
         }
 
         using var previousTarget = await target
-            .ReadAsync(reference, cancellationToken)
+            .ReadSnapshotAsync(reference, cancellationToken)
             .ConfigureAwait(false);
         var targetWriteAttempted = false;
         var targetWriteCompleted = false;
@@ -87,14 +92,24 @@ public sealed class CredentialStoreMigrator
                 var reportedPrimary = targetWriteCompleted
                     ? primaryException
                     : new MigrationTargetWriteUncertainException(primaryException);
-                var recoveryExceptions = await RestoreTargetAsync(
-                    target,
-                    reference,
-                    previousTarget).ConfigureAwait(false);
-                if (recoveryExceptions.Count != 0)
+                try
                 {
-                    throw new AggregateException(
-                        new[] { reportedPrimary }.Concat(recoveryExceptions));
+                    var restored = await RestoreTargetAsync(
+                        target,
+                        reference,
+                        sourceSecret,
+                        previousTarget).ConfigureAwait(false);
+                    if (!restored)
+                    {
+                        throw new MigrationTargetWriteUncertainException(
+                            primaryException,
+                            "MIGRATION_TARGET_CONCURRENT_CHANGE");
+                    }
+                }
+                catch (Exception recoveryException)
+                    when (recoveryException is not MigrationTargetWriteUncertainException)
+                {
+                    throw new AggregateException(reportedPrimary, recoveryException);
                 }
 
                 if (!targetWriteCompleted)
@@ -108,53 +123,33 @@ public sealed class CredentialStoreMigrator
         }
     }
 
-    private static async ValueTask<IReadOnlyList<Exception>> RestoreTargetAsync(
+    private static async ValueTask<bool> RestoreTargetAsync(
         ICredentialStore target,
         CredentialReference reference,
-        ISecret? previousTarget)
+        ISecret attemptedSecret,
+        CredentialStoreSnapshot? previousTarget)
     {
-        var exceptions = new List<Exception>();
-        try
+        using var current = await target
+            .ReadSnapshotAsync(reference, CancellationToken.None)
+            .ConfigureAwait(false);
+        if (current is null || !FixedTimeEqual(attemptedSecret, current.Secret))
         {
-            if (previousTarget is null)
-            {
-                await target
-                    .DeleteAsync(reference, CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
-            else
-            {
-                await target
-                    .SaveAsync(reference, previousTarget, CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
-        }
-        catch (Exception exception)
-        {
-            exceptions.Add(exception);
+            return false;
         }
 
-        try
+        var result = await target
+            .CompareExchangeAsync(
+                reference,
+                current.Version,
+                previousTarget?.Secret,
+                CancellationToken.None)
+            .ConfigureAwait(false);
+        if (result != CredentialStoreCompareExchangeResult.Succeeded)
         {
-            using var recovered = await target
-                .ReadAsync(reference, CancellationToken.None)
-                .ConfigureAwait(false);
-            var restored = previousTarget is null
-                ? recovered is null
-                : recovered is not null && FixedTimeEqual(previousTarget, recovered);
-            if (!restored)
-            {
-                exceptions.Add(
-                    new CryptographicException(
-                        "Credential migration target recovery verification failed."));
-            }
-        }
-        catch (Exception exception)
-        {
-            exceptions.Add(exception);
+            return false;
         }
 
-        return exceptions;
+        return true;
     }
 
     private static bool FixedTimeEqual(ISecret left, ISecret right)

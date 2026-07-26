@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Buffers.Binary;
 using System.Text;
 using WinARD.Application.Ports;
 using WinARD.Domain.Security;
@@ -75,7 +76,7 @@ public sealed class CredentialStoreMigratorTests
         var target = new MemoryCredentialStore
         {
             CorruptReads = true,
-            DeleteException = new IOException("rollback failed"),
+            CompareExchangeException = new IOException("rollback failed"),
         };
 
         var aggregate = await Assert.ThrowsAsync<AggregateException>(
@@ -208,7 +209,7 @@ public sealed class CredentialStoreMigratorTests
         var target = new MemoryCredentialStore
         {
             SaveExceptionAfterFirstCommit = new IOException("target save uncertain"),
-            DeleteException = new IOException("rollback failed"),
+            CompareExchangeException = new IOException("rollback failed"),
         };
 
         var aggregate = await Assert.ThrowsAsync<AggregateException>(
@@ -233,7 +234,7 @@ public sealed class CredentialStoreMigratorTests
         var target = new MemoryCredentialStore
         {
             SaveExceptionAfterFirstCommit = new IOException("target save uncertain"),
-            DeleteException = new OperationCanceledException(),
+            CompareExchangeException = new OperationCanceledException(),
         };
 
         var aggregate = await Assert.ThrowsAsync<AggregateException>(
@@ -247,6 +248,62 @@ public sealed class CredentialStoreMigratorTests
         Assert.IsType<OperationCanceledException>(aggregate.InnerExceptions[1]);
         AssertSecretText("new-value-8a11", target.ReadText());
         Assert.False(source.Deleted);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Concurrent_target_change_after_uncertain_save_is_never_overwritten(
+        bool hasPreviousValue)
+    {
+        var source = new MemoryCredentialStore("new-value-8a11");
+        var target = new MemoryCredentialStore(
+            hasPreviousValue ? "old-value-4e21" : null)
+        {
+            SaveExceptionAfterFirstCommit = new IOException("target save uncertain"),
+            AfterFirstSaveCommit = store => store.WriteExternal("winner-value-6d31"),
+        };
+
+        var exception = await Assert.ThrowsAsync<MigrationTargetWriteUncertainException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                CancellationToken.None).AsTask());
+
+        Assert.Equal("MIGRATION_TARGET_CONCURRENT_CHANGE", exception.SafeCode);
+        AssertSecretText("winner-value-6d31", target.ReadText());
+        Assert.False(source.Deleted);
+        Assert.Equal(0, target.CompareExchangeWriteCount);
+        Assert.All(target.SnapshotSecrets, static secret => Assert.True(secret.Disposed));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Conditional_restore_conflict_preserves_the_concurrent_winner(
+        bool hasPreviousValue)
+    {
+        var source = new MemoryCredentialStore("new-value-8a11");
+        var target = new MemoryCredentialStore(
+            hasPreviousValue ? "old-value-4e21" : null)
+        {
+            SaveExceptionAfterFirstCommit = new IOException("target save uncertain"),
+            CompareExchangeConflictValue = "winner-value-6d31",
+        };
+
+        var exception = await Assert.ThrowsAsync<MigrationTargetWriteUncertainException>(
+            () => new CredentialStoreMigrator().MoveAsync(
+                source,
+                target,
+                Reference,
+                CancellationToken.None).AsTask());
+
+        Assert.Equal("MIGRATION_TARGET_CONCURRENT_CHANGE", exception.SafeCode);
+        AssertSecretText("winner-value-6d31", target.ReadText());
+        Assert.False(source.Deleted);
+        Assert.Equal(0, target.CompareExchangeWriteCount);
+        Assert.All(target.SnapshotSecrets, static secret => Assert.True(secret.Disposed));
     }
 
     private static void AssertSecretText(string expectedText, string? actualText)
@@ -275,6 +332,7 @@ public sealed class CredentialStoreMigratorTests
     private sealed class MemoryCredentialStore(string? initial = null) : ICredentialStore
     {
         private byte[]? _value = initial is null ? null : Encoding.UTF8.GetBytes(initial);
+        private long _version;
 
         public bool CorruptReads { get; init; }
 
@@ -284,6 +342,12 @@ public sealed class CredentialStoreMigratorTests
 
         public Exception? SaveExceptionAfterFirstCommit { get; init; }
 
+        public Action<MemoryCredentialStore>? AfterFirstSaveCommit { get; init; }
+
+        public string? CompareExchangeConflictValue { get; init; }
+
+        public Exception? CompareExchangeException { get; init; }
+
         public bool DeleteValueBeforeThrow { get; init; }
 
         private int _saveCount;
@@ -291,6 +355,10 @@ public sealed class CredentialStoreMigratorTests
         public bool Deleted { get; private set; }
 
         public bool RollbackUsedNonCancellableToken { get; private set; }
+
+        public int CompareExchangeWriteCount { get; private set; }
+
+        public List<TrackingSecret> SnapshotSecrets { get; } = [];
 
         public ValueTask SaveAsync(
             CredentialReference reference,
@@ -303,6 +371,11 @@ public sealed class CredentialStoreMigratorTests
             Replace(value);
             Deleted = false;
             _saveCount++;
+            if (_saveCount == 1)
+            {
+                AfterFirstSaveCommit?.Invoke(this);
+            }
+
             if (_saveCount == 1 && SaveExceptionAfterFirstCommit is not null)
             {
                 return ValueTask.FromException(SaveExceptionAfterFirstCommit);
@@ -335,6 +408,67 @@ public sealed class CredentialStoreMigratorTests
             return ValueTask.FromResult<ISecret?>(SecretBuffer.CopyFrom(copy));
         }
 
+        public ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(
+            CredentialReference reference,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_value is null)
+            {
+                return ValueTask.FromResult<CredentialStoreSnapshot?>(null);
+            }
+
+            var secret = new TrackingSecret(_value);
+            SnapshotSecrets.Add(secret);
+            Span<byte> version = stackalloc byte[sizeof(long)];
+            BinaryPrimitives.WriteInt64LittleEndian(version, _version);
+            return ValueTask.FromResult<CredentialStoreSnapshot?>(
+                new CredentialStoreSnapshot(secret, CredentialStoreVersion.CopyFrom(version)));
+        }
+
+        public ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
+            CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            RollbackUsedNonCancellableToken = !cancellationToken.CanBeCanceled;
+            if (CompareExchangeException is not null)
+            {
+                return ValueTask.FromException<CredentialStoreCompareExchangeResult>(
+                    CompareExchangeException);
+            }
+
+            if (CompareExchangeConflictValue is not null)
+            {
+                WriteExternal(CompareExchangeConflictValue);
+                return ValueTask.FromResult(CredentialStoreCompareExchangeResult.Conflict);
+            }
+
+            Span<byte> currentVersion = stackalloc byte[sizeof(long)];
+            BinaryPrimitives.WriteInt64LittleEndian(currentVersion, _version);
+            var matches = _value is null
+                ? expectedVersion is null
+                : expectedVersion is not null && expectedVersion.FixedTimeEquals(currentVersion);
+            if (!matches)
+            {
+                return ValueTask.FromResult(CredentialStoreCompareExchangeResult.Conflict);
+            }
+
+            byte[]? value = null;
+            if (replacement is not null)
+            {
+                value = new byte[replacement.Length];
+                replacement.CopyTo(value);
+            }
+
+            Replace(value);
+            Deleted = replacement is null;
+            CompareExchangeWriteCount++;
+            return ValueTask.FromResult(CredentialStoreCompareExchangeResult.Succeeded);
+        }
+
         public ValueTask DeleteAsync(
             CredentialReference reference,
             CancellationToken cancellationToken)
@@ -359,6 +493,8 @@ public sealed class CredentialStoreMigratorTests
 
         public string? ReadText() => _value is null ? null : Encoding.UTF8.GetString(_value);
 
+        public void WriteExternal(string value) => Replace(Encoding.UTF8.GetBytes(value));
+
         private void Replace(byte[]? replacement)
         {
             if (_value is not null)
@@ -367,6 +503,34 @@ public sealed class CredentialStoreMigratorTests
             }
 
             _value = replacement;
+            _version++;
+        }
+
+        public sealed class TrackingSecret(byte[] value) : ISecret
+        {
+            private byte[]? _value = value.ToArray();
+
+            public bool Disposed { get; private set; }
+
+            public int Length => _value?.Length ??
+                throw new ObjectDisposedException(nameof(TrackingSecret));
+
+            public void CopyTo(Span<byte> destination) =>
+                (_value ?? throw new ObjectDisposedException(nameof(TrackingSecret)))
+                    .CopyTo(destination);
+
+            public ISecret Clone() => new TrackingSecret(
+                _value ?? throw new ObjectDisposedException(nameof(TrackingSecret)));
+
+            public void Dispose()
+            {
+                var value = Interlocked.Exchange(ref _value, null);
+                if (value is not null)
+                {
+                    CryptographicOperations.ZeroMemory(value);
+                    Disposed = true;
+                }
+            }
         }
     }
 }

@@ -408,6 +408,40 @@ public sealed class OpenSshAskPassTests
             return ValueTask.FromResult<ISecret?>(_last);
         }
 
+        public ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(
+            CredentialReference reference,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var secret = new TrackingSecret(value);
+            var digest = SHA256.HashData(value);
+            CredentialStoreVersion? version = null;
+            try
+            {
+                version = CredentialStoreVersion.CopyFrom(digest);
+                var snapshot = new CredentialStoreSnapshot(secret, version);
+                version = null;
+                return ValueTask.FromResult<CredentialStoreSnapshot?>(snapshot);
+            }
+            catch
+            {
+                secret.Dispose();
+                throw;
+            }
+            finally
+            {
+                version?.Dispose();
+                CryptographicOperations.ZeroMemory(digest);
+            }
+        }
+
+        public ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
+            CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public ValueTask DeleteAsync(
             CredentialReference reference,
             CancellationToken cancellationToken) =>

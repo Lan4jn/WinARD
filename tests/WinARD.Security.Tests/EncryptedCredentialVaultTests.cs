@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Buffers.Binary;
 using System.Text;
+using WinARD.Application.Ports;
 using WinARD.Domain.Security;
 using WinARD.Security.Secrets;
 using WinARD.Security.Vault;
@@ -155,6 +156,106 @@ public sealed class EncryptedCredentialVaultTests
             CancellationToken.None);
         Assert.Null(await reopened.ReadAsync(Reference, CancellationToken.None));
         Assert.Null(await reopened.ReadAsync(secondReference, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Credential_snapshot_compare_exchange_replaces_and_deletes()
+    {
+        var storage = new InMemoryVaultStorage();
+        using var master = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.CreateAsync(
+            storage,
+            master,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            CancellationToken.None);
+        using var original = Utf8("original-91a2");
+        using var replacement = Utf8("replacement-38c4");
+        await vault.SaveAsync(Reference, original, CancellationToken.None);
+
+        using var snapshot = await vault.ReadSnapshotAsync(Reference, CancellationToken.None);
+        Assert.NotNull(snapshot);
+        Assert.Equal(
+            CredentialStoreCompareExchangeResult.Succeeded,
+            await vault.CompareExchangeAsync(
+                Reference,
+                snapshot!.Version,
+                replacement,
+                CancellationToken.None));
+        using var replaced = await vault.ReadSnapshotAsync(Reference, CancellationToken.None);
+        Assert.Equal("replacement-38c4", ReadUtf8(replaced!.Secret));
+
+        Assert.Equal(
+            CredentialStoreCompareExchangeResult.Succeeded,
+            await vault.CompareExchangeAsync(
+                Reference,
+                replaced.Version,
+                replacement: null,
+                CancellationToken.None));
+        Assert.Null(await vault.ReadAsync(Reference, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Stale_credential_snapshot_conflicts_and_preserves_winner()
+    {
+        var storage = new InMemoryVaultStorage();
+        using var master = Utf8("master-52e6");
+        await using var vault = await EncryptedCredentialVault.CreateAsync(
+            storage,
+            master,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            CancellationToken.None);
+        using var original = Utf8("original-91a2");
+        using var winner = Utf8("winner-6d31");
+        using var loser = Utf8("loser-1234");
+        await vault.SaveAsync(Reference, original, CancellationToken.None);
+        using var stale = await vault.ReadSnapshotAsync(Reference, CancellationToken.None);
+
+        await vault.SaveAsync(Reference, winner, CancellationToken.None);
+        Assert.Equal(
+            CredentialStoreCompareExchangeResult.Conflict,
+            await vault.CompareExchangeAsync(
+                Reference,
+                stale!.Version,
+                loser,
+                CancellationToken.None));
+        using var actual = await vault.ReadAsync(Reference, CancellationToken.None);
+        Assert.Equal("winner-6d31", ReadUtf8(actual!));
+    }
+
+    [Fact]
+    public async Task Storage_conflict_during_credential_compare_exchange_preserves_external_winner()
+    {
+        var storage = await CreateStoredVaultAsync();
+        using var firstMaster = Utf8("master-52e6");
+        using var secondMaster = Utf8("master-52e6");
+        await using var first = await EncryptedCredentialVault.OpenAsync(
+            storage, firstMaster, TimeProvider.System, TimeSpan.FromMinutes(5), CancellationToken.None);
+        await using var second = await EncryptedCredentialVault.OpenAsync(
+            storage, secondMaster, TimeProvider.System, TimeSpan.FromMinutes(5), CancellationToken.None);
+        using var stale = await second.ReadSnapshotAsync(Reference, CancellationToken.None);
+        using var winner = Utf8("winner-6d31");
+        using var loser = Utf8("loser-1234");
+
+        await first.SaveAsync(Reference, winner, CancellationToken.None);
+        Assert.Equal(
+            CredentialStoreCompareExchangeResult.Conflict,
+            await second.CompareExchangeAsync(
+                Reference,
+                stale!.Version,
+                loser,
+                CancellationToken.None));
+
+        using var reopenMaster = Utf8("master-52e6");
+        await using var reopened = await EncryptedCredentialVault.OpenAsync(
+            storage,
+            reopenMaster,
+            TimeProvider.System,
+            TimeSpan.FromMinutes(5),
+            CancellationToken.None);
+        using var actual = await reopened.ReadAsync(Reference, CancellationToken.None);
+        Assert.Equal("winner-6d31", ReadUtf8(actual!));
     }
 
     [Fact]
