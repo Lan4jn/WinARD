@@ -116,16 +116,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             }
 
             await _dispatcher.InvokeAsync(() => IsDeleting = true, operationToken).ConfigureAwait(false);
+            // DisposeAsync waits for this gate, so shutdown must not interrupt an in-flight persistence commit.
+            var commitToken = CancellationToken.None;
             var credentialCleanupFailed = false;
             try
             {
                 await Task.Run(
-                    () => _repository.DeleteAsync(profile.Id, operationToken),
-                    operationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
+                    () => _repository.DeleteAsync(profile.Id, commitToken),
+                    commitToken).ConfigureAwait(false);
             }
             catch (Exception)
             {
@@ -142,8 +140,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 try
                 {
                     remainingProfiles = await Task.Run(
-                        () => _repository.GetAllAsync(CancellationToken.None),
-                        CancellationToken.None).ConfigureAwait(false);
+                        () => _repository.GetAllAsync(commitToken),
+                        commitToken).ConfigureAwait(false);
                 }
                 catch (Exception)
                 {
@@ -158,8 +156,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                         try
                         {
                             await Task.Run(
-                                async () => await _credentialStore.DeleteAsync(reference, CancellationToken.None).ConfigureAwait(false),
-                                CancellationToken.None).ConfigureAwait(false);
+                                async () => await _credentialStore.DeleteAsync(reference, commitToken).ConfigureAwait(false),
+                                commitToken).ConfigureAwait(false);
                         }
                         catch (Exception)
                         {

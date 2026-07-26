@@ -295,22 +295,86 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task Dispose_waits_for_an_active_delete_before_disposing_the_repository()
+    public async Task Dispose_does_not_cancel_an_entered_delete_and_waits_for_credential_cleanup()
     {
-        var repository = new BlockingDeleteRepository(Profile(StudioId, "Studio Mac", "studio.local"));
+        var credential = CredentialReference.Create("windows", "shutdown-commit");
+        var repository = new BlockingDeleteRepository(
+            Profile(StudioId, "Studio Mac", "studio.local").WithCredential(credential));
+        var credentialStore = new FakeCredentialStore();
+        using var shutdown = new CancellationTokenSource();
         var viewModel = new MainWindowViewModel(
-            repository, new FakeDiscovery(), new FakeCredentialStore(), new RecordingDispatcher());
+            repository, new FakeDiscovery(), credentialStore, new RecordingDispatcher());
         await viewModel.InitializeAsync(CancellationToken.None);
         viewModel.SelectedDevice = Assert.Single(viewModel.SavedDevices);
-        var delete = viewModel.DeleteSelectedAsync(deleteCredential: false, CancellationToken.None);
+        var delete = viewModel.DeleteSelectedAsync(deleteCredential: true, shutdown.Token);
         await repository.FirstDeleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
+        shutdown.Cancel();
         var dispose = viewModel.DisposeAsync().AsTask();
 
+        Assert.False(delete.IsCompleted);
         Assert.False(repository.DisposeCalled.Task.IsCompleted);
         repository.ReleaseFirstDelete.TrySetResult();
         Assert.True(await delete);
         await dispose;
+        Assert.False(repository.FirstDeleteToken.IsCancellationRequested);
+        Assert.Equal([credential], credentialStore.DeletedReferences);
+        Assert.Equal(1, credentialStore.DisposeCount);
+        Assert.True(repository.DisposeCalled.Task.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task Shutdown_cancels_a_queued_delete_without_starting_new_persistence()
+    {
+        var repository = new BlockingDeleteRepository(
+            Profile(StudioId, "Studio Mac", "studio.local"),
+            Profile(OfficeId, "Office Mini", "office.local"));
+        using var shutdown = new CancellationTokenSource();
+        var viewModel = new MainWindowViewModel(
+            repository, new FakeDiscovery(), new FakeCredentialStore(), new RecordingDispatcher());
+        await viewModel.InitializeAsync(CancellationToken.None);
+        viewModel.SelectedDevice = viewModel.SavedDevices.Single(item => item.Profile?.Id == StudioId);
+        var entered = viewModel.DeleteSelectedAsync(deleteCredential: false, shutdown.Token);
+        await repository.FirstDeleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        viewModel.SelectedDevice = viewModel.SavedDevices.Single(item => item.Profile?.Id == OfficeId);
+        var queued = viewModel.DeleteSelectedAsync(deleteCredential: false, shutdown.Token);
+
+        shutdown.Cancel();
+        var dispose = viewModel.DisposeAsync().AsTask();
+        repository.ReleaseFirstDelete.TrySetResult();
+
+        Assert.True(await entered);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued);
+        await dispose;
+        Assert.Equal([StudioId], repository.DeleteEnteredIds);
+        Assert.Equal([StudioId], repository.DeletedIds);
+    }
+
+    [Fact]
+    public async Task Entered_delete_operation_cancellation_is_reported_and_dispose_still_cleans_up_resources()
+    {
+        var repository = new BlockingDeleteRepository(Profile(StudioId, "Studio Mac", "studio.local"))
+        {
+            DeleteException = new OperationCanceledException("storage failure"),
+        };
+        var credentialStore = new FakeCredentialStore();
+        using var shutdown = new CancellationTokenSource();
+        var viewModel = new MainWindowViewModel(
+            repository, new FakeDiscovery(), credentialStore, new RecordingDispatcher());
+        await viewModel.InitializeAsync(CancellationToken.None);
+        viewModel.SelectedDevice = Assert.Single(viewModel.SavedDevices);
+        var delete = viewModel.DeleteSelectedAsync(deleteCredential: false, shutdown.Token);
+        await repository.FirstDeleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        shutdown.Cancel();
+        var dispose = viewModel.DisposeAsync().AsTask();
+        Assert.False(repository.DisposeCalled.Task.IsCompleted);
+        repository.ReleaseFirstDelete.TrySetResult();
+
+        Assert.False(await delete);
+        Assert.Contains("删除设备", viewModel.StatusMessage, StringComparison.Ordinal);
+        await dispose;
+        Assert.Equal(1, credentialStore.DisposeCount);
         Assert.True(repository.DisposeCalled.Task.IsCompletedSuccessfully);
     }
 
@@ -641,6 +705,9 @@ public sealed class MainWindowViewModelTests
         public TaskCompletionSource FirstDeleteEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource ReleaseFirstDelete { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource DisposeCalled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationToken FirstDeleteToken { get; private set; }
+        public Exception? DeleteException { get; init; }
+        public List<Guid> DeleteEnteredIds { get; } = [];
         public List<Guid> DeletedIds { get; } = [];
 
         public Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
@@ -651,10 +718,22 @@ public sealed class MainWindowViewModelTests
 
         public async Task DeleteAsync(Guid id, CancellationToken cancellationToken)
         {
-            if (Interlocked.Increment(ref _deleteCount) == 1)
+            var deleteCount = Interlocked.Increment(ref _deleteCount);
+            lock (_gate)
             {
+                DeleteEnteredIds.Add(id);
+            }
+
+            if (deleteCount == 1)
+            {
+                FirstDeleteToken = cancellationToken;
                 FirstDeleteEntered.TrySetResult();
-                await ReleaseFirstDelete.Task;
+                await ReleaseFirstDelete.Task.WaitAsync(cancellationToken);
+            }
+
+            if (DeleteException is not null)
+            {
+                throw DeleteException;
             }
 
             lock (_gate)
