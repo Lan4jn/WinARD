@@ -1,6 +1,7 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using WinARD.Application.Ports;
+using WinARD.Desktop.Services;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
 using WinARD.Domain.Security;
@@ -27,7 +28,8 @@ public sealed record ConnectionProfileSaveResult(
 public sealed record ConnectionProfileTestResult(
     ConnectionProfile Profile,
     IReadOnlyList<ConnectionTestStageResult> Stages,
-    WinArdError? Error = null);
+    WinArdError? Error = null,
+    SshHostKeyPromptRequest? HostKeyFailure = null);
 
 public sealed class ConnectionEditorViewModel : ObservableObject
 {
@@ -245,6 +247,8 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
     public WinArdError? LastTestError { get; private set; }
 
+    public SshHostKeyPromptRequest? LastTestHostKeyFailure { get; private set; }
+
     public async Task<ConnectionProfile> SaveAsync(ISecret? secret, CancellationToken cancellationToken)
     {
         EnterBusy();
@@ -281,12 +285,14 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
             TestResults = [];
             LastTestError = null;
+            LastTestHostKeyFailure = null;
             var result = await _test(BuildProfile(), CredentialSaveMode, secret, cancellationToken)
                 .ConfigureAwait(false);
             _hostKeyPin = result.Profile.SshProfile?.HostKeyPin;
             var results = result.Stages;
             TestResults = results;
             LastTestError = result.Error;
+            LastTestHostKeyFailure = result.HostKeyFailure;
             StatusMessage = results.Count == 0
                 ? "测试连接未返回结果。"
                 : results[^1].Message;

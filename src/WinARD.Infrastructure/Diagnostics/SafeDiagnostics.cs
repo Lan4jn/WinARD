@@ -13,6 +13,7 @@ public enum DiagnosticFieldCategory
     Secret,
     PrivateKey,
     Credential,
+    VaultMaster,
 }
 
 public sealed record DiagnosticField(
@@ -51,6 +52,7 @@ public sealed partial class InMemorySafeDiagnosticSink : ISafeDiagnosticSink
         DiagnosticFieldCategory.Secret,
         DiagnosticFieldCategory.PrivateKey,
         DiagnosticFieldCategory.Credential,
+        DiagnosticFieldCategory.VaultMaster,
     ];
     private readonly object _sync = new();
     private readonly SecretRedactor _redactor;
@@ -111,7 +113,26 @@ public sealed partial class InMemorySafeDiagnosticSink : ISafeDiagnosticSink
     }
 
     private static bool IsSensitive(DiagnosticField field) =>
-        SensitiveCategories.Contains(field.Category) || SensitiveName().IsMatch(field.Name);
+        SensitiveCategories.Contains(field.Category) || IsSensitiveName(field.Name);
+
+    private static bool IsSensitiveName(string name)
+    {
+        var normalized = new string(name
+            .Where(static character => character is not ('-' or '_') && !char.IsWhiteSpace(character))
+            .Select(char.ToLowerInvariant)
+            .ToArray());
+        return normalized.StartsWith("vaultmaster", StringComparison.Ordinal) ||
+               normalized.StartsWith("macpassword", StringComparison.Ordinal) ||
+               normalized.StartsWith("sshpassword", StringComparison.Ordinal) ||
+               normalized.StartsWith("privatekeypassphrase", StringComparison.Ordinal) ||
+               normalized.StartsWith("clipboardcontent", StringComparison.Ordinal) ||
+               normalized.StartsWith("clipboard", StringComparison.Ordinal) ||
+               normalized.StartsWith("password", StringComparison.Ordinal) ||
+               normalized.StartsWith("passphrase", StringComparison.Ordinal) ||
+               normalized.StartsWith("secret", StringComparison.Ordinal) ||
+               normalized.StartsWith("privatekey", StringComparison.Ordinal) ||
+               normalized.StartsWith("credential", StringComparison.Ordinal);
+    }
 
     private string Sanitize(string value)
     {
@@ -127,9 +148,7 @@ public sealed partial class InMemorySafeDiagnosticSink : ISafeDiagnosticSink
         ? value
         : value[.._maxFieldLength];
 
-    [GeneratedRegex("(?:clipboard(?:content)?|password|passphrase|secret|private[_-]?key|credential)\\s*[:=]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    [GeneratedRegex("(?:vault[ _-]?master|clipboard(?:content)?|password|passphrase|secret|private[_-]?key|credential)\\s*[:=]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex SensitiveAssignment();
 
-    [GeneratedRegex("^(?:clipboard(?:content)?|password|passphrase|secret|private[_-]?key|credential)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex SensitiveName();
 }

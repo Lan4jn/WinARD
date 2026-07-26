@@ -61,7 +61,20 @@ public partial class App : Microsoft.UI.Xaml.Application
                         "TCP_CONNECTION_FAILED",
                         "Smoke-only mapped message.",
                         "smoke-correlation-123"))
-                    : null);
+                    : null,
+                retryRequested: isConnectionErrorSmoke
+                    ? _ =>
+                    {
+                        var marker = Environment.GetEnvironmentVariable(
+                            "WINARD_CONNECTION_ERROR_RETRY_MARKER");
+                        if (!string.IsNullOrWhiteSpace(marker))
+                        {
+                            File.AppendAllText(marker, "retry\n");
+                        }
+
+                        return Task.CompletedTask;
+                    }
+            : null);
             _window.Activate();
             return;
         }

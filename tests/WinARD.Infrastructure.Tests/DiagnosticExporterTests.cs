@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text;
+using System.Text.Json;
 using WinARD.Infrastructure.Diagnostics;
 using Xunit;
 
@@ -103,6 +104,109 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.DoesNotContain(new string('x', 41), json, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task InvalidDestinationDoesNotLeakExportGate()
+    {
+        Directory.CreateDirectory(_directory);
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
+
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => exporter.ExportAsync(
+            Path.Combine(_directory, "bad\0name.zip"),
+            DiagnosticExportContext.Empty,
+            CancellationToken.None));
+
+        var valid = Path.Combine(_directory, "valid.zip");
+        await exporter.ExportAsync(valid, DiagnosticExportContext.Empty, CancellationToken.None);
+        Assert.True(File.Exists(valid));
+        Assert.Empty(Directory.EnumerateFiles(_directory, "*.tmp", SearchOption.TopDirectoryOnly));
+    }
+
+    [Fact]
+    public async Task LimitsAllCollectionCountsAndUtf8StringBytes()
+    {
+        Directory.CreateDirectory(_directory);
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        sink.Write(new SafeDiagnosticEventInput(
+            "EVENT",
+            "corr",
+            "密密密密密密",
+            Enumerable.Range(0, 6).Select(index => new DiagnosticField($"field-{index}", "value")).ToArray()));
+        var profiles = Enumerable.Range(0, 6).Select(index => new DiagnosticProfileSummary(
+            $"profile-{index}",
+            $"host-{index}",
+            5900,
+            "operator",
+            "3.8",
+            "30",
+            Enumerable.Range(0, 6).ToDictionary(value => $"e{value}", value => (long)value)))
+            .ToArray();
+        var context = new DiagnosticExportContext(
+            DiagnosticExportContext.Empty.Application,
+            profiles,
+            Enumerable.Range(0, 6).ToDictionary(value => $"c{value}", value => (long)value),
+            IncludeHosts: false);
+        using var exporter = new DiagnosticExporter(
+            sink,
+            redactor,
+            new DiagnosticExportLimits(
+                MaxEvents: 2,
+                MaxFieldLength: 100,
+                MaxArchiveBytes: 128 * 1024,
+                MaxProfiles: 2,
+                MaxEncodingStatisticsPerProfile: 2,
+                MaxPerformanceCounters: 2,
+                MaxFieldsPerEvent: 2,
+                MaxStringUtf8Bytes: 7,
+                MaxUncompressedBytes: 64 * 1024,
+                MaxEntryUncompressedBytes: 48 * 1024));
+        var destination = Path.Combine(_directory, "bounded.zip");
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var root = document.RootElement;
+        Assert.Equal(2, root.GetProperty("profiles").GetArrayLength());
+        Assert.Equal(2, root.GetProperty("profiles")[0].GetProperty("encodingStatistics").EnumerateObject().Count());
+        Assert.Equal(2, root.GetProperty("performanceCounters").EnumerateObject().Count());
+        Assert.Equal(2, root.GetProperty("events")[0].GetProperty("fields").EnumerateObject().Count());
+        Assert.True(Encoding.UTF8.GetByteCount(root.GetProperty("events")[0].GetProperty("message").GetString()!) <= 7);
+    }
+
+    [Theory]
+    [InlineData(512, 128 * 1024)]
+    [InlineData(128 * 1024, 1)]
+    public async Task SizeLimitFailurePreservesExistingDestinationAndCleansTemporaryFiles(
+        long maxUncompressedBytes,
+        long maxArchiveBytes)
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, $"existing-{maxUncompressedBytes}-{maxArchiveBytes}.zip");
+        await File.WriteAllTextAsync(destination, "existing");
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor, maxFieldLength: 256 * 1024);
+        sink.Write(new SafeDiagnosticEventInput("HUGE", "corr", new string('x', 200_000)));
+        using var exporter = new DiagnosticExporter(
+            sink,
+            redactor,
+            new DiagnosticExportLimits(
+                MaxEvents: 2,
+                MaxFieldLength: 256 * 1024,
+                MaxArchiveBytes: maxArchiveBytes,
+                MaxUncompressedBytes: maxUncompressedBytes,
+                MaxEntryUncompressedBytes: maxUncompressedBytes));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => exporter.ExportAsync(
+            destination,
+            DiagnosticExportContext.Empty,
+            CancellationToken.None));
+
+        Assert.Equal("existing", await File.ReadAllTextAsync(destination));
+        Assert.Empty(Directory.EnumerateFiles(_directory, "*.tmp", SearchOption.TopDirectoryOnly));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directory))
@@ -121,5 +225,11 @@ public sealed class DiagnosticExporterTests : IDisposable
         }
 
         return builder.ToString();
+    }
+
+    private static async Task<string> ReadEntryAsync(ZipArchive archive, string name)
+    {
+        using var reader = new StreamReader(archive.GetEntry(name)!.Open(), Encoding.UTF8);
+        return await reader.ReadToEndAsync();
     }
 }

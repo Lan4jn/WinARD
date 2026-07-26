@@ -28,6 +28,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly RemoteTextInputBuffer _textInput = new();
     private readonly AppWindow _appWindow;
     private readonly DiagnosticExportService? _diagnosticExportService;
+    private readonly ConnectionErrorActionHandler _errorActionHandler;
     private RemoteFramebufferSize _remoteSize;
     private Task? _closeTask;
     private ViewportScaleMode _scaleMode = ViewportScaleMode.Fit;
@@ -43,7 +44,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         IFramePresenter? presenter = null,
         ISafeDiagnosticSink? diagnosticSink = null,
         DiagnosticExportService? diagnosticExportService = null,
-        ConnectionErrorViewModel? initialError = null)
+        ConnectionErrorViewModel? initialError = null,
+        Func<CancellationToken, Task>? retryRequested = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(ownership);
@@ -60,6 +62,24 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             dispatcher,
             _clipboardBridge,
             diagnosticSink);
+        var handlers = new Dictionary<ConnectionErrorActionKind, Func<CancellationToken, Task>>
+        {
+            [ConnectionErrorActionKind.CopyCorrelationId] = CopyCorrelationIdAsync,
+            [ConnectionErrorActionKind.Disconnect] = _ => CloseSessionAsync(),
+            [ConnectionErrorActionKind.Cancel] = _ => CloseSessionAsync(),
+        };
+        if (_diagnosticExportService is not null)
+        {
+            handlers[ConnectionErrorActionKind.ExportDiagnostics] = ExportDiagnosticsAsync;
+        }
+        if (retryRequested is not null)
+        {
+            var retry = new RemoteSessionRetryAction(CloseSessionAsync, retryRequested);
+            handlers[ConnectionErrorActionKind.Retry] = retry.ExecuteAsync;
+        }
+
+        _errorActionHandler = new ConnectionErrorActionHandler(handlers);
+        SessionErrorCard.IsActionEnabled = _errorActionHandler.CanHandle;
         SessionErrorCard.ActionRequested += OnErrorActionRequested;
         SessionErrorCard.ViewModel = initialError;
         _inputOperations = new RemoteInputOperationRunner(
@@ -416,36 +436,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     {
         try
         {
-            switch (action)
-            {
-                case ConnectionErrorActionKind.CopyCorrelationId:
-                    if (SessionErrorCard.ViewModel is { } card)
-                    {
-                        var package = new Windows.ApplicationModel.DataTransfer.DataPackage();
-                        package.SetText(card.CorrelationId);
-                        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);
-                    }
-                    break;
-                case ConnectionErrorActionKind.ExportDiagnostics:
-                    if (_diagnosticExportService is not null)
-                    {
-                        var path = await _diagnosticExportService.ExportAsync(
-                            this,
-                            DesktopDiagnosticContextFactory.Create(),
-                            _lifetime.Token);
-                        if (path is not null)
-                        {
-                            StatusText.Text = $"诊断已导出：{path}";
-                        }
-                    }
-                    break;
-                case ConnectionErrorActionKind.Disconnect:
-                case ConnectionErrorActionKind.Cancel:
-                    await CloseSessionAsync();
-                    break;
-                default:
-                    break;
-            }
+            await _errorActionHandler.HandleAsync(action, _lifetime.Token);
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
@@ -453,6 +444,36 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         catch (Exception)
         {
             StatusText.Text = "错误操作未能完成。";
+        }
+    }
+
+    private Task CopyCorrelationIdAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (SessionErrorCard.ViewModel is { } card)
+        {
+            var package = new Windows.ApplicationModel.DataTransfer.DataPackage();
+            package.SetText(card.CorrelationId);
+            Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private async Task ExportDiagnosticsAsync(CancellationToken cancellationToken)
+    {
+        if (_diagnosticExportService is null)
+        {
+            throw new InvalidOperationException("Diagnostic export is not available.");
+        }
+
+        var path = await _diagnosticExportService.ExportAsync(
+            this,
+            DesktopDiagnosticContextFactory.Create(),
+            cancellationToken);
+        if (path is not null)
+        {
+            StatusText.Text = $"诊断已导出：{path}";
         }
     }
 

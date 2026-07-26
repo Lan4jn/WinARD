@@ -294,6 +294,74 @@ public sealed class ConnectionSessionControllerTests
         Assert.Equal(candidate.ToPin(), outcome.Profile.SshProfile!.HostKeyPin);
     }
 
+    [Fact]
+    public async Task ChangedHostKeyCancelReturnsSanitizedContextAndPreauthorizedReplaceRetriesOnce()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
+        var old = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "CQkJCQ==").ToPin();
+        var profile = SshProfileFor(endpoint).WithSsh(
+            SshProfileFor(endpoint).SshProfile!.WithHostKeyPin(old));
+        var transport = new HostKeyUntilPinnedTransport(candidate);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new FixedSecretProvider(),
+            new FixedClientFactory(new TrackingClient()),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(
+            handler,
+            new Prompt(SshHostKeyPromptDecision.Cancel));
+
+        var canceled = await workflow.AttemptAsync(
+            profile,
+            stageChanged: null,
+            acceptedHostKey: null,
+            CancellationToken.None);
+
+        Assert.NotNull(canceled.HostKeyFailure);
+        Assert.Equal(old.Fingerprint, canceled.HostKeyFailure.PreviousFingerprint);
+        Assert.Equal(candidate.Fingerprint, canceled.HostKeyFailure.NewFingerprint);
+        Assert.True(canceled.HostKeyFailure.IsChanged);
+        Assert.Equal(1, transport.Attempts);
+
+        var persisted = new List<ConnectionProfile>();
+        var replaced = await workflow.AttemptAsync(
+            profile,
+            stageChanged: null,
+            (updated, _) =>
+            {
+                persisted.Add(updated);
+                return Task.CompletedTask;
+            },
+            new PreauthorizedHostKeyPrompt(canceled.HostKeyFailure),
+            CancellationToken.None);
+
+        Assert.NotNull(replaced.Result.Session);
+        Assert.Equal(3, transport.Attempts);
+        Assert.Single(persisted);
+        Assert.Equal(candidate.ToPin(), persisted[0].SshProfile!.HostKeyPin);
+        await replaced.Result.Session.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PreauthorizedHostKeyDecisionCanOnlyBeConsumedOnce()
+    {
+        var request = new SshHostKeyPromptRequest(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "SHA256:new",
+            "SHA256:old",
+            IsChanged: true);
+        var prompt = new PreauthorizedHostKeyPrompt(request);
+
+        Assert.Equal(
+            SshHostKeyPromptDecision.Replace,
+            await prompt.PromptAsync(request, CancellationToken.None));
+        Assert.Equal(
+            SshHostKeyPromptDecision.Cancel,
+            await prompt.PromptAsync(request, CancellationToken.None));
+    }
+
     private static ConnectionProfile Profile() => ConnectionProfile.Create(
         Guid.NewGuid(), "Studio", "studio.local", 5900, "operator");
 
@@ -370,6 +438,30 @@ public sealed class ConnectionSessionControllerTests
             Attempts++;
             var verification = SshHostKeyVerifier.Verify(candidate, null);
             throw new SshHostKeyUnknownException(verification);
+        }
+    }
+
+    private sealed class HostKeyUntilPinnedTransport(
+        SshHostKeyCandidate candidate) : IRemoteTransportFactory
+    {
+        public int Attempts { get; private set; }
+
+        public Task<TransportConnection> ConnectAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Attempts++;
+            var verification = SshHostKeyVerifier.Verify(candidate, profile.SshProfile?.HostKeyPin);
+            return verification.Status switch
+            {
+                SshHostKeyStatus.Trusted => Task.FromResult(new TransportConnection(
+                    new MemoryStream(),
+                    new EndPointDescription(profile.Host, profile.Port))),
+                SshHostKeyStatus.Changed => Task.FromException<TransportConnection>(
+                    new SshHostKeyChangedException(verification)),
+                _ => Task.FromException<TransportConnection>(new SshHostKeyUnknownException(verification)),
+            };
         }
     }
 

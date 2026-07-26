@@ -26,6 +26,8 @@ public sealed partial class ConnectionErrorCard : UserControl
 
     public event EventHandler<ConnectionErrorActionKind>? ActionRequested;
 
+    public Func<ConnectionErrorActionKind, bool>? IsActionEnabled { get; set; }
+
     private void Render()
     {
         ActionPanel.Items.Clear();
@@ -40,7 +42,12 @@ public sealed partial class ConnectionErrorCard : UserControl
         CorrelationText.Text = _viewModel.CorrelationId;
         foreach (var action in _viewModel.Actions)
         {
-            var button = new Button { Content = action.Label, Tag = action.Kind };
+            var button = new Button
+            {
+                Content = action.Label,
+                Tag = action.Kind,
+                IsEnabled = IsActionEnabled?.Invoke(action.Kind) ?? true,
+            };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
                 button,
                 $"ConnectionErrorAction_{action.Kind}");

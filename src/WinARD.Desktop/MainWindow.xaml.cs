@@ -51,6 +51,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly SecretRedactor _secretRedactor;
     private Task? _shutdownTask;
     private RemoteSessionWindow? _remoteSessionWindow;
+    private SshHostKeyPromptRequest? _pendingHostKeyFailure;
     private bool _allowClose;
     private bool _sessionBusy;
     private int _disposed;
@@ -237,6 +238,8 @@ public sealed partial class MainWindow : Window, IDisposable
         details.Children.Add(_detailSource);
         details.Children.Add(_detailEndpoint);
         _connectionErrorCard.ActionRequested += OnConnectionErrorActionRequested;
+        _connectionErrorCard.IsActionEnabled = action =>
+            action != ConnectionErrorActionKind.ReplaceHostKey || _pendingHostKeyFailure is not null;
         details.Children.Add(_connectionErrorCard);
         _connectionStatus.Text = "未连接。";
         _connectionStatus.TextWrapping = TextWrapping.Wrap;
@@ -485,17 +488,34 @@ public sealed partial class MainWindow : Window, IDisposable
     private async Task ConnectSelectedWithHandlingAsync()
     {
         var profile = ViewModel.SelectedDevice?.Profile;
-        if (profile is null || _sessionBusy || _sessionController.IsConnected)
+        if (profile is null)
+        {
+            return;
+        }
+
+        await ConnectProfileWithHandlingAsync(profile);
+    }
+
+    private async Task ConnectProfileWithHandlingAsync(
+        ConnectionProfile profile,
+        ISshHostKeyPrompt? hostKeyPrompt = null)
+    {
+        if (_sessionBusy || _sessionController.IsConnected)
         {
             return;
         }
 
         SetSessionBusy(true);
+        if (hostKeyPrompt is null)
+        {
+            _pendingHostKeyFailure = null;
+        }
+
         _connectionErrorCard.ViewModel = null;
         _connectionStatus.Text = "正在连接…";
         try
         {
-            await _sessionController.ConnectAsync(profile, _shutdown.Token);
+            await _sessionController.ConnectAsync(profile, hostKeyPrompt, _shutdown.Token);
             var ownership = _sessionController.TransferConnectedSession();
             try
             {
@@ -505,7 +525,10 @@ public sealed partial class MainWindow : Window, IDisposable
                     _dispatcher,
                     presenter: null,
                     diagnosticSink: _diagnosticSink,
-                    diagnosticExportService: _diagnosticExportService);
+                    diagnosticExportService: _diagnosticExportService,
+                    retryRequested: _ => _uiOperation.RunAsync(
+                        () => ConnectProfileWithHandlingAsync(profile),
+                        _shutdown.Token));
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
                 _remoteSessionWindow = remoteWindow;
                 remoteWindow.Activate();
@@ -532,7 +555,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 "Connection attempt failed.",
                 [new("stage", error.Stage.ToString())],
                 exception));
-            ShowConnectionError(error);
+            ShowConnectionError(error, exception.HostKeyFailure);
         }
         catch (SessionAlreadyActiveException)
         {
@@ -550,7 +573,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 error.CorrelationId,
                 "Unexpected connection failure.",
                 Exception: exception));
-            ShowConnectionError(error);
+            ShowConnectionError(error, hostKeyFailure: null);
         }
         finally
         {
@@ -626,10 +649,16 @@ public sealed partial class MainWindow : Window, IDisposable
         _deleteButton.IsEnabled = !_sessionBusy && !_sessionController.IsConnected && !ViewModel.IsDeleting;
     }
 
-    private void ShowConnectionError(WinArdError error)
+    private void ShowConnectionError(
+        WinArdError error,
+        SshHostKeyPromptRequest? hostKeyFailure)
     {
+        _pendingHostKeyFailure = hostKeyFailure;
         _connectionStatus.Text = "连接失败。请使用下方操作继续。";
-        _connectionErrorCard.ViewModel = ConnectionErrorViewModel.FromError(error);
+        _connectionErrorCard.ViewModel = ConnectionErrorViewModel.FromError(
+            error,
+            hostKeyFailure?.PreviousFingerprint,
+            hostKeyFailure?.NewFingerprint);
     }
 
     private async void OnConnectionErrorActionRequested(
@@ -641,9 +670,21 @@ public sealed partial class MainWindow : Window, IDisposable
             switch (action)
             {
                 case ConnectionErrorActionKind.Retry:
-                case ConnectionErrorActionKind.ReplaceHostKey:
                     await _uiOperation.RunAsync(ConnectSelectedWithHandlingAsync, _shutdown.Token);
                     break;
+                case ConnectionErrorActionKind.ReplaceHostKey:
+                    if (ViewModel.SelectedDevice?.Profile is { } replaceProfile &&
+                        Interlocked.Exchange(ref _pendingHostKeyFailure, null) is { } hostKeyFailure)
+                    {
+                        await _uiOperation.RunAsync(
+                            () => ConnectProfileWithHandlingAsync(
+                                replaceProfile,
+                                new PreauthorizedHostKeyPrompt(hostKeyFailure)),
+                            _shutdown.Token);
+                        break;
+                    }
+
+                    throw new InvalidOperationException("SSH 主机密钥替换上下文已失效。");
                 case ConnectionErrorActionKind.ReenterCredentials:
                 case ConnectionErrorActionKind.UnlockVault:
                     if (ViewModel.SelectedDevice?.Profile is { } profile)
@@ -677,6 +718,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     await DisconnectWithHandlingAsync();
                     break;
                 case ConnectionErrorActionKind.Cancel:
+                    _pendingHostKeyFailure = null;
                     _connectionErrorCard.ViewModel = null;
                     break;
                 default:

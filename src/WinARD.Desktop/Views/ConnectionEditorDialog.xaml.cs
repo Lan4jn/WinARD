@@ -23,6 +23,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
     private readonly DiagnosticExportService? _diagnosticExportService;
     private readonly Window? _owner;
     private readonly SecretRedactor? _redactor;
+    private ConnectionEditorSecretPackage? _pendingHostKeyRetrySecret;
     private bool _saved;
 
     public ConnectionEditorDialog(
@@ -56,6 +57,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
             ? -1
             : (int)viewModel.CredentialSaveMode;
         WireFieldChanges();
+        ErrorCard.IsActionEnabled = CanHandleErrorAction;
         ErrorCard.ActionRequested += OnErrorActionRequested;
         PrimaryButtonClick += OnSaveClicked;
         Closing += OnClosing;
@@ -147,16 +149,26 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
     {
         _ = _operations.RunAsync(async () =>
         {
+            ConnectionEditorSecretPackage? retrySecret = null;
             try
             {
                 SetBusy(true);
-                using var secret = CaptureSecrets();
+                using var secret = Interlocked.Exchange(ref _pendingHostKeyRetrySecret, null) ?? CaptureSecrets();
+                retrySecret = secret?.Clone() as ConnectionEditorSecretPackage;
                 await ViewModel.TestConnectionAsync(secret?.Clone(), _lifetime.Token);
                 StatusText.Text = ViewModel.StatusMessage;
                 StageResults.ItemsSource = ViewModel.TestResults;
                 ErrorCard.ViewModel = ViewModel.LastTestError is null
                     ? null
-                    : ConnectionErrorViewModel.FromError(ViewModel.LastTestError);
+                    : ConnectionErrorViewModel.FromError(
+                        ViewModel.LastTestError,
+                        ViewModel.LastTestHostKeyFailure?.PreviousFingerprint,
+                        ViewModel.LastTestHostKeyFailure?.NewFingerprint);
+                if (ViewModel.LastTestHostKeyFailure is not null)
+                {
+                    _pendingHostKeyRetrySecret = retrySecret;
+                    retrySecret = null;
+                }
             }
             catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
             {
@@ -167,6 +179,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
             }
             finally
             {
+                retrySecret?.Dispose();
                 SetBusy(false);
             }
         }, _lifetime.Token);
@@ -175,6 +188,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
     private void OnClosing(ContentDialog sender, ContentDialogClosingEventArgs args)
     {
         _hostKeyPrompt?.Cancel();
+        Interlocked.Exchange(ref _pendingHostKeyRetrySecret, null)?.Dispose();
         if (!_saved)
         {
             _lifetime.Cancel();
@@ -338,9 +352,13 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
                         {
                             StatusText.Text = $"诊断已导出：{path}";
                         }
+
+                        break;
                     }
-                    break;
+
+                    throw new InvalidOperationException("Diagnostic export is not available.");
                 case ConnectionErrorActionKind.Cancel:
+                    Interlocked.Exchange(ref _pendingHostKeyRetrySecret, null)?.Dispose();
                     ErrorCard.ViewModel = null;
                     break;
                 case ConnectionErrorActionKind.OpenHelp:
@@ -348,8 +366,14 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
                         new Uri("https://support.apple.com/guide/mac-help/control-access-to-screen-recording-mchld6aa7d23/mac"));
                     break;
                 case ConnectionErrorActionKind.ReplaceHostKey:
-                    _hostKeyPrompt?.Replace();
-                    break;
+                    if (_hostKeyPrompt is not null && ViewModel.LastTestHostKeyFailure is { } failure)
+                    {
+                        _hostKeyPrompt.Preauthorize(failure);
+                        OnTestClicked(TestButton, new RoutedEventArgs());
+                        break;
+                    }
+
+                    throw new InvalidOperationException("SSH 主机密钥替换上下文已失效。");
                 case ConnectionErrorActionKind.Disconnect:
                     Hide();
                     break;
@@ -365,6 +389,15 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
             ShowError(exception);
         }
     }
+
+    private bool CanHandleErrorAction(ConnectionErrorActionKind action) => action switch
+    {
+        ConnectionErrorActionKind.ExportDiagnostics =>
+            _diagnosticExportService is not null && _owner is not null,
+        ConnectionErrorActionKind.ReplaceHostKey =>
+            _hostKeyPrompt is not null && ViewModel.LastTestHostKeyFailure is not null,
+        _ => true,
+    };
 
     private void ClearPasswords()
     {

@@ -8,7 +8,8 @@ namespace WinARD.Desktop.Services;
 
 public sealed record ConnectionAttemptOutcome(
     ConnectionProfile Profile,
-    ConnectResult Result);
+    ConnectResult Result,
+    SshHostKeyPromptRequest? HostKeyFailure = null);
 
 public sealed class ConnectionAttemptWorkflow(
     ConnectDeviceHandler handler,
@@ -44,41 +45,43 @@ public sealed class ConnectionAttemptWorkflow(
         var hostKeyRetried = false;
         while (true)
         {
-            Exception? failure = null;
+            HostKeyFailure? hostKeyFailure = null;
             var result = await _handler.HandleWithFailureObservationAsync(
                 profile,
                 stageChanged,
-                exception => failure = exception,
+                observation =>
+                {
+                    hostKeyFailure = GetHostKeyFailure(observation.Exception, profile);
+                    _diagnosticSink?.Write(new SafeDiagnosticEventInput(
+                        observation.Error.Code,
+                        observation.Error.CorrelationId,
+                        "Connection attempt stage failed.",
+                        [new("stage", observation.Error.Stage.ToString())],
+                        observation.Exception));
+                    return ValueTask.CompletedTask;
+                },
                 cancellationToken).ConfigureAwait(false);
-            if (result.Error is { } error && failure is not null)
-            {
-                _diagnosticSink?.Write(new SafeDiagnosticEventInput(
-                    error.Code,
-                    error.CorrelationId,
-                    "Connection attempt stage failed.",
-                    [new("stage", error.Stage.ToString())],
-                    failure));
-            }
 
             if (result.Session is not null || hostKeyRetried ||
-                !TryGetHostKeyFailure(failure, profile, out var verification, out var request))
+                hostKeyFailure is not { } failure)
             {
-                return new ConnectionAttemptOutcome(profile, result);
+                return new ConnectionAttemptOutcome(profile, result, hostKeyFailure?.Request);
             }
 
-            var decision = await (hostKeyPrompt ?? _hostKeyPrompt).PromptAsync(request, cancellationToken)
+            var decision = await (hostKeyPrompt ?? _hostKeyPrompt)
+                .PromptAsync(failure.Request, cancellationToken)
                 .ConfigureAwait(false);
-            var accepted = request.IsChanged
+            var accepted = failure.Request.IsChanged
                 ? decision == SshHostKeyPromptDecision.Replace
                 : decision == SshHostKeyPromptDecision.Trust;
             if (!accepted)
             {
-                return new ConnectionAttemptOutcome(profile, result);
+                return new ConnectionAttemptOutcome(profile, result, failure.Request);
             }
 
             var ssh = profile.SshProfile ??
                 throw new InvalidOperationException("SSH 主机密钥确认缺少 SSH 配置。");
-            profile = profile.WithSsh(ssh.WithHostKeyPin(verification.ToPin()));
+            profile = profile.WithSsh(ssh.WithHostKeyPin(failure.Verification.ToPin()));
             if (acceptedHostKey is not null)
             {
                 await acceptedHostKey(profile, cancellationToken).ConfigureAwait(false);
@@ -88,13 +91,11 @@ public sealed class ConnectionAttemptWorkflow(
         }
     }
 
-    private static bool TryGetHostKeyFailure(
-        Exception? exception,
-        ConnectionProfile profile,
-        out SshHostKeyVerification verification,
-        out SshHostKeyPromptRequest request)
+    private static HostKeyFailure? GetHostKeyFailure(
+        Exception exception,
+        ConnectionProfile profile)
     {
-        verification = exception switch
+        var verification = exception switch
         {
             SshHostKeyUnknownException unknown => unknown.Verification,
             SshHostKeyChangedException { Verification: not null } changed => changed.Verification,
@@ -102,17 +103,20 @@ public sealed class ConnectionAttemptWorkflow(
         };
         if (verification is null)
         {
-            request = null!;
-            return false;
+            return null;
         }
 
         var isChanged = verification.Status == SshHostKeyStatus.Changed;
-        request = new SshHostKeyPromptRequest(
+        var request = new SshHostKeyPromptRequest(
             verification.Endpoint,
             verification.Algorithm,
             verification.Fingerprint,
             isChanged ? profile.SshProfile?.HostKeyPin?.Fingerprint : null,
             isChanged);
-        return true;
+        return new HostKeyFailure(verification, request);
     }
+
+    private sealed record HostKeyFailure(
+        SshHostKeyVerification Verification,
+        SshHostKeyPromptRequest Request);
 }

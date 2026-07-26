@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using WinARD.Infrastructure.Diagnostics;
 using Xunit;
 
@@ -81,6 +82,58 @@ public sealed class SecretRedactorTests
     }
 
     [Fact]
+    public void RedactsSystemTextJsonUnicodeEscapesIncludingSurrogatePairs()
+    {
+        using var redactor = new SecretRedactor();
+        const string secret = "密碼🔐";
+        using var registration = redactor.Register(secret.AsSpan());
+        var escaped = JsonSerializer.Serialize(secret);
+        var lowerHex = LowerUnicodeHex(escaped);
+
+        var result = redactor.Redact($"upper={escaped};lower={lowerHex}");
+
+        Assert.DoesNotContain(secret, result, StringComparison.Ordinal);
+        Assert.DoesNotContain(escaped[1..^1], result, StringComparison.Ordinal);
+        Assert.DoesNotContain(lowerHex[1..^1], result, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("VaultMaster")]
+    [InlineData("vault-master")]
+    [InlineData("vault_master")]
+    [InlineData("MacPassword")]
+    [InlineData("SshPassword")]
+    [InlineData("PrivateKeyPassphrase")]
+    public void StructuredSinkRedactsNormalizedSecretFieldNamesWithoutRegistration(string name)
+    {
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+
+        sink.Write(new SafeDiagnosticEventInput(
+            "FIELD_TEST",
+            "corr-field",
+            "safe",
+            [new(name, "unregistered-sensitive-value")]));
+
+        Assert.Equal(SecretRedactor.RedactedValue, sink.Snapshot().Single().Fields[name]);
+    }
+
+    [Fact]
+    public void VaultMasterCategoryIsAlwaysRedactedWithoutRegistration()
+    {
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+
+        sink.Write(new SafeDiagnosticEventInput(
+            "FIELD_TEST",
+            "corr-field-kind",
+            "safe",
+            [new("master", "unregistered-master", DiagnosticFieldCategory.VaultMaster)]));
+
+        Assert.Equal(SecretRedactor.RedactedValue, sink.Snapshot().Single().Fields["master"]);
+    }
+
+    [Fact]
     public async Task RegistrationAndRedactionAreThreadSafe()
     {
         using var redactor = new SecretRedactor();
@@ -152,6 +205,31 @@ public sealed class SecretRedactorTests
         Assert.Equal(SecretRedactor.RedactedValue, latest.Fields["clipboard"]);
     }
 
+    [Fact]
+    public async Task StructuredSinkSupportsConcurrentBoundedWritesAndSnapshots()
+    {
+        const int capacity = 64;
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor, capacity, 128);
+        var writers = Enumerable.Range(0, 8).Select(writer => Task.Run(() =>
+        {
+            for (var index = 0; index < 250; index++)
+            {
+                sink.Write(new SafeDiagnosticEventInput(
+                    "PARALLEL",
+                    $"writer-{writer}-event-{index}",
+                    "safe"));
+                Assert.InRange(sink.Snapshot().Count, 0, capacity);
+            }
+        }));
+
+        await Task.WhenAll(writers);
+
+        var snapshot = sink.Snapshot();
+        Assert.Equal(capacity, snapshot.Count);
+        Assert.All(snapshot, item => Assert.Equal("PARALLEL", item.Code));
+    }
+
     private static string LowerPercentHex(string value)
     {
         var characters = value.ToCharArray();
@@ -165,6 +243,27 @@ public sealed class SecretRedactorTests
             characters[index + 1] = char.ToLowerInvariant(characters[index + 1]);
             characters[index + 2] = char.ToLowerInvariant(characters[index + 2]);
             index += 2;
+        }
+
+        return new string(characters);
+    }
+
+    private static string LowerUnicodeHex(string value)
+    {
+        var characters = value.ToCharArray();
+        for (var index = 0; index + 5 < characters.Length; index++)
+        {
+            if (characters[index] != '\\' || characters[index + 1] != 'u')
+            {
+                continue;
+            }
+
+            for (var hex = index + 2; hex < index + 6; hex++)
+            {
+                characters[hex] = char.ToLowerInvariant(characters[hex]);
+            }
+
+            index += 5;
         }
 
         return new string(characters);

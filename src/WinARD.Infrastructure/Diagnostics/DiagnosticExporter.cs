@@ -44,7 +44,14 @@ public sealed record DiagnosticExportContext(
 public sealed record DiagnosticExportLimits(
     int MaxEvents = 500,
     int MaxFieldLength = 4_096,
-    long MaxArchiveBytes = 5 * 1024 * 1024);
+    long MaxArchiveBytes = 5 * 1024 * 1024,
+    int MaxProfiles = 100,
+    int MaxEncodingStatisticsPerProfile = 100,
+    int MaxPerformanceCounters = 200,
+    int MaxFieldsPerEvent = 100,
+    int MaxStringUtf8Bytes = 16 * 1024,
+    long MaxUncompressedBytes = 20 * 1024 * 1024,
+    long MaxEntryUncompressedBytes = 16 * 1024 * 1024);
 
 public sealed class DiagnosticExporter : IDisposable
 {
@@ -65,6 +72,13 @@ public sealed class DiagnosticExporter : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxEvents);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxFieldLength);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxArchiveBytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxProfiles);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxEncodingStatisticsPerProfile);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxPerformanceCounters);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxFieldsPerEvent);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxStringUtf8Bytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxUncompressedBytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxEntryUncompressedBytes);
     }
 
     public async Task ExportAsync(
@@ -80,13 +94,16 @@ public sealed class DiagnosticExporter : IDisposable
             throw new InvalidOperationException("A diagnostic export is already in progress.");
         }
 
-        var fullDestination = Path.GetFullPath(destinationPath);
-        var directory = Path.GetDirectoryName(fullDestination) ??
-            throw new ArgumentException("The destination must have a parent directory.", nameof(destinationPath));
-        Directory.CreateDirectory(directory);
-        var temporaryPath = Path.Combine(directory, $".{Path.GetFileName(fullDestination)}.{Guid.NewGuid():N}.tmp");
+        string? temporaryPath = null;
         try
         {
+            var fullDestination = Path.GetFullPath(destinationPath);
+            var directory = Path.GetDirectoryName(fullDestination) ??
+                throw new ArgumentException("The destination must have a parent directory.", nameof(destinationPath));
+            Directory.CreateDirectory(directory);
+            temporaryPath = Path.Combine(
+                directory,
+                $".{Path.GetFileName(fullDestination)}.{Guid.NewGuid():N}.tmp");
             await WriteArchiveAsync(temporaryPath, context, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             var length = new FileInfo(temporaryPath).Length;
@@ -106,7 +123,11 @@ public sealed class DiagnosticExporter : IDisposable
         }
         finally
         {
-            TryDelete(temporaryPath);
+            if (temporaryPath is not null)
+            {
+                TryDelete(temporaryPath);
+            }
+
             _gate.Release();
         }
     }
@@ -117,18 +138,18 @@ public sealed class DiagnosticExporter : IDisposable
         CancellationToken cancellationToken)
     {
         var events = _sink.Snapshot().TakeLast(_limits.MaxEvents).Select(SafeEvent).ToArray();
-        var profiles = context.Profiles.Select(profile => new
+        var profiles = context.Profiles.Take(_limits.MaxProfiles).Select(profile => new
         {
             displayName = Safe(profile.DisplayName),
             host = context.IncludeHosts ? Safe(profile.Host) : null,
-            hostSha256 = Hash(profile.Host),
+            hostSha256 = Hash(Safe(profile.Host) ?? string.Empty),
             profile.Port,
             username = Safe(profile.Username),
             protocolVersion = Safe(profile.ProtocolVersion),
             securityType = Safe(profile.SecurityType),
             encodingStatistics = profile.EncodingStatistics is null
                 ? null
-                : SafeDictionary(profile.EncodingStatistics),
+                : SafeDictionary(profile.EncodingStatistics, _limits.MaxEncodingStatisticsPerProfile),
             errorCode = Safe(profile.ErrorCode),
             correlationId = Safe(profile.CorrelationId),
         }).ToArray();
@@ -144,7 +165,7 @@ public sealed class DiagnosticExporter : IDisposable
                 windowsAppSdk = Safe(context.Application.WindowsAppSdkVersion),
             },
             profiles,
-            performanceCounters = SafeDictionary(context.PerformanceCounters),
+            performanceCounters = SafeDictionary(context.PerformanceCounters, _limits.MaxPerformanceCounters),
             events,
         };
         var manifest = new
@@ -178,8 +199,21 @@ public sealed class DiagnosticExporter : IDisposable
             64 * 1024,
             FileOptions.Asynchronous | FileOptions.WriteThrough);
         using var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true);
-        await WriteJsonEntryAsync(archive, "manifest.json", manifest, cancellationToken).ConfigureAwait(false);
-        await WriteJsonEntryAsync(archive, "diagnostics.json", diagnostics, cancellationToken).ConfigureAwait(false);
+        long totalUncompressedBytes = 0;
+        totalUncompressedBytes += await WriteJsonEntryAsync(
+            archive,
+            "manifest.json",
+            manifest,
+            _limits.MaxEntryUncompressedBytes,
+            _limits.MaxUncompressedBytes - totalUncompressedBytes,
+            cancellationToken).ConfigureAwait(false);
+        totalUncompressedBytes += await WriteJsonEntryAsync(
+            archive,
+            "diagnostics.json",
+            diagnostics,
+            _limits.MaxEntryUncompressedBytes,
+            _limits.MaxUncompressedBytes - totalUncompressedBytes,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private object SafeEvent(SafeDiagnosticEvent item) => new
@@ -188,7 +222,7 @@ public sealed class DiagnosticExporter : IDisposable
         code = Safe(item.Code),
         correlationId = Safe(item.CorrelationId),
         message = Safe(item.Message),
-        fields = SafeStringDictionary(item.Fields),
+        fields = SafeStringDictionary(item.Fields, _limits.MaxFieldsPerEvent),
         exception = Safe(item.RedactedException),
     };
 
@@ -200,16 +234,18 @@ public sealed class DiagnosticExporter : IDisposable
         }
 
         var redacted = _redactor.Redact(value);
-        return redacted.Length <= _limits.MaxFieldLength
+        var characterLimited = redacted.Length <= _limits.MaxFieldLength
             ? redacted
             : redacted[.._limits.MaxFieldLength];
+        return LimitUtf8(characterLimited, _limits.MaxStringUtf8Bytes);
     }
 
     private Dictionary<string, TValue> SafeDictionary<TValue>(
-        IReadOnlyDictionary<string, TValue> values)
+        IReadOnlyDictionary<string, TValue> values,
+        int maxCount)
     {
         var safe = new Dictionary<string, TValue>(StringComparer.Ordinal);
-        foreach (var pair in values)
+        foreach (var pair in values.Take(maxCount))
         {
             var key = Safe(pair.Key) ?? string.Empty;
             safe[key] = pair.Value;
@@ -219,10 +255,11 @@ public sealed class DiagnosticExporter : IDisposable
     }
 
     private Dictionary<string, string> SafeStringDictionary(
-        IReadOnlyDictionary<string, string> values)
+        IReadOnlyDictionary<string, string> values,
+        int maxCount)
     {
         var safe = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var pair in values)
+        foreach (var pair in values.Take(maxCount))
         {
             var key = Safe(pair.Key) ?? string.Empty;
             safe[key] = Safe(pair.Value) ?? string.Empty;
@@ -234,10 +271,36 @@ public sealed class DiagnosticExporter : IDisposable
     private static string Hash(string value) => Convert.ToHexString(
         SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
-    private static async Task WriteJsonEntryAsync<T>(
+    private static string LimitUtf8(string value, int maxBytes)
+    {
+        if (Encoding.UTF8.GetByteCount(value) <= maxBytes)
+        {
+            return value;
+        }
+
+        var builder = new StringBuilder(Math.Min(value.Length, maxBytes));
+        var written = 0;
+        foreach (var rune in value.EnumerateRunes())
+        {
+            var bytes = rune.Utf8SequenceLength;
+            if (written + bytes > maxBytes)
+            {
+                break;
+            }
+
+            builder.Append(rune);
+            written += bytes;
+        }
+
+        return builder.ToString();
+    }
+
+    private static async Task<long> WriteJsonEntryAsync<T>(
         ZipArchive archive,
         string entryName,
         T value,
+        long maxEntryBytes,
+        long remainingTotalBytes,
         CancellationToken cancellationToken)
     {
         if (Path.IsPathRooted(entryName) || entryName.Contains("..", StringComparison.Ordinal) ||
@@ -246,10 +309,24 @@ public sealed class DiagnosticExporter : IDisposable
             throw new InvalidOperationException("Unsafe diagnostic archive entry name.");
         }
 
+        var limit = Math.Min(maxEntryBytes, remainingTotalBytes);
+        if (limit <= 0)
+        {
+            throw new InvalidOperationException("The diagnostic archive exceeded its uncompressed size limit.");
+        }
+
+        await using var buffer = new MemoryStream();
+        await using (var bounded = new BoundedWriteStream(buffer, limit))
+        {
+            await JsonSerializer.SerializeAsync(bounded, value, JsonOptions, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
         var entry = archive.CreateEntry(entryName, CompressionLevel.SmallestSize);
         await using var entryStream = entry.Open();
-        await JsonSerializer.SerializeAsync(entryStream, value, JsonOptions, cancellationToken)
-            .ConfigureAwait(false);
+        buffer.Position = 0;
+        await buffer.CopyToAsync(entryStream, cancellationToken).ConfigureAwait(false);
+        return buffer.Length;
     }
 
     private static void TryDelete(string path)
@@ -270,4 +347,48 @@ public sealed class DiagnosticExporter : IDisposable
     }
 
     public void Dispose() => _gate.Dispose();
+
+    private sealed class BoundedWriteStream(Stream inner, long maxBytes) : Stream
+    {
+        private long _written;
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => _written;
+        public override long Position { get => _written; set => throw new NotSupportedException(); }
+        public override void Flush() => inner.Flush();
+        public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken);
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            Write(buffer.AsSpan(offset, count));
+
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            EnsureCapacity(buffer.Length);
+            inner.Write(buffer);
+            _written += buffer.Length;
+        }
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            EnsureCapacity(buffer.Length);
+            await inner.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+            _written += buffer.Length;
+        }
+
+        private void EnsureCapacity(int count)
+        {
+            if (_written + count > maxBytes)
+            {
+                throw new InvalidOperationException(
+                    "The diagnostic archive exceeded its uncompressed size limit.");
+            }
+        }
+    }
 }

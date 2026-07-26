@@ -18,6 +18,7 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
 {
     private readonly object _gate = new();
     private PendingPrompt? _pending;
+    private SshHostKeyPromptRequest? _preauthorized;
     private ConnectionEditorHostKeyPromptState _state = ConnectionEditorHostKeyPromptState.Hidden;
     private bool _disposed;
 
@@ -44,6 +45,13 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (Interlocked.Exchange(ref _preauthorized, null) is { } expected && expected == request)
+            {
+                return ValueTask.FromResult(request.IsChanged
+                    ? SshHostKeyPromptDecision.Replace
+                    : SshHostKeyPromptDecision.Trust);
+            }
+
             if (_pending is not null)
             {
                 throw new InvalidOperationException("SSH 主机密钥确认已在等待处理。");
@@ -72,6 +80,21 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
     public void Replace() => Complete(SshHostKeyPromptDecision.Replace, expectedChanged: true);
 
     public void Cancel() => Complete(SshHostKeyPromptDecision.Cancel, expectedChanged: null);
+
+    public void Preauthorize(SshHostKeyPromptRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_pending is not null)
+            {
+                throw new InvalidOperationException("SSH 主机密钥确认仍在等待处理。");
+            }
+
+            _preauthorized = request;
+        }
+    }
 
     private void Complete(SshHostKeyPromptDecision decision, bool? expectedChanged)
     {
@@ -104,6 +127,7 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
             }
 
             _disposed = true;
+            _preauthorized = null;
         }
 
         Cancel();

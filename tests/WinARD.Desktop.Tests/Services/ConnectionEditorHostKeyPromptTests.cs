@@ -61,4 +61,22 @@ public sealed class ConnectionEditorHostKeyPromptTests
         Assert.Equal(SshHostKeyPromptDecision.Cancel, await pending);
         Assert.False(sut.State.IsVisible);
     }
+
+    [Fact]
+    public async Task PreauthorizedReplaceCompletesMatchingNextPromptWithoutShowingPendingUi()
+    {
+        using var sut = new ConnectionEditorHostKeyPrompt();
+        var request = new SshHostKeyPromptRequest(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "SHA256:new",
+            "SHA256:old",
+            IsChanged: true);
+        sut.Preauthorize(request);
+
+        var decision = await sut.PromptAsync(request, CancellationToken.None);
+
+        Assert.Equal(SshHostKeyPromptDecision.Replace, decision);
+        Assert.False(sut.State.IsVisible);
+    }
 }

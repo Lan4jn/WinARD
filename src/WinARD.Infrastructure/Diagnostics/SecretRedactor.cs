@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Text;
 using System.Security.Cryptography;
 using System.Text;
@@ -176,6 +177,8 @@ public sealed class SecretRedactor : IDisposable
         AddDistinct(variants, url);
         AddDistinct(variants, UrlEncode(secret, lowerHex: true));
         AddDistinct(variants, JsonEscape(secret));
+        AddDistinct(variants, JsonUnicodeEscape(secret, lowerHex: false));
+        AddDistinct(variants, JsonUnicodeEscape(secret, lowerHex: true));
         return variants;
     }
 
@@ -222,7 +225,7 @@ public sealed class SecretRedactor : IDisposable
             }
         }
 
-        return output.ToArray();
+        return CopyAndZero(output);
     }
 
     private static byte[] JsonEscape(ReadOnlySpan<byte> secret)
@@ -259,7 +262,106 @@ public sealed class SecretRedactor : IDisposable
             }
         }
 
-        return output.ToArray();
+        return CopyAndZero(output);
+    }
+
+    private static byte[] JsonUnicodeEscape(ReadOnlySpan<byte> secret, bool lowerHex)
+    {
+        const string upper = "0123456789ABCDEF";
+        const string lower = "0123456789abcdef";
+        var hex = lowerHex ? lower : upper;
+        using var output = new MemoryStream(secret.Length * 6);
+        while (!secret.IsEmpty)
+        {
+            var status = Rune.DecodeFromUtf8(secret, out var rune, out var consumed);
+            if (status != OperationStatus.Done)
+            {
+                ZeroBuffer(output);
+                return [];
+            }
+
+            secret = secret[consumed..];
+            if (rune.IsAscii)
+            {
+                WriteJsonAscii(output, (byte)rune.Value, hex);
+                continue;
+            }
+
+            if (rune.Value <= char.MaxValue)
+            {
+                WriteUnicodeEscape(output, (ushort)rune.Value, hex);
+                continue;
+            }
+
+            var scalar = rune.Value - 0x10000;
+            WriteUnicodeEscape(output, (ushort)(0xD800 + (scalar >> 10)), hex);
+            WriteUnicodeEscape(output, (ushort)(0xDC00 + (scalar & 0x3FF)), hex);
+        }
+
+        return CopyAndZero(output);
+    }
+
+    private static void WriteJsonAscii(Stream output, byte value, string hex)
+    {
+        switch (value)
+        {
+            case (byte)'"':
+                output.Write("\\\""u8);
+                break;
+            case (byte)'\\':
+                output.Write("\\\\"u8);
+                break;
+            case (byte)'\b':
+                output.Write("\\b"u8);
+                break;
+            case (byte)'\f':
+                output.Write("\\f"u8);
+                break;
+            case (byte)'\n':
+                output.Write("\\n"u8);
+                break;
+            case (byte)'\r':
+                output.Write("\\r"u8);
+                break;
+            case (byte)'\t':
+                output.Write("\\t"u8);
+                break;
+            case < 0x20:
+            case (byte)'&':
+            case (byte)'\'':
+            case (byte)'<':
+            case (byte)'>':
+                WriteUnicodeEscape(output, value, hex);
+                break;
+            default:
+                output.WriteByte(value);
+                break;
+        }
+    }
+
+    private static void WriteUnicodeEscape(Stream output, ushort value, string hex)
+    {
+        output.WriteByte((byte)'\\');
+        output.WriteByte((byte)'u');
+        output.WriteByte((byte)hex[(value >> 12) & 0xF]);
+        output.WriteByte((byte)hex[(value >> 8) & 0xF]);
+        output.WriteByte((byte)hex[(value >> 4) & 0xF]);
+        output.WriteByte((byte)hex[value & 0xF]);
+    }
+
+    private static byte[] CopyAndZero(MemoryStream stream)
+    {
+        var result = stream.ToArray();
+        ZeroBuffer(stream);
+        return result;
+    }
+
+    private static void ZeroBuffer(MemoryStream stream)
+    {
+        if (stream.TryGetBuffer(out var buffer))
+        {
+            CryptographicOperations.ZeroMemory(buffer.AsSpan(0, checked((int)stream.Length)));
+        }
     }
 
     private static void AddDistinct(List<byte[]> variants, byte[] candidate)

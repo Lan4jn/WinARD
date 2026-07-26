@@ -8,6 +8,8 @@ namespace WinARD.Application.Sessions;
 
 public sealed record ConnectResult(SessionState State, RemoteSession? Session, WinArdError? Error);
 
+internal sealed record ConnectionFailureObservation(Exception Exception, WinArdError Error);
+
 public sealed class ConnectDeviceHandler
 {
     private readonly IRemoteTransportFactory _transportFactory;
@@ -42,7 +44,7 @@ public sealed class ConnectDeviceHandler
     internal async Task<ConnectResult> HandleWithFailureObservationAsync(
         ConnectionProfile profile,
         Action<ConnectionStage>? stageChanged,
-        Action<Exception> failureObserved,
+        Func<ConnectionFailureObservation, ValueTask> failureObserved,
         CancellationToken cancellationToken) =>
         await HandleCoreAsync(
             profile,
@@ -53,7 +55,7 @@ public sealed class ConnectDeviceHandler
     private async Task<ConnectResult> HandleCoreAsync(
         ConnectionProfile profile,
         Action<ConnectionStage>? stageChanged,
-        Action<Exception>? failureObserved,
+        Func<ConnectionFailureObservation, ValueTask>? failureObserved,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -63,6 +65,7 @@ public sealed class ConnectDeviceHandler
         ISecret? secret = null;
         TransportConnection? transport = null;
         IRfbClient? client = null;
+        var sessionOwnsResources = false;
 
         try
         {
@@ -91,27 +94,45 @@ public sealed class ConnectDeviceHandler
             cancellationToken.ThrowIfCancellationRequested();
             stateMachine.MoveTo(SessionState.Connected);
             stageChanged?.Invoke(ConnectionStage.Connected);
-
-            return new ConnectResult(
+            var result = new ConnectResult(
                 stateMachine.Current,
                 new RemoteSession(stateMachine, transport, client),
                 null);
+            sessionOwnsResources = true;
+            return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            await CleanupAsync(client, transport, secret).ConfigureAwait(false);
             throw;
         }
         catch (Exception exception)
         {
             var failedAt = ToConnectionStage(stateMachine.Current);
-            await CleanupAsync(client, transport, secret).ConfigureAwait(false);
+            var error = _errorMapper.Map(exception, failedAt);
             stateMachine.MoveTo(SessionState.Failed);
-            failureObserved?.Invoke(exception);
+            if (failureObserved is not null)
+            {
+                try
+                {
+                    await failureObserved(new ConnectionFailureObservation(exception, error))
+                        .ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                }
+            }
+
             return new ConnectResult(
                 stateMachine.Current,
                 null,
-                _errorMapper.Map(exception, failedAt));
+                error);
+        }
+        finally
+        {
+            if (!sessionOwnsResources)
+            {
+                await CleanupAsync(client, transport, secret).ConfigureAwait(false);
+            }
         }
     }
 

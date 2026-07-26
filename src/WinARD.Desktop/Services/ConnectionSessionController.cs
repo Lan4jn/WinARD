@@ -41,6 +41,14 @@ public sealed class ConnectionSessionController : IAsyncDisposable
 
     public async Task ConnectAsync(ConnectionProfile profile, CancellationToken cancellationToken)
     {
+        await ConnectAsync(profile, hostKeyPrompt: null, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task ConnectAsync(
+        ConnectionProfile profile,
+        ISshHostKeyPrompt? hostKeyPrompt,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(profile);
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -82,6 +90,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
                         await _repository.SaveAsync(updated, token).ConfigureAwait(false);
                         ProfileUpdated?.Invoke(updated);
                     },
+                    hostKeyPrompt,
                     cancellationToken).ConfigureAwait(false);
                 profile = outcome.Profile;
                 var result = outcome.Result;
@@ -91,7 +100,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
                     completed.Add(new ConnectionTestStageResult(error.Stage, false, timer.Elapsed, error.UserMessage));
                     StageResults = completed;
                     StatusMessage = error.UserMessage;
-                    throw new ConnectionFailedException(result);
+                    throw new ConnectionFailedException(outcome);
                 }
 
                 completed.Add(new ConnectionTestStageResult(
@@ -262,10 +271,15 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
 
 public sealed class ConnectionFailedException : InvalidOperationException
 {
-    public ConnectionFailedException(ConnectResult result)
-        : base(result.Error?.UserMessage ?? "连接失败。") => Result = result;
+    public ConnectionFailedException(ConnectionAttemptOutcome outcome)
+        : base((outcome ?? throw new ArgumentNullException(nameof(outcome))).Result.Error?.UserMessage ??
+            "连接失败。") => Outcome = outcome;
 
-    public ConnectResult Result { get; }
+    public ConnectionAttemptOutcome Outcome { get; }
+
+    public ConnectResult Result => Outcome.Result;
+
+    public SshHostKeyPromptRequest? HostKeyFailure => Outcome.HostKeyFailure;
 }
 
 public enum SshHostKeyPromptDecision
