@@ -83,7 +83,7 @@ public sealed class ConnectionEditorViewModelTests
     }
 
     [Fact]
-    public async Task DialogInitializationSameModeDoesNotDiscardOpaqueSshReferenceOrPin()
+    public async Task DialogInitializationLeavesOpaqueCredentialModeUntouched()
     {
         var macReference = CredentialReference.Create("windows", "mac");
         var sshReference = CredentialReference.Create("opaque-store", "ssh/password");
@@ -110,7 +110,6 @@ public sealed class ConnectionEditorViewModelTests
             },
             (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
 
-        sut.CredentialSaveMode = CredentialSaveMode.WindowsCredentialManager;
         sut.DisplayName = "Renamed";
         await sut.SaveAsync(null, CancellationToken.None);
 
@@ -118,6 +117,26 @@ public sealed class ConnectionEditorViewModelTests
         Assert.Equal(macReference, saved!.CredentialReference);
         Assert.Equal(sshReference, saved.SshProfile!.PasswordCredentialReference);
         Assert.Equal(pin, saved.SshProfile.HostKeyPin);
+    }
+
+    [Fact]
+    public void DialogInitializationSameSupportedModeDoesNotMarkModeChanged()
+    {
+        var profile = ConnectionProfile.Create(
+                Guid.NewGuid(), "Original", "mac.local", 5900, "mac-user")
+            .WithCredential(CredentialReference.Create("windows", "mac"))
+            .WithSsh(SshProfile.Create(
+                "jump.local", 22, "ssh-user", null, "mac.local", 5900,
+                CredentialReference.Create("windows", "ssh"), null, null));
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (saved, _, _, _) => Task.FromResult(saved),
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+
+        sut.CredentialSaveMode = CredentialSaveMode.WindowsCredentialManager;
+
+        Assert.False(sut.CredentialModeChanged);
+        Assert.False(sut.HasUnsupportedCredentialReference);
     }
 
     [Theory]
@@ -237,23 +256,148 @@ public sealed class ConnectionEditorViewModelTests
     }
 
     [Fact]
-    public void UnknownCredentialStoreBlocksSaveUntilUserChoosesMode()
+    public async Task UnknownCredentialStoreAllowsNonSecretEditButDisablesTest()
+    {
+        var macReference = CredentialReference.Create("legacy-plugin", "shared/mac");
+        var sshReference = CredentialReference.Create("opaque-ssh", "shared/ssh");
+        var pin = new SshHostKeyPin(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "AAAAC3NzaC1lZDI1NTE5AAAAIFixture",
+            "SHA256:fixture");
+        var profile = ConnectionProfile.Create(
+                Guid.NewGuid(), "Legacy", "legacy.local", 5900, "operator")
+            .WithCredential(macReference)
+            .WithSsh(SshProfile.Create(
+                    "jump.local", 22, "ssh-user", null, "legacy.local", 5900,
+                    credentialReference: null, null, null)
+                .WithAuthenticationCredentials(sshReference, null)
+                .WithHostKeyPin(pin));
+        ConnectionProfile? saved = null;
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (candidate, _, _, _) =>
+            {
+                saved = candidate;
+                return Task.FromResult(candidate);
+            },
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+
+        sut.DisplayName = "Legacy Renamed";
+
+        Assert.True(sut.SaveCommand.CanExecute(null));
+        Assert.False(sut.TestConnectionCommand.CanExecute(null));
+        Assert.True(sut.HasUnsupportedCredentialReference);
+        Assert.Contains("不受支持的后端", sut.StatusMessage, StringComparison.Ordinal);
+
+        await sut.SaveAsync(secret: null, CancellationToken.None);
+
+        Assert.Equal(macReference, saved!.CredentialReference);
+        Assert.Equal(sshReference, saved.SshProfile!.PasswordCredentialReference);
+        Assert.Equal(pin, saved.SshProfile.HostKeyPin);
+    }
+
+    [Fact]
+    public void ExplicitCredentialModeChangeStopsPreservingOpaqueReferences()
     {
         var profile = ConnectionProfile.Create(
                 Guid.NewGuid(), "Legacy", "legacy.local", 5900, "operator")
-            .WithCredential(CredentialReference.Create("custom-store", "shared/key"));
+            .WithCredential(CredentialReference.Create("legacy-plugin", "shared/mac"))
+            .WithSsh(SshProfile.Create(
+                    "jump.local", 22, "ssh-user", null, "legacy.local", 5900,
+                    credentialReference: null, null, null)
+                .WithAuthenticationCredentials(
+                    CredentialReference.Create("opaque-ssh", "shared/ssh"),
+                    null));
         var sut = new ConnectionEditorViewModel(
             profile,
             (saved, _, _, _) => Task.FromResult(saved),
             (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
 
-        Assert.False(sut.SaveCommand.CanExecute(null));
-        Assert.True(sut.HasUnsupportedCredentialReference);
-
         sut.CredentialSaveMode = CredentialSaveMode.AskEveryTime;
 
         Assert.True(sut.SaveCommand.CanExecute(null));
         Assert.False(sut.HasUnsupportedCredentialReference);
+        Assert.Null(sut.BuildProfile().CredentialReference);
+        Assert.Null(sut.BuildProfile().SshProfile!.PasswordCredentialReference);
+    }
+
+    [Fact]
+    public void ExplicitWindowsSelectionMigratesUnknownFallbackMode()
+    {
+        var profile = ConnectionProfile.Create(
+                Guid.NewGuid(), "Legacy", "legacy.local", 5900, "operator")
+            .WithCredential(CredentialReference.Create("legacy-plugin", "shared/mac"));
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (saved, _, _, _) => Task.FromResult(saved),
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+
+        Assert.Equal(CredentialSaveMode.WindowsCredentialManager, sut.CredentialSaveMode);
+        sut.CredentialSaveMode = CredentialSaveMode.WindowsCredentialManager;
+
+        Assert.True(sut.CredentialModeChanged);
+        Assert.False(sut.HasUnsupportedCredentialReference);
+        Assert.Null(sut.BuildProfile().CredentialReference);
+    }
+
+    [Fact]
+    public async Task UnknownCredentialStoreRejectsSecretUntilModeChanges()
+    {
+        var profile = ConnectionProfile.Create(
+                Guid.NewGuid(), "Legacy", "legacy.local", 5900, "operator")
+            .WithCredential(CredentialReference.Create("legacy-plugin", "shared/mac"));
+        var saveCalls = 0;
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (saved, _, _, _) =>
+            {
+                saveCalls++;
+                return Task.FromResult(saved);
+            },
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+        using var secret = new TestSecret();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sut.SaveAsync(secret.Clone(), CancellationToken.None));
+
+        Assert.Contains("先选择受支持的凭据保存方式", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(0, saveCalls);
+    }
+
+    [Fact]
+    public void OpaqueSshCredentialDisablesTestWhileKeepingNonSecretSaveEnabled()
+    {
+        var sshReference = CredentialReference.Create("opaque-ssh", "shared/ssh");
+        var profile = ConnectionProfile.Create(
+                Guid.NewGuid(), "Legacy SSH", "legacy.local", 5900, "operator")
+            .WithCredential(CredentialReference.Create("windows", "shared/mac"))
+            .WithSsh(SshProfile.Create(
+                    "jump.local", 22, "ssh-user", null, "legacy.local", 5900,
+                    credentialReference: null, null, null)
+                .WithAuthenticationCredentials(sshReference, null));
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (saved, _, _, _) => Task.FromResult(saved),
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+
+        Assert.True(sut.HasUnsupportedCredentialReference);
+        Assert.True(sut.SaveCommand.CanExecute(null));
+        Assert.False(sut.TestConnectionCommand.CanExecute(null));
+        Assert.Equal(sshReference, sut.BuildProfile().SshProfile!.PasswordCredentialReference);
+    }
+
+    private sealed class TestSecret : ISecret
+    {
+        public int Length => 1;
+
+        public void CopyTo(Span<byte> destination) => destination[0] = 1;
+
+        public ISecret Clone() => new TestSecret();
+
+        public void Dispose()
+        {
+        }
     }
 
     [Fact]

@@ -35,7 +35,9 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         SshPortBox.Value = viewModel.SshPort;
         SshUsernameBox.Text = viewModel.SshUsername;
         PrivateKeyPathBox.Text = viewModel.PrivateKeyPath;
-        CredentialModeBox.SelectedIndex = (int)viewModel.CredentialSaveMode;
+        CredentialModeBox.SelectedIndex = viewModel.HasUnsupportedCredentialReference
+            ? -1
+            : (int)viewModel.CredentialSaveMode;
         WireFieldChanges();
         PrimaryButtonClick += OnSaveClicked;
         Closing += OnClosing;

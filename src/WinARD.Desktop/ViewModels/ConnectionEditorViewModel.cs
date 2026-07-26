@@ -3,6 +3,7 @@ using CommunityToolkit.Mvvm.Input;
 using WinARD.Application.Ports;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
+using WinARD.Domain.Security;
 
 namespace WinARD.Desktop.ViewModels;
 
@@ -29,6 +30,10 @@ public sealed record ConnectionProfileTestResult(
 
 public sealed class ConnectionEditorViewModel : ObservableObject
 {
+    private const string UnsupportedCredentialStatus =
+        "凭据由不受支持的后端管理，可保存连接信息，但无法测试连接或修改密码。";
+    private const string UnsupportedCredentialChangeError =
+        "凭据由不受支持的后端管理。请先选择受支持的凭据保存方式再修改密码。";
     private readonly ConnectionProfile? _original;
     private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> _save;
     private readonly Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileTestResult>> _test;
@@ -90,7 +95,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             _ => CanSave());
         TestConnectionCommand = new AsyncRelayCommand<ISecret?>(
             secret => TestConnectionAsync(secret, CancellationToken.None),
-            _ => CanSave());
+            _ => CanTestConnection());
 
         if (profile is null)
         {
@@ -103,6 +108,11 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         _macUsername = profile.MacUsername;
         _useSsh = profile.TransportMode == TransportMode.Ssh;
         (_credentialSaveMode, _hasUnsupportedCredentialReference) = ModeFromProfile(profile);
+        if (_hasUnsupportedCredentialReference)
+        {
+            _statusMessage = UnsupportedCredentialStatus;
+        }
+
         if (profile.SshProfile is { } ssh)
         {
             _sshHost = ssh.Host;
@@ -182,7 +192,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         get => _credentialSaveMode;
         set
         {
-            if (_credentialSaveMode == value)
+            if (_credentialSaveMode == value && !_hasUnsupportedCredentialReference)
             {
                 return;
             }
@@ -192,6 +202,10 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             {
                 _hasUnsupportedCredentialReference = false;
                 OnPropertyChanged(nameof(HasUnsupportedCredentialReference));
+                if (string.Equals(StatusMessage, UnsupportedCredentialStatus, StringComparison.Ordinal))
+                {
+                    StatusMessage = string.Empty;
+                }
             }
 
             SetValidated(ref _credentialSaveMode, value);
@@ -227,6 +241,11 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         try
         {
             LastSaveResult = null;
+            if (_hasUnsupportedCredentialReference && !_credentialModeChanged && secret is not null)
+            {
+                throw new InvalidOperationException(UnsupportedCredentialChangeError);
+            }
+
             var profile = BuildProfile();
             var result = await _save(profile, CredentialSaveMode, secret, cancellationToken).ConfigureAwait(false);
             LastSaveResult = result;
@@ -245,6 +264,11 @@ public sealed class ConnectionEditorViewModel : ObservableObject
         EnterBusy();
         try
         {
+            if (_hasUnsupportedCredentialReference && !_credentialModeChanged)
+            {
+                throw new InvalidOperationException(UnsupportedCredentialStatus);
+            }
+
             TestResults = [];
             var result = await _test(BuildProfile(), CredentialSaveMode, secret, cancellationToken)
                 .ConfigureAwait(false);
@@ -313,9 +337,12 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
     private bool CanSave() => !IsBusy && FieldsAreValid();
 
+    private bool CanTestConnection() =>
+        !IsBusy && !_hasUnsupportedCredentialReference && FieldsAreValid();
+
     private bool FieldsAreValid()
     {
-        if (_hasUnsupportedCredentialReference || string.IsNullOrWhiteSpace(DisplayName) || !ValidHost(Host) ||
+        if (string.IsNullOrWhiteSpace(DisplayName) || !ValidHost(Host) ||
             Port is < 1 or > 65535 || string.IsNullOrWhiteSpace(MacUsername))
         {
             return false;
@@ -353,17 +380,30 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
     private static (CredentialSaveMode Mode, bool Unsupported) ModeFromProfile(ConnectionProfile profile)
     {
+        var references = new[]
+        {
+            profile.CredentialReference,
+            profile.SshProfile?.PasswordCredentialReference,
+            profile.SshProfile?.PrivateKeyPassphraseCredentialReference,
+        }.Where(static reference => reference is not null).Cast<CredentialReference>().ToArray();
+        var unsupported = references.Any(static reference => !IsSupportedStore(reference.Store));
         var store = profile.CredentialReference?.Store ??
             profile.SshProfile?.PasswordCredentialReference?.Store ??
             profile.SshProfile?.PrivateKeyPassphraseCredentialReference?.Store;
-        return store?.ToLowerInvariant() switch
+        var mode = store?.ToLowerInvariant() switch
         {
-            null or "windows" => (CredentialSaveMode.WindowsCredentialManager, false),
-            "vault" => (CredentialSaveMode.EncryptedVault, false),
-            "ask" => (CredentialSaveMode.AskEveryTime, false),
-            _ => (CredentialSaveMode.WindowsCredentialManager, true),
+            null or "windows" => CredentialSaveMode.WindowsCredentialManager,
+            "vault" => CredentialSaveMode.EncryptedVault,
+            "ask" => CredentialSaveMode.AskEveryTime,
+            _ => CredentialSaveMode.WindowsCredentialManager,
         };
+        return (mode, unsupported);
     }
+
+    private static bool IsSupportedStore(string store) =>
+        string.Equals(store, "windows", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(store, "vault", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(store, "ask", StringComparison.OrdinalIgnoreCase);
 
     private void SetValidated<T>(ref T field, T value, [System.Runtime.CompilerServices.CallerMemberName] string? propertyName = null)
     {

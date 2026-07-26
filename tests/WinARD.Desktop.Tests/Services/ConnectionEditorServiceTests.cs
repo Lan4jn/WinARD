@@ -59,24 +59,103 @@ public sealed class ConnectionEditorServiceTests
     public async Task EditingWithoutNewSecretPreservesOpaqueReferences()
     {
         var macReference = WinARD.Domain.Security.CredentialReference.Create("migrated", "shared/mac");
-        var sshReference = WinARD.Domain.Security.CredentialReference.Create("legacy-vault", "shared/ssh");
+        var sshReference = WinARD.Domain.Security.CredentialReference.Create("legacy-vault", "shared/ssh-password");
+        var passphraseReference = WinARD.Domain.Security.CredentialReference.Create("legacy-vault", "shared/ssh-passphrase");
+        var pin = new SshHostKeyPin(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "AAAAC3NzaC1lZDI1NTE5AAAAIFixture",
+            "SHA256:fixture");
         var original = Profile()
             .WithCredential(macReference)
             .WithSsh(SshProfile.Create(
-                "jump.local", 22, "ssh-user", null, "studio.local", 5900,
-                sshReference, null, null));
+                    "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+                    credentialReference: null, null, null)
+                .WithAuthenticationCredentials(sshReference, passphraseReference)
+                .WithHostKeyPin(pin));
         var repository = new FakeRepository { Existing = original };
-        using var store = new TransientCredentialStore();
+        var store = new FailOnCredentialAccessStore();
         var sut = CreateService(repository, store);
+        var renamed = ConnectionProfile.Create(
+                original.Id, "Renamed", original.Host, original.Port, original.MacUsername)
+            .WithCredential(macReference)
+            .WithSsh(original.SshProfile!);
 
         var saved = await sut.SaveAsync(
-            original,
+            renamed,
             CredentialSaveMode.WindowsCredentialManager,
             secret: null,
             CancellationToken.None);
 
+        Assert.Equal("Renamed", saved.DisplayName);
         Assert.Equal(macReference, saved.CredentialReference);
         Assert.Equal(sshReference, saved.SshProfile!.PasswordCredentialReference);
+        Assert.Equal(passphraseReference, saved.SshProfile.PrivateKeyPassphraseCredentialReference);
+        Assert.Equal(pin, saved.SshProfile.HostKeyPin);
+        Assert.Equal(saved, repository.Saved);
+        Assert.Equal(0, store.AccessAttempts);
+    }
+
+    [Fact]
+    public async Task OpaqueCredentialReferenceRejectsSecretWithoutExplicitModeMigration()
+    {
+        var original = Profile()
+            .WithCredential(WinARD.Domain.Security.CredentialReference.Create(
+                "legacy-plugin",
+                "shared/mac"));
+        var repository = new FakeRepository { Existing = original };
+        using var store = new VersionedCredentialStore();
+        var sut = CreateService(repository, store, store);
+        using var secret = Secret("replacement");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            sut.SaveAsync(
+                original,
+                CredentialSaveMode.WindowsCredentialManager,
+                secret,
+                CancellationToken.None));
+
+        Assert.Contains("先选择受支持的凭据保存方式", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(0, repository.SaveCalls);
+        Assert.Empty(store.References);
+    }
+
+    [Fact]
+    public async Task ExplicitModeMigrationDoesNotDeleteOpaqueCredentialReferences()
+    {
+        var oldMac = WinARD.Domain.Security.CredentialReference.Create(
+            "legacy-plugin",
+            "shared/mac");
+        var oldSsh = WinARD.Domain.Security.CredentialReference.Create(
+            "opaque-ssh",
+            "shared/ssh");
+        var original = Profile()
+            .WithCredential(oldMac)
+            .WithSsh(SshProfile.Create(
+                    "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+                    credentialReference: null, null, null)
+                .WithAuthenticationCredentials(oldSsh, null));
+        var migratedDraft = ProfileWithId(original.Id)
+            .WithSsh(SshProfile.Create(
+                "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+                credentialReference: null, null, null));
+        var repository = new FakeRepository { Existing = original };
+        using var store = new VersionedCredentialStore();
+        var sut = CreateService(repository, store, store);
+        using var mac = Secret("new-mac");
+        using var ssh = Secret("new-ssh");
+        using var package = new ConnectionEditorSecretPackage(mac, ssh);
+
+        var saved = await sut.SaveAsync(
+            migratedDraft,
+            CredentialSaveMode.WindowsCredentialManager,
+            package,
+            CancellationToken.None);
+
+        Assert.Equal("windows", saved.CredentialReference!.Store);
+        Assert.Equal("windows", saved.SshProfile!.PasswordCredentialReference!.Store);
+        Assert.DoesNotContain(oldMac, store.DeleteAttempts);
+        Assert.DoesNotContain(oldSsh, store.DeleteAttempts);
     }
 
     [Fact]
@@ -236,6 +315,13 @@ public sealed class ConnectionEditorServiceTests
         5900,
         "operator");
 
+    private static ConnectionProfile ProfileWithId(Guid id) => ConnectionProfile.Create(
+        id,
+        "Studio Mac",
+        "studio.local",
+        5900,
+        "operator");
+
     private static SecretBuffer Secret(string value) =>
         SecretBuffer.CopyFrom(Encoding.UTF8.GetBytes(value));
 
@@ -300,6 +386,8 @@ public sealed class ConnectionEditorServiceTests
         public int? FailSaveNumber { get; init; }
 
         public IReadOnlyCollection<WinARD.Domain.Security.CredentialReference> References => _values.Keys;
+
+        public List<WinARD.Domain.Security.CredentialReference> DeleteAttempts { get; } = [];
 
         public ValueTask SaveAsync(
             WinARD.Domain.Security.CredentialReference reference,
@@ -397,6 +485,7 @@ public sealed class ConnectionEditorServiceTests
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            DeleteAttempts.Add(reference);
             if (ThrowOnDelete)
             {
                 throw new IOException("credential cleanup failure");
@@ -431,6 +520,47 @@ public sealed class ConnectionEditorServiceTests
             CredentialStoreVersion.CopyFrom(VersionBytes(version));
 
         private static byte[] VersionBytes(long version) => BitConverter.GetBytes(version);
+    }
+
+    private sealed class FailOnCredentialAccessStore : ITransientCredentialStore
+    {
+        public int AccessAttempts { get; private set; }
+
+        public ValueTask SaveAsync(
+            WinARD.Domain.Security.CredentialReference reference,
+            ISecret secret,
+            CancellationToken cancellationToken) => Fail();
+
+        public ValueTask<ISecret?> ReadAsync(
+            WinARD.Domain.Security.CredentialReference reference,
+            CancellationToken cancellationToken) => Fail<ISecret?>();
+
+        public ValueTask<CredentialStoreSnapshot?> ReadSnapshotAsync(
+            WinARD.Domain.Security.CredentialReference reference,
+            CancellationToken cancellationToken) => Fail<CredentialStoreSnapshot?>();
+
+        public ValueTask<CredentialStoreCompareExchangeResult> CompareExchangeAsync(
+            WinARD.Domain.Security.CredentialReference reference,
+            CredentialStoreVersion? expectedVersion,
+            ISecret? replacement,
+            CancellationToken cancellationToken) => Fail<CredentialStoreCompareExchangeResult>();
+
+        public ValueTask DeleteAsync(
+            WinARD.Domain.Security.CredentialReference reference,
+            CancellationToken cancellationToken) => Fail();
+
+        private ValueTask Fail()
+        {
+            AccessAttempts++;
+            return ValueTask.FromException(new InvalidOperationException("Credential store must not be accessed."));
+        }
+
+        private ValueTask<T> Fail<T>()
+        {
+            AccessAttempts++;
+            return ValueTask.FromException<T>(
+                new InvalidOperationException("Credential store must not be accessed."));
+        }
     }
 
     private sealed class UnusedTransport : IRemoteTransportFactory

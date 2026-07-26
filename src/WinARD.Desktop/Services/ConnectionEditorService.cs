@@ -34,6 +34,18 @@ public sealed class ConnectionEditorService(
     {
         ArgumentNullException.ThrowIfNull(profile);
         var oldProfile = await _repository.GetAsync(profile.Id, cancellationToken).ConfigureAwait(false);
+        if (CredentialReferences(profile).Any(static reference => !IsSupportedStore(reference.Store)))
+        {
+            if (secret is not null)
+            {
+                throw new InvalidOperationException(
+                    "凭据由不受支持的后端管理。请先选择受支持的凭据保存方式再修改密码。");
+            }
+
+            await _repository.SaveAsync(profile, cancellationToken).ConfigureAwait(false);
+            return await CompleteCommittedSaveAsync(oldProfile, profile).ConfigureAwait(false);
+        }
+
         var package = secret as ConnectionEditorSecretPackage;
         using var macSecret = package?.HasMacSecret == true ? package.CloneMacSecret() : secret?.Clone();
         using var sshSecret = package?.HasSshSecret == true ? package.CloneSshSecret() : null;
@@ -270,7 +282,7 @@ public sealed class ConnectionEditorService(
         var retained = profiles.SelectMany(CredentialReferences).ToHashSet();
         foreach (var oldReference in CredentialReferences(oldProfile)
             .Except(CredentialReferences(newProfile))
-            .Where(candidate => !string.Equals(candidate.Store, "ask", StringComparison.OrdinalIgnoreCase))
+            .Where(static candidate => IsManagedStore(candidate.Store))
             .Except(retained))
         {
             await _credentialStore.DeleteAsync(oldReference, cancellationToken).ConfigureAwait(false);
@@ -318,6 +330,13 @@ public sealed class ConnectionEditorService(
             yield return profile.SshProfile.PrivateKeyPassphraseCredentialReference;
         }
     }
+
+    private static bool IsSupportedStore(string store) =>
+        IsManagedStore(store) || string.Equals(store, "ask", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsManagedStore(string store) =>
+        string.Equals(store, "windows", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(store, "vault", StringComparison.OrdinalIgnoreCase);
 
     private static CredentialReference ReferenceFor(Guid id, CredentialSaveMode mode) => mode switch
     {
