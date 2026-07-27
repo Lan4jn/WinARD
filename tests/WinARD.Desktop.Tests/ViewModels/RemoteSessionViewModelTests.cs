@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using WinARD.Application.Ports;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
@@ -6,7 +7,7 @@ using WinARD.Desktop.ViewModels;
 using WinARD.Infrastructure.Diagnostics;
 using Xunit;
 
-#pragma warning disable CA1707
+#pragma warning disable CA1707, CA2201
 
 namespace WinARD.Desktop.Tests.ViewModels;
 
@@ -380,6 +381,55 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal(2, runtime.ReceiveCount);
         Assert.True(runtime.ReceiveCancelled);
         Assert.Equal(1, lifetime.DisposeCount);
+        Assert.True(frameOwner.IsDisposed);
+        Assert.Equal(1, frameOwner.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Presentation_failure_diagnostic_preserves_stage_and_hresult()
+    {
+        var frameOwner = new TrackingMemoryOwner([17, 34, 51, 68]);
+        var runtime = new SingleFrameThenBlockingRuntime(frameOwner);
+        var presenter = new FailingWithExceptionPresenter(
+            new D3DPresentationException(
+                D3DPresentationStage.Present1,
+                new COMException(
+                    "sensitive native details",
+                    unchecked((int)0x887A0001))));
+        var diagnosticSink = new RecordingDiagnosticSink();
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            presenter,
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var diagnostic = Assert.Single(
+            diagnosticSink.Events,
+            item => item.Code == "REMOTE_PRESENTATION_FAILED");
+        Assert.Equal("Remote session loop failed.", diagnostic.Message);
+        var exception = Assert.IsType<D3DPresentationException>(diagnostic.Exception);
+        Assert.Equal(unchecked((int)0x887A0001), exception.HResult);
+        var fields = Assert.IsAssignableFrom<IReadOnlyList<DiagnosticField>>(diagnostic.Fields);
+        var field = Assert.Single(fields);
+        Assert.Equal("PresentationStage", field.Name);
+        Assert.Equal("Present1", field.Value);
+        Assert.Equal(DiagnosticFieldCategory.Public, field.Category);
+        Assert.DoesNotContain(
+            "sensitive native details",
+            diagnostic.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            fields,
+            item => item.Value?.Contains("sensitive native details", StringComparison.Ordinal) is true);
+        Assert.DoesNotContain(
+            fields,
+            item => item.Value?.Contains("17, 34, 51, 68", StringComparison.Ordinal) is true);
+        Assert.Equal(1, presenter.PresentCount);
         Assert.True(frameOwner.IsDisposed);
         Assert.Equal(1, frameOwner.DisposeCount);
     }
@@ -762,6 +812,24 @@ public sealed class RemoteSessionViewModelTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
+    private sealed class FailingWithExceptionPresenter(Exception exception) : IFramePresenter
+    {
+        public int PresentCount { get; private set; }
+
+        public void Resize(int width, int height) { }
+
+        public void Present(
+            ReadOnlySpan<byte> bgra32,
+            int stride,
+            IReadOnlyList<RemoteRectangle> dirtyRectangles)
+        {
+            PresentCount++;
+            throw exception;
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     private sealed class DispatcherBoundPresenter(Func<bool> isDispatching) : IFramePresenter
     {
         public bool WasDisposed { get; private set; }
@@ -815,6 +883,16 @@ public sealed class RemoteSessionViewModelTests
     {
         public void Write(SafeDiagnosticEventInput diagnosticEvent) =>
             throw new InvalidOperationException("sink failed");
+
+        public IReadOnlyList<SafeDiagnosticEvent> Snapshot() => [];
+    }
+
+    private sealed class RecordingDiagnosticSink : ISafeDiagnosticSink
+    {
+        public List<SafeDiagnosticEventInput> Events { get; } = [];
+
+        public void Write(SafeDiagnosticEventInput diagnosticEvent) =>
+            Events.Add(diagnosticEvent);
 
         public IReadOnlyList<SafeDiagnosticEvent> Snapshot() => [];
     }
