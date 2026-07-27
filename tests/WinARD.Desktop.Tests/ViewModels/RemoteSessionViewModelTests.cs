@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using WinARD.Application.Ports;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
@@ -80,6 +81,34 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal("连接已中断。", viewModel.StatusMessage);
         Assert.DoesNotContain("sensitive", viewModel.StatusMessage, StringComparison.Ordinal);
         Assert.Equal(1, lifetime.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Receive_failure_diagnostic_preserves_nested_aggregate_base_exception()
+    {
+        var runtime = new FailingWithExceptionRuntime(
+            new AggregateException(
+                new AggregateException(
+                    new IOException("sensitive endpoint"))));
+        var diagnosticSink = new RecordingDiagnosticSink();
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var diagnostic = Assert.Single(
+            diagnosticSink.Events,
+            item => item.Code == "REMOTE_SESSION_INTERRUPTED");
+        Assert.IsType<IOException>(diagnostic.Exception);
+        Assert.DoesNotContain(
+            diagnostic.Fields ?? [],
+            item => item.Name == "PresentationStage");
     }
 
     [Fact]
@@ -396,7 +425,9 @@ public sealed class RemoteSessionViewModelTests
                 new COMException(
                     "sensitive native details",
                     unchecked((int)0x887A0001))));
-        var diagnosticSink = new RecordingDiagnosticSink();
+        using var redactor = new SecretRedactor();
+        var safeDiagnosticSink = new InMemorySafeDiagnosticSink(redactor);
+        var diagnosticSink = new RecordingDiagnosticSink(safeDiagnosticSink);
         await using var viewModel = new RemoteSessionViewModel(
             runtime,
             new TrackingLifetime(),
@@ -429,6 +460,24 @@ public sealed class RemoteSessionViewModelTests
         Assert.DoesNotContain(
             fields,
             item => item.Value?.Contains("17, 34, 51, 68", StringComparison.Ordinal) is true);
+
+        var storedEvent = Assert.Single(
+            safeDiagnosticSink.Snapshot(),
+            item => item.Code == "REMOTE_PRESENTATION_FAILED");
+        var storedField = Assert.Single(storedEvent.Fields);
+        Assert.Equal("PresentationStage", storedField.Name);
+        Assert.Equal("Present1", storedField.Value);
+        Assert.Equal(DiagnosticFieldCategory.Public, storedField.Category);
+        Assert.Equal(nameof(D3DPresentationException), storedEvent.Exception?.Type);
+        Assert.Equal("0x887A0001", storedEvent.Exception?.HResult);
+        var storedJson = JsonSerializer.Serialize(storedEvent);
+        Assert.DoesNotContain(
+            "sensitive native details",
+            storedJson,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("[17,34,51,68]", storedJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("17, 34, 51, 68", storedJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("ESIzRA==", storedJson, StringComparison.Ordinal);
         Assert.Equal(1, presenter.PresentCount);
         Assert.True(frameOwner.IsDisposed);
         Assert.Equal(1, frameOwner.DisposeCount);
@@ -628,6 +677,18 @@ public sealed class RemoteSessionViewModelTests
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
             ValueTask.FromException<RemoteServerMessage>(new IOException("sensitive endpoint"));
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class FailingWithExceptionRuntime(Exception exception) : IRemoteSessionRuntime
+    {
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromException<RemoteServerMessage>(exception);
         public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
@@ -887,12 +948,16 @@ public sealed class RemoteSessionViewModelTests
         public IReadOnlyList<SafeDiagnosticEvent> Snapshot() => [];
     }
 
-    private sealed class RecordingDiagnosticSink : ISafeDiagnosticSink
+    private sealed class RecordingDiagnosticSink(ISafeDiagnosticSink? inner = null)
+        : ISafeDiagnosticSink
     {
         public List<SafeDiagnosticEventInput> Events { get; } = [];
 
-        public void Write(SafeDiagnosticEventInput diagnosticEvent) =>
+        public void Write(SafeDiagnosticEventInput diagnosticEvent)
+        {
             Events.Add(diagnosticEvent);
+            inner?.Write(diagnosticEvent);
+        }
 
         public IReadOnlyList<SafeDiagnosticEvent> Snapshot() => [];
     }

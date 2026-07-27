@@ -337,14 +337,6 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    private static Exception GetTerminalException(Task completed) =>
-        completed.Exception switch
-        {
-            { InnerExceptions.Count: 1 } aggregate => aggregate.InnerException!,
-            { } aggregate => aggregate.GetBaseException(),
-            _ => new InvalidOperationException("Remote session terminated unexpectedly."),
-        };
-
     private static IReadOnlyList<DiagnosticField>? GetPresentationFailureFields(
         Exception exception) =>
         exception is D3DPresentationException presentation
@@ -368,7 +360,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             var ownershipDisposal = DisposeOwnershipOnceAsync();
             if (wasTerminalFailure)
             {
-                var exception = GetTerminalException(completed);
+                var exception = completed.Exception?.GetBaseException() ??
+                    new InvalidOperationException("Remote session terminated unexpectedly.");
                 var error = WinArdError.Create(
                     ConnectionStage.Connected,
                     ReferenceEquals(completed, present)
