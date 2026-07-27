@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using SharpGen.Runtime;
 using WinARD.Application.Ports;
 using WinARD.Desktop.Rendering;
 using Xunit;
@@ -26,7 +27,7 @@ public sealed class D3DPresentationRecoveryTests
             (_, _, _) => optimizedCount++,
             () => false,
             () => rebuildCount++,
-            (_, _, _) => fallbackCount++);
+            (_, _) => fallbackCount++);
 
         Assert.Equal(1, optimizedCount);
         Assert.Equal(0, rebuildCount);
@@ -39,18 +40,28 @@ public sealed class D3DPresentationRecoveryTests
         var rebuildCount = 0;
         var fallbackCount = 0;
         var failure = PresentationFailure(D3DPresentationStage.Present1);
+        byte[] pixels = [1, 2, 3, 4];
+        byte[]? fallbackPixels = null;
+        var fallbackStride = 0;
 
         D3DPresentationRecovery.Execute(
-            [1, 2, 3, 4],
+            pixels,
             4,
             [new RemoteRectangle(0, 0, 1, 1)],
             (_, _, _) => throw failure,
             () => false,
             () => rebuildCount++,
-            (_, _, _) => fallbackCount++);
+            (bgra32, stride) =>
+            {
+                fallbackCount++;
+                fallbackPixels = bgra32.ToArray();
+                fallbackStride = stride;
+            });
 
         Assert.Equal(1, rebuildCount);
         Assert.Equal(1, fallbackCount);
+        Assert.Equal(pixels, fallbackPixels);
+        Assert.Equal(4, fallbackStride);
     }
 
     [Fact]
@@ -68,7 +79,7 @@ public sealed class D3DPresentationRecoveryTests
                 (_, _, _) => throw failure,
                 () => false,
                 () => rebuildCount++,
-                (_, _, _) => fallbackCount++));
+                (_, _) => fallbackCount++));
 
         Assert.Same(failure, thrown);
         Assert.Equal(0, rebuildCount);
@@ -90,7 +101,7 @@ public sealed class D3DPresentationRecoveryTests
                 (_, _, _) => throw failure,
                 () => true,
                 () => rebuildCount++,
-                (_, _, _) => fallbackCount++));
+                (_, _) => fallbackCount++));
 
         Assert.Same(failure, thrown);
         Assert.Equal(0, rebuildCount);
@@ -116,7 +127,7 @@ public sealed class D3DPresentationRecoveryTests
                     rebuildCount++;
                     throw rebuildFailure;
                 },
-                (_, _, _) => fallbackCount++));
+                (_, _) => fallbackCount++));
 
         Assert.Same(rebuildFailure, thrown);
         Assert.Equal(1, rebuildCount);
@@ -138,7 +149,7 @@ public sealed class D3DPresentationRecoveryTests
                 (_, _, _) => throw PresentationFailure(D3DPresentationStage.Present1),
                 () => false,
                 () => rebuildCount++,
-                (_, _, _) =>
+                (_, _) =>
                 {
                     fallbackCount++;
                     throw fallbackFailure;
@@ -166,6 +177,120 @@ public sealed class D3DPresentationRecoveryTests
         Assert.Same(inner, failure.InnerException);
     }
 
+    [Fact]
+    public void Action_operation_wraps_SharpGen_failure_with_stage_and_native_metadata()
+    {
+        var nativeFailure = SharpGenFailure();
+
+        var failure = Assert.Throws<D3DPresentationException>(() =>
+            D3DPresentationOperation.Run(
+                D3DPresentationStage.CreateDevice,
+                () => throw nativeFailure));
+
+        Assert.Equal(D3DPresentationStage.CreateDevice, failure.Stage);
+        Assert.Equal(DxgiErrorInvalidCall, failure.HResult);
+        Assert.Same(nativeFailure, failure.InnerException);
+    }
+
+    [Fact]
+    public void Action_operation_propagates_non_SharpGen_failure_unchanged()
+    {
+        var operationFailure = new InvalidOperationException("synthetic managed failure");
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            D3DPresentationOperation.Run(
+                D3DPresentationStage.CreateDevice,
+                () => throw operationFailure));
+
+        Assert.Same(operationFailure, thrown);
+    }
+
+    [Fact]
+    public void Generic_operation_returns_value()
+    {
+        var result = D3DPresentationOperation.Run(
+            D3DPresentationStage.GetBuffer,
+            () => 42);
+
+        Assert.Equal(42, result);
+    }
+
+    [Fact]
+    public void Generic_operation_wraps_SharpGen_failure()
+    {
+        var nativeFailure = SharpGenFailure();
+
+        var failure = Assert.Throws<D3DPresentationException>(() =>
+            D3DPresentationOperation.Run<int>(
+                D3DPresentationStage.GetBuffer,
+                () => throw nativeFailure));
+
+        Assert.Equal(D3DPresentationStage.GetBuffer, failure.Stage);
+        Assert.Equal(DxgiErrorInvalidCall, failure.HResult);
+        Assert.Same(nativeFailure, failure.InnerException);
+    }
+
+    [Fact]
+    public void Span_operation_receives_original_byte_content()
+    {
+        byte[] pixels = [4, 3, 2, 1];
+        byte[]? received = null;
+
+        D3DPresentationOperation.Run(
+            D3DPresentationStage.UpdateSubresource,
+            pixels,
+            bytes => received = bytes.ToArray());
+
+        Assert.Equal(pixels, received);
+    }
+
+    [Fact]
+    public void Span_operation_wraps_SharpGen_failure()
+    {
+        var nativeFailure = SharpGenFailure();
+
+        var failure = Assert.Throws<D3DPresentationException>(() =>
+            D3DPresentationOperation.Run(
+                D3DPresentationStage.UpdateSubresource,
+                [1, 2, 3, 4],
+                _ => throw nativeFailure));
+
+        Assert.Equal(D3DPresentationStage.UpdateSubresource, failure.Stage);
+        Assert.Equal(DxgiErrorInvalidCall, failure.HResult);
+        Assert.Same(nativeFailure, failure.InnerException);
+    }
+
+    [Fact]
+    public void Presentation_failure_rejects_null_inner_exception()
+    {
+        Assert.Throws<ArgumentNullException>(() =>
+            new D3DPresentationException(D3DPresentationStage.Present1, null!));
+    }
+
+    [Fact]
+    public void Presentation_operations_reject_null_delegates()
+    {
+        Assert.Throws<ArgumentNullException>(() =>
+            D3DPresentationOperation.Run(
+                D3DPresentationStage.CreateDevice,
+                (Action)null!));
+        Assert.Throws<ArgumentNullException>(() =>
+            D3DPresentationOperation.Run<int>(
+                D3DPresentationStage.GetBuffer,
+                null!));
+        Assert.Throws<ArgumentNullException>(() =>
+            D3DPresentationOperation.Run(
+                D3DPresentationStage.UpdateSubresource,
+                [],
+                null!));
+    }
+
     private static D3DPresentationException PresentationFailure(D3DPresentationStage stage) =>
         new(stage, new COMException("synthetic native failure", DxgiErrorInvalidCall));
+
+    private static SharpGenException SharpGenFailure() =>
+        new(
+            new Result(DxgiErrorInvalidCall),
+            "synthetic native failure",
+            new COMException("synthetic native failure", DxgiErrorInvalidCall));
 }

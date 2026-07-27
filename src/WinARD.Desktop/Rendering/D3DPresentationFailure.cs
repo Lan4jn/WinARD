@@ -26,7 +26,9 @@ internal sealed class D3DPresentationException : Exception
     public D3DPresentationException(
         D3DPresentationStage stage,
         Exception innerException)
-        : base($"D3D presentation operation '{stage}' failed.", innerException)
+        : base(
+            $"D3D presentation operation '{stage}' failed.",
+            innerException ?? throw new ArgumentNullException(nameof(innerException)))
     {
         Stage = stage;
         HResult = innerException.HResult;
@@ -45,6 +47,8 @@ internal static class D3DPresentationOperation
 {
     public static void Run(D3DPresentationStage stage, Action operation)
     {
+        ArgumentNullException.ThrowIfNull(operation);
+
         try
         {
             operation();
@@ -57,6 +61,8 @@ internal static class D3DPresentationOperation
 
     public static T Run<T>(D3DPresentationStage stage, Func<T> operation)
     {
+        ArgumentNullException.ThrowIfNull(operation);
+
         try
         {
             return operation();
@@ -72,6 +78,8 @@ internal static class D3DPresentationOperation
         ReadOnlySpan<byte> bytes,
         D3DPresentationSpanOperation operation)
     {
+        ArgumentNullException.ThrowIfNull(operation);
+
         try
         {
             operation(bytes);

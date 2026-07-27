@@ -7,6 +7,10 @@ internal delegate void FramePresentOperation(
     int stride,
     IReadOnlyList<RemoteRectangle> dirtyRectangles);
 
+internal delegate void FullFramePresentOperation(
+    ReadOnlySpan<byte> bgra32,
+    int stride);
+
 internal static class D3DPresentationRecovery
 {
     public static void Execute(
@@ -16,7 +20,7 @@ internal static class D3DPresentationRecovery
         FramePresentOperation presentOptimized,
         Func<bool> deviceRemoved,
         Action rebuildSwapChain,
-        FramePresentOperation presentFullFrame)
+        FullFramePresentOperation presentFullFrame)
     {
         ArgumentNullException.ThrowIfNull(dirtyRectangles);
         ArgumentNullException.ThrowIfNull(presentOptimized);
@@ -32,7 +36,7 @@ internal static class D3DPresentationRecovery
             when (exception.IsPresent1InvalidCall && !deviceRemoved())
         {
             rebuildSwapChain();
-            presentFullFrame(bgra32, stride, dirtyRectangles);
+            presentFullFrame(bgra32, stride);
         }
     }
 }
