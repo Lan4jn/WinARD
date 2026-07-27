@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
 using WinARD.Application.Ports;
@@ -132,6 +133,69 @@ public sealed class D3DPresentationRecoveryTests
         Assert.Same(failure, thrown);
         Assert.Equal(0, rebuildCount);
         Assert.Equal(0, fallbackCount);
+    }
+
+    [Fact]
+    public void No_frame_resource_failures_returns()
+    {
+        D3DFramePresenter.ThrowFrameResourceFailures([]);
+    }
+
+    [Fact]
+    public void Single_recovery_detach_failure_preserves_original_exception()
+    {
+        var failure = PresentationFailure(D3DPresentationStage.RecoveryDetachSwapChain);
+
+        var thrown = Assert.Throws<D3DPresentationException>(() =>
+            D3DFramePresenter.ThrowFrameResourceFailures([failure]));
+
+        Assert.Same(failure, thrown);
+    }
+
+    [Fact]
+    public void Recovery_detach_failure_preserves_original_throw_site()
+    {
+        var failure = CaptureThrownPresentationFailure(
+            D3DPresentationStage.RecoveryDetachSwapChain);
+
+        var thrown = Assert.Throws<D3DPresentationException>(() =>
+            D3DFramePresenter.ThrowFrameResourceFailures([failure]));
+
+        Assert.Same(failure, thrown);
+        Assert.Contains(nameof(ThrowPresentationFailure), thrown.StackTrace);
+    }
+
+    [Fact]
+    public void Recovery_detach_failure_preserves_metadata_and_attaches_later_cleanup_failures()
+    {
+        var failure = PresentationFailure(D3DPresentationStage.RecoveryDetachSwapChain);
+        var swapChainCleanupFailure =
+            new InvalidOperationException("synthetic swap-chain cleanup failure");
+        var textureCleanupFailure =
+            new InvalidOperationException("synthetic texture cleanup failure");
+
+        var thrown = Assert.Throws<D3DPresentationException>(() =>
+            D3DFramePresenter.ThrowFrameResourceFailures(
+                [failure, swapChainCleanupFailure, textureCleanupFailure]));
+
+        Assert.Same(failure, thrown);
+        var cleanupFailures = Assert.IsType<Exception[]>(
+            thrown.Data[FrameResourceTransaction.CleanupFailuresDataKey]);
+        Assert.Equal(
+            [swapChainCleanupFailure, textureCleanupFailure],
+            cleanupFailures);
+    }
+
+    [Fact]
+    public void Ordinary_frame_resource_failure_remains_aggregate_exception()
+    {
+        var cleanupFailure = new InvalidOperationException("synthetic cleanup failure");
+
+        var thrown = Assert.Throws<AggregateException>(() =>
+            D3DFramePresenter.ThrowFrameResourceFailures([cleanupFailure]));
+
+        Assert.StartsWith("D3D frame resource cleanup failed.", thrown.Message);
+        Assert.Equal([cleanupFailure], thrown.InnerExceptions);
     }
 
     [Fact]
@@ -313,6 +377,24 @@ public sealed class D3DPresentationRecoveryTests
 
     private static D3DPresentationException PresentationFailure(D3DPresentationStage stage) =>
         new(stage, new COMException("synthetic native failure", DxgiErrorInvalidCall));
+
+    private static D3DPresentationException CaptureThrownPresentationFailure(
+        D3DPresentationStage stage)
+    {
+        try
+        {
+            ThrowPresentationFailure(stage);
+            throw new InvalidOperationException("Expected presentation failure was not thrown.");
+        }
+        catch (D3DPresentationException failure)
+        {
+            return failure;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowPresentationFailure(D3DPresentationStage stage) =>
+        throw PresentationFailure(stage);
 
     private static SharpGenException SharpGenFailure() =>
         new(

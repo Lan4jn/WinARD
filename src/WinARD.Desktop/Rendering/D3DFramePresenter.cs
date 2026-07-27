@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using Microsoft.UI.Xaml.Controls;
 using SharpGen.Runtime;
 using Vortice;
@@ -307,10 +308,36 @@ public sealed class D3DFramePresenter : IFramePresenter
         CaptureFailure(() => _texture?.Dispose(), failures);
         _swapChain = null;
         _texture = null;
-        if (failures.Count != 0)
+        ThrowFrameResourceFailures(failures);
+    }
+
+    internal static void ThrowFrameResourceFailures(IReadOnlyList<Exception> failures)
+    {
+        if (failures.Count == 0)
+        {
+            return;
+        }
+
+        var primaryFailure = failures[0];
+        if (primaryFailure is not D3DPresentationException)
         {
             throw new AggregateException("D3D frame resource cleanup failed.", failures);
         }
+
+        if (failures.Count > 1)
+        {
+            var cleanupFailures = new Exception[failures.Count - 1];
+            for (var index = 1; index < failures.Count; index++)
+            {
+                cleanupFailures[index - 1] = failures[index];
+            }
+
+            FrameResourceTransaction.TryAttachCleanupFailures(
+                primaryFailure,
+                cleanupFailures);
+        }
+
+        ExceptionDispatchInfo.Capture(primaryFailure).Throw();
     }
 
     private static void CaptureFailure(Action operation, List<Exception> failures)

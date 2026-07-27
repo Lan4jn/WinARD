@@ -70,7 +70,7 @@ internal static class FrameResourceTransaction
     }
 
 #pragma warning disable CA1859
-    private static void TryAttachCleanupFailures(
+    internal static void TryAttachCleanupFailures(
         Exception primaryFailure,
         IReadOnlyList<Exception> cleanupFailures)
     {
