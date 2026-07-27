@@ -313,6 +313,112 @@ public sealed class ClipboardBridgeTests
         Assert.Equal("A", sent[^1]);
     }
 
+    [Fact]
+    public async Task Remote_writes_without_callbacks_keep_only_one_fixed_size_digest()
+    {
+        var adapter = new DelayedClipboardAdapter();
+        await using var bridge = new WindowsClipboardBridge(
+            adapter,
+            new InlineDispatcher(),
+            (_, _) => ValueTask.CompletedTask);
+        var payload = new string('x', 1024 * 1024);
+
+        for (var index = 0; index < 256; index++)
+        {
+            await bridge.SetRemoteTextAsync(payload, CancellationToken.None);
+            Assert.InRange(bridge.PendingRemoteSuppressionCount, 0, 1);
+        }
+
+        Assert.Equal(1, bridge.PendingRemoteSuppressionCount);
+        Assert.All(
+            typeof(RemoteClipboardWriteContext).GetFields(
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Public),
+            field => Assert.NotEqual(typeof(string), field.FieldType));
+    }
+
+    [Fact]
+    public async Task Coalesced_remote_callback_suppresses_latest_then_sends_different_local_text()
+    {
+        var adapter = new DelayedClipboardAdapter();
+        var sent = new List<string>();
+        await using var bridge = new WindowsClipboardBridge(
+            adapter,
+            new InlineDispatcher(),
+            (text, _) => { sent.Add(text); return ValueTask.CompletedTask; });
+
+        await bridge.SetRemoteTextAsync("old", CancellationToken.None);
+        await bridge.SetRemoteTextAsync("latest", CancellationToken.None);
+        adapter.EmitChanged();
+        await bridge.WhenIdleAsync();
+        adapter.SetExternalText("local");
+        await bridge.WhenIdleAsync();
+
+        Assert.Equal(["local"], sent);
+        Assert.Equal(0, bridge.PendingRemoteSuppressionCount);
+    }
+
+    [Fact]
+    public async Task Out_of_order_remote_callback_does_not_suppress_a_new_local_value()
+    {
+        var adapter = new DelayedClipboardAdapter();
+        var sent = new List<string>();
+        await using var bridge = new WindowsClipboardBridge(
+            adapter,
+            new InlineDispatcher(),
+            (text, _) => { sent.Add(text); return ValueTask.CompletedTask; });
+
+        await bridge.SetRemoteTextAsync("remote-a", CancellationToken.None);
+        await bridge.SetRemoteTextAsync("remote-b", CancellationToken.None);
+        adapter.SetExternalText("local");
+        await bridge.WhenIdleAsync();
+        adapter.EmitChanged();
+        await bridge.WhenIdleAsync();
+
+        Assert.Equal(["local", "local"], sent);
+        Assert.Equal(0, bridge.PendingRemoteSuppressionCount);
+    }
+
+    [Fact]
+    public async Task Dispose_clears_pending_remote_suppression()
+    {
+        var adapter = new DelayedClipboardAdapter();
+        var bridge = new WindowsClipboardBridge(
+            adapter,
+            new InlineDispatcher(),
+            (_, _) => ValueTask.CompletedTask);
+
+        await bridge.SetRemoteTextAsync("remote", CancellationToken.None);
+        Assert.Equal(1, bridge.PendingRemoteSuppressionCount);
+
+        await bridge.DisposeAsync();
+
+        Assert.Equal(0, bridge.PendingRemoteSuppressionCount);
+        Assert.Equal(0, adapter.SubscriptionCount);
+    }
+
+    [Fact]
+    public void Callback_claimed_after_publish_before_write_completion_removes_pending_owner()
+    {
+        var state = new RemoteClipboardSuppressionState();
+        using var context = new RemoteClipboardWriteContext(
+            generation: 7,
+            System.Security.Cryptography.SHA256.HashData([1, 2, 3]));
+        state.Begin(context);
+        state.PublishSuccessfulWrite(context);
+
+        var claimed = state.ClaimCallback();
+        state.CompleteWrite(context);
+
+        Assert.Same(context, claimed);
+        Assert.Equal(0, state.PendingCount);
+        Assert.False(state.References(context));
+        Assert.False(context.IsDisposed);
+        claimed!.Dispose();
+        Assert.Null(state.ClaimCallback());
+    }
+
     private sealed class TestClipboardAdapter : IWindowsClipboardAdapter
     {
         private EventHandler<object>? _changed;
@@ -336,6 +442,45 @@ public sealed class ClipboardBridgeTests
         }
 
         public void SetExternalText(string text) => SetText(text);
+    }
+
+    private sealed class DelayedClipboardAdapter : IWindowsClipboardAdapter
+    {
+        private EventHandler<object>? _changed;
+
+        public string Text { get; private set; } = string.Empty;
+
+        public int SubscriptionCount { get; private set; }
+
+        public event EventHandler<object>? Changed
+        {
+            add
+            {
+                _changed += value;
+                SubscriptionCount++;
+            }
+            remove
+            {
+                _changed -= value;
+                SubscriptionCount--;
+            }
+        }
+
+        public ValueTask<string?> GetTextAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return ValueTask.FromResult<string?>(Text);
+        }
+
+        public void SetText(string text) => Text = text;
+
+        public void SetExternalText(string text)
+        {
+            Text = text;
+            EmitChanged();
+        }
+
+        public void EmitChanged() => _changed?.Invoke(this, new object());
     }
 
     private sealed class BlockingClipboardAdapter : IWindowsClipboardAdapter

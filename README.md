@@ -53,7 +53,7 @@ dotnet run --project tools/WinARD.ProtocolProbe/WinARD.ProtocolProbe.csproj -- <
 
 ## 连接方式
 
-直接 TCP 适合可信局域网中的 5900 端口。SSH 模式使用系统 `ssh.exe` 建立到远端回环地址的隧道，支持 SSH 密码或私钥；私钥口令通过随应用发布且进行完整性检查的 `WinARD.OpenSshAskPass.exe` 提供。首次主机密钥必须由用户确认，指纹变化默认拒绝。
+直接 TCP 适合可信局域网中的 5900 端口。SSH 模式使用系统 `ssh.exe` 建立到远端回环地址的隧道，支持 SSH 密码或私钥；私钥口令只通过应用目录中固定文件名、固定绝对路径且与主程序同目录的 `WinARD.OpenSshAskPass.exe` 提供。发布签名、哈希与 ACL 校验仍属于外部发布门禁。首次主机密钥必须由用户确认，指纹变化默认拒绝。
 
 ARD 密码可保存到：
 

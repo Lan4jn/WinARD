@@ -525,6 +525,7 @@ public sealed partial class MainWindow : Window, IDisposable
             var ownership = _sessionController.TransferConnectedSession();
             try
             {
+                var effectiveProfile = ownership.Profile;
                 var remoteWindow = new RemoteSessionWindow(
                     ownership.Session,
                     ownership,
@@ -534,7 +535,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     diagnosticExportService: _diagnosticExportService,
                     retryRequested: retryToken => _uiOperation.RunAsync(
                         () => ConnectProfileWithHandlingAsync(
-                            profile,
+                            effectiveProfile,
                             cancellationToken: retryToken),
                         retryToken));
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;

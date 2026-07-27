@@ -15,6 +15,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
     private readonly IDeviceRepository _repository;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private RemoteSession? _session;
+    private ConnectionProfile? _connectedProfile;
     private ActiveSessionCoordinator.ActiveSessionLease? _lease;
     private ConnectedSessionOwnership? _ownership;
     private bool _disposed;
@@ -108,6 +109,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
                 _lease = lease;
                 lease = null;
                 _session = result.Session;
+                _connectedProfile = profile;
                 StageResults = completed;
                 StatusMessage = "已连接。";
             }
@@ -140,7 +142,13 @@ public sealed class ConnectionSessionController : IAsyncDisposable
                 throw new InvalidOperationException("There is no connected session to transfer.");
             var lease = Interlocked.Exchange(ref _lease, null) ??
                 throw new InvalidOperationException("The connected session lease is missing.");
-            var ownership = new ConnectedSessionOwnership(session, lease, OnOwnershipDisposed);
+            var effectiveProfile = Interlocked.Exchange(ref _connectedProfile, null) ??
+                throw new InvalidOperationException("The connected session profile is missing.");
+            var ownership = new ConnectedSessionOwnership(
+                effectiveProfile,
+                session,
+                lease,
+                OnOwnershipDisposed);
             Volatile.Write(ref _ownership, ownership);
             return ownership;
         }
@@ -156,6 +164,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
         try
         {
             var session = Interlocked.Exchange(ref _session, null);
+            _ = Interlocked.Exchange(ref _connectedProfile, null);
             var lease = Interlocked.Exchange(ref _lease, null);
             var ownership = Interlocked.Exchange(ref _ownership, null);
             try
@@ -217,16 +226,20 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
     private Task? _disposeTask;
 
     internal ConnectedSessionOwnership(
+        ConnectionProfile profile,
         RemoteSession session,
         ActiveSessionCoordinator.ActiveSessionLease lease,
         Action<ConnectedSessionOwnership> disposedCallback)
     {
+        Profile = profile ?? throw new ArgumentNullException(nameof(profile));
         _session = session;
         _lease = lease;
         _disposedCallback = disposedCallback;
     }
 
     public RemoteSession Session => _session;
+
+    public ConnectionProfile Profile { get; }
 
     public ValueTask DisposeAsync()
     {

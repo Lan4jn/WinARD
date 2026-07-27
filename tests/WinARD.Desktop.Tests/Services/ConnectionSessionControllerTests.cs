@@ -162,6 +162,67 @@ public sealed class ConnectionSessionControllerTests
         Assert.Equal(candidate.Algorithm, prompt.Request.Algorithm);
         Assert.Equal(candidate.Fingerprint, prompt.Request.NewFingerprint);
         Assert.Equal(changed, prompt.Request.IsChanged);
+
+        await using var ownership = sut.TransferConnectedSession();
+        Assert.Equal(candidate.ToPin(), ownership.Profile.SshProfile!.HostKeyPin);
+    }
+
+    [Theory]
+    [InlineData(false, SshHostKeyPromptDecision.Trust)]
+    [InlineData(true, SshHostKeyPromptDecision.Replace)]
+    public async Task TransferredEffectiveProfileRetriesWithoutPromptingForAcceptedHostKeyAgain(
+        bool changed,
+        SshHostKeyPromptDecision decision)
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
+        var profile = SshProfileFor(endpoint);
+        if (changed)
+        {
+            var old = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "CQkJCQ==").ToPin();
+            profile = profile.WithSsh(profile.SshProfile!.WithHostKeyPin(old));
+        }
+
+        var firstTransport = new HostKeyUntilPinnedTransport(candidate);
+        var firstPrompt = new CountingPrompt(decision);
+        var repository = new Repository();
+        await using var first = Controller(firstTransport, firstPrompt, repository);
+
+        await first.ConnectAsync(profile, CancellationToken.None);
+        await using var ownership = first.TransferConnectedSession();
+        var retryProfile = ownership.Profile;
+        await ownership.DisposeAsync();
+
+        var retryTransport = new HostKeyUntilPinnedTransport(candidate);
+        var retryPrompt = new CountingPrompt(SshHostKeyPromptDecision.Cancel);
+        await using var retry = Controller(retryTransport, retryPrompt, repository);
+        await retry.ConnectAsync(retryProfile, CancellationToken.None);
+
+        Assert.Equal(candidate.ToPin(), retryProfile.SshProfile!.HostKeyPin);
+        Assert.Equal(1, firstPrompt.Count);
+        Assert.Equal(1, retryTransport.Attempts);
+        Assert.Equal(0, retryPrompt.Count);
+    }
+
+    [Fact]
+    public async Task FailedAcceptedHostKeyPersistenceDoesNotPublishOrTransferUpdatedProfile()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
+        var profile = SshProfileFor(endpoint);
+        var repository = new ThrowingRepository();
+        await using var sut = Controller(
+            new HostKeyUntilPinnedTransport(candidate),
+            new CountingPrompt(SshHostKeyPromptDecision.Trust),
+            repository);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sut.ConnectAsync(profile, CancellationToken.None));
+
+        Assert.False(sut.IsConnected);
+        Assert.Throws<InvalidOperationException>(() => sut.TransferConnectedSession());
+        Assert.Equal(candidate.ToPin(), repository.Attempted!.SshProfile!.HostKeyPin);
+        Assert.Null(repository.Published);
     }
 
     [Theory]
@@ -379,6 +440,21 @@ public sealed class ConnectionSessionControllerTests
             coordinator,
             new Repository());
 
+    private static ConnectionSessionController Controller(
+        IRemoteTransportFactory transport,
+        ISshHostKeyPrompt prompt,
+        IDeviceRepository repository) =>
+        new(
+            new ConnectionAttemptWorkflow(
+                new ConnectDeviceHandler(
+                    transport,
+                    new FixedSecretProvider(),
+                    new FixedClientFactory(new TrackingClient()),
+                    new ErrorMapper()),
+                prompt),
+            new ActiveSessionCoordinator(),
+            repository);
+
     private static ConnectionProfile SshProfileFor(SshHostKeyEndpoint endpoint) =>
         Profile().WithSsh(SshProfile.Create(
             endpoint.Host,
@@ -499,6 +575,44 @@ public sealed class ConnectionSessionControllerTests
             Request = request;
             return ValueTask.FromResult(decision);
         }
+    }
+
+    private sealed class CountingPrompt(SshHostKeyPromptDecision decision) : ISshHostKeyPrompt
+    {
+        public int Count { get; private set; }
+
+        public ValueTask<SshHostKeyPromptDecision> PromptAsync(
+            SshHostKeyPromptRequest request,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Count++;
+            return ValueTask.FromResult(decision);
+        }
+    }
+
+    private sealed class ThrowingRepository : IDeviceRepository
+    {
+        public ConnectionProfile? Attempted { get; private set; }
+
+        public ConnectionProfile? Published { get; private set; }
+
+        public Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Attempted = profile;
+            throw new InvalidOperationException("CAS conflict");
+        }
+
+        public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
+            Task.FromResult(Published?.Id == id ? Published : null);
+
+        public Task<IReadOnlyList<ConnectionProfile>> GetAllAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<ConnectionProfile>>(Published is null ? [] : [Published]);
+
+        public Task DeleteAsync(Guid id, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class FixedSecretProvider : IConnectionSecretProvider

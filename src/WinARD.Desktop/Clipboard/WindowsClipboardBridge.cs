@@ -23,10 +23,9 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
     private readonly Func<string, CancellationToken, ValueTask> _sendRemote;
     private readonly int _maxUtf8Bytes;
     private readonly CancellationTokenSource _lifetime = new();
-    private readonly Queue<RemoteWriteContext> _expectedRemoteCallbacks = [];
+    private readonly RemoteClipboardSuppressionState _remoteSuppression = new();
     private Task _pending = Task.CompletedTask;
     private Task? _disposeTask;
-    private RemoteWriteContext? _activeRemoteWrite;
     private long _generation;
     private bool _disposed;
     private bool _isEnabled = true;
@@ -85,8 +84,19 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
                 if (!value)
                 {
                     _generation++;
-                    _expectedRemoteCallbacks.Clear();
+                    ClearRemoteSuppressionLocked();
                 }
+            }
+        }
+    }
+
+    internal int PendingRemoteSuppressionCount
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _remoteSuppression.PendingCount;
             }
         }
     }
@@ -105,9 +115,28 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
             generation = _generation;
         }
 
-        var sanitized = Sanitize(text, _maxUtf8Bytes);
-        await _dispatcher.InvokeAsync(() => ApplyRemoteText(sanitized, generation), cancellationToken)
-            .ConfigureAwait(false);
+        var sanitized = SanitizeAndDigest(text, _maxUtf8Bytes);
+        try
+        {
+            var digestTransferred = false;
+            await _dispatcher.InvokeAsync(
+                () => digestTransferred = ApplyRemoteText(
+                    sanitized.Text,
+                    sanitized.Digest,
+                    generation),
+                cancellationToken).ConfigureAwait(false);
+            if (digestTransferred)
+            {
+                sanitized = sanitized with { Digest = null! };
+            }
+        }
+        finally
+        {
+            if (sanitized.Digest is not null)
+            {
+                CryptographicOperations.ZeroMemory(sanitized.Digest);
+            }
+        }
     }
 
     public Task WhenIdleAsync()
@@ -134,7 +163,7 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
         {
             _disposed = true;
             _generation++;
-            _expectedRemoteCallbacks.Clear();
+            ClearRemoteSuppressionLocked();
             pending = _pending;
         }
 
@@ -198,15 +227,7 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
                 return;
             }
 
-            var remoteWrite = _activeRemoteWrite;
-            if (remoteWrite is not null)
-            {
-                remoteWrite.CallbackClaimed = true;
-            }
-            else if (_expectedRemoteCallbacks.TryDequeue(out var expectedRemoteCallback))
-            {
-                remoteWrite = expectedRemoteCallback;
-            }
+            var remoteWrite = _remoteSuppression.ClaimCallback();
 
             var generation = remoteWrite?.Generation ?? _generation;
             _pending = ObserveLocalChangeAsync(_pending, remoteWrite, generation, _lifetime.Token);
@@ -215,7 +236,7 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
 
     private async Task ObserveLocalChangeAsync(
         Task predecessor,
-        RemoteWriteContext? remoteWrite,
+        RemoteClipboardWriteContext? remoteWrite,
         long generation,
         CancellationToken cancellationToken)
     {
@@ -239,10 +260,10 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
                 return;
             }
 
-            string sanitized;
+            SanitizedClipboardText sanitized;
             try
             {
-                sanitized = Sanitize(text, _maxUtf8Bytes);
+                sanitized = SanitizeAndDigest(text, _maxUtf8Bytes);
             }
             catch (ArgumentException)
             {
@@ -253,21 +274,33 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
                 return;
             }
 
-            lock (_sync)
+            try
             {
-                if (_disposed || !_isEnabled || generation != _generation)
+                lock (_sync)
                 {
-                    return;
+                    if (_disposed || !_isEnabled || generation != _generation)
+                    {
+                        return;
+                    }
+
+                    if (remoteWrite is { Succeeded: true } &&
+                        CryptographicOperations.FixedTimeEquals(
+                            remoteWrite.Digest,
+                            sanitized.Digest))
+                    {
+                        return;
+                    }
+
+                    ClearPendingRemoteSuppressionLocked();
                 }
 
-                if (remoteWrite is { Succeeded: true } &&
-                    string.Equals(remoteWrite.SuppressedText, sanitized, StringComparison.Ordinal))
-                {
-                    return;
-                }
+                await _sendRemote(sanitized.Text, cancellationToken).ConfigureAwait(false);
             }
-
-            await _sendRemote(sanitized, cancellationToken).ConfigureAwait(false);
+            finally
+            {
+                CryptographicOperations.ZeroMemory(sanitized.Digest);
+                remoteWrite?.Dispose();
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -278,18 +311,18 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
         }
     }
 
-    private void ApplyRemoteText(string text, long generation)
+    private bool ApplyRemoteText(string text, byte[] digest, long generation)
     {
-        RemoteWriteContext remoteWrite;
+        RemoteClipboardWriteContext remoteWrite;
         lock (_sync)
         {
             if (_disposed || !_isEnabled || generation != _generation)
             {
-                return;
+                return false;
             }
 
-            remoteWrite = new RemoteWriteContext(generation);
-            _activeRemoteWrite = remoteWrite;
+            remoteWrite = new RemoteClipboardWriteContext(generation, digest);
+            _remoteSuppression.Begin(remoteWrite);
         }
 
         try
@@ -297,51 +330,57 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
             _adapter.SetText(text);
             lock (_sync)
             {
-                remoteWrite.Succeeded = true;
-                remoteWrite.SuppressedText = text;
-                if (!_disposed && _isEnabled && generation == _generation && !remoteWrite.CallbackClaimed)
+                if (!_disposed && _isEnabled && generation == _generation)
                 {
-                    _expectedRemoteCallbacks.Enqueue(remoteWrite);
+                    _remoteSuppression.PublishSuccessfulWrite(remoteWrite);
                 }
             }
+        }
+        catch
+        {
+            remoteWrite.Dispose();
+            throw;
         }
         finally
         {
             lock (_sync)
             {
-                if (ReferenceEquals(_activeRemoteWrite, remoteWrite))
-                {
-                    _activeRemoteWrite = null;
-                }
+                _remoteSuppression.CompleteWrite(remoteWrite);
             }
 
             remoteWrite.Completion.TrySetResult();
         }
+
+        return true;
     }
 
-    private static string Sanitize(string text, int maxUtf8Bytes)
+    private void ClearRemoteSuppressionLocked()
+    {
+        _remoteSuppression.Clear();
+    }
+
+    private void ClearPendingRemoteSuppressionLocked()
+    {
+        _remoteSuppression.ClearPending();
+    }
+
+    private static SanitizedClipboardText SanitizeAndDigest(string text, int maxUtf8Bytes)
     {
         ArgumentNullException.ThrowIfNull(text);
         var sanitized = new string(text.Where(character =>
             !char.IsControl(character) || character is '\t' or '\n' or '\r').ToArray());
         var encoded = ClipboardProtocol.EncodeText(sanitized, maxUtf8Bytes);
-        CryptographicOperations.ZeroMemory(encoded);
-        return sanitized;
+        try
+        {
+            return new SanitizedClipboardText(sanitized, SHA256.HashData(encoded));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encoded);
+        }
     }
 
-    private sealed class RemoteWriteContext(long generation)
-    {
-        public TaskCompletionSource Completion { get; } =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public long Generation { get; } = generation;
-
-        public string? SuppressedText { get; set; }
-
-        public bool CallbackClaimed { get; set; }
-
-        public bool Succeeded { get; set; }
-    }
+    private sealed record SanitizedClipboardText(string Text, byte[] Digest);
 
     private sealed class WindowsClipboardAdapter : IWindowsClipboardAdapter
     {
@@ -368,6 +407,124 @@ public sealed class WindowsClipboardBridge : IAsyncDisposable
             var package = new DataPackage();
             package.SetText(text);
             ClipboardApi.SetContent(package);
+        }
+    }
+}
+
+internal sealed class RemoteClipboardSuppressionState
+{
+    private RemoteClipboardWriteContext? _active;
+    private RemoteClipboardWriteContext? _pending;
+
+    public int PendingCount =>
+        _active is null
+            ? (_pending is null ? 0 : 1)
+            : (_pending is null || ReferenceEquals(_active, _pending) ? 1 : 2);
+
+    public void Begin(RemoteClipboardWriteContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        _active = context;
+    }
+
+    public void PublishSuccessfulWrite(RemoteClipboardWriteContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        context.Succeeded = true;
+        if (context.CallbackClaimed)
+        {
+            return;
+        }
+
+        if (!ReferenceEquals(_pending, context))
+        {
+            _pending?.Dispose();
+            _pending = context;
+        }
+    }
+
+    public RemoteClipboardWriteContext? ClaimCallback()
+    {
+        if (_active is { } active)
+        {
+            active.CallbackClaimed = true;
+            return active;
+        }
+
+        var pending = _pending;
+        _pending = null;
+        return pending;
+    }
+
+    public void CompleteWrite(RemoteClipboardWriteContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (!ReferenceEquals(_active, context))
+        {
+            return;
+        }
+
+        if (context.CallbackClaimed && ReferenceEquals(_pending, context))
+        {
+            _pending = null;
+        }
+
+        _active = null;
+    }
+
+    public void ClearPending()
+    {
+        if (_pending is { } pending)
+        {
+            _pending = null;
+            if (!ReferenceEquals(_active, pending))
+            {
+                pending.Dispose();
+            }
+        }
+    }
+
+    public void Clear()
+    {
+        var active = _active;
+        var pending = _pending;
+        _active = null;
+        _pending = null;
+        active?.Dispose();
+        if (pending is not null && !ReferenceEquals(active, pending))
+        {
+            pending.Dispose();
+        }
+    }
+
+    public bool References(RemoteClipboardWriteContext context) =>
+        ReferenceEquals(_active, context) || ReferenceEquals(_pending, context);
+}
+
+internal sealed class RemoteClipboardWriteContext(long generation, byte[] digest) : IDisposable
+{
+    private byte[]? _digest = digest;
+
+    public TaskCompletionSource Completion { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public byte[] Digest => Volatile.Read(ref _digest) ??
+        throw new ObjectDisposedException(nameof(RemoteClipboardWriteContext));
+
+    public bool IsDisposed => Volatile.Read(ref _digest) is null;
+
+    public long Generation { get; } = generation;
+
+    public bool CallbackClaimed { get; set; }
+
+    public bool Succeeded { get; set; }
+
+    public void Dispose()
+    {
+        var digestToClear = Interlocked.Exchange(ref _digest, null);
+        if (digestToClear is not null)
+        {
+            CryptographicOperations.ZeroMemory(digestToClear);
         }
     }
 }

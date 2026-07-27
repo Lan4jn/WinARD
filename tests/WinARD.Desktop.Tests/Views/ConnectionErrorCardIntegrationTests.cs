@@ -132,7 +132,8 @@ public sealed class ConnectionErrorCardIntegrationTests
         var window = File.ReadAllText(RepositoryFile(
             "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
         var main = File.ReadAllText(RepositoryFile(
-            "src", "WinARD.Desktop", "MainWindow.xaml.cs"));
+            "src", "WinARD.Desktop", "MainWindow.xaml.cs"))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
 
         Assert.Contains("_windowLifecycle.StopSessionAsync", window, StringComparison.Ordinal);
         Assert.Contains("_windowLifecycle.DisconnectAsync", window, StringComparison.Ordinal);
@@ -143,6 +144,15 @@ public sealed class ConnectionErrorCardIntegrationTests
             StringComparison.Ordinal);
         Assert.Contains("retryToken => _uiOperation.RunAsync", main, StringComparison.Ordinal);
         Assert.Contains("cancellationToken: retryToken", main, StringComparison.Ordinal);
+        Assert.Contains("var effectiveProfile = ownership.Profile", main, StringComparison.Ordinal);
+        Assert.Contains(
+            "ConnectProfileWithHandlingAsync(\n                            effectiveProfile,",
+            main,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "ConnectProfileWithHandlingAsync(\n                            profile,",
+            main,
+            StringComparison.Ordinal);
     }
 
     private static string RepositoryFile(params string[] segments)
