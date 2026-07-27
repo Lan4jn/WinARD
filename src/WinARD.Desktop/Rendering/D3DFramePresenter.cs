@@ -61,7 +61,14 @@ public sealed class D3DFramePresenter : IFramePresenter
             CreateDevice();
         }
 
-        CreateFrameResources(width, height);
+        ExecuteWithDeviceRecovery(
+            () => CreateFrameResources(width, height),
+            IsDeviceRemoved,
+            () =>
+            {
+                RecreateDevice();
+                CreateFrameResources(width, height, recovery: true);
+            });
     }
 
     public void Present(
@@ -122,6 +129,37 @@ public sealed class D3DFramePresenter : IFramePresenter
     internal static bool IsDeviceRecoveryCandidate(Exception exception) =>
         exception is D3DPresentationException or SharpGenException;
 
+    internal static void ExecuteWithDeviceRecovery(
+        Action operation,
+        Func<bool> isDeviceRemoved,
+        Action recovery)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(isDeviceRemoved);
+        ArgumentNullException.ThrowIfNull(recovery);
+
+        try
+        {
+            operation();
+        }
+        catch (Exception exception)
+            when (IsDeviceRecoveryCandidate(exception) && isDeviceRemoved())
+        {
+            recovery();
+        }
+    }
+
+    internal static IReadOnlyList<RemoteRectangle> ClipPresentRectangles(
+        IReadOnlyList<RemoteRectangle> dirtyRectangles,
+        int width,
+        int height) =>
+        FrameValidation.ClipDirtyRectangles(dirtyRectangles, width, height);
+
+    internal static D3DPresentationStage GetSwapChainCreationStage(bool recovery) =>
+        recovery
+            ? D3DPresentationStage.RecoveryCreateSwapChain
+            : D3DPresentationStage.CreateSwapChainForComposition;
+
     private void PresentOptimized(
         ReadOnlySpan<byte> bgra32,
         int stride,
@@ -151,6 +189,12 @@ public sealed class D3DFramePresenter : IFramePresenter
         bool useDirtyRectanglePresent,
         bool recovery)
     {
+        var clipped = ClipPresentRectangles(dirtyRectangles, _width, _height);
+        if (clipped.Count == 0)
+        {
+            return;
+        }
+
         var context = _context ?? throw new InvalidOperationException("The D3D11 device is unavailable.");
         var texture = _texture ?? throw new InvalidOperationException("The D3D11 frame texture is unavailable.");
         var swapChain = _swapChain ?? throw new InvalidOperationException("The DXGI swap chain is unavailable.");
@@ -159,11 +203,6 @@ public sealed class D3DFramePresenter : IFramePresenter
                 ? D3DPresentationStage.RecoveryGetBuffer
                 : D3DPresentationStage.GetBuffer,
             () => swapChain.GetBuffer<ID3D11Texture2D>(0));
-        var clipped = FrameValidation.ClipDirtyRectangles(dirtyRectangles, _width, _height);
-        if (clipped.Count == 0)
-        {
-            return;
-        }
 
         var presentRectangles = new RawRect[clipped.Count];
         for (var index = 0; index < clipped.Count; index++)
@@ -231,7 +270,9 @@ public sealed class D3DFramePresenter : IFramePresenter
             ID3D11Device,
             ID3D11DeviceContext>(
             _panelNative,
-            () => new SwapChainPanelNative(_panel),
+            () => D3DPresentationOperation.Run(
+                D3DPresentationStage.SetSwapChain,
+                () => new SwapChainPanelNative(_panel)),
             creation => D3DPresentationOperation.Run(
                 D3DPresentationStage.CreateDevice,
                 () => D3D11CreateDevice(
@@ -267,9 +308,16 @@ public sealed class D3DFramePresenter : IFramePresenter
             0,
             ResourceOptionFlags.None);
 
-        using var dxgiDevice = device.QueryInterface<IDXGIDevice>();
-        using var adapter = dxgiDevice.GetAdapter();
-        using var factory = adapter.GetParent<IDXGIFactory2>();
+        var swapChainStage = GetSwapChainCreationStage(recovery);
+        using var dxgiDevice = D3DPresentationOperation.Run(
+            swapChainStage,
+            () => device.QueryInterface<IDXGIDevice>());
+        using var adapter = D3DPresentationOperation.Run(
+            swapChainStage,
+            dxgiDevice.GetAdapter);
+        using var factory = D3DPresentationOperation.Run(
+            swapChainStage,
+            adapter.GetParent<IDXGIFactory2>);
         var swapChainDescription = new SwapChainDescription1(
             checked((uint)width),
             checked((uint)height),
@@ -288,9 +336,7 @@ public sealed class D3DFramePresenter : IFramePresenter
                 D3DPresentationStage.CreateTexture2D,
                 () => device.CreateTexture2D(textureDescription)),
             () => D3DPresentationOperation.Run(
-                recovery
-                    ? D3DPresentationStage.RecoveryCreateSwapChain
-                    : D3DPresentationStage.CreateSwapChainForComposition,
+                swapChainStage,
                 () => factory.CreateSwapChainForComposition(
                     device,
                     swapChainDescription,

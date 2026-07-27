@@ -48,6 +48,109 @@ public sealed class D3DDeviceRecoveryTests
     }
 
     [Fact]
+    public void Resize_control_flow_recovers_wrapped_D3D_failure_once_when_device_is_removed()
+    {
+        var initialCount = 0;
+        var recoveryCount = 0;
+
+        D3DFramePresenter.ExecuteWithDeviceRecovery(
+            () =>
+            {
+                initialCount++;
+                throw PresentationFailure(D3DPresentationStage.CreateTexture2D);
+            },
+            () => true,
+            () => recoveryCount++);
+
+        Assert.Equal(1, initialCount);
+        Assert.Equal(1, recoveryCount);
+    }
+
+    [Fact]
+    public void Resize_control_flow_recovers_raw_SharpGen_failure_once_when_device_is_removed()
+    {
+        var initialCount = 0;
+        var recoveryCount = 0;
+
+        D3DFramePresenter.ExecuteWithDeviceRecovery(
+            () =>
+            {
+                initialCount++;
+                throw SharpGenFailure();
+            },
+            () => true,
+            () => recoveryCount++);
+
+        Assert.Equal(1, initialCount);
+        Assert.Equal(1, recoveryCount);
+    }
+
+    [Fact]
+    public void Resize_control_flow_propagates_native_failure_when_device_is_not_removed()
+    {
+        var recoveryCount = 0;
+        var failure = PresentationFailure(D3DPresentationStage.CreateTexture2D);
+
+        var thrown = Assert.Throws<D3DPresentationException>(() =>
+            D3DFramePresenter.ExecuteWithDeviceRecovery(
+                () => throw failure,
+                () => false,
+                () => recoveryCount++));
+
+        Assert.Same(failure, thrown);
+        Assert.Equal(0, recoveryCount);
+    }
+
+    [Fact]
+    public void Resize_control_flow_does_not_query_device_state_for_managed_failure()
+    {
+        var deviceStateQueryCount = 0;
+        var recoveryCount = 0;
+        var failure = new InvalidOperationException("synthetic managed failure");
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            D3DFramePresenter.ExecuteWithDeviceRecovery(
+                () => throw failure,
+                () =>
+                {
+                    deviceStateQueryCount++;
+                    return true;
+                },
+                () => recoveryCount++));
+
+        Assert.Same(failure, thrown);
+        Assert.Equal(0, deviceStateQueryCount);
+        Assert.Equal(0, recoveryCount);
+    }
+
+    [Fact]
+    public void Resize_control_flow_propagates_recovery_failure_once_without_looping()
+    {
+        var deviceStateQueryCount = 0;
+        var recoveryCount = 0;
+        var recoveryFailure = PresentationFailure(
+            D3DPresentationStage.RecoveryCreateSwapChain);
+
+        var thrown = Assert.Throws<D3DPresentationException>(() =>
+            D3DFramePresenter.ExecuteWithDeviceRecovery(
+                () => throw PresentationFailure(D3DPresentationStage.CreateTexture2D),
+                () =>
+                {
+                    deviceStateQueryCount++;
+                    return true;
+                },
+                () =>
+                {
+                    recoveryCount++;
+                    throw recoveryFailure;
+                }));
+
+        Assert.Same(recoveryFailure, thrown);
+        Assert.Equal(1, deviceStateQueryCount);
+        Assert.Equal(1, recoveryCount);
+    }
+
+    [Fact]
     public void Device_resources_transfer_only_after_all_creation_steps_succeed()
     {
         var panel = new TrackingDisposable();
