@@ -319,12 +319,12 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             if (!_shutdown.IsCancellationRequested)
             {
-                _diagnosticSink.Write(new SafeDiagnosticEventInput(
+                await ShowStartupErrorAsync();
+                _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
                     "DEVICE_LIBRARY_INIT_FAILED",
                     Guid.NewGuid().ToString("N"),
                     "Device library initialization failed.",
                     Exception: exception));
-                await ShowStartupErrorAsync();
             }
         }
     }
@@ -498,8 +498,14 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task ConnectProfileWithHandlingAsync(
         ConnectionProfile profile,
-        ISshHostKeyPrompt? hostKeyPrompt = null)
+        ISshHostKeyPrompt? hostKeyPrompt = null,
+        CancellationToken cancellationToken = default)
     {
+        using var operationLifetime = CancellationTokenSource.CreateLinkedTokenSource(
+            _shutdown.Token,
+            cancellationToken);
+        var operationToken = operationLifetime.Token;
+        operationToken.ThrowIfCancellationRequested();
         if (_sessionBusy || _sessionController.IsConnected)
         {
             return;
@@ -515,7 +521,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _connectionStatus.Text = "正在连接…";
         try
         {
-            await _sessionController.ConnectAsync(profile, hostKeyPrompt, _shutdown.Token);
+            await _sessionController.ConnectAsync(profile, hostKeyPrompt, operationToken);
             var ownership = _sessionController.TransferConnectedSession();
             try
             {
@@ -526,9 +532,11 @@ public sealed partial class MainWindow : Window, IDisposable
                     presenter: null,
                     diagnosticSink: _diagnosticSink,
                     diagnosticExportService: _diagnosticExportService,
-                    retryRequested: _ => _uiOperation.RunAsync(
-                        () => ConnectProfileWithHandlingAsync(profile),
-                        _shutdown.Token));
+                    retryRequested: retryToken => _uiOperation.RunAsync(
+                        () => ConnectProfileWithHandlingAsync(
+                            profile,
+                            cancellationToken: retryToken),
+                        retryToken));
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
                 _remoteSessionWindow = remoteWindow;
                 remoteWindow.Activate();
@@ -539,7 +547,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 throw;
             }
         }
-        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        catch (OperationCanceledException) when (operationToken.IsCancellationRequested)
         {
         }
         catch (ConnectionFailedException exception)
@@ -549,13 +557,13 @@ public sealed partial class MainWindow : Window, IDisposable
                 "UNEXPECTED_CONNECTION_ERROR",
                 "连接失败。",
                 Guid.NewGuid().ToString("N"));
-            _diagnosticSink.Write(new SafeDiagnosticEventInput(
+            ShowConnectionError(error, exception.HostKeyFailure);
+            _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
                 error.Code,
                 error.CorrelationId,
                 "Connection attempt failed.",
                 [new("stage", error.Stage.ToString())],
                 exception));
-            ShowConnectionError(error, exception.HostKeyFailure);
         }
         catch (SessionAlreadyActiveException)
         {
@@ -568,12 +576,12 @@ public sealed partial class MainWindow : Window, IDisposable
                 "UNEXPECTED_CONNECTION_ERROR",
                 "连接失败。",
                 Guid.NewGuid().ToString("N"));
-            _diagnosticSink.Write(new SafeDiagnosticEventInput(
+            ShowConnectionError(error, hostKeyFailure: null);
+            _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
                 error.Code,
                 error.CorrelationId,
                 "Unexpected connection failure.",
                 Exception: exception));
-            ShowConnectionError(error, hostKeyFailure: null);
         }
         finally
         {
@@ -607,12 +615,12 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         catch (Exception exception)
         {
-            _diagnosticSink.Write(new SafeDiagnosticEventInput(
+            _connectionStatus.Text = "断开连接时出现错误。";
+            _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
                 "DISCONNECT_FAILED",
                 Guid.NewGuid().ToString("N"),
                 "Session disconnect failed.",
                 Exception: exception));
-            _connectionStatus.Text = "断开连接时出现错误。";
         }
         finally
         {
@@ -731,13 +739,13 @@ public sealed partial class MainWindow : Window, IDisposable
         catch (Exception exception)
         {
             var correlationId = Guid.NewGuid().ToString("N");
-            _diagnosticSink.Write(new SafeDiagnosticEventInput(
+            _connectionStatus.Text = $"操作失败。关联 ID：{correlationId}";
+            _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
                 "ERROR_ACTION_FAILED",
                 correlationId,
                 "Connection error action failed.",
                 [new("action", action.ToString())],
                 exception));
-            _connectionStatus.Text = $"操作失败。关联 ID：{correlationId}";
         }
     }
 

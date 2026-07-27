@@ -58,4 +58,39 @@ public sealed class ConnectionErrorViewModelTests
     {
         Assert.Throws<ArgumentException>(() => new ConnectionErrorAction(" ", ConnectionErrorActionKind.Retry));
     }
+
+    [Fact]
+    public void InterruptedRemoteSessionOffersRetryAndDisconnect()
+    {
+        var error = WinArdError.Create(
+            ConnectionStage.Connected,
+            "REMOTE_SESSION_INTERRUPTED",
+            "ignored",
+            "corr-remote");
+
+        var viewModel = ConnectionErrorViewModel.FromError(error);
+
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.Retry);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.Disconnect);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.CopyCorrelationId);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.ExportDiagnostics);
+    }
+
+    [Fact]
+    public void RfbConnectionRejectedDoesNotMisleadUserToReenterCredentials()
+    {
+        var error = WinArdError.Create(
+            ConnectionStage.Negotiating,
+            "RFB_CONNECTION_REJECTED",
+            "ignored",
+            "corr-rejected");
+
+        var viewModel = ConnectionErrorViewModel.FromError(error);
+
+        Assert.DoesNotContain(
+            viewModel.Actions,
+            action => action.Kind == ConnectionErrorActionKind.ReenterCredentials);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.Retry);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.CopyCorrelationId);
+    }
 }

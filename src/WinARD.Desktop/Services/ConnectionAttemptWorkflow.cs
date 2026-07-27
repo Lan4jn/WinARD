@@ -52,7 +52,7 @@ public sealed class ConnectionAttemptWorkflow(
                 observation =>
                 {
                     hostKeyFailure = GetHostKeyFailure(observation.Exception, profile);
-                    _diagnosticSink?.Write(new SafeDiagnosticEventInput(
+                    _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
                         observation.Error.Code,
                         observation.Error.CorrelationId,
                         "Connection attempt stage failed.",

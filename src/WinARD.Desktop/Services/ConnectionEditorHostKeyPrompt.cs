@@ -18,7 +18,7 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
 {
     private readonly object _gate = new();
     private PendingPrompt? _pending;
-    private SshHostKeyPromptRequest? _preauthorized;
+    private Preauthorization? _preauthorized;
     private ConnectionEditorHostKeyPromptState _state = ConnectionEditorHostKeyPromptState.Hidden;
     private bool _disposed;
 
@@ -45,8 +45,10 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (Interlocked.Exchange(ref _preauthorized, null) is { } expected && expected == request)
+            if (_preauthorized is { } expected && expected.Request == request)
             {
+                _preauthorized = null;
+                expected.Detach();
                 return ValueTask.FromResult(request.IsChanged
                     ? SshHostKeyPromptDecision.Replace
                     : SshHostKeyPromptDecision.Trust);
@@ -68,9 +70,24 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
                 request.IsChanged);
         }
 
-        pending.CancellationRegistration = cancellationToken.Register(
-            static state => ((ConnectionEditorHostKeyPrompt)state!).Cancel(),
-            this);
+        pending.SetCancellationRegistration(cancellationToken.Register(
+            static state =>
+            {
+                var cancellation = (PromptCancellation)state!;
+                cancellation.Owner.Complete(
+                    SshHostKeyPromptDecision.Cancel,
+                    expectedChanged: null,
+                    cancellation.Pending);
+            },
+            new PromptCancellation(this, pending)));
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_pending, pending))
+            {
+                return new ValueTask<SshHostKeyPromptDecision>(pending.Completion.Task);
+            }
+        }
+
         StateChanged?.Invoke(this, EventArgs.Empty);
         return new ValueTask<SshHostKeyPromptDecision>(pending.Completion.Task);
     }
@@ -81,7 +98,7 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
 
     public void Cancel() => Complete(SshHostKeyPromptDecision.Cancel, expectedChanged: null);
 
-    public void Preauthorize(SshHostKeyPromptRequest request)
+    public IDisposable Preauthorize(SshHostKeyPromptRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
         lock (_gate)
@@ -92,17 +109,39 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
                 throw new InvalidOperationException("SSH 主机密钥确认仍在等待处理。");
             }
 
-            _preauthorized = request;
+            if (_preauthorized is not null)
+            {
+                throw new InvalidOperationException("SSH 主机密钥预授权仍在等待使用。");
+            }
+
+            var preauthorization = new Preauthorization(this, request);
+            _preauthorized = preauthorization;
+            return preauthorization;
         }
     }
 
-    private void Complete(SshHostKeyPromptDecision decision, bool? expectedChanged)
+    private void Remove(Preauthorization preauthorization)
+    {
+        lock (_gate)
+        {
+            if (ReferenceEquals(_preauthorized, preauthorization))
+            {
+                _preauthorized = null;
+            }
+        }
+    }
+
+    private void Complete(
+        SshHostKeyPromptDecision decision,
+        bool? expectedChanged,
+        PendingPrompt? expectedPending = null)
     {
         PendingPrompt? pending;
         lock (_gate)
         {
             pending = _pending;
             if (pending is null ||
+                (expectedPending is not null && !ReferenceEquals(pending, expectedPending)) ||
                 (expectedChanged is not null && pending.IsChanged != expectedChanged.Value))
             {
                 return;
@@ -112,13 +151,13 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
             _state = ConnectionEditorHostKeyPromptState.Hidden;
         }
 
-        _ = pending.CancellationRegistration.Unregister();
-        pending.Completion.TrySetResult(decision);
+        pending.Complete(decision);
         StateChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public void Dispose()
     {
+        Preauthorization? preauthorization;
         lock (_gate)
         {
             if (_disposed)
@@ -127,20 +166,74 @@ public sealed class ConnectionEditorHostKeyPrompt : ISshHostKeyPrompt, IDisposab
             }
 
             _disposed = true;
+            preauthorization = _preauthorized;
             _preauthorized = null;
         }
 
+        preauthorization?.Detach();
         Cancel();
         GC.SuppressFinalize(this);
     }
 
+    private sealed class Preauthorization(
+        ConnectionEditorHostKeyPrompt owner,
+        SshHostKeyPromptRequest request) : IDisposable
+    {
+        private ConnectionEditorHostKeyPrompt? _owner = owner;
+
+        public SshHostKeyPromptRequest Request { get; } = request;
+
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.Remove(this);
+
+        public void Detach() => Interlocked.Exchange(ref _owner, null);
+    }
+
+    private sealed record PromptCancellation(
+        ConnectionEditorHostKeyPrompt Owner,
+        PendingPrompt Pending);
+
     private sealed class PendingPrompt(bool isChanged)
     {
+        private readonly object _gate = new();
+        private CancellationTokenRegistration _cancellationRegistration;
+        private bool _completed;
+
         public bool IsChanged { get; } = isChanged;
 
         public TaskCompletionSource<SshHostKeyPromptDecision> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public CancellationTokenRegistration CancellationRegistration { get; set; }
+        public void SetCancellationRegistration(CancellationTokenRegistration registration)
+        {
+            lock (_gate)
+            {
+                if (!_completed)
+                {
+                    _cancellationRegistration = registration;
+                    return;
+                }
+            }
+
+            _ = registration.Unregister();
+        }
+
+        public void Complete(SshHostKeyPromptDecision decision)
+        {
+            CancellationTokenRegistration registration;
+            lock (_gate)
+            {
+                if (_completed)
+                {
+                    return;
+                }
+
+                _completed = true;
+                registration = _cancellationRegistration;
+                _cancellationRegistration = default;
+            }
+
+            _ = registration.Unregister();
+            Completion.TrySetResult(decision);
+        }
     }
 }

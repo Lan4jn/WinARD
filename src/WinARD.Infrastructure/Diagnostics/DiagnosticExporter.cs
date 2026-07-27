@@ -1,5 +1,4 @@
 using System.IO.Compression;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -59,7 +58,9 @@ public sealed class DiagnosticExporter : IDisposable
     private readonly ISafeDiagnosticSink _sink;
     private readonly SecretRedactor _redactor;
     private readonly DiagnosticExportLimits _limits;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly object _gate = new();
+    private bool _busy;
+    private bool _disposed;
 
     public DiagnosticExporter(
         ISafeDiagnosticSink sink,
@@ -88,11 +89,7 @@ public sealed class DiagnosticExporter : IDisposable
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
         ArgumentNullException.ThrowIfNull(context);
-        cancellationToken.ThrowIfCancellationRequested();
-        if (!await _gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
-        {
-            throw new InvalidOperationException("A diagnostic export is already in progress.");
-        }
+        EnterExport(cancellationToken);
 
         string? temporaryPath = null;
         try
@@ -128,7 +125,30 @@ public sealed class DiagnosticExporter : IDisposable
                 TryDelete(temporaryPath);
             }
 
-            _gate.Release();
+            ExitExport();
+        }
+    }
+
+    private void EnterExport(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_busy)
+            {
+                throw new InvalidOperationException("A diagnostic export is already in progress.");
+            }
+
+            _busy = true;
+        }
+    }
+
+    private void ExitExport()
+    {
+        lock (_gate)
+        {
+            _busy = false;
         }
     }
 
@@ -137,35 +157,44 @@ public sealed class DiagnosticExporter : IDisposable
         DiagnosticExportContext context,
         CancellationToken cancellationToken)
     {
-        var events = _sink.Snapshot().TakeLast(_limits.MaxEvents).Select(SafeEvent).ToArray();
+        var privacy = new ExportPrivacyCounters();
+        var events = _sink.Snapshot()
+            .TakeLast(_limits.MaxEvents)
+            .Select(item => SafeEvent(item, context.IncludeHosts, privacy))
+            .ToArray();
         var profiles = context.Profiles.Take(_limits.MaxProfiles).Select(profile => new
         {
-            displayName = Safe(profile.DisplayName),
-            host = context.IncludeHosts ? Safe(profile.Host) : null,
-            hostSha256 = Hash(Safe(profile.Host) ?? string.Empty),
+            displayName = Safe(profile.DisplayName, privacy),
+            host = ExportHost(profile.Host, context.IncludeHosts, privacy),
             profile.Port,
-            username = Safe(profile.Username),
-            protocolVersion = Safe(profile.ProtocolVersion),
-            securityType = Safe(profile.SecurityType),
+            username = Safe(profile.Username, privacy),
+            protocolVersion = Safe(profile.ProtocolVersion, privacy),
+            securityType = Safe(profile.SecurityType, privacy),
             encodingStatistics = profile.EncodingStatistics is null
                 ? null
-                : SafeDictionary(profile.EncodingStatistics, _limits.MaxEncodingStatisticsPerProfile),
-            errorCode = Safe(profile.ErrorCode),
-            correlationId = Safe(profile.CorrelationId),
+                : SafeDictionary(
+                    profile.EncodingStatistics,
+                    _limits.MaxEncodingStatisticsPerProfile,
+                    privacy),
+            errorCode = Safe(profile.ErrorCode, privacy),
+            correlationId = Safe(profile.CorrelationId, privacy),
         }).ToArray();
         var diagnostics = new
         {
             generatedUtc = DateTimeOffset.UtcNow,
             application = new
             {
-                name = Safe(context.Application.Application),
-                version = Safe(context.Application.ApplicationVersion),
-                operatingSystem = Safe(context.Application.OperatingSystem),
-                dotNet = Safe(context.Application.DotNetVersion),
-                windowsAppSdk = Safe(context.Application.WindowsAppSdkVersion),
+                name = Safe(context.Application.Application, privacy),
+                version = Safe(context.Application.ApplicationVersion, privacy),
+                operatingSystem = Safe(context.Application.OperatingSystem, privacy),
+                dotNet = Safe(context.Application.DotNetVersion, privacy),
+                windowsAppSdk = Safe(context.Application.WindowsAppSdkVersion, privacy),
             },
             profiles,
-            performanceCounters = SafeDictionary(context.PerformanceCounters, _limits.MaxPerformanceCounters),
+            performanceCounters = SafeDictionary(
+                context.PerformanceCounters,
+                _limits.MaxPerformanceCounters,
+                privacy),
             events,
         };
         var manifest = new
@@ -189,6 +218,13 @@ public sealed class DiagnosticExporter : IDisposable
                 "Raw exception text before redaction",
             },
             limits = _limits,
+            privacy = new
+            {
+                hostFieldsOmitted = privacy.HostFieldsOmitted,
+                pathFieldsOmitted = privacy.PathFieldsOmitted,
+                invalidHostsOmitted = privacy.InvalidHostsOmitted,
+                truncatedValues = privacy.TruncatedValues,
+            },
         };
 
         await using var stream = new FileStream(
@@ -216,17 +252,26 @@ public sealed class DiagnosticExporter : IDisposable
             cancellationToken).ConfigureAwait(false);
     }
 
-    private object SafeEvent(SafeDiagnosticEvent item) => new
-    {
-        item.Timestamp,
-        code = Safe(item.Code),
-        correlationId = Safe(item.CorrelationId),
-        message = Safe(item.Message),
-        fields = SafeStringDictionary(item.Fields, _limits.MaxFieldsPerEvent),
-        exception = Safe(item.RedactedException),
-    };
+    private object SafeEvent(
+        SafeDiagnosticEvent item,
+        bool includeHosts,
+        ExportPrivacyCounters privacy) => new
+        {
+            item.Timestamp,
+            code = Safe(item.Code, privacy),
+            correlationId = Safe(item.CorrelationId, privacy),
+            message = Safe(item.Message, privacy),
+            fields = ExportFields(item.Fields, includeHosts, privacy),
+            exception = item.Exception is null
+                ? null
+                : new
+                {
+                    type = Safe(item.Exception.Type, privacy),
+                    hResult = Safe(item.Exception.HResult, privacy),
+                },
+        };
 
-    private string? Safe(string? value)
+    private string? Safe(string? value, ExportPrivacyCounters privacy)
     {
         if (value is null)
         {
@@ -234,42 +279,106 @@ public sealed class DiagnosticExporter : IDisposable
         }
 
         var redacted = _redactor.Redact(value);
-        var characterLimited = redacted.Length <= _limits.MaxFieldLength
-            ? redacted
-            : redacted[.._limits.MaxFieldLength];
-        return LimitUtf8(characterLimited, _limits.MaxStringUtf8Bytes);
+        var characterLimited = LimitUtf16(redacted, _limits.MaxFieldLength);
+        var characterTruncated = characterLimited.Length != redacted.Length;
+        var limited = LimitUtf8(characterLimited, _limits.MaxStringUtf8Bytes);
+        if (characterTruncated || limited.Length != characterLimited.Length)
+        {
+            privacy.TruncatedValues++;
+        }
+
+        return limited;
+    }
+
+    private static string LimitUtf16(string value, int maxChars)
+    {
+        var consumedChars = 0;
+        var remaining = value.AsSpan();
+        while (!remaining.IsEmpty)
+        {
+            var status = Rune.DecodeFromUtf16(remaining, out _, out var charsConsumed);
+            if (status != System.Buffers.OperationStatus.Done || consumedChars + charsConsumed > maxChars)
+            {
+                break;
+            }
+
+            consumedChars += charsConsumed;
+            remaining = remaining[charsConsumed..];
+        }
+
+        return consumedChars == value.Length ? value : value[..consumedChars];
     }
 
     private Dictionary<string, TValue> SafeDictionary<TValue>(
         IReadOnlyDictionary<string, TValue> values,
-        int maxCount)
+        int maxCount,
+        ExportPrivacyCounters privacy)
     {
         var safe = new Dictionary<string, TValue>(StringComparer.Ordinal);
         foreach (var pair in values.Take(maxCount))
         {
-            var key = Safe(pair.Key) ?? string.Empty;
+            var key = Safe(pair.Key, privacy) ?? string.Empty;
             safe[key] = pair.Value;
         }
 
         return safe;
     }
 
-    private Dictionary<string, string> SafeStringDictionary(
-        IReadOnlyDictionary<string, string> values,
-        int maxCount)
+    private Dictionary<string, string> ExportFields(
+        IReadOnlyList<SafeDiagnosticField> values,
+        bool includeHosts,
+        ExportPrivacyCounters privacy)
     {
         var safe = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var pair in values.Take(maxCount))
+        foreach (var field in values.Take(_limits.MaxFieldsPerEvent))
         {
-            var key = Safe(pair.Key) ?? string.Empty;
-            safe[key] = Safe(pair.Value) ?? string.Empty;
+            if (field.Category == DiagnosticFieldCategory.Path)
+            {
+                privacy.PathFieldsOmitted++;
+                continue;
+            }
+
+            if (field.Category == DiagnosticFieldCategory.Host)
+            {
+                var host = ExportHost(field.Value, includeHosts, privacy);
+                if (host is not null)
+                {
+                    safe[Safe(field.Name, privacy) ?? string.Empty] = host;
+                }
+
+                continue;
+            }
+
+            var key = Safe(field.Name, privacy) ?? string.Empty;
+            safe[key] = Safe(field.Value, privacy) ?? string.Empty;
         }
 
         return safe;
     }
 
-    private static string Hash(string value) => Convert.ToHexString(
-        SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+    private string? ExportHost(
+        string value,
+        bool includeHosts,
+        ExportPrivacyCounters privacy)
+    {
+        if (!includeHosts)
+        {
+            privacy.HostFieldsOmitted++;
+            return null;
+        }
+
+        var safe = Safe(value, privacy) ?? string.Empty;
+        if (safe.Length == 0 || !safe.EnumerateRunes().All(IsValidHostRune))
+        {
+            privacy.InvalidHostsOmitted++;
+            return null;
+        }
+
+        return safe;
+    }
+
+    private static bool IsValidHostRune(Rune rune) => Rune.IsLetterOrDigit(rune) ||
+        rune.Value is (int)'.' or (int)'-' or (int)'_' or (int)':' or (int)'[' or (int)']' or (int)'%';
 
     private static string LimitUtf8(string value, int maxBytes)
     {
@@ -346,7 +455,21 @@ public sealed class DiagnosticExporter : IDisposable
         }
     }
 
-    public void Dispose() => _gate.Dispose();
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            _disposed = true;
+        }
+    }
+
+    private sealed class ExportPrivacyCounters
+    {
+        public int HostFieldsOmitted { get; set; }
+        public int PathFieldsOmitted { get; set; }
+        public int InvalidHostsOmitted { get; set; }
+        public int TruncatedValues { get; set; }
+    }
 
     private sealed class BoundedWriteStream(Stream inner, long maxBytes) : Stream
     {

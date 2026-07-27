@@ -5,7 +5,7 @@ namespace WinARD.Desktop.Input;
 internal sealed class RemoteInputOperationRunner(
     IUiDispatcher dispatcher,
     Func<Task> reportFailure,
-    Func<Task> closeSession,
+    Func<Task> stopSession,
     Func<bool> isClosing,
     Action<Exception>? observeFailure = null)
 {
@@ -44,11 +44,11 @@ internal sealed class RemoteInputOperationRunner(
 
             try
             {
-                Task close = Task.CompletedTask;
+                Task stop = Task.CompletedTask;
                 await dispatcher.InvokeAsync(
-                    () => close = closeSession(),
+                    () => stop = stopSession(),
                     CancellationToken.None).ConfigureAwait(false);
-                await close.ConfigureAwait(false);
+                await stop.ConfigureAwait(false);
             }
             catch (Exception)
             {

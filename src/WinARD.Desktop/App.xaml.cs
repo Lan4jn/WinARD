@@ -36,10 +36,16 @@ public partial class App : Microsoft.UI.Xaml.Application
         var isPresenterFailureSmoke = commandLine.Contains(
             "--remote-session-smoke-presenter-failure",
             StringComparer.Ordinal);
+        var isInputFailureSmoke = commandLine.Contains(
+            "--remote-session-smoke-input-failure",
+            StringComparer.Ordinal);
         var isConnectionErrorSmoke = commandLine.Contains(
             "--connection-error-smoke",
             StringComparer.Ordinal);
-        if (isRemoteSessionSmoke || isPresenterFailureSmoke || isConnectionErrorSmoke)
+        if (isRemoteSessionSmoke ||
+            isPresenterFailureSmoke ||
+            isInputFailureSmoke ||
+            isConnectionErrorSmoke)
         {
             var dispatcher = new DispatcherQueueUiDispatcher(
                 DispatcherQueue.GetForCurrentThread() ??
@@ -49,7 +55,7 @@ public partial class App : Microsoft.UI.Xaml.Application
             var exporter = new DiagnosticExporter(sink, redactor);
             var exportService = new DiagnosticExportService(exporter);
             _window = new RemoteSessionWindow(
-                new SmokeRemoteSessionRuntime(),
+                new SmokeRemoteSessionRuntime(failPointerSend: isInputFailureSmoke),
                 new SmokeSessionOwnership(),
                 dispatcher,
                 isPresenterFailureSmoke ? new SmokeFailingPresenter() : null,
@@ -57,12 +63,14 @@ public partial class App : Microsoft.UI.Xaml.Application
                 exportService,
                 isConnectionErrorSmoke
                     ? ConnectionErrorViewModel.FromError(WinARD.Domain.Errors.WinArdError.Create(
-                        WinARD.Domain.Errors.ConnectionStage.Connecting,
-                        "TCP_CONNECTION_FAILED",
+                        WinARD.Domain.Errors.ConnectionStage.Connected,
+                        "REMOTE_SESSION_INTERRUPTED",
                         "Smoke-only mapped message.",
                         "smoke-correlation-123"))
                     : null,
-                retryRequested: isConnectionErrorSmoke
+                retryRequested: isConnectionErrorSmoke ||
+                                isPresenterFailureSmoke ||
+                                isInputFailureSmoke
                     ? _ =>
                     {
                         var marker = Environment.GetEnvironmentVariable(
@@ -139,7 +147,8 @@ public partial class App : Microsoft.UI.Xaml.Application
         return services.BuildServiceProvider(validateScopes: true);
     }
 
-    private sealed class SmokeRemoteSessionRuntime : IRemoteSessionRuntime
+    private sealed class SmokeRemoteSessionRuntime(
+        bool failPointerSend = false) : IRemoteSessionRuntime
     {
         private const int SmokeWidth = 3840;
         private const int SmokeHeight = 2160;
@@ -204,6 +213,11 @@ public partial class App : Microsoft.UI.Xaml.Application
             int y,
             CancellationToken cancellationToken)
         {
+            if (failPointerSend)
+            {
+                throw new IOException("sensitive smoke input failure");
+            }
+
             var release = Environment.GetEnvironmentVariable(
                 "WINARD_REMOTE_SMOKE_POINTER_SEND_RELEASE");
             if (string.IsNullOrWhiteSpace(release))

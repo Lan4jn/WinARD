@@ -115,7 +115,9 @@ public sealed class SecretRedactorTests
             "safe",
             [new(name, "unregistered-sensitive-value")]));
 
-        Assert.Equal(SecretRedactor.RedactedValue, sink.Snapshot().Single().Fields[name]);
+        Assert.Equal(
+            SecretRedactor.RedactedValue,
+            sink.Snapshot().Single().Fields.Single(field => field.Name == name).Value);
     }
 
     [Fact]
@@ -130,7 +132,9 @@ public sealed class SecretRedactorTests
             "safe",
             [new("master", "unregistered-master", DiagnosticFieldCategory.VaultMaster)]));
 
-        Assert.Equal(SecretRedactor.RedactedValue, sink.Snapshot().Single().Fields["master"]);
+        Assert.Equal(
+            SecretRedactor.RedactedValue,
+            sink.Snapshot().Single().Fields.Single(field => field.Name == "master").Value);
     }
 
     [Fact]
@@ -202,7 +206,9 @@ public sealed class SecretRedactorTests
             [new("clipboard", "private text", DiagnosticFieldCategory.ClipboardContent)]));
         var latest = sink.Snapshot()[^1];
         Assert.DoesNotContain("private text", latest.ToString(), StringComparison.Ordinal);
-        Assert.Equal(SecretRedactor.RedactedValue, latest.Fields["clipboard"]);
+        Assert.Equal(
+            SecretRedactor.RedactedValue,
+            latest.Fields.Single(field => field.Name == "clipboard").Value);
     }
 
     [Fact]
@@ -230,6 +236,250 @@ public sealed class SecretRedactorTests
         Assert.All(snapshot, item => Assert.Equal("PARALLEL", item.Code));
     }
 
+    [Fact]
+    public void SafeDiagnosticWriterNeverPropagatesSinkFailure()
+    {
+        ISafeDiagnosticSink sink = new ThrowingSink();
+
+        var written = sink.TryWrite(new SafeDiagnosticEventInput("CODE", "corr", "safe"));
+
+        Assert.False(written);
+    }
+
+    [Fact]
+    public void SecretRegistrationRejectsOversizeAndEnforcesRegistrationAndVariantLimits()
+    {
+        using var redactor = new SecretRedactor(new SecretRedactorLimits(
+            MaxSecretBytes: 16,
+            MaxRegisteredSecrets: 2,
+            MaxVariantsPerSecret: 3,
+            MaxTextUtf8Bytes: 128));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            redactor.Register(new string('x', 17).AsSpan()));
+        using var first = redactor.Register("first-secret".AsSpan());
+        using var second = redactor.Register("second-secret".AsSpan());
+        Assert.Throws<InvalidOperationException>(() => redactor.Register("third-secret".AsSpan()));
+        Assert.Equal(2, redactor.RegisteredSecretCount);
+        Assert.InRange(redactor.RegisteredVariantCount, 2, 6);
+
+        first.Dispose();
+        using var replacement = redactor.Register("third-secret".AsSpan());
+        Assert.Equal(2, redactor.RegisteredSecretCount);
+    }
+
+    [Fact]
+    public void OversizeCharRegistrationHasLengthGuardBeforeUtf8ByteCounting()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Infrastructure", "Diagnostics", "SecretRedactor.cs"));
+        var method = source.IndexOf(
+            "public IDisposable Register(ReadOnlySpan<char> secret)",
+            StringComparison.Ordinal);
+        var nextMethod = source.IndexOf(
+            "public IDisposable Register(ReadOnlySpan<byte> secret)",
+            method,
+            StringComparison.Ordinal);
+        var lengthGuard = source.IndexOf(
+            "secret.Length > _limits.MaxSecretBytes",
+            method,
+            StringComparison.Ordinal);
+        var byteCount = source.IndexOf(
+            "Encoding.UTF8.GetByteCount(secret)",
+            method,
+            StringComparison.Ordinal);
+
+        Assert.True(method >= 0);
+        Assert.True(nextMethod > method);
+        Assert.InRange(lengthGuard, method, byteCount - 1);
+        Assert.InRange(byteCount, lengthGuard + 1, nextMethod - 1);
+    }
+
+    [Fact]
+    public void RedactionBoundsUtf8InputAtRuneBoundary()
+    {
+        using var redactor = new SecretRedactor(new SecretRedactorLimits(
+            MaxSecretBytes: 32,
+            MaxRegisteredSecrets: 2,
+            MaxVariantsPerSecret: 7,
+            MaxTextUtf8Bytes: 7));
+        using var registration = redactor.Register("secret-value".AsSpan());
+
+        var result = redactor.Redact("密密密secret-value");
+
+        Assert.Equal(SecretRedactor.RedactedValue[..7], result);
+        Assert.True(Encoding.UTF8.GetByteCount(result) <= 7);
+        Assert.DoesNotContain('\uFFFD', result);
+    }
+
+    [Fact]
+    public void OversizeDirectRedactionDoesNotExposeASecretPrefixAcrossTheBoundary()
+    {
+        const int boundary = 64 * 1_024;
+        const string secret = "boundary-secret-value";
+        using var redactor = new SecretRedactor();
+        using var registration = redactor.Register(secret.AsSpan());
+
+        var result = redactor.Redact(
+            new string('x', boundary - 8) + secret + "-untrusted-tail");
+
+        Assert.Equal(SecretRedactor.RedactedValue, result);
+        Assert.DoesNotContain(secret[..8], result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OversizeDirectRedactionFailsClosedWhenMultibyteSecretCrossesUtf8Boundary()
+    {
+        const int boundary = 64 * 1_024;
+        const string secret = "密碼🔐boundary-secret";
+        using var redactor = new SecretRedactor();
+        using var registration = redactor.Register(secret.AsSpan());
+        var secretBytes = Encoding.UTF8.GetByteCount(secret);
+        var prefixLength = boundary - (secretBytes / 2);
+
+        var result = redactor.Redact(
+            new string('x', prefixLength) + secret + "-untrusted-tail");
+
+        Assert.Equal(SecretRedactor.RedactedValue, result);
+        Assert.DoesNotContain(secret[..2], result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OversizeDiagnosticMessageDoesNotExposeASecretPrefixAcrossTheBoundary()
+    {
+        const int boundary = 64 * 1_024;
+        const string secret = "boundary-secret-value";
+        using var redactor = new SecretRedactor();
+        using var registration = redactor.Register(secret.AsSpan());
+        var sink = new InMemorySafeDiagnosticSink(redactor, new SafeDiagnosticLimits(
+            MaxEvents: 2,
+            MaxRawTextUtf8Bytes: boundary,
+            MaxFieldsPerEvent: 2,
+            MaxFieldUtf8Bytes: boundary,
+            MaxRingApproximateBytes: boundary * 2));
+
+        sink.Write(new SafeDiagnosticEventInput(
+            "OVERSIZE_MESSAGE",
+            "corr-message",
+            new string('x', boundary - 8) + secret + "-untrusted-tail"));
+
+        var message = sink.Snapshot().Single().Message;
+        Assert.Equal(SecretRedactor.RedactedValue, message);
+        Assert.DoesNotContain(secret[..8], message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OversizeDiagnosticFieldDoesNotExposeASecretPrefixAcrossTheBoundary()
+    {
+        const int boundary = 64 * 1_024;
+        const string secret = "boundary-secret-value";
+        using var redactor = new SecretRedactor();
+        using var registration = redactor.Register(secret.AsSpan());
+        var sink = new InMemorySafeDiagnosticSink(redactor, new SafeDiagnosticLimits(
+            MaxEvents: 2,
+            MaxRawTextUtf8Bytes: boundary,
+            MaxFieldsPerEvent: 2,
+            MaxFieldUtf8Bytes: boundary,
+            MaxRingApproximateBytes: boundary * 2));
+
+        sink.Write(new SafeDiagnosticEventInput(
+            "OVERSIZE_FIELD",
+            "corr-field",
+            "safe",
+            [new DiagnosticField(
+                "detail",
+                new string('x', boundary - 8) + secret + "-untrusted-tail")]));
+
+        var value = sink.Snapshot().Single().Fields.Single().Value;
+        Assert.Equal(SecretRedactor.RedactedValue, value);
+        Assert.DoesNotContain(secret[..8], value, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void StructuredSinkBoundsRawTextFieldsAndApproximateRingBytes()
+    {
+        using var redactor = new SecretRedactor();
+        var limits = new SafeDiagnosticLimits(
+            MaxEvents: 100,
+            MaxRawTextUtf8Bytes: 13,
+            MaxFieldsPerEvent: 2,
+            MaxFieldUtf8Bytes: 7,
+            MaxRingApproximateBytes: 160);
+        var sink = new InMemorySafeDiagnosticSink(redactor, limits);
+        for (var index = 0; index < 20; index++)
+        {
+            sink.Write(new SafeDiagnosticEventInput(
+                "EVENT",
+                $"corr-{index}",
+                "密密密密密密password=tail-secret",
+                Enumerable.Range(0, 8)
+                    .Select(field => new DiagnosticField($"field-{field}", "密密密密"))
+                    .ToArray()));
+        }
+
+        var snapshot = sink.Snapshot();
+        Assert.NotEmpty(snapshot);
+        Assert.True(snapshot.Count < 20);
+        Assert.True(sink.ApproximateSizeBytes <= limits.MaxRingApproximateBytes);
+        Assert.All(snapshot, item =>
+        {
+            Assert.True(Encoding.UTF8.GetByteCount(item.Message) <= limits.MaxRawTextUtf8Bytes);
+            Assert.DoesNotContain('\uFFFD', item.Message);
+            Assert.Equal(limits.MaxFieldsPerEvent, item.Fields.Count);
+            Assert.All(item.Fields, field =>
+            {
+                Assert.True(Encoding.UTF8.GetByteCount(field.Name) <= limits.MaxFieldUtf8Bytes);
+                Assert.True(Encoding.UTF8.GetByteCount(field.Value) <= limits.MaxFieldUtf8Bytes);
+                Assert.DoesNotContain('\uFFFD', field.Value);
+            });
+        });
+    }
+
+    [Fact]
+    public async Task ConcurrentSnapshotRedactionAndUnregistrationStayBoundedAndSafe()
+    {
+        var limits = new SecretRedactorLimits(
+            MaxSecretBytes: 64,
+            MaxRegisteredSecrets: 16,
+            MaxVariantsPerSecret: 7,
+            MaxTextUtf8Bytes: 4_096);
+        using var redactor = new SecretRedactor(limits);
+        var registrations = Enumerable.Range(0, limits.MaxRegisteredSecrets)
+            .Select(index => redactor.Register($"bounded-secret-{index:D2}".AsSpan()))
+            .ToArray();
+        var failures = new System.Collections.Concurrent.ConcurrentQueue<Exception>();
+
+        var readers = Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        {
+            try
+            {
+                for (var iteration = 0; iteration < 250; iteration++)
+                {
+                    var result = redactor.Redact(
+                        new string('x', 3_000) + " bounded-secret-07 " + new string('y', 3_000));
+                    Assert.True(Encoding.UTF8.GetByteCount(result) <= limits.MaxTextUtf8Bytes);
+                }
+            }
+            catch (Exception exception)
+            {
+                failures.Enqueue(exception);
+            }
+        })).ToArray();
+        var unregister = Task.Run(() =>
+        {
+            foreach (var registration in registrations)
+            {
+                registration.Dispose();
+            }
+        });
+
+        await Task.WhenAll([.. readers, unregister]);
+
+        Assert.Empty(failures);
+        Assert.Equal(0, redactor.RegisteredSecretCount);
+        Assert.Equal(0, redactor.RegisteredVariantCount);
+    }
+
     private static string LowerPercentHex(string value)
     {
         var characters = value.ToCharArray();
@@ -246,6 +496,27 @@ public sealed class SecretRedactorTests
         }
 
         return new string(characters);
+    }
+
+    private static string RepositoryFile(params string[] segments)
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "WinARD.sln")))
+        {
+            directory = directory.Parent;
+        }
+
+        return directory is null
+            ? throw new FileNotFoundException("Could not locate repository root.")
+            : Path.Combine([directory.FullName, .. segments]);
+    }
+
+    private sealed class ThrowingSink : ISafeDiagnosticSink
+    {
+        public void Write(SafeDiagnosticEventInput diagnosticEvent) =>
+            throw new InvalidOperationException("sink failed");
+
+        public IReadOnlyList<SafeDiagnosticEvent> Snapshot() => [];
     }
 
     private static string LowerUnicodeHex(string value)

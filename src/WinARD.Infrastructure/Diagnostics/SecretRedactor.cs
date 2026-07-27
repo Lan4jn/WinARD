@@ -5,9 +5,19 @@ using System.Text;
 
 namespace WinARD.Infrastructure.Diagnostics;
 
+public sealed record SecretRedactorLimits(
+    int MaxSecretBytes = 1_024,
+    int MaxRegisteredSecrets = 16,
+    int MaxVariantsPerSecret = 7,
+    int MaxTextUtf8Bytes = 64 * 1_024);
+
 /// <summary>
 /// Redacts byte-backed secret variants from diagnostic text. Registered secrets and variants are
-/// retained only in zeroable byte arrays; they are never placed in a string collection.
+/// retained only in zeroable byte arrays; they are never placed in a string collection. Default
+/// work is bounded to 16 secrets * 7 variants * 64 KiB of UTF-8 text per redaction call. Oversized
+/// text fails closed to <see cref="RedactedValue"/>; when a configured text limit is smaller than
+/// that marker, the marker itself is truncated at a valid UTF-8 rune boundary and no source prefix
+/// is returned.
 /// </summary>
 public sealed class SecretRedactor : IDisposable
 {
@@ -17,7 +27,34 @@ public sealed class SecretRedactor : IDisposable
     private static readonly byte[] Replacement = Encoding.UTF8.GetBytes(RedactedValue);
     private readonly object _sync = new();
     private readonly List<RegistrationEntry> _entries = [];
+    private readonly SecretRedactorLimits _limits;
     private bool _disposed;
+
+    public SecretRedactor()
+        : this(new SecretRedactorLimits())
+    {
+    }
+
+    public SecretRedactor(SecretRedactorLimits limits)
+    {
+        _limits = limits ?? throw new ArgumentNullException(nameof(limits));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxSecretBytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxRegisteredSecrets);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxVariantsPerSecret);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(_limits.MaxVariantsPerSecret, 7);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxTextUtf8Bytes);
+    }
+
+    public int RegisteredSecretCount
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _entries.Count;
+            }
+        }
+    }
 
     public int RegisteredVariantCount
     {
@@ -32,7 +69,18 @@ public sealed class SecretRedactor : IDisposable
 
     public IDisposable Register(ReadOnlySpan<char> secret)
     {
-        var bytes = new byte[Encoding.UTF8.GetByteCount(secret)];
+        if (secret.Length > _limits.MaxSecretBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(secret), "Secret exceeds the configured byte limit.");
+        }
+
+        var byteCount = Encoding.UTF8.GetByteCount(secret);
+        if (byteCount > _limits.MaxSecretBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(secret), "Secret exceeds the configured byte limit.");
+        }
+
+        var bytes = new byte[byteCount];
         Encoding.UTF8.GetBytes(secret, bytes);
         try
         {
@@ -46,60 +94,134 @@ public sealed class SecretRedactor : IDisposable
 
     public IDisposable Register(ReadOnlySpan<byte> secret)
     {
-        lock (_sync)
+        if (secret.Length > _limits.MaxSecretBytes)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (secret.Length < MinimumSecretBytes)
-            {
-                return EmptyRegistration.Instance;
-            }
+            throw new ArgumentOutOfRangeException(nameof(secret), "Secret exceeds the configured byte limit.");
+        }
 
-            var entry = new RegistrationEntry(BuildVariants(secret));
-            _entries.Add(entry);
-            return new Registration(this, entry);
+        if (secret.Length < MinimumSecretBytes)
+        {
+            return EmptyRegistration.Instance;
+        }
+
+        var variants = BuildVariants(secret, _limits.MaxVariantsPerSecret);
+        try
+        {
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                if (_entries.Count >= _limits.MaxRegisteredSecrets)
+                {
+                    throw new InvalidOperationException("The secret registration limit has been reached.");
+                }
+
+                var entry = new RegistrationEntry(variants);
+                _entries.Add(entry);
+                variants = null!;
+                return new Registration(this, entry);
+            }
+        }
+        finally
+        {
+            if (variants is not null)
+            {
+                ZeroVariants(variants);
+            }
         }
     }
 
     public string Redact(string? text)
     {
+        if (string.IsNullOrEmpty(text))
+        {
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+            }
+
+            return text ?? string.Empty;
+        }
+
+        if (ExceedsUtf8Limit(text, _limits.MaxTextUtf8Bytes))
+        {
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+            }
+
+            return LimitUtf8(RedactedValue, _limits.MaxTextUtf8Bytes);
+        }
+
+        List<byte[]> snapshot = [];
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (string.IsNullOrEmpty(text) || _entries.Count == 0)
+            if (_entries.Count == 0)
             {
-                return text ?? string.Empty;
+                return text;
             }
 
-            var source = Encoding.UTF8.GetBytes(text);
             try
             {
-                var patterns = _entries
-                    .SelectMany(entry => entry.Variants)
-                    .OrderByDescending(static variant => variant.Length)
-                    .ToArray();
-                var masked = new bool[source.Length];
-                for (var offset = 0; offset < source.Length; offset++)
+                foreach (var entry in _entries)
                 {
-                    foreach (var pattern in patterns)
+                    foreach (var variant in entry.Variants)
                     {
-                        if (pattern.Length == 0 || offset + pattern.Length > source.Length ||
-                            masked.AsSpan(offset, pattern.Length).Contains(true) ||
-                            !source.AsSpan(offset, pattern.Length).SequenceEqual(pattern))
+                        var copy = variant.ToArray();
+                        try
                         {
-                            continue;
+                            snapshot.Add(copy);
                         }
-
-                        masked.AsSpan(offset, pattern.Length).Fill(true);
-                        break;
+                        catch
+                        {
+                            CryptographicOperations.ZeroMemory(copy);
+                            throw;
+                        }
                     }
                 }
+            }
+            catch
+            {
+                ZeroVariants(snapshot);
+                throw;
+            }
+        }
 
-                if (!masked.Contains(true))
+        byte[]? source = null;
+        try
+        {
+            source = Encoding.UTF8.GetBytes(text);
+            snapshot.Sort(static (left, right) => right.Length.CompareTo(left.Length));
+            var masked = new bool[source.Length];
+            foreach (var pattern in snapshot)
+            {
+                var searchOffset = 0;
+                while (searchOffset <= source.Length - pattern.Length)
                 {
-                    return text;
-                }
+                    var relative = source.AsSpan(searchOffset).IndexOf(pattern);
+                    if (relative < 0)
+                    {
+                        break;
+                    }
 
-                using var output = new MemoryStream(source.Length);
+                    var matchOffset = searchOffset + relative;
+                    if (!masked.AsSpan(matchOffset, pattern.Length).Contains(true))
+                    {
+                        masked.AsSpan(matchOffset, pattern.Length).Fill(true);
+                    }
+
+                    searchOffset = matchOffset + Math.Max(1, pattern.Length);
+                }
+            }
+
+            if (!masked.Contains(true))
+            {
+                return text;
+            }
+
+            using var output = new MemoryStream(source.Length);
+            try
+            {
                 for (var offset = 0; offset < source.Length;)
                 {
                     if (!masked[offset])
@@ -115,12 +237,24 @@ public sealed class SecretRedactor : IDisposable
                     }
                 }
 
-                return Encoding.UTF8.GetString(output.GetBuffer(), 0, checked((int)output.Length));
+                return Encoding.UTF8.GetString(
+                    output.GetBuffer(),
+                    0,
+                    checked((int)output.Length));
             }
             finally
             {
+                ZeroBuffer(output);
+            }
+        }
+        finally
+        {
+            if (source is not null)
+            {
                 CryptographicOperations.ZeroMemory(source);
             }
+
+            ZeroVariants(snapshot);
         }
     }
 
@@ -168,38 +302,54 @@ public sealed class SecretRedactor : IDisposable
         _entries.Clear();
     }
 
-    private static List<byte[]> BuildVariants(ReadOnlySpan<byte> secret)
+    private static List<byte[]> BuildVariants(ReadOnlySpan<byte> secret, int maxVariants)
     {
         List<byte[]> variants = [];
-        AddDistinct(variants, secret.ToArray());
-        AddDistinct(variants, EncodeBase64(secret));
-        var url = UrlEncode(secret, lowerHex: false);
-        AddDistinct(variants, url);
-        AddDistinct(variants, UrlEncode(secret, lowerHex: true));
-        AddDistinct(variants, JsonEscape(secret));
-        AddDistinct(variants, JsonUnicodeEscape(secret, lowerHex: false));
-        AddDistinct(variants, JsonUnicodeEscape(secret, lowerHex: true));
-        return variants;
+        try
+        {
+            AddDistinct(variants, secret.ToArray(), maxVariants);
+            AddDistinct(variants, EncodeBase64(secret), maxVariants);
+            AddDistinct(variants, UrlEncode(secret, lowerHex: false), maxVariants);
+            AddDistinct(variants, UrlEncode(secret, lowerHex: true), maxVariants);
+            AddDistinct(variants, JsonEscape(secret), maxVariants);
+            AddDistinct(variants, JsonUnicodeEscape(secret, lowerHex: false), maxVariants);
+            AddDistinct(variants, JsonUnicodeEscape(secret, lowerHex: true), maxVariants);
+            return variants;
+        }
+        catch
+        {
+            ZeroVariants(variants);
+            throw;
+        }
     }
 
     private static byte[] EncodeBase64(ReadOnlySpan<byte> secret)
     {
-        var buffer = new byte[System.Buffers.Text.Base64.GetMaxEncodedToUtf8Length(secret.Length)];
-        var status = System.Buffers.Text.Base64.EncodeToUtf8(secret, buffer, out _, out var written);
-        if (status != System.Buffers.OperationStatus.Done)
+        byte[]? buffer = new byte[System.Buffers.Text.Base64.GetMaxEncodedToUtf8Length(secret.Length)];
+        try
         {
-            CryptographicOperations.ZeroMemory(buffer);
-            throw new InvalidOperationException("Secret base64 variant could not be encoded.");
-        }
+            var status = System.Buffers.Text.Base64.EncodeToUtf8(secret, buffer, out _, out var written);
+            if (status != System.Buffers.OperationStatus.Done)
+            {
+                throw new InvalidOperationException("Secret base64 variant could not be encoded.");
+            }
 
-        if (written == buffer.Length)
+            if (written == buffer.Length)
+            {
+                var result = buffer;
+                buffer = null;
+                return result;
+            }
+
+            return buffer.AsSpan(0, written).ToArray();
+        }
+        finally
         {
-            return buffer;
+            if (buffer is not null)
+            {
+                CryptographicOperations.ZeroMemory(buffer);
+            }
         }
-
-        var result = buffer.AsSpan(0, written).ToArray();
-        CryptographicOperations.ZeroMemory(buffer);
-        return result;
     }
 
     private static byte[] UrlEncode(ReadOnlySpan<byte> secret, bool lowerHex)
@@ -208,61 +358,75 @@ public sealed class SecretRedactor : IDisposable
         const string lower = "0123456789abcdef";
         var hex = lowerHex ? lower : upper;
         using var output = new MemoryStream(secret.Length * 3);
-        foreach (var value in secret)
+        try
         {
-            if ((value >= (byte)'a' && value <= (byte)'z') ||
-                (value >= (byte)'A' && value <= (byte)'Z') ||
-                (value >= (byte)'0' && value <= (byte)'9') ||
-                value is (byte)'-' or (byte)'_' or (byte)'.' or (byte)'~')
+            foreach (var value in secret)
             {
-                output.WriteByte(value);
+                if ((value >= (byte)'a' && value <= (byte)'z') ||
+                    (value >= (byte)'A' && value <= (byte)'Z') ||
+                    (value >= (byte)'0' && value <= (byte)'9') ||
+                    value is (byte)'-' or (byte)'_' or (byte)'.' or (byte)'~')
+                {
+                    output.WriteByte(value);
+                }
+                else
+                {
+                    output.WriteByte((byte)'%');
+                    output.WriteByte((byte)hex[value >> 4]);
+                    output.WriteByte((byte)hex[value & 0x0f]);
+                }
             }
-            else
-            {
-                output.WriteByte((byte)'%');
-                output.WriteByte((byte)hex[value >> 4]);
-                output.WriteByte((byte)hex[value & 0x0f]);
-            }
-        }
 
-        return CopyAndZero(output);
+            return output.ToArray();
+        }
+        finally
+        {
+            ZeroBuffer(output);
+        }
     }
 
     private static byte[] JsonEscape(ReadOnlySpan<byte> secret)
     {
         using var output = new MemoryStream(secret.Length * 2);
-        foreach (var value in secret)
+        try
         {
-            switch (value)
+            foreach (var value in secret)
             {
-                case (byte)'"':
-                    output.Write("\\\""u8);
-                    break;
-                case (byte)'\\':
-                    output.Write("\\\\"u8);
-                    break;
-                case (byte)'\b':
-                    output.Write("\\b"u8);
-                    break;
-                case (byte)'\f':
-                    output.Write("\\f"u8);
-                    break;
-                case (byte)'\n':
-                    output.Write("\\n"u8);
-                    break;
-                case (byte)'\r':
-                    output.Write("\\r"u8);
-                    break;
-                case (byte)'\t':
-                    output.Write("\\t"u8);
-                    break;
-                default:
-                    output.WriteByte(value);
-                    break;
+                switch (value)
+                {
+                    case (byte)'"':
+                        output.Write("\\\""u8);
+                        break;
+                    case (byte)'\\':
+                        output.Write("\\\\"u8);
+                        break;
+                    case (byte)'\b':
+                        output.Write("\\b"u8);
+                        break;
+                    case (byte)'\f':
+                        output.Write("\\f"u8);
+                        break;
+                    case (byte)'\n':
+                        output.Write("\\n"u8);
+                        break;
+                    case (byte)'\r':
+                        output.Write("\\r"u8);
+                        break;
+                    case (byte)'\t':
+                        output.Write("\\t"u8);
+                        break;
+                    default:
+                        output.WriteByte(value);
+                        break;
+                }
             }
-        }
 
-        return CopyAndZero(output);
+            return output.ToArray();
+        }
+        finally
+        {
+            ZeroBuffer(output);
+        }
     }
 
     private static byte[] JsonUnicodeEscape(ReadOnlySpan<byte> secret, bool lowerHex)
@@ -271,34 +435,40 @@ public sealed class SecretRedactor : IDisposable
         const string lower = "0123456789abcdef";
         var hex = lowerHex ? lower : upper;
         using var output = new MemoryStream(secret.Length * 6);
-        while (!secret.IsEmpty)
+        try
         {
-            var status = Rune.DecodeFromUtf8(secret, out var rune, out var consumed);
-            if (status != OperationStatus.Done)
+            while (!secret.IsEmpty)
             {
-                ZeroBuffer(output);
-                return [];
+                var status = Rune.DecodeFromUtf8(secret, out var rune, out var consumed);
+                if (status != OperationStatus.Done)
+                {
+                    return [];
+                }
+
+                secret = secret[consumed..];
+                if (rune.IsAscii)
+                {
+                    WriteJsonAscii(output, (byte)rune.Value, hex);
+                    continue;
+                }
+
+                if (rune.Value <= char.MaxValue)
+                {
+                    WriteUnicodeEscape(output, (ushort)rune.Value, hex);
+                    continue;
+                }
+
+                var scalar = rune.Value - 0x10000;
+                WriteUnicodeEscape(output, (ushort)(0xD800 + (scalar >> 10)), hex);
+                WriteUnicodeEscape(output, (ushort)(0xDC00 + (scalar & 0x3FF)), hex);
             }
 
-            secret = secret[consumed..];
-            if (rune.IsAscii)
-            {
-                WriteJsonAscii(output, (byte)rune.Value, hex);
-                continue;
-            }
-
-            if (rune.Value <= char.MaxValue)
-            {
-                WriteUnicodeEscape(output, (ushort)rune.Value, hex);
-                continue;
-            }
-
-            var scalar = rune.Value - 0x10000;
-            WriteUnicodeEscape(output, (ushort)(0xD800 + (scalar >> 10)), hex);
-            WriteUnicodeEscape(output, (ushort)(0xDC00 + (scalar & 0x3FF)), hex);
+            return output.ToArray();
         }
-
-        return CopyAndZero(output);
+        finally
+        {
+            ZeroBuffer(output);
+        }
     }
 
     private static void WriteJsonAscii(Stream output, byte value, string hex)
@@ -349,13 +519,6 @@ public sealed class SecretRedactor : IDisposable
         output.WriteByte((byte)hex[value & 0xF]);
     }
 
-    private static byte[] CopyAndZero(MemoryStream stream)
-    {
-        var result = stream.ToArray();
-        ZeroBuffer(stream);
-        return result;
-    }
-
     private static void ZeroBuffer(MemoryStream stream)
     {
         if (stream.TryGetBuffer(out var buffer))
@@ -364,16 +527,60 @@ public sealed class SecretRedactor : IDisposable
         }
     }
 
-    private static void AddDistinct(List<byte[]> variants, byte[] candidate)
+    private static string LimitUtf8(string value, int maxBytes)
     {
-        if (candidate.Length < MinimumSecretBytes ||
-            variants.Any(existing => existing.AsSpan().SequenceEqual(candidate)))
+        var consumedChars = 0;
+        var consumedBytes = 0;
+        var remaining = value.AsSpan();
+        while (!remaining.IsEmpty)
         {
-            CryptographicOperations.ZeroMemory(candidate);
-            return;
+            var status = Rune.DecodeFromUtf16(remaining, out var rune, out var charsConsumed);
+            if (status != OperationStatus.Done || consumedBytes + rune.Utf8SequenceLength > maxBytes)
+            {
+                break;
+            }
+
+            consumedChars += charsConsumed;
+            consumedBytes += rune.Utf8SequenceLength;
+            remaining = remaining[charsConsumed..];
         }
 
-        variants.Add(candidate);
+        return consumedChars == value.Length ? value : value[..consumedChars];
+    }
+
+    private static bool ExceedsUtf8Limit(string value, int maxBytes) =>
+        value.Length > maxBytes || Encoding.UTF8.GetByteCount(value) > maxBytes;
+
+    private static void ZeroVariants(IEnumerable<byte[]> variants)
+    {
+        foreach (var variant in variants)
+        {
+            CryptographicOperations.ZeroMemory(variant);
+        }
+    }
+
+    private static void AddDistinct(List<byte[]> variants, byte[] candidate, int maxVariants)
+    {
+        byte[]? ownedCandidate = candidate;
+        try
+        {
+            if (variants.Count >= maxVariants ||
+                candidate.Length < MinimumSecretBytes ||
+                variants.Any(existing => existing.AsSpan().SequenceEqual(candidate)))
+            {
+                return;
+            }
+
+            variants.Add(candidate);
+            ownedCandidate = null;
+        }
+        finally
+        {
+            if (ownedCandidate is not null)
+            {
+                CryptographicOperations.ZeroMemory(ownedCandidate);
+            }
+        }
     }
 
     private sealed class Registration(SecretRedactor owner, RegistrationEntry entry) : IDisposable

@@ -9,10 +9,10 @@ namespace WinARD.Desktop.Tests;
 public sealed class RemoteInputOperationRunnerTests
 {
     [Fact]
-    public async Task Input_failure_is_observed_reported_and_closes_session()
+    public async Task Input_failure_is_observed_reported_and_stops_failed_session()
     {
         var reports = 0;
-        var closes = 0;
+        var stops = 0;
         var dispatcher = new TrackingDispatcher();
         var runner = new RemoteInputOperationRunner(
             dispatcher,
@@ -20,7 +20,7 @@ public sealed class RemoteInputOperationRunnerTests
             () =>
             {
                 Assert.True(dispatcher.IsDispatching);
-                closes++;
+                stops++;
                 return Task.CompletedTask;
             },
             () => false);
@@ -28,7 +28,7 @@ public sealed class RemoteInputOperationRunnerTests
         await runner.RunAsync(() => Task.FromException(new IOException("sensitive input failure")));
 
         Assert.Equal(1, reports);
-        Assert.Equal(1, closes);
+        Assert.Equal(1, stops);
     }
 
     [Fact]

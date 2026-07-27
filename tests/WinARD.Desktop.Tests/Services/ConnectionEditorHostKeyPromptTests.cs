@@ -79,4 +79,63 @@ public sealed class ConnectionEditorHostKeyPromptTests
         Assert.Equal(SshHostKeyPromptDecision.Replace, decision);
         Assert.False(sut.State.IsVisible);
     }
+
+    [Fact]
+    public async Task NonMatchingPromptDoesNotConsumeTheSinglePreauthorization()
+    {
+        using var sut = new ConnectionEditorHostKeyPrompt();
+        var expected = new SshHostKeyPromptRequest(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "SHA256:expected",
+            "SHA256:old",
+            IsChanged: true);
+        var unexpected = expected with { NewFingerprint = "SHA256:unexpected" };
+        sut.Preauthorize(expected);
+
+        var unrelatedPrompt = sut.PromptAsync(unexpected, CancellationToken.None).AsTask();
+        sut.Cancel();
+        Assert.Equal(SshHostKeyPromptDecision.Cancel, await unrelatedPrompt);
+
+        var authorizedPrompt = sut.PromptAsync(expected, CancellationToken.None);
+        Assert.True(authorizedPrompt.IsCompletedSuccessfully);
+        Assert.Equal(SshHostKeyPromptDecision.Replace, await authorizedPrompt);
+        Assert.False(sut.State.IsVisible);
+    }
+
+    [Fact]
+    public void OutstandingPreauthorizationCannotBeSilentlyReplaced()
+    {
+        using var sut = new ConnectionEditorHostKeyPrompt();
+        var first = new SshHostKeyPromptRequest(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "SHA256:first",
+            "SHA256:old",
+            IsChanged: true);
+        sut.Preauthorize(first);
+
+        Assert.Throws<InvalidOperationException>(() => sut.Preauthorize(
+            first with { NewFingerprint = "SHA256:second" }));
+    }
+
+    [Fact]
+    public async Task DisposedAttemptLeaseCannotAuthorizeALaterMatchingPrompt()
+    {
+        using var sut = new ConnectionEditorHostKeyPrompt();
+        var request = new SshHostKeyPromptRequest(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "SHA256:new",
+            "SHA256:old",
+            IsChanged: true);
+        var attemptLease = sut.Preauthorize(request);
+
+        attemptLease.Dispose();
+        var prompt = sut.PromptAsync(request, CancellationToken.None).AsTask();
+
+        Assert.False(prompt.IsCompleted);
+        sut.Cancel();
+        Assert.Equal(SshHostKeyPromptDecision.Cancel, await prompt);
+    }
 }

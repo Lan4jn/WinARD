@@ -62,11 +62,18 @@ public sealed record ConnectionErrorViewModel(
                 new("取消", ConnectionErrorActionKind.Cancel),
                 new("显式替换主机密钥", ConnectionErrorActionKind.ReplaceHostKey),
                 export),
-            "ARD_AUTH_REJECTED" or "RFB_CONNECTION_REJECTED" => Create(
+            "ARD_AUTH_REJECTED" => Create(
                 "认证失败",
                 "Mac 拒绝了凭据。请重新输入用户名和密码后重试。",
                 error,
                 new("重新输入凭据", ConnectionErrorActionKind.ReenterCredentials),
+                export),
+            "RFB_CONNECTION_REJECTED" => Create(
+                "远程服务拒绝连接",
+                "远程服务在认证前拒绝了连接。请检查服务状态和连接策略后重试。",
+                error,
+                new("重试", ConnectionErrorActionKind.Retry),
+                new("复制关联 ID", ConnectionErrorActionKind.CopyCorrelationId),
                 export),
             "VAULT_LOCKED" => Create(
                 "凭据库已锁定",
@@ -87,9 +94,17 @@ public sealed record ConnectionErrorViewModel(
                     error,
                     new("重试", ConnectionErrorActionKind.Retry),
                     export),
-            "REMOTE_SESSION_INTERRUPTED" or "REMOTE_PRESENTATION_FAILED" or "REMOTE_INPUT_FAILED" => Create(
+            "REMOTE_SESSION_INTERRUPTED" => Create(
                 "远程会话已中断",
-                "远程会话发生错误并已停止。可以断开窗口或导出脱敏诊断。",
+                "远程连接已中断。可以释放当前窗口后重新连接，或导出脱敏诊断。",
+                error,
+                new("重试", ConnectionErrorActionKind.Retry),
+                new("断开", ConnectionErrorActionKind.Disconnect),
+                new("复制关联 ID", ConnectionErrorActionKind.CopyCorrelationId),
+                export),
+            "REMOTE_PRESENTATION_FAILED" or "REMOTE_INPUT_FAILED" => Create(
+                "远程会话已停止",
+                "本地画面或输入处理失败，会话已停止。请断开窗口并导出脱敏诊断。",
                 error,
                 new("断开", ConnectionErrorActionKind.Disconnect),
                 new("复制关联 ID", ConnectionErrorActionKind.CopyCorrelationId),

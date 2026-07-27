@@ -46,4 +46,36 @@ public sealed class ConnectionErrorActionHandlerTests
         Assert.Equal(["close", "connect"], sequence);
         Assert.Equal(1, connectCalls);
     }
+
+    [Fact]
+    public async Task RepeatedRemoteRetryClicksShareOneCloseAndReconnect()
+    {
+        var closeEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowClose = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var closeCalls = 0;
+        var reconnectCalls = 0;
+        var sut = new RemoteSessionRetryAction(
+            async () =>
+            {
+                closeCalls++;
+                closeEntered.TrySetResult();
+                await allowClose.Task;
+            },
+            _ =>
+            {
+                reconnectCalls++;
+                return Task.CompletedTask;
+            });
+
+        var first = sut.ExecuteAsync(CancellationToken.None);
+        await closeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var second = sut.ExecuteAsync(CancellationToken.None);
+        allowClose.TrySetResult();
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(1, closeCalls);
+        Assert.Equal(1, reconnectCalls);
+    }
 }

@@ -150,14 +150,14 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             "REMOTE_INPUT_FAILED",
             "远程输入发送失败。",
             Guid.NewGuid().ToString("N"));
-        _diagnosticSink?.Write(new SafeDiagnosticEventInput(
+        _ = _dispatcher.InvokeAsync(
+            () => Error = error,
+            CancellationToken.None);
+        _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
             error.Code,
             error.CorrelationId,
             "Remote input operation failed.",
             Exception: exception));
-        _ = _dispatcher.InvokeAsync(
-            () => Error = error,
-            CancellationToken.None);
     }
 
     public ValueTask DisposeAsync()
@@ -360,11 +360,6 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                         : "REMOTE_SESSION_INTERRUPTED",
                     "远程会话已中断。",
                     Guid.NewGuid().ToString("N"));
-                _diagnosticSink?.Write(new SafeDiagnosticEventInput(
-                    error.Code,
-                    error.CorrelationId,
-                    "Remote session loop failed.",
-                    Exception: exception));
                 var status = ReferenceEquals(completed, present)
                     ? "画面呈现失败，会话正在关闭。"
                     : "连接已中断。";
@@ -382,6 +377,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 {
                     // Terminal cleanup must not depend on status reporting.
                 }
+
+                _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
+                    error.Code,
+                    error.CorrelationId,
+                    "Remote session loop failed.",
+                    Exception: exception));
             }
 
             await ObserveFailureAsync(receive).ConfigureAwait(false);

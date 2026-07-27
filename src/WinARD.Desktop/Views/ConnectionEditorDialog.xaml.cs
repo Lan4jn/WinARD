@@ -147,6 +147,11 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
 
     private void OnTestClicked(object sender, RoutedEventArgs args)
     {
+        StartTest(hostKeyPreauthorization: null);
+    }
+
+    private void StartTest(IDisposable? hostKeyPreauthorization)
+    {
         _ = _operations.RunAsync(async () =>
         {
             ConnectionEditorSecretPackage? retrySecret = null;
@@ -179,6 +184,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
             }
             finally
             {
+                hostKeyPreauthorization?.Dispose();
                 retrySecret?.Dispose();
                 SetBusy(false);
             }
@@ -309,13 +315,13 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
                 "操作失败。",
                 Guid.NewGuid().ToString("N")),
         };
-        _diagnosticSink?.Write(new SafeDiagnosticEventInput(
+        StatusText.Text = SafeMessage(exception);
+        ErrorCard.ViewModel = ConnectionErrorViewModel.FromError(error);
+        _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
             error.Code,
             error.CorrelationId,
             "Connection editor operation failed.",
             Exception: exception));
-        StatusText.Text = SafeMessage(exception);
-        ErrorCard.ViewModel = ConnectionErrorViewModel.FromError(error);
     }
 
     private async void OnErrorActionRequested(object? sender, ConnectionErrorActionKind action)
@@ -368,8 +374,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
                 case ConnectionErrorActionKind.ReplaceHostKey:
                     if (_hostKeyPrompt is not null && ViewModel.LastTestHostKeyFailure is { } failure)
                     {
-                        _hostKeyPrompt.Preauthorize(failure);
-                        OnTestClicked(TestButton, new RoutedEventArgs());
+                        StartTest(_hostKeyPrompt.Preauthorize(failure));
                         break;
                     }
 

@@ -31,7 +31,9 @@ public sealed class DiagnosticExportService : IDisposable
 {
     private readonly DiagnosticExporter _exporter;
     private readonly IDiagnosticSavePicker _picker;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly object _gate = new();
+    private bool _busy;
+    private bool _disposed;
 
     public DiagnosticExportService(
         DiagnosticExporter exporter,
@@ -60,7 +62,7 @@ public sealed class DiagnosticExportService : IDisposable
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (!await _gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+        if (!TryEnterExport(cancellationToken))
         {
             return null;
         }
@@ -78,9 +80,39 @@ public sealed class DiagnosticExportService : IDisposable
         }
         finally
         {
-            _gate.Release();
+            ExitExport();
         }
     }
 
-    public void Dispose() => _gate.Dispose();
+    private bool TryEnterExport(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_busy)
+            {
+                return false;
+            }
+
+            _busy = true;
+            return true;
+        }
+    }
+
+    private void ExitExport()
+    {
+        lock (_gate)
+        {
+            _busy = false;
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            _disposed = true;
+        }
+    }
 }

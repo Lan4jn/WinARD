@@ -1,7 +1,9 @@
 using WinARD.Application.Ports;
 using WinARD.Desktop.Rendering;
+using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
+using WinARD.Infrastructure.Diagnostics;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -77,6 +79,84 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal("连接已中断。", viewModel.StatusMessage);
         Assert.DoesNotContain("sensitive", viewModel.StatusMessage, StringComparison.Ordinal);
         Assert.Equal(1, lifetime.DisposeCount);
+    }
+
+    [Fact]
+    public async Task ThrowingDiagnosticSinkCannotSuppressTerminalErrorOrOwnershipRelease()
+    {
+        var lifetime = new TrackingLifetime();
+        await using var viewModel = new RemoteSessionViewModel(
+            new FailingRuntime(),
+            lifetime,
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: new ThrowingSink());
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal("连接已中断。", viewModel.StatusMessage);
+        Assert.Equal("REMOTE_SESSION_INTERRUPTED", viewModel.Error?.Code);
+        Assert.Equal(1, lifetime.DisposeCount);
+    }
+
+    [Fact]
+    public async Task InterruptedErrorFlowsThroughCardRetryToCloseAndOneNewConnection()
+    {
+        var lifetime = new TrackingLifetime();
+        var viewModel = new RemoteSessionViewModel(
+            new FailingRuntime(),
+            lifetime,
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null);
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+        var card = ConnectionErrorViewModel.FromError(viewModel.Error!);
+        var sequence = new List<string>();
+        var connectCalls = 0;
+        var openCalls = 0;
+        var retry = new RemoteSessionRetryAction(
+            async () =>
+            {
+                sequence.Add("close");
+                await viewModel.DisposeAsync();
+            },
+            _ =>
+            {
+                sequence.Add("connect");
+                connectCalls++;
+                openCalls++;
+                return Task.CompletedTask;
+            });
+        var handler = new ConnectionErrorActionHandler(
+            [new(ConnectionErrorActionKind.Retry, retry.ExecuteAsync)]);
+
+        await handler.HandleAsync(
+            card.Actions.Single(action => action.Kind == ConnectionErrorActionKind.Retry).Kind,
+            CancellationToken.None);
+
+        Assert.Equal(["close", "connect"], sequence);
+        Assert.Equal(1, lifetime.DisposeCount);
+        Assert.Equal(1, connectCalls);
+        Assert.Equal(1, openCalls);
+    }
+
+    [Fact]
+    public void ThrowingDiagnosticSinkCannotSuppressInputErrorPresentation()
+    {
+        var viewModel = new RemoteSessionViewModel(
+            new BlockingRuntime(),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: new ThrowingSink());
+
+        viewModel.ObserveInputFailure(new InvalidOperationException("raw"));
+
+        Assert.Equal("REMOTE_INPUT_FAILED", viewModel.Error?.Code);
     }
 
     [Fact]
@@ -729,6 +809,14 @@ public sealed class RemoteSessionViewModelTests
             action();
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class ThrowingSink : ISafeDiagnosticSink
+    {
+        public void Write(SafeDiagnosticEventInput diagnosticEvent) =>
+            throw new InvalidOperationException("sink failed");
+
+        public IReadOnlyList<SafeDiagnosticEvent> Snapshot() => [];
     }
 
     private sealed class FailingDispatcher : IUiDispatcher

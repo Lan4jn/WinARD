@@ -77,6 +77,18 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
         Assert.Equal(1, transportLifetime.DisposeCount);
     }
 
+    [Fact]
+    public void RegisteredSecretDisposesTransferredSecretWhenConstructionFailsBeforeRegistration()
+    {
+        using var redactor = new SecretRedactor();
+        var secret = new ThrowingLengthSecret();
+
+        Assert.Throws<InvalidOperationException>(() => new RegisteredSecret(secret, redactor));
+
+        Assert.Equal(1, secret.DisposeCount);
+        Assert.Equal(0, redactor.RegisteredSecretCount);
+    }
+
     private static ConnectionAttemptWorkflow Workflow(
         SecretRedactor redactor,
         ISafeDiagnosticSink sink,
@@ -189,6 +201,15 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
             DisposeCount++;
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class ThrowingLengthSecret : ISecret
+    {
+        public int DisposeCount { get; private set; }
+        public int Length => throw new InvalidOperationException("length failed");
+        public void CopyTo(Span<byte> destination) => throw new NotSupportedException();
+        public ISecret Clone() => throw new NotSupportedException();
+        public void Dispose() => DisposeCount++;
     }
 
     private sealed class CancelPrompt : ISshHostKeyPrompt

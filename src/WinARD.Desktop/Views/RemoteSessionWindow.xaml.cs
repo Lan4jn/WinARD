@@ -20,7 +20,6 @@ namespace WinARD.Desktop.Views;
 public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 {
     private readonly CancellationTokenSource _lifetime = new();
-    private readonly object _closeSync = new();
     private readonly IUiDispatcher _dispatcher;
     private readonly WindowsClipboardBridge _clipboardBridge;
     private readonly RemoteInputOperationRunner _inputOperations;
@@ -29,8 +28,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly AppWindow _appWindow;
     private readonly DiagnosticExportService? _diagnosticExportService;
     private readonly ConnectionErrorActionHandler _errorActionHandler;
+    private readonly RemoteSessionWindowLifecycle _windowLifecycle;
     private RemoteFramebufferSize _remoteSize;
-    private Task? _closeTask;
     private ViewportScaleMode _scaleMode = ViewportScaleMode.Fit;
     private byte _pointerMask;
     private RemotePoint _lastPointer;
@@ -62,31 +61,36 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             dispatcher,
             _clipboardBridge,
             diagnosticSink);
+        _windowLifecycle = new RemoteSessionWindowLifecycle(
+            ViewModel.Completion,
+            () => ViewModel.Error is not null,
+            StopSessionCoreAsync,
+            CloseWindowCoreAsync,
+            retryRequested);
         var handlers = new Dictionary<ConnectionErrorActionKind, Func<CancellationToken, Task>>
         {
             [ConnectionErrorActionKind.CopyCorrelationId] = CopyCorrelationIdAsync,
-            [ConnectionErrorActionKind.Disconnect] = _ => CloseSessionAsync(),
-            [ConnectionErrorActionKind.Cancel] = _ => CloseSessionAsync(),
+            [ConnectionErrorActionKind.Disconnect] = _ => _windowLifecycle.DisconnectAsync(),
+            [ConnectionErrorActionKind.Cancel] = _ => _windowLifecycle.DisconnectAsync(),
         };
         if (_diagnosticExportService is not null)
         {
             handlers[ConnectionErrorActionKind.ExportDiagnostics] = ExportDiagnosticsAsync;
         }
-        if (retryRequested is not null)
+        if (_windowLifecycle.CanRetry)
         {
-            var retry = new RemoteSessionRetryAction(CloseSessionAsync, retryRequested);
-            handlers[ConnectionErrorActionKind.Retry] = retry.ExecuteAsync;
+            handlers[ConnectionErrorActionKind.Retry] = _windowLifecycle.RetryAsync;
         }
 
         _errorActionHandler = new ConnectionErrorActionHandler(handlers);
-        SessionErrorCard.IsActionEnabled = _errorActionHandler.CanHandle;
+        SessionErrorCard.IsActionEnabled = IsErrorActionEnabled;
         SessionErrorCard.ActionRequested += OnErrorActionRequested;
         SessionErrorCard.ViewModel = initialError;
         _inputOperations = new RemoteInputOperationRunner(
             dispatcher,
             ViewModel.ReportInputFailureAsync,
-            CloseSessionAsync,
-            () => _lifetime.IsCancellationRequested,
+            _windowLifecycle.StopSessionAsync,
+            () => _lifetime.IsCancellationRequested || _windowLifecycle.IsSessionStopped,
             ViewModel.ObserveInputFailure);
         _cursorVisibility = new RemoteCursorVisibilityController(
             InputSurface.SetHostCursorHidden,
@@ -123,12 +127,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     public RemoteSessionViewModel ViewModel { get; }
 
     public Task CloseSessionAsync()
-    {
-        lock (_closeSync)
-        {
-            return _closeTask ??= CloseCoreAsync();
-        }
-    }
+        => _windowLifecycle.DisconnectAsync();
 
     public ValueTask DisposeAsync() => new(CloseSessionAsync());
 
@@ -136,7 +135,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     {
         FramePanel.Loaded -= OnFramePanelLoaded;
         _ = ViewModel.StartAsync(_lifetime.Token);
-        _ = ObserveCompletionAsync();
+        _ = ObserveFailureAsync(_windowLifecycle.ObserveCompletionAsync(_lifetime.Token));
         _ = ObserveFailureAsync(ObserveSmokePointerProbeAsync());
     }
 
@@ -426,17 +425,43 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
         else if (args.PropertyName == nameof(RemoteSessionViewModel.Error))
         {
-            SessionErrorCard.ViewModel = ViewModel.Error is null
+            var error = ViewModel.Error;
+            SessionErrorCard.ViewModel = error is null
                 ? null
-                : ConnectionErrorViewModel.FromError(ViewModel.Error);
+                : ConnectionErrorViewModel.FromError(error);
+            if (error is not null)
+            {
+                WriteSmokeMarker("WINARD_REMOTE_SMOKE_ERROR_MARKER", error.Code);
+                TriggerSmokeErrorAction();
+            }
         }
+    }
+
+    private void TriggerSmokeErrorAction()
+    {
+        var value = Environment.GetEnvironmentVariable(
+            "WINARD_REMOTE_SMOKE_ERROR_ACTION");
+        if (!Enum.TryParse<ConnectionErrorActionKind>(
+                value,
+                ignoreCase: true,
+                out var action) ||
+            !_errorActionHandler.CanHandle(action))
+        {
+            return;
+        }
+
+        var operation = _errorActionHandler.HandleAsync(action, CancellationToken.None);
+        RefreshErrorActionState();
+        _ = ObserveFailureAsync(operation);
     }
 
     private async void OnErrorActionRequested(object? sender, ConnectionErrorActionKind action)
     {
         try
         {
-            await _errorActionHandler.HandleAsync(action, _lifetime.Token);
+            var operation = _errorActionHandler.HandleAsync(action, _lifetime.Token);
+            RefreshErrorActionState();
+            await operation;
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
@@ -444,6 +469,23 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         catch (Exception)
         {
             StatusText.Text = "错误操作未能完成。";
+        }
+    }
+
+    private bool IsErrorActionEnabled(ConnectionErrorActionKind action) => action switch
+    {
+        ConnectionErrorActionKind.Retry =>
+            _errorActionHandler.CanHandle(action) && _windowLifecycle.CanRetry,
+        ConnectionErrorActionKind.Disconnect or ConnectionErrorActionKind.Cancel =>
+            _errorActionHandler.CanHandle(action) && _windowLifecycle.CanDisconnect,
+        _ => _errorActionHandler.CanHandle(action),
+    };
+
+    private void RefreshErrorActionState()
+    {
+        if (SessionErrorCard.ViewModel is { } error)
+        {
+            SessionErrorCard.ViewModel = error;
         }
     }
 
@@ -488,49 +530,47 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _ = CloseSessionAsync();
     }
 
-    private async Task CloseCoreAsync()
+    private async Task StopSessionCoreAsync()
+    {
+        try
+        {
+            using var releaseTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+            var release = ReleaseInputAsync(releaseTimeout.Token);
+            try
+            {
+                await release.WaitAsync(TimeSpan.FromMilliseconds(250));
+            }
+            catch (TimeoutException)
+            {
+                _ = ObserveFailureAsync(release);
+            }
+        }
+        catch (Exception)
+        {
+        }
+
+        try
+        {
+            await ViewModel.DisposeAsync();
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private async Task CloseWindowCoreAsync()
     {
         _lifetime.Cancel();
         try
         {
-            try
+            await _dispatcher.InvokeAsync(() =>
             {
-                using var releaseTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
-                var release = ReleaseInputAsync(releaseTimeout.Token);
-                try
-                {
-                    await release.WaitAsync(TimeSpan.FromMilliseconds(250));
-                }
-                catch (TimeoutException)
-                {
-                    _ = ObserveFailureAsync(release);
-                }
-            }
-            catch (Exception)
-            {
-            }
-
-            try
-            {
-                await ViewModel.DisposeAsync();
-            }
-            catch (Exception)
-            {
-            }
+                _allowClose = true;
+                Close();
+            }, CancellationToken.None);
         }
-        finally
+        catch (Exception)
         {
-            try
-            {
-                await _dispatcher.InvokeAsync(() =>
-                {
-                    _allowClose = true;
-                    Close();
-                }, CancellationToken.None);
-            }
-            catch (Exception)
-            {
-            }
         }
     }
 
@@ -578,29 +618,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         await send.ConfigureAwait(false);
     }
 
-    private async Task ObserveCompletionAsync()
-    {
-        try
-        {
-            await ViewModel.Completion.ConfigureAwait(false);
-            if (!_lifetime.IsCancellationRequested)
-            {
-                await _dispatcher.InvokeAsync(
-                    () => _ = CloseSessionAsync(),
-                    CancellationToken.None).ConfigureAwait(false);
-            }
-        }
-        catch (Exception)
-        {
-            // Completion observation must never become an unobserved fire-and-forget failure.
-        }
-    }
-
     private void OnClosed(object sender, WindowEventArgs args)
     {
         _appWindow.Closing -= OnClosing;
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
         SessionErrorCard.ActionRequested -= OnErrorActionRequested;
+        _windowLifecycle.Dispose();
         _cursorVisibility.Reset();
         InputSurface.Dispose();
         _lifetime.Dispose();

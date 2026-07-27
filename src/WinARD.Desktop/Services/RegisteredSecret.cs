@@ -12,22 +12,27 @@ internal sealed class RegisteredSecret : ISecret
 
     public RegisteredSecret(ISecret secret, SecretRedactor redactor)
     {
-        _secret = secret ?? throw new ArgumentNullException(nameof(secret));
+        ArgumentNullException.ThrowIfNull(secret);
         _redactor = redactor ?? throw new ArgumentNullException(nameof(redactor));
-        var bytes = new byte[secret.Length];
+        _secret = secret;
+        byte[]? bytes = null;
         try
         {
+            bytes = new byte[secret.Length];
             secret.CopyTo(bytes);
             _registration = redactor.Register(bytes);
         }
         catch
         {
-            secret.Dispose();
+            Interlocked.Exchange(ref _secret, null)?.Dispose();
             throw;
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(bytes);
+            if (bytes is not null)
+            {
+                CryptographicOperations.ZeroMemory(bytes);
+            }
         }
     }
 

@@ -76,6 +76,25 @@ public sealed class DiagnosticExportServiceTests : IDisposable
         Assert.Equal(1, picker.Calls);
     }
 
+    [Fact]
+    public async Task DisposeDuringPickerDoesNotInvalidateTheActiveOperationGate()
+    {
+        var picker = new BlockingPicker();
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
+        var service = new DiagnosticExportService(exporter, picker);
+
+        var export = service.ExportForTestAsync(DiagnosticExportContext.Empty, CancellationToken.None);
+        await picker.Entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        service.Dispose();
+        picker.Release.TrySetResult(null);
+
+        Assert.Null(await export.WaitAsync(TimeSpan.FromSeconds(2)));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            service.ExportForTestAsync(DiagnosticExportContext.Empty, CancellationToken.None));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directory))

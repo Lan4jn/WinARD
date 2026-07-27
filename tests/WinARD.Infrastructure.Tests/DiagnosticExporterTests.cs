@@ -45,7 +45,7 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.DoesNotContain("never-export-this-secret", content, StringComparison.Ordinal);
         Assert.DoesNotContain("private text", content, StringComparison.Ordinal);
         Assert.DoesNotContain("mac.internal", content, StringComparison.Ordinal);
-        Assert.Contains("hostSha256", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("hostSha256", content, StringComparison.Ordinal);
         Assert.Contains("excluded", content, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("SQLite", content, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("redactionVersion", content, StringComparison.Ordinal);
@@ -72,6 +72,32 @@ public sealed class DiagnosticExporterTests : IDisposable
 
         Assert.Equal("existing", await File.ReadAllTextAsync(destination));
         Assert.Empty(Directory.EnumerateFiles(_directory, "*.tmp", SearchOption.TopDirectoryOnly));
+    }
+
+    [Fact]
+    public async Task DisposeDuringExportDoesNotInvalidateTheActiveOperationGate()
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "dispose-race.zip");
+        using var redactor = new SecretRedactor();
+        var sink = new BlockingSnapshotSink();
+        var exporter = new DiagnosticExporter(sink, redactor);
+
+        var export = Task.Run(() => exporter.ExportAsync(
+            destination,
+            DiagnosticExportContext.Empty,
+            CancellationToken.None));
+        await sink.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        exporter.Dispose();
+        sink.Release.TrySetResult();
+
+        await export.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(File.Exists(destination));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => exporter.ExportAsync(
+            Path.Combine(_directory, "after-dispose.zip"),
+            DiagnosticExportContext.Empty,
+            CancellationToken.None));
     }
 
     [Fact]
@@ -102,6 +128,33 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.DoesNotContain("corr-16", json, StringComparison.Ordinal);
         Assert.Contains("corr-19", json, StringComparison.Ordinal);
         Assert.DoesNotContain(new string('x', 41), json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CharacterLimitDoesNotSplitASurrogatePair()
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "rune-limit.zip");
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(
+            new InMemorySafeDiagnosticSink(redactor),
+            redactor,
+            new DiagnosticExportLimits(MaxFieldLength: 1, MaxStringUtf8Bytes: 16));
+        var context = DiagnosticExportContext.Empty with
+        {
+            Application = DiagnosticExportContext.Empty.Application with { Application = "😀" },
+        };
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var applicationName = document.RootElement
+            .GetProperty("application")
+            .GetProperty("name")
+            .GetString();
+        Assert.NotNull(applicationName);
+        Assert.DoesNotContain('\uFFFD', applicationName);
     }
 
     [Fact]
@@ -207,6 +260,93 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.Empty(Directory.EnumerateFiles(_directory, "*.tmp", SearchOption.TopDirectoryOnly));
     }
 
+    [Fact]
+    public async Task ExceptionMetadataNeverStoresRawMessageAndClassifiedFieldsReachExporter()
+    {
+        const string host = "private-host.internal";
+        const string address = "10.23.45.67";
+        const string path = @"C:\Users\private\credential.key";
+        const string query = "?token=private-query-value";
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        var exception = new InvalidOperationException($"host={host} ip={address} path={path} {query}");
+        sink.Write(new SafeDiagnosticEventInput(
+            "CONNECT_FAILED",
+            "corr-private",
+            "Connection failed.",
+            [
+                new("endpoint", host, DiagnosticFieldCategory.Host),
+                new("credentialPath", path, DiagnosticFieldCategory.Path),
+                new("fingerprint", "SHA256:safe", DiagnosticFieldCategory.Public),
+            ],
+            exception));
+
+        var stored = sink.Snapshot().Single();
+        Assert.Equal(nameof(InvalidOperationException), stored.Exception?.Type);
+        Assert.Equal($"0x{exception.HResult:X8}", stored.Exception?.HResult);
+        Assert.Equal(DiagnosticFieldCategory.Host, stored.Fields.Single(field => field.Name == "endpoint").Category);
+        var exceptionMetadata = JsonSerializer.Serialize(stored.Exception);
+        Assert.DoesNotContain(host, exceptionMetadata, StringComparison.Ordinal);
+        Assert.DoesNotContain(address, exceptionMetadata, StringComparison.Ordinal);
+        Assert.DoesNotContain(path, exceptionMetadata, StringComparison.Ordinal);
+        Assert.DoesNotContain(query, exceptionMetadata, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExportAppliesHostAndPathPrivacyWithoutDictionaryHash(bool includeHosts)
+    {
+        Directory.CreateDirectory(_directory);
+        const string host = "private-host.internal";
+        const string path = @"C:\Users\private\credential.key";
+        var hostHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(host))).ToLowerInvariant();
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        sink.Write(new SafeDiagnosticEventInput(
+            "SSH_HOST_KEY_CHANGED",
+            "corr-host-policy",
+            "Host key changed.",
+            [
+                new("endpoint", host, DiagnosticFieldCategory.Host),
+                new("privateKeyPath", path, DiagnosticFieldCategory.Path),
+                new("oldFingerprint", "SHA256:old", DiagnosticFieldCategory.Public),
+                new("newFingerprint", "SHA256:new", DiagnosticFieldCategory.Public),
+            ],
+            new InvalidOperationException($"{host}|{path}|?query=private")));
+        var context = new DiagnosticExportContext(
+            DiagnosticExportContext.Empty.Application,
+            [new DiagnosticProfileSummary("Office Mac", host, 5900, "operator", "3.8", "30")],
+            new Dictionary<string, long>(),
+            includeHosts);
+        using var exporter = new DiagnosticExporter(sink, redactor);
+        var destination = Path.Combine(_directory, $"privacy-{includeHosts}.zip");
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        var content = await ReadAllAsync(archive);
+        Assert.DoesNotContain(path, content, StringComparison.Ordinal);
+        Assert.DoesNotContain("?query=private", content, StringComparison.Ordinal);
+        Assert.DoesNotContain(hostHash, content, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("SHA256:old", content, StringComparison.Ordinal);
+        Assert.Contains("SHA256:new", content, StringComparison.Ordinal);
+        if (includeHosts)
+        {
+            Assert.Contains(host, content, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.DoesNotContain(host, content, StringComparison.Ordinal);
+        }
+
+        using var manifest = JsonDocument.Parse(await ReadEntryAsync(archive, "manifest.json"));
+        var privacy = manifest.RootElement.GetProperty("privacy");
+        Assert.True(privacy.GetProperty("pathFieldsOmitted").GetInt32() >= 1);
+        Assert.Equal(includeHosts ? 0 : 2, privacy.GetProperty("hostFieldsOmitted").GetInt32());
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directory))
@@ -231,5 +371,25 @@ public sealed class DiagnosticExporterTests : IDisposable
     {
         using var reader = new StreamReader(archive.GetEntry(name)!.Open(), Encoding.UTF8);
         return await reader.ReadToEndAsync();
+    }
+
+    private sealed class BlockingSnapshotSink : ISafeDiagnosticSink
+    {
+        public TaskCompletionSource Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Write(SafeDiagnosticEventInput diagnosticEvent)
+        {
+        }
+
+        public IReadOnlyList<SafeDiagnosticEvent> Snapshot()
+        {
+            Entered.TrySetResult();
+            Release.Task.GetAwaiter().GetResult();
+            return [];
+        }
     }
 }
