@@ -109,6 +109,32 @@ public sealed class D3DPresentationRecoveryTests
     }
 
     [Fact]
+    public void Non_target_hresult_is_not_recovered()
+    {
+        var rebuildCount = 0;
+        var fallbackCount = 0;
+        var failure = new D3DPresentationException(
+            D3DPresentationStage.Present1,
+            new COMException(
+                "synthetic non-target native failure",
+                unchecked((int)0x887A0005)));
+
+        var thrown = Assert.Throws<D3DPresentationException>(() =>
+            D3DPresentationRecovery.Execute(
+                [1, 2, 3, 4],
+                4,
+                [new RemoteRectangle(0, 0, 1, 1)],
+                (_, _, _) => throw failure,
+                () => false,
+                () => rebuildCount++,
+                (_, _) => fallbackCount++));
+
+        Assert.Same(failure, thrown);
+        Assert.Equal(0, rebuildCount);
+        Assert.Equal(0, fallbackCount);
+    }
+
+    [Fact]
     public void Rebuild_failure_propagates_original_exception_without_fallback()
     {
         var rebuildCount = 0;

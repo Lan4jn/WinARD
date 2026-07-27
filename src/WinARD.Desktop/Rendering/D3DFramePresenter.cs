@@ -57,16 +57,20 @@ public sealed class D3DFramePresenter : IFramePresenter
         FrameValidation.ValidateBgra32(_width, _height, stride, bgra32.Length);
         try
         {
-            PresentCore(bgra32, stride, dirtyRectangles);
-        }
-        catch (SharpGenException) when (_device?.DeviceRemovedReason.Failure == true)
-        {
-            RecreateDevice();
-            CreateFrameResources(_width, _height);
-            PresentCore(
+            D3DPresentationRecovery.Execute(
                 bgra32,
                 stride,
-                [new RemoteRectangle(0, 0, _width, _height)]);
+                dirtyRectangles,
+                PresentOptimized,
+                IsDeviceRemoved,
+                RebuildSwapChainForRecovery,
+                PresentRecoveredFullFrame);
+        }
+        catch (D3DPresentationException) when (IsDeviceRemoved())
+        {
+            RecreateDevice();
+            CreateFrameResources(_width, _height, recovery: true);
+            PresentRecoveredFullFrame(bgra32, stride);
         }
     }
 
@@ -95,15 +99,45 @@ public sealed class D3DFramePresenter : IFramePresenter
         return ValueTask.CompletedTask;
     }
 
+    private bool IsDeviceRemoved() => _device?.DeviceRemovedReason.Failure == true;
+
+    private void PresentOptimized(
+        ReadOnlySpan<byte> bgra32,
+        int stride,
+        IReadOnlyList<RemoteRectangle> dirtyRectangles) =>
+        PresentCore(
+            bgra32,
+            stride,
+            dirtyRectangles,
+            useDirtyRectanglePresent: true,
+            recovery: false);
+
+    private void RebuildSwapChainForRecovery() =>
+        CreateFrameResources(_width, _height, detachPanel: true, recovery: true);
+
+    private void PresentRecoveredFullFrame(ReadOnlySpan<byte> bgra32, int stride) =>
+        PresentCore(
+            bgra32,
+            stride,
+            [new RemoteRectangle(0, 0, _width, _height)],
+            useDirtyRectanglePresent: false,
+            recovery: true);
+
     private void PresentCore(
         ReadOnlySpan<byte> bgra32,
         int stride,
-        IReadOnlyList<RemoteRectangle> dirtyRectangles)
+        IReadOnlyList<RemoteRectangle> dirtyRectangles,
+        bool useDirtyRectanglePresent,
+        bool recovery)
     {
         var context = _context ?? throw new InvalidOperationException("The D3D11 device is unavailable.");
         var texture = _texture ?? throw new InvalidOperationException("The D3D11 frame texture is unavailable.");
         var swapChain = _swapChain ?? throw new InvalidOperationException("The DXGI swap chain is unavailable.");
-        using var backBuffer = swapChain.GetBuffer<ID3D11Texture2D>(0);
+        using var backBuffer = D3DPresentationOperation.Run(
+            recovery
+                ? D3DPresentationStage.RecoveryGetBuffer
+                : D3DPresentationStage.GetBuffer,
+            () => swapChain.GetBuffer<ID3D11Texture2D>(0));
         var clipped = FrameValidation.ClipDirtyRectangles(dirtyRectangles, _width, _height);
         if (clipped.Count == 0)
         {
@@ -123,22 +157,27 @@ public sealed class D3DFramePresenter : IFramePresenter
                 checked(rectangle.X + rectangle.Width),
                 checked(rectangle.Y + rectangle.Height),
                 1);
-            context.UpdateSubresource(
+            D3DPresentationOperation.Run(
+                D3DPresentationStage.UpdateSubresource,
                 source,
-                texture,
-                0,
-                checked((uint)stride),
-                0,
-                box);
-            context.CopySubresourceRegion(
-                backBuffer,
-                0,
-                checked((uint)rectangle.X),
-                checked((uint)rectangle.Y),
-                0,
-                texture,
-                0,
-                box);
+                bytes => context.UpdateSubresource(
+                    bytes,
+                    texture,
+                    0,
+                    checked((uint)stride),
+                    0,
+                    box));
+            D3DPresentationOperation.Run(
+                D3DPresentationStage.CopySubresourceRegion,
+                () => context.CopySubresourceRegion(
+                    backBuffer,
+                    0,
+                    checked((uint)rectangle.X),
+                    checked((uint)rectangle.Y),
+                    0,
+                    texture,
+                    0,
+                    box));
             presentRectangles[index] = new RawRect(
                 rectangle.X,
                 rectangle.Y,
@@ -146,32 +185,50 @@ public sealed class D3DFramePresenter : IFramePresenter
                 checked(rectangle.Y + rectangle.Height));
         }
 
-        swapChain.Present1(
-            0,
-            PresentFlags.None,
-            presentRectangles,
-            scrollRectangle: null,
-            scrollOffset: null).CheckError();
+        if (useDirtyRectanglePresent)
+        {
+            D3DPresentationOperation.Run(
+                D3DPresentationStage.Present1,
+                () => swapChain.Present1(
+                    0,
+                    PresentFlags.None,
+                    presentRectangles,
+                    scrollRectangle: null,
+                    scrollOffset: null).CheckError());
+            return;
+        }
+
+        D3DPresentationOperation.Run(
+            D3DPresentationStage.RecoveryPresent,
+            () => swapChain.Present(0, PresentFlags.None).CheckError());
     }
 
     private void CreateDevice()
     {
-        D3D11CreateDevice(
-            IntPtr.Zero,
-            DriverType.Hardware,
-            DeviceCreationFlags.BgraSupport,
-            [FeatureLevel.Level_11_1, FeatureLevel.Level_11_0, FeatureLevel.Level_10_1],
-            out var device,
-            out var context).CheckError();
+        ID3D11Device device = null!;
+        ID3D11DeviceContext context = null!;
+        D3DPresentationOperation.Run(
+            D3DPresentationStage.CreateDevice,
+            () => D3D11CreateDevice(
+                IntPtr.Zero,
+                DriverType.Hardware,
+                DeviceCreationFlags.BgraSupport,
+                [FeatureLevel.Level_11_1, FeatureLevel.Level_11_0, FeatureLevel.Level_10_1],
+                out device,
+                out context).CheckError());
         _device = device;
         _context = context;
         _panelNative = new SwapChainPanelNative(_panel);
     }
 
-    private void CreateFrameResources(int width, int height)
+    private void CreateFrameResources(
+        int width,
+        int height,
+        bool detachPanel = false,
+        bool recovery = false)
     {
         var device = _device ?? throw new InvalidOperationException("The D3D11 device is unavailable.");
-        DisposeFrameResources(detachPanel: false);
+        DisposeFrameResources(detachPanel);
         var textureDescription = new Texture2DDescription(
             Format.B8G8R8A8_UNorm,
             checked((uint)width),
@@ -184,7 +241,6 @@ public sealed class D3DFramePresenter : IFramePresenter
             1,
             0,
             ResourceOptionFlags.None);
-        _texture = device.CreateTexture2D(textureDescription);
 
         using var dxgiDevice = device.QueryInterface<IDXGIDevice>();
         using var adapter = dxgiDevice.GetAdapter();
@@ -200,9 +256,27 @@ public sealed class D3DFramePresenter : IFramePresenter
             SwapEffect.FlipSequential,
             AlphaMode.Ignore,
             SwapChainFlags.None);
-        _swapChain = factory.CreateSwapChainForComposition(device, swapChainDescription, null!);
-        (_panelNative ?? throw new InvalidOperationException("SwapChainPanel native interop is unavailable."))
-            .SetSwapChain(_swapChain).CheckError();
+        var panelNative = _panelNative
+            ?? throw new InvalidOperationException("SwapChainPanel native interop is unavailable.");
+        var resources = FrameResourceTransaction.Create(
+            () => D3DPresentationOperation.Run(
+                D3DPresentationStage.CreateTexture2D,
+                () => device.CreateTexture2D(textureDescription)),
+            () => D3DPresentationOperation.Run(
+                recovery
+                    ? D3DPresentationStage.RecoveryCreateSwapChain
+                    : D3DPresentationStage.CreateSwapChainForComposition,
+                () => factory.CreateSwapChainForComposition(
+                    device,
+                    swapChainDescription,
+                    null!)),
+            swapChain => D3DPresentationOperation.Run(
+                recovery
+                    ? D3DPresentationStage.RecoverySetSwapChain
+                    : D3DPresentationStage.SetSwapChain,
+                () => panelNative.SetSwapChain(swapChain).CheckError()));
+        _texture = resources.Texture;
+        _swapChain = resources.SwapChain;
         _width = width;
         _height = height;
     }
@@ -222,7 +296,11 @@ public sealed class D3DFramePresenter : IFramePresenter
         List<Exception> failures = [];
         if (detachPanel && _panelNative is not null)
         {
-            CaptureFailure(() => _panelNative.SetSwapChain(null!).CheckError(), failures);
+            CaptureFailure(
+                () => D3DPresentationOperation.Run(
+                    D3DPresentationStage.RecoveryDetachSwapChain,
+                    () => _panelNative.SetSwapChain(null!).CheckError()),
+                failures);
         }
 
         CaptureFailure(() => _swapChain?.Dispose(), failures);
