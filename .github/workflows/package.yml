@@ -1,0 +1,162 @@
+name: package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Four-part MSIX version (for example 0.1.0.0)'
+        required: true
+        default: '0.1.0.0'
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: Directory.Packages.props
+      - name: Restore
+        run: dotnet restore src/WinARD.Desktop/WinARD.Desktop.csproj -r win-x64 -p:Platform=x64
+      - name: License allowlist gate
+        shell: pwsh
+        run: ./packaging/check-licenses.ps1
+      - name: NuGet vulnerability gate
+        shell: pwsh
+        run: ./packaging/check-vulnerabilities.ps1
+      - name: Resolve package version from dispatch or strict vMAJOR.MINOR.PATCH tag
+        id: version
+        shell: pwsh
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if ($env:REF_TYPE -eq 'tag') {
+            $packageVersion = ./packaging/resolve-version.ps1 -Tag $env:REF_NAME
+          } else {
+            $packageVersion = ./packaging/resolve-version.ps1 -Version $env:DISPATCH_VERSION
+          }
+          "package_version=$packageVersion" >> $env:GITHUB_OUTPUT
+      - name: Build unsigned release candidates
+        shell: pwsh
+        run: ./packaging/portable.ps1 -SkipRestore -Version '${{ steps.version.outputs.package_version }}'
+      - name: Verify unsigned release candidates
+        shell: pwsh
+        run: ./packaging/verify-artifacts.ps1 -ExpectedVersion '${{ steps.version.outputs.package_version }}'
+      - name: Sign tagged MSIX
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          SIGNING_CERTIFICATE: ${{ secrets.WINARD_SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.WINARD_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE) -or
+              [string]::IsNullOrWhiteSpace($env:SIGNING_PASSWORD)) {
+            throw 'Tagged releases require WINARD_SIGNING_CERTIFICATE_BASE64 and WINARD_SIGNING_CERTIFICATE_PASSWORD.'
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'winard-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes(
+              $certificatePath,
+              [Convert]::FromBase64String($env:SIGNING_CERTIFICATE))
+            $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $certificatePath,
+              $env:SIGNING_PASSWORD,
+              [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+            if ($certificate.Subject -cne 'CN=WinARD Development' -or
+                -not $certificate.HasPrivateKey) {
+              throw 'Signing certificate subject/private-key requirements do not match the MSIX publisher.'
+            }
+            $now = [DateTime]::UtcNow
+            if ($certificate.NotBefore.ToUniversalTime() -gt $now -or
+                $certificate.NotAfter.ToUniversalTime() -le $now) {
+              throw 'Signing certificate is not currently valid.'
+            }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $unsignedPackage = [IO.Compression.ZipFile]::OpenRead(
+              (Resolve-Path 'artifacts/WinARD.msix'))
+            try {
+              $manifestEntry = $unsignedPackage.GetEntry('AppxManifest.xml')
+              if ($null -eq $manifestEntry) {
+                throw 'Unsigned MSIX has no AppxManifest.xml.'
+              }
+              $reader = [IO.StreamReader]::new($manifestEntry.Open())
+              try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
+              $identity = $manifest.SelectSingleNode(
+                "/*[local-name()='Package']/*[local-name()='Identity']")
+              if ($null -eq $identity -or
+                  $identity.GetAttribute('Publisher') -cne $certificate.Subject) {
+                throw 'Signing certificate subject does not match the manifest Publisher.'
+              }
+            } finally {
+              $unsignedPackage.Dispose()
+            }
+            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+              -Recurse -Filter signtool.exe -File |
+              Where-Object DirectoryName -Match '\\x64$' |
+              Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+            if (-not $signTool) {
+              throw 'signtool.exe was not found.'
+            }
+            & $signTool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+              /f $certificatePath /p $env:SIGNING_PASSWORD artifacts/WinARD.msix
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool.exe exited with code $LASTEXITCODE."
+            }
+            & $signTool verify /pa /all /v /tw artifacts/WinARD.msix
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool.exe verification exited with code $LASTEXITCODE."
+            }
+            $signedPackage = [IO.Compression.ZipFile]::OpenRead(
+              (Resolve-Path 'artifacts/WinARD.msix'))
+            try {
+              $signature = $signedPackage.GetEntry('AppxSignature.p7x')
+              if ($null -eq $signature -or $signature.Length -le 0) {
+                throw 'Signed MSIX has no non-empty AppxSignature.p7x.'
+              }
+            } finally {
+              $signedPackage.Dispose()
+            }
+            $hashLines = foreach ($path in @(
+              'artifacts/WinARD.msix',
+              'artifacts/WinARD-portable-win-x64.zip'
+            )) {
+              $hash = Get-FileHash $path -Algorithm SHA256
+              '{0}  {1}' -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $path)
+            }
+            [IO.File]::WriteAllLines(
+              'artifacts/SHA256SUMS.txt',
+              $hashLines,
+              [Text.UTF8Encoding]::new($false))
+          } finally {
+            if (Test-Path $certificatePath) {
+              Remove-Item $certificatePath -Force
+            }
+          }
+      - name: Remove temporary signing certificate
+        if: always() && startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: Remove-Item (Join-Path $env:RUNNER_TEMP 'winard-signing.pfx') -Force -ErrorAction SilentlyContinue
+      - name: Verify final artifacts
+        shell: pwsh
+        run: ./packaging/verify-artifacts.ps1 -ExpectedVersion '${{ steps.version.outputs.package_version }}'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: WinARD-${{ github.run_number }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            artifacts/WinARD.msix
+            artifacts/WinARD-portable-win-x64.zip
+            artifacts/SHA256SUMS.txt
+            THIRD-PARTY-NOTICES.md
