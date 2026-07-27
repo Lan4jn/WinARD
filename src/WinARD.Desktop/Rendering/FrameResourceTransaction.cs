@@ -26,8 +26,10 @@ internal static class FrameResourceTransaction
 
         try
         {
-            texture = createTexture();
-            swapChain = createSwapChain();
+            texture = createTexture()
+                ?? throw new InvalidOperationException("Frame texture creation returned null.");
+            swapChain = createSwapChain()
+                ?? throw new InvalidOperationException("DXGI swap-chain creation returned null.");
             bindSwapChain(swapChain);
 
             var resources = new FrameResourcePair<TTexture, TSwapChain>(texture, swapChain);
@@ -60,10 +62,50 @@ internal static class FrameResourceTransaction
 
             if (cleanupFailures is not null)
             {
-                primaryFailure.Data[CleanupFailuresDataKey] = cleanupFailures.ToArray();
+                TryAttachCleanupFailures(primaryFailure, cleanupFailures);
             }
 
             throw;
         }
     }
+
+#pragma warning disable CA1859
+    private static void TryAttachCleanupFailures(
+        Exception primaryFailure,
+        IReadOnlyList<Exception> cleanupFailures)
+    {
+        try
+        {
+            var data = primaryFailure.Data;
+            if (!data.Contains(CleanupFailuresDataKey))
+            {
+                data[CleanupFailuresDataKey] = cleanupFailures.ToArray();
+                return;
+            }
+
+            if (data[CleanupFailuresDataKey] is not Exception[] existingCleanupFailures)
+            {
+                return;
+            }
+
+            var combinedCleanupFailures =
+                new Exception[existingCleanupFailures.Length + cleanupFailures.Count];
+            Array.Copy(
+                existingCleanupFailures,
+                combinedCleanupFailures,
+                existingCleanupFailures.Length);
+            for (var index = 0; index < cleanupFailures.Count; index++)
+            {
+                combinedCleanupFailures[existingCleanupFailures.Length + index] =
+                    cleanupFailures[index];
+            }
+
+            data[CleanupFailuresDataKey] = combinedCleanupFailures;
+        }
+        catch (Exception)
+        {
+            // Diagnostic attachment must never replace the primary failure.
+        }
+    }
+#pragma warning restore CA1859
 }
