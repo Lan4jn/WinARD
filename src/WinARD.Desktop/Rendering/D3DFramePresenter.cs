@@ -13,6 +13,22 @@ using SwapChainPanelNative = Vortice.WinUI.ISwapChainPanelNative;
 
 namespace WinARD.Desktop.Rendering;
 
+internal sealed class DeviceResourceCreation<TDevice, TContext>
+    where TDevice : class, IDisposable
+    where TContext : class, IDisposable
+{
+    internal TDevice? Device;
+    internal TContext? Context;
+}
+
+internal readonly record struct DeviceResourceSet<TPanel, TDevice, TContext>(
+    TPanel Panel,
+    TDevice Device,
+    TContext Context)
+    where TPanel : class, IDisposable
+    where TDevice : class, IDisposable
+    where TContext : class, IDisposable;
+
 public sealed class D3DFramePresenter : IFramePresenter
 {
     private readonly SwapChainPanel _panel;
@@ -67,7 +83,8 @@ public sealed class D3DFramePresenter : IFramePresenter
                 RebuildSwapChainForRecovery,
                 PresentRecoveredFullFrame);
         }
-        catch (D3DPresentationException) when (IsDeviceRemoved())
+        catch (Exception exception)
+            when (IsDeviceRecoveryCandidate(exception) && IsDeviceRemoved())
         {
             RecreateDevice();
             CreateFrameResources(_width, _height, recovery: true);
@@ -101,6 +118,9 @@ public sealed class D3DFramePresenter : IFramePresenter
     }
 
     private bool IsDeviceRemoved() => _device?.DeviceRemovedReason.Failure == true;
+
+    internal static bool IsDeviceRecoveryCandidate(Exception exception) =>
+        exception is D3DPresentationException or SharpGenException;
 
     private void PresentOptimized(
         ReadOnlySpan<byte> bgra32,
@@ -206,20 +226,24 @@ public sealed class D3DFramePresenter : IFramePresenter
 
     private void CreateDevice()
     {
-        ID3D11Device device = null!;
-        ID3D11DeviceContext context = null!;
-        D3DPresentationOperation.Run(
-            D3DPresentationStage.CreateDevice,
-            () => D3D11CreateDevice(
-                IntPtr.Zero,
-                DriverType.Hardware,
-                DeviceCreationFlags.BgraSupport,
-                [FeatureLevel.Level_11_1, FeatureLevel.Level_11_0, FeatureLevel.Level_10_1],
-                out device,
-                out context).CheckError());
-        _device = device;
-        _context = context;
-        _panelNative ??= new SwapChainPanelNative(_panel);
+        var resources = CreateDeviceResources<
+            SwapChainPanelNative,
+            ID3D11Device,
+            ID3D11DeviceContext>(
+            _panelNative,
+            () => new SwapChainPanelNative(_panel),
+            creation => D3DPresentationOperation.Run(
+                D3DPresentationStage.CreateDevice,
+                () => D3D11CreateDevice(
+                    IntPtr.Zero,
+                    DriverType.Hardware,
+                    DeviceCreationFlags.BgraSupport,
+                    [FeatureLevel.Level_11_1, FeatureLevel.Level_11_0, FeatureLevel.Level_10_1],
+                    out creation.Device,
+                    out creation.Context).CheckError()));
+        _panelNative = resources.Panel;
+        _device = resources.Device;
+        _context = resources.Context;
     }
 
     private void CreateFrameResources(
@@ -371,6 +395,59 @@ public sealed class D3DFramePresenter : IFramePresenter
         {
             TryAttachFrameResourceCleanupFailures(createFailure, cleanupFailures);
             ExceptionDispatchInfo.Capture(createFailure).Throw();
+        }
+    }
+
+    internal static DeviceResourceSet<TPanel, TDevice, TContext>
+        CreateDeviceResources<TPanel, TDevice, TContext>(
+            TPanel? existingPanel,
+            Func<TPanel> createPanel,
+            Action<DeviceResourceCreation<TDevice, TContext>> createDevice)
+        where TPanel : class, IDisposable
+        where TDevice : class, IDisposable
+        where TContext : class, IDisposable
+    {
+        ArgumentNullException.ThrowIfNull(createPanel);
+        ArgumentNullException.ThrowIfNull(createDevice);
+
+        var panel = existingPanel;
+        var ownsPanel = false;
+        var creation = new DeviceResourceCreation<TDevice, TContext>();
+
+        try
+        {
+            if (panel is null)
+            {
+                panel = createPanel()
+                    ?? throw new InvalidOperationException(
+                        "SwapChainPanel native interop creation returned null.");
+                ownsPanel = true;
+            }
+
+            createDevice(creation);
+            var device = creation.Device
+                ?? throw new InvalidOperationException("D3D11 device creation returned null.");
+            var context = creation.Context
+                ?? throw new InvalidOperationException(
+                    "D3D11 device context creation returned null.");
+            return new DeviceResourceSet<TPanel, TDevice, TContext>(
+                panel,
+                device,
+                context);
+        }
+        catch (Exception primaryFailure)
+        {
+            List<Exception> cleanupFailures = [];
+            CaptureFailure(() => creation.Context?.Dispose(), cleanupFailures);
+            CaptureFailure(() => creation.Device?.Dispose(), cleanupFailures);
+            if (ownsPanel)
+            {
+                CaptureFailure(() => panel?.Dispose(), cleanupFailures);
+            }
+
+            TryAttachFrameResourceCleanupFailures(primaryFailure, cleanupFailures);
+            ExceptionDispatchInfo.Capture(primaryFailure).Throw();
+            throw;
         }
     }
 
