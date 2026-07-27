@@ -219,7 +219,7 @@ public sealed class D3DFramePresenter : IFramePresenter
                 out context).CheckError());
         _device = device;
         _context = context;
-        _panelNative = new SwapChainPanelNative(_panel);
+        _panelNative ??= new SwapChainPanelNative(_panel);
     }
 
     private void CreateFrameResources(
@@ -284,12 +284,16 @@ public sealed class D3DFramePresenter : IFramePresenter
 
     private void RecreateDevice()
     {
-        DisposeFrameResources(detachPanel: true);
-        _context?.Dispose();
-        _device?.Dispose();
-        _context = null;
-        _device = null;
-        CreateDevice();
+        RecoverDeviceAfterRemoval(
+            () => DisposeFrameResources(detachPanel: true),
+            () => _context?.Dispose(),
+            () => _device?.Dispose(),
+            () =>
+            {
+                _context = null;
+                _device = null;
+            },
+            CreateDevice);
     }
 
     private void DisposeFrameResources(bool detachPanel)
@@ -332,12 +336,88 @@ public sealed class D3DFramePresenter : IFramePresenter
                 cleanupFailures[index - 1] = failures[index];
             }
 
-            FrameResourceTransaction.TryAttachCleanupFailures(
+            TryAttachFrameResourceCleanupFailures(
                 primaryFailure,
                 cleanupFailures);
         }
 
         ExceptionDispatchInfo.Capture(primaryFailure).Throw();
+    }
+
+    internal static void RecoverDeviceAfterRemoval(
+        Action disposeFrameResources,
+        Action disposeContext,
+        Action disposeDevice,
+        Action resetReferences,
+        Action createDevice)
+    {
+        ArgumentNullException.ThrowIfNull(disposeFrameResources);
+        ArgumentNullException.ThrowIfNull(disposeContext);
+        ArgumentNullException.ThrowIfNull(disposeDevice);
+        ArgumentNullException.ThrowIfNull(resetReferences);
+        ArgumentNullException.ThrowIfNull(createDevice);
+
+        List<Exception> cleanupFailures = [];
+        CaptureFailure(disposeFrameResources, cleanupFailures);
+        CaptureFailure(disposeContext, cleanupFailures);
+        CaptureFailure(disposeDevice, cleanupFailures);
+        resetReferences();
+
+        try
+        {
+            createDevice();
+        }
+        catch (Exception createFailure)
+        {
+            TryAttachFrameResourceCleanupFailures(createFailure, cleanupFailures);
+            ExceptionDispatchInfo.Capture(createFailure).Throw();
+        }
+    }
+
+    private static void TryAttachFrameResourceCleanupFailures(
+        Exception primaryFailure,
+        IReadOnlyList<Exception> cleanupFailures)
+    {
+        if (cleanupFailures.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var data = primaryFailure.Data;
+            if (!data.Contains(FrameResourceTransaction.CleanupFailuresDataKey))
+            {
+                data[FrameResourceTransaction.CleanupFailuresDataKey] =
+                    cleanupFailures.ToArray();
+                return;
+            }
+
+            if (data[FrameResourceTransaction.CleanupFailuresDataKey]
+                is not Exception[] existingCleanupFailures)
+            {
+                return;
+            }
+
+            var combinedCleanupFailures =
+                new Exception[existingCleanupFailures.Length + cleanupFailures.Count];
+            Array.Copy(
+                existingCleanupFailures,
+                combinedCleanupFailures,
+                existingCleanupFailures.Length);
+            for (var index = 0; index < cleanupFailures.Count; index++)
+            {
+                combinedCleanupFailures[existingCleanupFailures.Length + index] =
+                    cleanupFailures[index];
+            }
+
+            data[FrameResourceTransaction.CleanupFailuresDataKey] =
+                combinedCleanupFailures;
+        }
+        catch (Exception)
+        {
+            // Diagnostic attachment must never replace the primary failure.
+        }
     }
 
     private static void CaptureFailure(Action operation, List<Exception> failures)

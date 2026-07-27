@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
@@ -199,6 +200,194 @@ public sealed class D3DPresentationRecoveryTests
     }
 
     [Fact]
+    public void Device_recovery_continues_cleanup_and_creates_device_after_cleanup_failure()
+    {
+        var operations = new List<string>();
+        var cleanupFailure = new InvalidOperationException("synthetic frame cleanup failure");
+
+        D3DFramePresenter.RecoverDeviceAfterRemoval(
+            () =>
+            {
+                operations.Add("frame-resources");
+                throw cleanupFailure;
+            },
+            () => operations.Add("context"),
+            () => operations.Add("device"),
+            () => operations.Add("reset"),
+            () => operations.Add("create"));
+
+        Assert.Equal(
+            ["frame-resources", "context", "device", "reset", "create"],
+            operations);
+    }
+
+    [Fact]
+    public void Device_creation_failure_preserves_primary_and_attaches_cleanup_failures_in_order()
+    {
+        var frameCleanupFailure =
+            new InvalidOperationException("synthetic frame cleanup failure");
+        var contextCleanupFailure =
+            new InvalidOperationException("synthetic context cleanup failure");
+        var deviceCleanupFailure =
+            new InvalidOperationException("synthetic device cleanup failure");
+        var createFailure = new InvalidOperationException("synthetic create failure");
+        var resetCount = 0;
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            D3DFramePresenter.RecoverDeviceAfterRemoval(
+                () => throw frameCleanupFailure,
+                () => throw contextCleanupFailure,
+                () => throw deviceCleanupFailure,
+                () => resetCount++,
+                () => ThrowFailure(createFailure)));
+
+        Assert.Same(createFailure, thrown);
+        Assert.Contains(nameof(ThrowFailure), thrown.StackTrace);
+        Assert.Equal(1, resetCount);
+        var cleanupFailures = Assert.IsType<Exception[]>(
+            thrown.Data[FrameResourceTransaction.CleanupFailuresDataKey]);
+        Assert.Equal(
+            [frameCleanupFailure, contextCleanupFailure, deviceCleanupFailure],
+            cleanupFailures);
+    }
+
+    [Fact]
+    public void Device_recovery_attempts_device_creation_once_without_looping()
+    {
+        var createCount = 0;
+        var createFailure = new InvalidOperationException("synthetic create failure");
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            D3DFramePresenter.RecoverDeviceAfterRemoval(
+                () => { },
+                () => { },
+                () => { },
+                () => { },
+                () =>
+                {
+                    createCount++;
+                    throw createFailure;
+                }));
+
+        Assert.Same(createFailure, thrown);
+        Assert.Equal(1, createCount);
+    }
+
+    [Fact]
+    public void Device_recovery_reset_failure_propagates_without_creating_device()
+    {
+        var resetFailure = new InvalidOperationException("synthetic reset failure");
+        var createCount = 0;
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            D3DFramePresenter.RecoverDeviceAfterRemoval(
+                () => { },
+                () => { },
+                () => { },
+                () => throw resetFailure,
+                () => createCount++));
+
+        Assert.Same(resetFailure, thrown);
+        Assert.Equal(0, createCount);
+    }
+
+    [Fact]
+    public void Device_recovery_appends_existing_cleanup_failure_diagnostics()
+    {
+        var existingFailure = new InvalidOperationException("existing cleanup failure");
+        var frameCleanupFailure =
+            new InvalidOperationException("synthetic frame cleanup failure");
+        var createFailure = new InvalidOperationException("synthetic create failure");
+        createFailure.Data[FrameResourceTransaction.CleanupFailuresDataKey] =
+            new Exception[] { existingFailure };
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            D3DFramePresenter.RecoverDeviceAfterRemoval(
+                () => throw frameCleanupFailure,
+                () => { },
+                () => { },
+                () => { },
+                () => throw createFailure));
+
+        Assert.Same(createFailure, thrown);
+        var cleanupFailures = Assert.IsType<Exception[]>(
+            thrown.Data[FrameResourceTransaction.CleanupFailuresDataKey]);
+        Assert.Equal([existingFailure, frameCleanupFailure], cleanupFailures);
+    }
+
+    [Fact]
+    public void Device_recovery_data_failure_does_not_replace_create_failure()
+    {
+        var cleanupFailure = new InvalidOperationException("synthetic cleanup failure");
+        var createFailure = new ThrowingDataException(
+            () => throw new InvalidOperationException("synthetic Data getter failure"));
+
+        var thrown = Assert.Throws<ThrowingDataException>(() =>
+            D3DFramePresenter.RecoverDeviceAfterRemoval(
+                () => throw cleanupFailure,
+                () => { },
+                () => { },
+                () => { },
+                () => throw createFailure));
+
+        Assert.Same(createFailure, thrown);
+    }
+
+    [Fact]
+    public void Device_recovery_data_contains_failure_does_not_replace_create_failure()
+    {
+        var cleanupFailure = new InvalidOperationException("synthetic cleanup failure");
+        var createFailure = new ThrowingDataException(
+            () => new ThrowingContainsDictionary());
+
+        var thrown = Assert.Throws<ThrowingDataException>(() =>
+            D3DFramePresenter.RecoverDeviceAfterRemoval(
+                () => throw cleanupFailure,
+                () => { },
+                () => { },
+                () => { },
+                () => throw createFailure));
+
+        Assert.Same(createFailure, thrown);
+    }
+
+    [Fact]
+    public void Device_recovery_data_indexer_failure_does_not_replace_create_failure()
+    {
+        var cleanupFailure = new InvalidOperationException("synthetic cleanup failure");
+        var createFailure = new ThrowingDataException(
+            () => new ThrowingGetterDictionary());
+
+        var thrown = Assert.Throws<ThrowingDataException>(() =>
+            D3DFramePresenter.RecoverDeviceAfterRemoval(
+                () => throw cleanupFailure,
+                () => { },
+                () => { },
+                () => { },
+                () => throw createFailure));
+
+        Assert.Same(createFailure, thrown);
+    }
+
+    [Fact]
+    public void Device_recovery_data_setter_failure_does_not_replace_create_failure()
+    {
+        var cleanupFailure = new InvalidOperationException("synthetic cleanup failure");
+        var createFailure = new ThrowingDataException(
+            () => new ThrowingSetterDictionary());
+
+        var thrown = Assert.Throws<ThrowingDataException>(() =>
+            D3DFramePresenter.RecoverDeviceAfterRemoval(
+                () => throw cleanupFailure,
+                () => { },
+                () => { },
+                () => { },
+                () => throw createFailure));
+
+        Assert.Same(createFailure, thrown);
+    }
+
+    [Fact]
     public void Rebuild_failure_propagates_original_exception_without_fallback()
     {
         var rebuildCount = 0;
@@ -396,9 +585,50 @@ public sealed class D3DPresentationRecoveryTests
     private static void ThrowPresentationFailure(D3DPresentationStage stage) =>
         throw PresentationFailure(stage);
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowFailure(Exception failure) => throw failure;
+
     private static SharpGenException SharpGenFailure() =>
         new(
             new Result(DxgiErrorInvalidCall),
             "synthetic native failure",
             new COMException("synthetic native failure", DxgiErrorInvalidCall));
+
+    private sealed class ThrowingDataException : Exception
+    {
+        private readonly Func<IDictionary> _getData;
+
+        public ThrowingDataException(Func<IDictionary> getData)
+        {
+            _getData = getData;
+        }
+
+        public override IDictionary Data => _getData();
+    }
+
+    private sealed class ThrowingContainsDictionary : Hashtable
+    {
+        public override bool Contains(object key) =>
+            throw new InvalidOperationException("synthetic Data Contains failure");
+    }
+
+    private sealed class ThrowingGetterDictionary : Hashtable
+    {
+        public override bool Contains(object key) => true;
+
+        public override object? this[object key]
+        {
+            get => throw new InvalidOperationException("synthetic Data getter failure");
+            set => base[key] = value;
+        }
+    }
+
+    private sealed class ThrowingSetterDictionary : Hashtable
+    {
+        public override object? this[object key]
+        {
+            get => base[key];
+            set => throw new InvalidOperationException("synthetic Data setter failure");
+        }
+    }
 }
