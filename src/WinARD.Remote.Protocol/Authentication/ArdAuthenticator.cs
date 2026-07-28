@@ -260,7 +260,7 @@ public sealed class ArdAuthenticator
             return;
         }
 
-        if (version == RfbVersion.V3_8)
+        if (version.UsesRfb38SecurityResult)
         {
             try
             {

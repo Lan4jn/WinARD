@@ -74,7 +74,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
         securityTypes.CopyTo(securityBytes, 1);
         return new FakeRfbServer(
             Encoding.ASCII.GetBytes(banner),
-            Encoding.ASCII.GetBytes(banner is "RFB 003.889\n" ? "RFB 003.008\n" : banner),
+            Encoding.ASCII.GetBytes(banner),
             securityBytes,
             expectsSecuritySelection: true,
             exposesSentinel: true);
@@ -90,7 +90,7 @@ public sealed class FakeRfbServer : IAsyncDisposable
             {
                 return new FakeRfbServer(
                     serverBytes[..12],
-                    Encoding.ASCII.GetBytes(banner is "RFB 003.889\n" ? "RFB 003.008\n" : banner),
+                    Encoding.ASCII.GetBytes(banner),
                     serverBytes[12..],
                     expectsSecuritySelection: false,
                     exposesSentinel: false);

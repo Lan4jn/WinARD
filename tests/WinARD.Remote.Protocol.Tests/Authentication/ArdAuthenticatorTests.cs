@@ -425,6 +425,28 @@ public sealed class ArdAuthenticatorTests
     }
 
     [Fact]
+    public async Task Reads_failure_reason_for_apple_003_889()
+    {
+        await using var server = ArdServerFixture.Create(
+            securityResult: 7,
+            reasonBytes: Encoding.UTF8.GetBytes("Apple authentication denied"));
+        using var username = SecretMaterial.FromUtf8("user");
+        using var password = SecretMaterial.FromUtf8("password");
+
+        var exception = await Assert.ThrowsAsync<ArdAuthenticationRejectedException>(() =>
+            new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+                server.ClientStream,
+                RfbVersion.V3_889,
+                username,
+                password,
+                CancellationToken.None));
+
+        Assert.Equal(7u, exception.ResultCode);
+        Assert.Equal("Apple authentication denied", exception.Reason);
+        Assert.False(exception.IsReasonTruncated);
+    }
+
+    [Fact]
     public async Task Redacts_repeated_username_and_password_bytes_before_reason_decode_and_sanitize()
     {
         const string testUsername = "echo-user";

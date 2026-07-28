@@ -21,11 +21,15 @@ public sealed record RfbVersion
 
     public static RfbVersion V3_8 { get; } = new(3, 8, "RFB 003.008\n");
 
+    public static RfbVersion V3_889 { get; } = new(3, 889, "RFB 003.889\n");
+
     public int Major { get; }
 
     public int Minor { get; }
 
     public string Banner { get; }
+
+    public bool UsesRfb38SecurityResult => this == V3_8 || this == V3_889;
 
     internal static RfbVersion Parse(ReadOnlySpan<byte> banner)
     {
@@ -53,7 +57,7 @@ public sealed record RfbVersion
             (3, 3) => V3_3,
             (3, 7) => V3_7,
             (3, 8) => V3_8,
-            (3, 889) => V3_8,
+            (3, 889) => V3_889,
             _ => throw new UnsupportedRfbVersionException(ToSafeBannerText(banner)),
         };
     }

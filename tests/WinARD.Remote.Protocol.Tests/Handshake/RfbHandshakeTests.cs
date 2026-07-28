@@ -32,7 +32,7 @@ public sealed class RfbHandshakeTests
     }
 
     [Fact]
-    public async Task Negotiates_apple_003_889_alias_as_rfb_38_and_selects_ard()
+    public async Task Negotiates_apple_003_889_and_preserves_its_protocol_identity()
     {
         await using var server = FakeRfbServer.ForVersion(
             "RFB 003.889\n",
@@ -40,9 +40,9 @@ public sealed class RfbHandshakeTests
 
         var result = await RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None);
 
-        Assert.Equal(RfbVersion.V3_8, result.Version);
+        Assert.Equal(RfbVersion.V3_889, result.Version);
         Assert.Equal(RfbSecurityType.AppleRemoteDesktop, result.SecurityType);
-        Assert.Equal("RFB 003.008\n", server.ReceivedVersion);
+        Assert.Equal("RFB 003.889\n", server.ReceivedVersion);
         Assert.Equal((byte)RfbSecurityType.AppleRemoteDesktop, server.ReceivedBytes[12]);
     }
 
@@ -118,9 +118,9 @@ public sealed class RfbHandshakeTests
         var exception = await Assert.ThrowsAsync<RfbConnectionRejectedException>(() =>
             RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
 
-        Assert.Equal(RfbVersion.V3_8, exception.Version);
+        Assert.Equal(RfbVersion.V3_889, exception.Version);
         Assert.Equal("Alias denied\\u000Aretry", exception.Reason);
-        Assert.Equal("RFB 003.008\n", server.ReceivedVersion);
+        Assert.Equal("RFB 003.889\n", server.ReceivedVersion);
     }
 
     [Fact]
