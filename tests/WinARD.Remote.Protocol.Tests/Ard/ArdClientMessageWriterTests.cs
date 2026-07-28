@@ -119,6 +119,45 @@ public sealed class ArdClientMessageWriterTests
     }
 
     [Fact]
+    public async Task Session_command_rejects_embedded_nul_before_writing()
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            writer.WriteSessionCommandAsync(1, "alice\0bob", CancellationToken.None).AsTask());
+
+        Assert.Empty(stream.ToArray());
+        Assert.Equal(0, stream.WriteCount);
+    }
+
+    [Fact]
+    public async Task Session_command_rejects_an_unpaired_high_surrogate_before_writing()
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            writer.WriteSessionCommandAsync(1, "\uD800", CancellationToken.None).AsTask());
+
+        Assert.Empty(stream.ToArray());
+        Assert.Equal(0, stream.WriteCount);
+    }
+
+    [Fact]
+    public async Task Session_command_rejects_an_unpaired_low_surrogate_before_writing()
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            writer.WriteSessionCommandAsync(1, "\uDC00", CancellationToken.None).AsTask());
+
+        Assert.Empty(stream.ToArray());
+        Assert.Equal(0, stream.WriteCount);
+    }
+
+    [Fact]
     public async Task Invalid_control_mode_and_command_are_rejected_before_writing()
     {
         await using var stream = new TrackingMemoryStream();
@@ -144,7 +183,20 @@ public sealed class ArdClientMessageWriterTests
     }
 
     [Fact]
-    public async Task Writes_do_not_flush_or_dispose_the_stream_and_propagate_cancellation()
+    public async Task Successful_write_does_not_flush_or_dispose_the_stream()
+    {
+        var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await writer.WriteViewerInfoAsync(CancellationToken.None);
+
+        Assert.Equal(1, stream.WriteCount);
+        Assert.Equal(0, stream.FlushCount);
+        Assert.Equal(0, stream.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Cancellation_propagates_without_writing()
     {
         var stream = new TrackingMemoryStream();
         var writer = new ArdClientMessageWriter(new RfbWriter(stream));
@@ -156,6 +208,7 @@ public sealed class ArdClientMessageWriterTests
 
         Assert.Equal(0, stream.FlushCount);
         Assert.Equal(0, stream.DisposeCount);
+        Assert.Equal(0, stream.WriteCount);
         Assert.Empty(stream.ToArray());
     }
 

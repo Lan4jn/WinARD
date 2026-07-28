@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 using WinARD.Remote.Protocol.IO;
@@ -79,16 +80,33 @@ public sealed class ArdClientMessageWriter
     private static void WriteUsername(Span<byte> destination, string username)
     {
         var bytesWritten = 0;
-        foreach (var rune in username.EnumerateRunes())
+        var source = username.AsSpan();
+        var truncated = false;
+        while (!source.IsEmpty)
         {
-            var encodedLength = rune.Utf8SequenceLength;
-            if (bytesWritten + encodedLength > destination.Length)
+            var status = Rune.DecodeFromUtf16(source, out var rune, out var charsConsumed);
+            if (status != OperationStatus.Done)
             {
-                break;
+                throw new ArgumentException("The username must contain valid UTF-16 text.", nameof(username));
             }
 
-            rune.EncodeToUtf8(destination[bytesWritten..]);
-            bytesWritten += encodedLength;
+            if (rune.Value == 0)
+            {
+                throw new ArgumentException("The username must not contain NUL characters.", nameof(username));
+            }
+
+            var encodedLength = rune.Utf8SequenceLength;
+            if (!truncated && bytesWritten + encodedLength <= destination.Length)
+            {
+                rune.EncodeToUtf8(destination[bytesWritten..]);
+                bytesWritten += encodedLength;
+            }
+            else
+            {
+                truncated = true;
+            }
+
+            source = source[charsConsumed..];
         }
     }
 }
