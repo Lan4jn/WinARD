@@ -36,7 +36,13 @@ public sealed class ProbeRunner
         ISecretMaterial username,
         ISecretMaterial password,
         CancellationToken cancellationToken) =>
-        await RunAsync(host, port, username, password, null, cancellationToken);
+        await RunAsync(
+            host,
+            port,
+            username,
+            password,
+            new ProbeRequest(ProbeMode.Authentication),
+            cancellationToken);
 
     public async Task<ProbeResult> RunAsync(
         string host,
@@ -44,6 +50,23 @@ public sealed class ProbeRunner
         ISecretMaterial username,
         ISecretMaterial password,
         string? captureFirstFramePath,
+        CancellationToken cancellationToken) =>
+        await RunAsync(
+            host,
+            port,
+            username,
+            password,
+            captureFirstFramePath is null
+                ? new ProbeRequest(ProbeMode.Authentication)
+                : new ProbeRequest(ProbeMode.CaptureFirstFrame, captureFirstFramePath),
+            cancellationToken);
+
+    public async Task<ProbeResult> RunAsync(
+        string host,
+        int port,
+        ISecretMaterial username,
+        ISecretMaterial password,
+        ProbeRequest request,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(host);
@@ -51,6 +74,7 @@ public sealed class ProbeRunner
         ArgumentOutOfRangeException.ThrowIfGreaterThan(port, ushort.MaxValue);
         ArgumentNullException.ThrowIfNull(username);
         ArgumentNullException.ThrowIfNull(password);
+        ArgumentNullException.ThrowIfNull(request);
 
         using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         operationCancellation.CancelAfter(_operationTimeout);
@@ -71,11 +95,34 @@ public sealed class ProbeRunner
                 username,
                 password,
                 operationCancellation.Token);
-            if (captureFirstFramePath is null)
+            if (request.Mode == ProbeMode.Authentication)
             {
                 return new ProbeResult(handshake.Version, handshake.SecurityType);
             }
 
+            if (request.Mode == ProbeMode.PointerSmoke)
+            {
+                var pointerServer = await RfbSessionInitializer.InitializeAsync(
+                    stream,
+                    ProtocolLimits.Default,
+                    operationCancellation.Token);
+                var pointerSmoke = await PointerSmokeProbe.SendAsync(
+                    stream,
+                    pointerServer.Width,
+                    pointerServer.Height,
+                    operationCancellation.Token);
+                return new ProbeResult(
+                    handshake.Version,
+                    handshake.SecurityType,
+                    PointerSmoke: pointerSmoke);
+            }
+
+            if (request.Mode != ProbeMode.CaptureFirstFrame)
+            {
+                throw new ArgumentOutOfRangeException(nameof(request));
+            }
+
+            var captureFirstFramePath = request.CaptureFirstFramePath;
             ArgumentException.ThrowIfNullOrWhiteSpace(captureFirstFramePath);
             var server = await RfbSessionInitializer.InitializeAsync(
                 stream,

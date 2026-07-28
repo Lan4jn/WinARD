@@ -20,6 +20,12 @@ public static class ProbeOutput
         return $"Captured: {capture.Width}x{capture.Height} -> {capture.Path}{Environment.NewLine}Dirty: {dirtyRects}";
     }
 
+    public static string FormatPointerSmoke(ProbePointerSmoke pointerSmoke)
+    {
+        ArgumentNullException.ThrowIfNull(pointerSmoke);
+        return $"Pointer smoke: sent buttonless move to ({pointerSmoke.X},{pointerSmoke.Y}) within {pointerSmoke.Width}x{pointerSmoke.Height}. RFB does not confirm server execution.";
+    }
+
     public static string FormatFailure(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);

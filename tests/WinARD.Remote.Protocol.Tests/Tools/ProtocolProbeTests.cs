@@ -97,6 +97,45 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
+    public async Task Pointer_smoke_probe_initializes_then_sends_only_buttonless_center_move()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunPointerSmokeServerAsync(listener);
+        using var username = SecretMaterial.FromUtf8("pointer-user");
+        using var password = SecretMaterial.FromUtf8("pointer-password");
+
+        var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+            IPAddress.Loopback.ToString(),
+            GetPort(listener),
+            username,
+            password,
+            new ProbeRequest(ProbeMode.PointerSmoke),
+            CancellationToken.None);
+
+        Assert.Null(result.Capture);
+        Assert.Equal(new ProbePointerSmoke(4, 2, 2, 1), result.PointerSmoke);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public void Pointer_smoke_output_reports_move_without_claiming_server_execution_or_secrets()
+    {
+        const string host = "private-host";
+        const string username = "private-user";
+        const string password = "private-password";
+
+        var output = ProbeOutput.FormatPointerSmoke(new ProbePointerSmoke(4, 2, 2, 1));
+
+        Assert.Contains("(2,1)", output, StringComparison.Ordinal);
+        Assert.Contains("4x2", output, StringComparison.Ordinal);
+        Assert.Contains("does not confirm", output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(host, output, StringComparison.Ordinal);
+        Assert.DoesNotContain(username, output, StringComparison.Ordinal);
+        Assert.DoesNotContain(password, output, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Capture_probe_initializes_requests_full_frame_and_writes_requested_format()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -631,6 +670,49 @@ public sealed class ProtocolProbeTests
 
         await stream.WriteAsync(resultBytes.ToArray());
         stageReached.TrySetResult();
+    }
+
+    private static async Task RunPointerSmokeServerAsync(TcpListener listener)
+    {
+        using var client = await listener.AcceptTcpClientAsync();
+        await using var stream = client.GetStream();
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+        Assert.Equal(Encoding.ASCII.GetBytes("RFB 003.008\n"), await ReadExactlyAsync(stream, 12));
+        await stream.WriteAsync(new byte[] { 1, (byte)RfbSecurityType.AppleRemoteDesktop });
+        Assert.Equal(new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop }, await ReadExactlyAsync(stream, 1));
+
+        var modulus = Convert.FromHexString(
+            "D2652EF10104A3DDC1219700EDFBD1E19F7678B4A4F6D5952634BD8BF1D60326322B5D32366DC25CB4E8E73AF4312A70D2DCAF2747EB89D7E88553EECD6A283D");
+        var serverPublic = new byte[64];
+        serverPublic[^1] = 125;
+        await stream.WriteAsync(ArdServerFixture.EncodeChallenge(5, 64, modulus, serverPublic));
+        _ = await ReadExactlyAsync(stream, 128 + 64);
+        await stream.WriteAsync(new byte[4]);
+
+        Assert.Equal(new byte[] { 1 }, await ReadExactlyAsync(stream, 1));
+        var serverInit = new List<byte>();
+        AddUInt16(serverInit, 4);
+        AddUInt16(serverInit, 2);
+        serverInit.AddRange(PixelFormat.WinArdBgra32.ToWireBytes());
+        AddUInt32(serverInit, 3);
+        serverInit.AddRange(Encoding.UTF8.GetBytes("Mac"));
+        await stream.WriteAsync(serverInit.ToArray());
+
+        var declarationHeader = await ReadExactlyAsync(stream, 24);
+        Assert.Equal((byte)0, declarationHeader[0]);
+        Assert.Equal((byte)2, declarationHeader[20]);
+        Assert.Equal(5, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
+        Assert.Equal(
+            [
+                0, 0, 0, 16,
+                0, 0, 0, 0,
+                0, 0, 0, 1,
+                0xFF, 0xFF, 0xFF, 0x11,
+                0xFF, 0xFF, 0xFF, 0x21,
+            ],
+            await ReadExactlyAsync(stream, 20));
+        Assert.Equal(new byte[] { 5, 0, 0, 2, 0, 1 }, await ReadExactlyAsync(stream, 6));
+        await AssertClientClosedWithoutAnotherRequestAsync(stream);
     }
 
     private static async Task RunCaptureServerAsync(

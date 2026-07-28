@@ -22,12 +22,6 @@ internal static class Program
                 return 2;
             }
 
-            if (request.Mode == ProbeMode.PointerSmoke)
-            {
-                Console.Error.WriteLine("Pointer smoke mode is not supported yet.");
-                return 2;
-            }
-
             var host = ReadRequiredText("WINARD_HOST", "Host: ");
             var usernameText = ReadRequiredText("WINARD_USERNAME", "Username: ");
             if (host is null || usernameText is null || !TryReadPort(out var port))
@@ -49,7 +43,7 @@ internal static class Program
                 port,
                 username,
                 password,
-                request.CaptureFirstFramePath,
+                request,
                 cancellation.Token);
 
             Console.WriteLine($"Version: {result.Version.Major}.{result.Version.Minor}");
@@ -58,6 +52,11 @@ internal static class Program
             if (result.Capture is { } capture)
             {
                 Console.WriteLine(ProbeOutput.FormatCapture(capture));
+            }
+
+            if (result.PointerSmoke is { } pointerSmoke)
+            {
+                Console.WriteLine(ProbeOutput.FormatPointerSmoke(pointerSmoke));
             }
 
             return 0;
