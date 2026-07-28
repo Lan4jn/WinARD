@@ -107,7 +107,7 @@ public static class ArdSessionSelector
         var allowedCommands = BinaryPrimitives.ReadUInt32BigEndian(body[2..]);
         var usernameBytes = body[10..];
         var nulIndex = usernameBytes.IndexOf((byte)0);
-        if (nulIndex < 0)
+        if (nulIndex != usernameBytes.Length - 1)
         {
             throw new ArdSessionMalformedException();
         }

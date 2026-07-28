@@ -153,16 +153,29 @@ public sealed class ArdSessionSelectorTests
     }
 
     [Fact]
-    public async Task Username_ends_at_the_first_nul_and_ignores_following_bytes()
+    public async Task Username_bytes_after_the_terminating_nul_are_malformed_without_writing()
     {
         byte[] usernameField = [.. "alice"u8.ToArray(), 0, 0xFF, .. "hidden"u8.ToArray()];
         var stream = new ScriptedDuplexStream(
             [.. SessionInfo(1u << 1, usernameField), .. SessionResult(0)]);
 
+        await Assert.ThrowsAsync<ArdSessionMalformedException>(() =>
+            ArdSessionSelector.SelectConsoleAsync(stream, ProtocolLimits.Default, CancellationToken.None));
+
+        Assert.Equal(0, stream.WriteCount);
+        Assert.Empty(stream.WrittenBytes);
+    }
+
+    [Fact]
+    public async Task Empty_nul_terminated_username_is_valid()
+    {
+        var stream = new ScriptedDuplexStream(
+            [.. SessionInfo(1u << 1, []), .. SessionResult(0)]);
+
         await ArdSessionSelector.SelectConsoleAsync(stream, ProtocolLimits.Default, CancellationToken.None);
 
-        Assert.Equal("alice"u8.ToArray(), stream.WrittenBytes[10..15]);
-        Assert.All(stream.WrittenBytes[15..], value => Assert.Equal(0, value));
+        Assert.Equal(1, stream.WriteCount);
+        Assert.All(stream.WrittenBytes[10..], value => Assert.Equal(0, value));
     }
 
     [Fact]
