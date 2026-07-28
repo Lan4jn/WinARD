@@ -144,7 +144,13 @@ public sealed class RfbReader
             CryptographicOperations.ZeroMemory(buffer);
             throw new RfbProtocolException(
                 $"Unexpected end of stream while reading {expectedByteCount} bytes.",
-                exception);
+                exception,
+                new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.TruncatedRead,
+                    null,
+                    null,
+                    null,
+                    null));
         }
         catch
         {

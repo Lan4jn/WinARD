@@ -149,6 +149,8 @@ public sealed class RfbReaderTests
         var innerException = Assert.IsType<EndOfStreamException>(exception.InnerException);
         Assert.Contains("Expected 2 bytes", innerException.Message, StringComparison.Ordinal);
         Assert.Contains("after 1 bytes", innerException.Message, StringComparison.Ordinal);
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Null(exception.Failure?.ReadStage);
     }
 
     [Fact]
