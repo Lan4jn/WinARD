@@ -35,11 +35,6 @@ public static class ArdSessionSelector
         var pendingResults = 0;
         while (true)
         {
-            if (pendingResults == MaximumPendingResults)
-            {
-                throw new ArdSessionMalformedException();
-            }
-
             var status = await ReadSessionResultAsync(reader, limits, cancellationToken).ConfigureAwait(false);
             switch (status)
             {
@@ -48,6 +43,11 @@ public static class ArdSessionSelector
                     return;
                 case PendingStatus:
                 case PendingAlternateStatus:
+                    if (pendingResults == MaximumPendingResults)
+                    {
+                        throw new ArdSessionMalformedException();
+                    }
+
                     pendingResults++;
                     break;
                 default:

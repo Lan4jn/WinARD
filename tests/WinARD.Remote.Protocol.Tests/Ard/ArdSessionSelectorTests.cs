@@ -113,11 +113,30 @@ public sealed class ArdSessionSelectorTests
     }
 
     [Fact]
-    public async Task Sixty_four_pending_results_fail_before_reading_a_sixty_fifth_result()
+    public async Task Sixty_four_pending_results_can_be_followed_by_a_granted_result()
     {
         var input = new List<byte>();
         input.AddRange(SessionInfo(1u << 1, "alice"u8.ToArray()));
         for (var index = 0; index < 64; index++)
+        {
+            input.AddRange(SessionResult(2));
+        }
+
+        input.AddRange(SessionResult(0));
+        var stream = new ScriptedDuplexStream(input.ToArray());
+
+        await ArdSessionSelector.SelectConsoleAsync(stream, ProtocolLimits.Default, CancellationToken.None);
+
+        Assert.Equal(stream.InputLength, stream.BytesRead);
+        Assert.Equal(1, stream.WriteCount);
+    }
+
+    [Fact]
+    public async Task Sixty_fifth_pending_result_is_malformed_without_reading_a_sixty_sixth_result()
+    {
+        var input = new List<byte>();
+        input.AddRange(SessionInfo(1u << 1, "alice"u8.ToArray()));
+        for (var index = 0; index < 65; index++)
         {
             input.AddRange(SessionResult(2));
         }
