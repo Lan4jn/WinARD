@@ -1,7 +1,10 @@
 using System.Buffers.Binary;
 using System.Text;
+using WinARD.Remote.Protocol.Ard;
+using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
+using WinARD.Remote.Protocol.Handshake;
 using WinARD.Remote.Protocol.Initialization;
 using WinARD.Remote.Protocol.IO;
 using Xunit;
@@ -12,6 +15,16 @@ namespace WinARD.Remote.Protocol.Tests.Initialization;
 
 public sealed class RfbSessionInitializerTests
 {
+    [Fact]
+    public void Explicit_handshake_initializer_overload_is_available()
+    {
+        var overload = typeof(RfbSessionInitializer).GetMethod(
+            nameof(RfbSessionInitializer.InitializeAsync),
+            [typeof(Stream), typeof(RfbHandshakeResult), typeof(ProtocolLimits), typeof(CancellationToken)]);
+
+        Assert.NotNull(overload);
+    }
+
     [Fact]
     public async Task Initialize_writes_shared_init_pixel_format_and_encodings_in_order()
     {
@@ -31,6 +44,355 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal([1, 20, 24], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
+    }
+
+    [Theory]
+    [MemberData(nameof(StandardVersions))]
+    public async Task Explicit_standard_versions_preserve_the_exact_standard_initialization(RfbVersion version)
+    {
+        var input = ServerInit(640, 480, PixelFormat.WinArdBgra32, "Studio Mac");
+        await using var stream = new ScriptedDuplexStream(input);
+
+        var server = await RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(version),
+            ProtocolLimits.Default,
+            CancellationToken.None);
+
+        Assert.Equal(640, server.Width);
+        Assert.Equal(480, server.Height);
+        Assert.Equal("Studio Mac", server.Name);
+        Assert.Null(server.ArdCapabilities);
+        Assert.Equal(ExpectedClientInitialization(), stream.WrittenBytes);
+        Assert.Equal([1, 20, 24], stream.WriteLengths);
+        Assert.Equal(0, stream.FlushCount);
+        Assert.False(stream.WasDisposed);
+    }
+
+    [Fact]
+    public async Task Non_ARD_security_handshake_is_rejected_before_io()
+    {
+        await using var stream = new ScriptedDuplexStream([]);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                new RfbHandshakeResult(RfbVersion.V3_8, RfbSecurityType.None),
+                ProtocolLimits.Default,
+                CancellationToken.None));
+
+        Assert.Equal(0, stream.ReadPosition);
+        Assert.Empty(stream.WrittenBytes);
+    }
+
+    [Fact]
+    public async Task Explicit_initializer_validates_nulls_and_pre_cancellation_before_io()
+    {
+        await using var stream = new ScriptedDuplexStream([]);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            RfbSessionInitializer.InitializeAsync(null!, Handshake(RfbVersion.V3_8), ProtocolLimits.Default, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            RfbSessionInitializer.InitializeAsync(stream, null!, ProtocolLimits.Default, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            RfbSessionInitializer.InitializeAsync(stream, Handshake(RfbVersion.V3_8), null!, CancellationToken.None));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            RfbSessionInitializer.InitializeAsync(stream, Handshake(RfbVersion.V3_889), ProtocolLimits.Default, cancellation.Token));
+
+        Assert.Equal(0, stream.ReadPosition);
+        Assert.Empty(stream.WrittenBytes);
+    }
+
+    [Fact]
+    public async Task Ard_non_session_initialization_parses_capabilities_and_writes_exact_control_sequence()
+    {
+        var bitmap = Enumerable.Range(0, 16).Select(index => (byte)(index + 1)).ToArray();
+        var nameField = ExtendedNameField((uint)ArdServerFlags.MayControl, bitmap, "Studio Mac");
+        await using var stream = new ScriptedDuplexStream(
+            ServerInit(1440, 900, PixelFormat.WinArdBgra32, nameField));
+
+        var server = await RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_889),
+            ProtocolLimits.Default,
+            CancellationToken.None);
+
+        Assert.Equal((1440, 900, "Studio Mac"), (server.Width, server.Height, server.Name));
+        Assert.NotNull(server.ArdCapabilities);
+        Assert.Equal((uint)ArdServerFlags.MayControl, server.ArdCapabilities.RawFlags);
+        Assert.Equal(bitmap, server.ArdCapabilities.CommandBitmap.ToArray());
+        Assert.Equal(
+            [ClientInitArd(), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), StandardSetEncodingsMessage()],
+            stream.Writes);
+        Assert.Equal([1, 66, 4, 8, 20, 24], stream.WriteLengths);
+        Assert.Equal(0, stream.FlushCount);
+        Assert.False(stream.WasDisposed);
+    }
+
+    [Fact]
+    public async Task Ard_plain_name_field_requires_extended_initialization_and_writes_only_client_init()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            ServerInit(640, 480, PixelFormat.WinArdBgra32, "ordinary name"));
+
+        await Assert.ThrowsAsync<ArdExtendedInitializationRequiredException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                Handshake(RfbVersion.V3_889),
+                ProtocolLimits.Default,
+                CancellationToken.None));
+
+        Assert.Equal([ClientInitArd()], stream.Writes);
+    }
+
+    [Fact]
+    public async Task Ard_server_without_control_permission_stops_after_client_init()
+    {
+        var nameField = ExtendedNameField((uint)ArdServerFlags.Observe, new byte[16], "private");
+        await using var stream = new ScriptedDuplexStream(
+            ServerInit(640, 480, PixelFormat.WinArdBgra32, nameField));
+
+        var exception = await Assert.ThrowsAsync<ArdControlNotAllowedException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                Handshake(RfbVersion.V3_889),
+                ProtocolLimits.Default,
+                CancellationToken.None));
+
+        Assert.Equal((uint)ArdServerFlags.Observe, exception.RawServerFlags);
+        Assert.Equal([ClientInitArd()], stream.Writes);
+    }
+
+    [Theory]
+    [InlineData(0, 480)]
+    [InlineData(640, 0)]
+    public async Task Ard_zero_dimensions_without_session_selection_fail_before_control_or_bootstrap(
+        ushort width,
+        ushort height)
+    {
+        var serverInit = ServerInit(
+            width,
+            height,
+            PixelFormat.WinArdBgra32,
+            ExtendedNameField((uint)ArdServerFlags.MayControl, new byte[16], "Studio"));
+        var input = serverInit.Concat(FramebufferUpdate(DisplayInfoRectangle(1280, 720))).ToArray();
+        await using var stream = new ScriptedDuplexStream(input);
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                Handshake(RfbVersion.V3_889),
+                ProtocolLimits.Default,
+                CancellationToken.None));
+
+        Assert.Equal(serverInit.Length, stream.ReadPosition);
+        Assert.Equal([ClientInitArd()], stream.Writes);
+    }
+
+    [Theory]
+    [InlineData(0, 480)]
+    [InlineData(640, 0)]
+    public async Task Ard_session_selection_rejects_half_zero_dimensions_before_selection_or_control(
+        ushort width,
+        ushort height)
+    {
+        var serverInit = ServerInit(
+            width,
+            height,
+            PixelFormat.WinArdBgra32,
+            ExtendedNameField(
+                (uint)(ArdServerFlags.MayControl | ArdServerFlags.SessionSelect),
+                new byte[16],
+                "Studio"));
+        var input = serverInit
+            .Concat(SessionInfo(1u << 1, "alice"u8.ToArray()))
+            .Concat(SessionResult(0))
+            .Concat(FramebufferUpdate(DisplayInfoRectangle(1280, 720)))
+            .ToArray();
+        await using var stream = new ScriptedDuplexStream(input);
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                Handshake(RfbVersion.V3_889),
+                ProtocolLimits.Default,
+                CancellationToken.None));
+
+        Assert.Equal(serverInit.Length, stream.ReadPosition);
+        Assert.Equal([ClientInitArd()], stream.Writes);
+    }
+
+    [Fact]
+    public async Task Ard_session_selection_finishes_before_control_messages_are_written()
+    {
+        var prefix = ServerInit(
+            640,
+            480,
+            PixelFormat.WinArdBgra32,
+            ExtendedNameField(
+                (uint)(ArdServerFlags.MayControl | ArdServerFlags.SessionSelect),
+                new byte[16],
+                "Studio"))
+            .Concat(SessionInfo(1u << 1, "alice"u8.ToArray()))
+            .ToArray();
+        await using var stream = new GatedSessionDuplexStream(prefix, SessionResult(0));
+
+        var initialization = RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_889),
+            ProtocolLimits.Default,
+            CancellationToken.None);
+        await stream.SessionCommandWritten.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal([ClientInitArd(), SessionCommand("alice", command: 1)], stream.Writes);
+
+        stream.ReleaseSessionResult();
+        await initialization.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(
+            [ClientInitArd(), SessionCommand("alice", command: 1), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), StandardSetEncodingsMessage()],
+            stream.Writes);
+    }
+
+    [Fact]
+    public async Task Ard_zero_size_session_bootstraps_with_extended_encodings_then_restores_standard_encodings()
+    {
+        var serverInit = ServerInit(
+            0,
+            0,
+            PixelFormat.WinArdBgra32,
+            ExtendedNameField(
+                (uint)(ArdServerFlags.MayControl | ArdServerFlags.SessionSelect),
+                new byte[16],
+                "Studio"));
+        var sessionInfo = SessionInfo(1u << 1, "alice"u8.ToArray());
+        var sessionResult = SessionResult(0);
+        var bootstrap = FramebufferUpdate(DisplayInfoRectangle(1920, 1080));
+        await using var stream = new ScriptedDuplexStream(
+            [.. serverInit, .. sessionInfo, .. sessionResult, .. bootstrap]);
+
+        var server = await RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_889),
+            ProtocolLimits.Default,
+            CancellationToken.None);
+
+        Assert.Equal((1920, 1080), (server.Width, server.Height));
+        Assert.Equal(
+            [ClientInitArd(), SessionCommand("alice", command: 1), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), BootstrapSetEncodingsMessage(), StandardSetEncodingsMessage()],
+            stream.Writes);
+        Assert.Equal([1, 74, 66, 4, 8, 20, 32, 24], stream.WriteLengths);
+        Assert.All(stream.Writes, message => Assert.NotEqual(3, message[0]));
+        Assert.Equal(serverInit.Length + sessionInfo.Length + sessionResult.Length + bootstrap.Length, stream.ReadPosition);
+        Assert.Equal(0, stream.FlushCount);
+        Assert.False(stream.WasDisposed);
+    }
+
+    [Fact]
+    public async Task Ard_nonzero_session_does_not_read_bootstrap_or_declare_bootstrap_encodings()
+    {
+        var serverInit = ServerInit(
+            800,
+            600,
+            PixelFormat.WinArdBgra32,
+            ExtendedNameField(
+                (uint)(ArdServerFlags.MayControl | ArdServerFlags.SessionSelect),
+                new byte[16],
+                "Studio"));
+        var sessionInfo = SessionInfo(1u << 1, "alice"u8.ToArray());
+        var sessionResult = SessionResult(0);
+        byte[] unreadBootstrap = [0xDE, 0xAD, 0xBE, 0xEF];
+        await using var stream = new ScriptedDuplexStream(
+            [.. serverInit, .. sessionInfo, .. sessionResult, .. unreadBootstrap]);
+
+        var server = await RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_889),
+            ProtocolLimits.Default,
+            CancellationToken.None);
+
+        Assert.Equal((800, 600), (server.Width, server.Height));
+        Assert.Equal(serverInit.Length + sessionInfo.Length + sessionResult.Length, stream.ReadPosition);
+        Assert.Equal(StandardSetEncodingsMessage(), stream.Writes[^1]);
+        Assert.DoesNotContain(stream.Writes, message => message.SequenceEqual(BootstrapSetEncodingsMessage()));
+    }
+
+    [Fact]
+    public async Task Ard_display_name_uses_only_the_parser_tail_and_cleans_controls()
+    {
+        var bitmap = Enumerable.Repeat((byte)0xA5, 16).ToArray();
+        var nameField = ExtendedNameField(
+            (uint)ArdServerFlags.MayControl,
+            bitmap,
+            "Studio\r\nMac");
+        await using var stream = new ScriptedDuplexStream(
+            ServerInit(640, 480, PixelFormat.WinArdBgra32, nameField));
+
+        var server = await RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_889),
+            ProtocolLimits.Default,
+            CancellationToken.None);
+
+        Assert.Equal("Studio  Mac", server.Name);
+        Assert.DoesNotContain('�', server.Name);
+        Assert.DoesNotContain('\0', server.Name);
+    }
+
+    [Fact]
+    public async Task Ard_oversized_name_is_rejected_before_payload_read()
+    {
+        var header = ServerInitHeader(1, 1, PixelFormat.WinArdBgra32, 1025);
+        await using var stream = new ScriptedDuplexStream(header);
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                Handshake(RfbVersion.V3_889),
+                new ProtocolLimits(1024, 1024),
+                CancellationToken.None));
+
+        Assert.Equal(header.Length, stream.ReadPosition);
+        Assert.Equal([ClientInitArd()], stream.Writes);
+    }
+
+    [Fact]
+    public async Task Ard_truncated_server_init_is_protocol_failure_and_preserves_stream_ownership()
+    {
+        await using var stream = new ScriptedDuplexStream([0, 1, 0]);
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                Handshake(RfbVersion.V3_889),
+                ProtocolLimits.Default,
+                CancellationToken.None));
+
+        Assert.Equal([ClientInitArd()], stream.Writes);
+        Assert.Equal(0, stream.FlushCount);
+        Assert.False(stream.WasDisposed);
+    }
+
+    [Fact]
+    public async Task Ard_initializer_propagates_asynchronous_cancellation()
+    {
+        await using var stream = new BlockingDuplexStream();
+        using var cancellation = new CancellationTokenSource();
+
+        var task = RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_889),
+            ProtocolLimits.Default,
+            cancellation.Token);
+        await stream.Started.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.Equal(cancellation.Token, stream.ReceivedCancellationToken);
     }
 
     [Fact]
@@ -168,6 +530,13 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal(cancellation.Token, stream.ReceivedCancellationToken);
     }
 
+    public static TheoryData<RfbVersion> StandardVersions => new()
+    {
+        RfbVersion.V3_3,
+        RfbVersion.V3_7,
+        RfbVersion.V3_8,
+    };
+
     public static TheoryData<byte[]> InvalidPixelFormats => new()
     {
         PixelFormatBytes(24, 24, 0, 1, 255, 255, 255, 16, 8, 0),
@@ -179,6 +548,141 @@ public sealed class RfbSessionInitializerTests
         PixelFormatBytes(32, 24, 0, 1, 255, 255, 255, 28, 8, 0),
         PixelFormatBytes(32, 24, 0, 1, 255, 255, 255, 8, 8, 0),
     };
+
+    private static RfbHandshakeResult Handshake(RfbVersion version) =>
+        new(version, RfbSecurityType.AppleRemoteDesktop);
+
+    private static byte[] ClientInitArd() => [(byte)ArdClientInitFlags.Ard];
+
+    private static byte[] ViewerInfoMessage()
+    {
+        var message = new byte[66];
+        message[0] = 0x21;
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(2), 62);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(4), 1);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(6), 2);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(10), 6);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(14), 1);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(18), 0);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(22), 15);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(26), 0);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(30), 0);
+        message[34] = 0xB0;
+        message[36] = 0x0C;
+        message[37] = 0x03;
+        message[38] = 0x90;
+        message[44] = 0x40;
+        return message;
+    }
+
+    private static byte[] SetModeSharedMessage() => [0x0A, 0, 0, 1];
+
+    private static byte[] SetDisplayAllMessage() => [0x0D, 1, 0, 0, 0, 0, 0, 0];
+
+    private static byte[] SetPixelFormatMessage()
+    {
+        var message = new byte[20];
+        PixelFormat.WinArdBgra32.ToWireBytes().CopyTo(message, 4);
+        return message;
+    }
+
+    private static byte[] StandardSetEncodingsMessage() =>
+        SetEncodingsMessage(
+            (int)RfbEncodingType.Zrle,
+            (int)RfbEncodingType.Raw,
+            (int)RfbEncodingType.CopyRect,
+            (int)RfbEncodingType.Cursor,
+            (int)RfbEncodingType.DesktopSize);
+
+    private static byte[] BootstrapSetEncodingsMessage() =>
+        SetEncodingsMessage(
+            (int)RfbEncodingType.Zrle,
+            (int)RfbEncodingType.Raw,
+            (int)RfbEncodingType.CopyRect,
+            (int)RfbEncodingType.Cursor,
+            (int)RfbEncodingType.DesktopSize,
+            (int)RfbEncodingType.ArdDisplayInfo,
+            (int)RfbEncodingType.ArdDisplayInfo2);
+
+    private static byte[] SetEncodingsMessage(params int[] encodings)
+    {
+        var message = new byte[4 + (encodings.Length * sizeof(int))];
+        message[0] = 2;
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(2), checked((ushort)encodings.Length));
+        for (var index = 0; index < encodings.Length; index++)
+        {
+            BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(4 + (index * sizeof(int))), encodings[index]);
+        }
+
+        return message;
+    }
+
+    private static byte[] ExtendedNameField(uint flags, byte[] bitmap, string displayName)
+    {
+        ArgumentOutOfRangeException.ThrowIfNotEqual(bitmap.Length, 16);
+        var field = new byte[23 + Encoding.UTF8.GetByteCount(displayName)];
+        BinaryPrimitives.WriteUInt32BigEndian(field.AsSpan(2), flags);
+        bitmap.CopyTo(field, 6);
+        Encoding.UTF8.GetBytes(displayName).CopyTo(field, 23);
+        return field;
+    }
+
+    private static byte[] SessionInfo(uint allowedCommands, byte[] username)
+    {
+        var body = new byte[10 + username.Length];
+        BinaryPrimitives.WriteUInt16BigEndian(body, 1);
+        BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(2), allowedCommands);
+        username.CopyTo(body, 10);
+        return SizedBody(body);
+    }
+
+    private static byte[] SessionResult(uint status)
+    {
+        var body = new byte[6];
+        BinaryPrimitives.WriteUInt16BigEndian(body, 1);
+        BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(2), status);
+        return SizedBody(body);
+    }
+
+    private static byte[] SizedBody(byte[] body)
+    {
+        var message = new byte[2 + body.Length];
+        BinaryPrimitives.WriteUInt16BigEndian(message, checked((ushort)body.Length));
+        body.CopyTo(message, 2);
+        return message;
+    }
+
+    private static byte[] SessionCommand(string username, byte command)
+    {
+        var message = new byte[74];
+        BinaryPrimitives.WriteUInt16BigEndian(message, 72);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(2), 1);
+        message[8] = command;
+        Encoding.UTF8.GetBytes(username).CopyTo(message, 10);
+        return message;
+    }
+
+    private static byte[] FramebufferUpdate(params byte[][] rectangles)
+    {
+        var message = new List<byte> { 0, 0 };
+        message.Add((byte)(rectangles.Length >> 8));
+        message.Add((byte)rectangles.Length);
+        foreach (var rectangle in rectangles)
+        {
+            message.AddRange(rectangle);
+        }
+
+        return message.ToArray();
+    }
+
+    private static byte[] DisplayInfoRectangle(ushort width, ushort height)
+    {
+        var rectangle = new byte[20];
+        BinaryPrimitives.WriteInt32BigEndian(rectangle.AsSpan(8), (int)RfbEncodingType.ArdDisplayInfo);
+        BinaryPrimitives.WriteUInt16BigEndian(rectangle.AsSpan(12), width);
+        BinaryPrimitives.WriteUInt16BigEndian(rectangle.AsSpan(14), height);
+        return rectangle;
+    }
 
     private static byte[] ExpectedClientInitialization() =>
     [
@@ -254,6 +758,7 @@ public sealed class RfbSessionInitializerTests
 
         public byte[] WrittenBytes => _output.ToArray();
         public List<int> WriteLengths { get; } = [];
+        public List<byte[]> Writes { get; } = [];
         public long ReadPosition => _input.Position;
         public int FlushCount { get; private set; }
         public bool WasDisposed { get; private set; }
@@ -272,6 +777,7 @@ public sealed class RfbSessionInitializerTests
             CancellationToken cancellationToken = default)
         {
             WriteLengths.Add(buffer.Length);
+            Writes.Add(buffer.ToArray());
             return _output.WriteAsync(buffer, cancellationToken);
         }
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
@@ -282,6 +788,70 @@ public sealed class RfbSessionInitializerTests
             WasDisposed = true;
             _input.Dispose();
             _output.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class GatedSessionDuplexStream(byte[] prefix, byte[] suffix) : Stream
+    {
+        private readonly MemoryStream _prefix = new(prefix, writable: false);
+        private readonly MemoryStream _suffix = new(suffix, writable: false);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _sessionCommandWritten =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<byte[]> Writes { get; } = [];
+        public Task SessionCommandWritten => _sessionCommandWritten.Task;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (_prefix.Position < _prefix.Length)
+            {
+                return await _prefix.ReadAsync(buffer, cancellationToken);
+            }
+
+            await _release.Task.WaitAsync(cancellationToken);
+            return await _suffix.ReadAsync(buffer, cancellationToken);
+        }
+
+        public void ReleaseSessionResult() => _release.TrySetResult();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Writes.Add(buffer.ToArray());
+            if (Writes.Count == 2)
+            {
+                _sessionCommandWritten.TrySetResult();
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _prefix.Dispose();
+                _suffix.Dispose();
+            }
+
             base.Dispose(disposing);
         }
     }
