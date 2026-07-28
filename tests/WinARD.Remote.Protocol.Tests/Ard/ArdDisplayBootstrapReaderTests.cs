@@ -66,6 +66,18 @@ public sealed class ArdDisplayBootstrapReaderTests
     }
 
     [Fact]
+    public async Task Desktop_size_with_nonzero_origin_is_malformed()
+    {
+        var rectangle = RectangleHeader(1, 2, 2560, 1440, (int)RfbEncodingType.DesktopSize);
+        var stream = new TrackingDuplexStream(FramebufferUpdate(rectangle));
+
+        var exception = await Assert.ThrowsAsync<ArdSessionMalformedException>(() =>
+            ArdDisplayBootstrapReader.ReadAsync(stream, ProtocolLimits.Default, CancellationToken.None));
+
+        AssertSafe(exception);
+    }
+
+    [Fact]
     public async Task First_nonzero_size_is_returned_only_after_the_whole_framebuffer_update_is_consumed()
     {
         var message = FramebufferUpdate(
@@ -148,6 +160,70 @@ public sealed class ArdDisplayBootstrapReaderTests
 
         AssertSafe(exception);
         Assert.Equal(acceptedInputLength, stream.BytesRead);
+    }
+
+    [Fact]
+    public async Task Sixty_third_ack_or_nop_can_be_followed_by_a_valid_sixty_fourth_message()
+    {
+        var input = new List<byte>();
+        for (var messageIndex = 0; messageIndex < 63; messageIndex++)
+        {
+            input.Add(messageIndex % 2 == 0 ? (byte)0x04 : (byte)0x07);
+        }
+
+        input.AddRange(FramebufferUpdate(DesktopSizeRectangle(800, 600)));
+        var stream = new TrackingDuplexStream(input.ToArray());
+
+        var size = await ArdDisplayBootstrapReader.ReadAsync(
+            stream,
+            ProtocolLimits.Default,
+            CancellationToken.None);
+
+        Assert.Equal(new ArdDisplaySize(800, 600), size);
+        Assert.Equal(input.Count, stream.BytesRead);
+    }
+
+    [Fact]
+    public async Task More_than_four_thousand_ninety_six_rectangles_are_rejected_before_any_rectangle_header()
+    {
+        var message = new List<byte> { 0x00, 0x00 };
+        AddUInt16(message, 4097);
+        message.AddRange(DesktopSizeRectangle(800, 600));
+        var stream = new TrackingDuplexStream(message.ToArray());
+
+        var exception = await Assert.ThrowsAsync<ArdSessionMalformedException>(() =>
+            ArdDisplayBootstrapReader.ReadAsync(stream, ProtocolLimits.Default, CancellationToken.None));
+
+        AssertSafe(exception);
+        Assert.Equal(4, stream.BytesRead);
+    }
+
+    [Fact]
+    public async Task Budget_equal_to_the_complete_framebuffer_update_length_is_accepted()
+    {
+        var message = FramebufferUpdate(DesktopSizeRectangle(800, 600));
+        var stream = new TrackingDuplexStream(message);
+
+        var size = await ArdDisplayBootstrapReader.ReadAsync(
+            stream,
+            Limits(message.Length),
+            CancellationToken.None);
+
+        Assert.Equal(new ArdDisplaySize(800, 600), size);
+        Assert.Equal(message.Length, stream.BytesRead);
+    }
+
+    [Fact]
+    public async Task Budget_one_byte_below_the_complete_framebuffer_update_length_is_malformed()
+    {
+        var message = FramebufferUpdate(DesktopSizeRectangle(800, 600));
+        var stream = new TrackingDuplexStream(message);
+
+        var exception = await Assert.ThrowsAsync<ArdSessionMalformedException>(() =>
+            ArdDisplayBootstrapReader.ReadAsync(stream, Limits(message.Length - 1), CancellationToken.None));
+
+        AssertSafe(exception);
+        Assert.Equal(4, stream.BytesRead);
     }
 
     [Fact]

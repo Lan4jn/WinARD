@@ -13,6 +13,7 @@ public static class ArdDisplayBootstrapReader
     private const byte AckMessageType = 0x04;
     private const byte NopMessageType = 0x07;
     private const int MaximumTopLevelMessages = 64;
+    private const int MaximumRectanglesPerFramebufferUpdate = 4096;
     private const int FramebufferUpdateHeaderBytes = 4;
     private const int RectangleHeaderBytes = 12;
     private const int DisplayInfoHeaderBytes = 8;
@@ -42,16 +43,16 @@ public static class ArdDisplayBootstrapReader
                     case NopMessageType:
                         continue;
                     case FramebufferUpdateMessageType:
-                    {
-                        var size = await ReadFramebufferUpdateAsync(reader, limits, cancellationToken)
-                            .ConfigureAwait(false);
-                        if (size.HasValue)
                         {
-                            return size.Value;
-                        }
+                            var size = await ReadFramebufferUpdateAsync(reader, limits, cancellationToken)
+                                .ConfigureAwait(false);
+                            if (size.HasValue)
+                            {
+                                return size.Value;
+                            }
 
-                        break;
-                    }
+                            break;
+                        }
                     default:
                         throw new ArdSessionMalformedException();
                 }
@@ -79,13 +80,18 @@ public static class ArdDisplayBootstrapReader
 
         _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
         var rectangleCount = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+        if (rectangleCount > MaximumRectanglesPerFramebufferUpdate)
+        {
+            throw new ArdSessionMalformedException();
+        }
+
         budget.Reserve(checked((int)rectangleCount * RectangleHeaderBytes));
 
         ArdDisplaySize? firstNonzeroSize = null;
         for (var rectangleIndex = 0; rectangleIndex < rectangleCount; rectangleIndex++)
         {
-            _ = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-            _ = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+            var rectangleX = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+            var rectangleY = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
             var rectangleWidth = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
             var rectangleHeight = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
             var encoding = await reader.ReadInt32Async(cancellationToken).ConfigureAwait(false);
@@ -94,6 +100,11 @@ public static class ArdDisplayBootstrapReader
             switch ((RfbEncodingType)encoding)
             {
                 case RfbEncodingType.DesktopSize:
+                    if (rectangleX != 0 || rectangleY != 0)
+                    {
+                        throw new ArdSessionMalformedException();
+                    }
+
                     candidate = new ArdDisplaySize(rectangleWidth, rectangleHeight);
                     break;
                 case RfbEncodingType.ArdDisplayInfo:
