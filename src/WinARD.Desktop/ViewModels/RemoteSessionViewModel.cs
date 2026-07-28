@@ -1,3 +1,4 @@
+using System.Globalization;
 using CommunityToolkit.Mvvm.ComponentModel;
 using WinARD.Application.Ports;
 using WinARD.Desktop.Clipboard;
@@ -6,6 +7,7 @@ using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Threading;
 using WinARD.Domain.Errors;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Remote.Protocol.Errors;
 
 namespace WinARD.Desktop.ViewModels;
 
@@ -347,6 +349,85 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 DiagnosticFieldCategory.Public)]
             : null;
 
+    private static RfbProtocolException? FindProtocolFailureException(Exception? exception)
+    {
+        if (exception is null)
+        {
+            return null;
+        }
+
+        if (exception is RfbProtocolException { Failure: not null } protocolException)
+        {
+            return protocolException;
+        }
+
+        if (exception is AggregateException aggregateException)
+        {
+            foreach (var innerException in aggregateException.InnerExceptions)
+            {
+                var match = FindProtocolFailureException(innerException);
+                if (match is not null)
+                {
+                    return match;
+                }
+            }
+
+            return null;
+        }
+
+        return FindProtocolFailureException(exception.InnerException);
+    }
+
+    private static List<DiagnosticField>? GetProtocolFailureFields(
+        RfbProtocolException? exception)
+    {
+        if (exception?.Failure is not { } failure)
+        {
+            return null;
+        }
+
+        var fields = new List<DiagnosticField>(5)
+        {
+            new(
+                "ProtocolFailureKind",
+                failure.Kind.ToString(),
+                DiagnosticFieldCategory.Public),
+        };
+        if (failure.ReadStage is { } readStage)
+        {
+            fields.Add(new DiagnosticField(
+                "ProtocolReadStage",
+                readStage.ToString(),
+                DiagnosticFieldCategory.Public));
+        }
+
+        if (failure.ServerMessageType is { } serverMessageType)
+        {
+            fields.Add(new DiagnosticField(
+                "ServerMessageType",
+                $"0x{serverMessageType.ToString("X2", CultureInfo.InvariantCulture)}",
+                DiagnosticFieldCategory.Public));
+        }
+
+        if (failure.EncodingId is { } encodingId)
+        {
+            fields.Add(new DiagnosticField(
+                "EncodingId",
+                encodingId.ToString(CultureInfo.InvariantCulture),
+                DiagnosticFieldCategory.Public));
+        }
+
+        if (failure.RectangleIndex is { } rectangleIndex)
+        {
+            fields.Add(new DiagnosticField(
+                "RectangleIndex",
+                rectangleIndex.ToString(CultureInfo.InvariantCulture),
+                DiagnosticFieldCategory.Public));
+        }
+
+        return fields;
+    }
+
     private async Task MonitorLoopsAsync(Task receive, Task present)
     {
         try
@@ -361,7 +442,10 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             var ownershipDisposal = DisposeOwnershipOnceAsync();
             if (wasTerminalFailure)
             {
-                var exception = completed.Exception?.GetBaseException() ??
+                var protocolException = ReferenceEquals(completed, receive)
+                    ? FindProtocolFailureException(completed.Exception)
+                    : null;
+                var exception = protocolException ?? completed.Exception?.GetBaseException() ??
                     new InvalidOperationException("Remote session terminated unexpectedly.");
                 var error = WinArdError.Create(
                     ConnectionStage.Connected,
@@ -394,7 +478,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                     "Remote session loop failed.",
                     Fields: ReferenceEquals(completed, present)
                         ? GetPresentationFailureFields(exception)
-                        : null,
+                        : GetProtocolFailureFields(protocolException),
                     Exception: exception));
             }
 

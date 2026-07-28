@@ -6,6 +6,7 @@ using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Remote.Protocol.Errors;
 using Xunit;
 
 #pragma warning disable CA1707, CA2201
@@ -110,6 +111,168 @@ public sealed class RemoteSessionViewModelTests
             diagnostic.Fields ?? [],
             item => item.Name == "PresentationStage");
     }
+
+    [Fact]
+    public async Task Receive_protocol_failure_exports_only_safe_public_fingerprint_fields()
+    {
+        const string secret = "decoder leaked-secret-payload clipboard=private-clipboard host=private-host frame=17,34,51,68";
+        var failure = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.DecoderFailure,
+            RfbProtocolReadStage.FramebufferRectanglePayload,
+            0xFA,
+            -239,
+            7);
+        var protocolException = RfbProtocolException.Create(secret, failure);
+        using var redactor = new SecretRedactor();
+        var safeDiagnosticSink = new InMemorySafeDiagnosticSink(redactor);
+        var diagnosticSink = new RecordingDiagnosticSink(safeDiagnosticSink);
+        await using var viewModel = new RemoteSessionViewModel(
+            new FailingWithExceptionRuntime(protocolException),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var diagnostic = Assert.Single(
+            diagnosticSink.Events,
+            item => item.Code == "REMOTE_SESSION_INTERRUPTED");
+        Assert.Same(protocolException, diagnostic.Exception);
+        var fields = Assert.IsAssignableFrom<IReadOnlyList<DiagnosticField>>(diagnostic.Fields);
+        Assert.Equal(
+            [
+                ("ProtocolFailureKind", "DecoderFailure"),
+                ("ProtocolReadStage", "FramebufferRectanglePayload"),
+                ("ServerMessageType", "0xFA"),
+                ("EncodingId", "-239"),
+                ("RectangleIndex", "7"),
+            ],
+            fields.Select(field => (field.Name, field.Value)).ToArray());
+        Assert.All(fields, field => Assert.Equal(DiagnosticFieldCategory.Public, field.Category));
+
+        var stored = Assert.Single(
+            safeDiagnosticSink.Snapshot(),
+            item => item.Code == "REMOTE_SESSION_INTERRUPTED");
+        Assert.Equal(nameof(RfbProtocolException), stored.Exception?.Type);
+        Assert.Equal($"0x{protocolException.HResult:X8}", stored.Exception?.HResult);
+        var storedJson = JsonSerializer.Serialize(stored);
+        Assert.DoesNotContain("leaked-secret-payload", storedJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("private-clipboard", storedJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("private-host", storedJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("17,34,51,68", storedJson, StringComparison.Ordinal);
+        Assert.Equal(new RemoteFramebufferSize(1, 1), viewModel.FramebufferSize);
+        Assert.Equal("连接已中断。", viewModel.StatusMessage);
+    }
+
+    [Fact]
+    public async Task Receive_protocol_failure_exports_only_present_optional_fields()
+    {
+        var diagnosticSink = new RecordingDiagnosticSink();
+        await using var viewModel = new RemoteSessionViewModel(
+            new FailingWithExceptionRuntime(RfbProtocolException.Create(
+                "decoder failure",
+                new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.UnsupportedEncoding,
+                    EncodingId: 16))),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var diagnostic = Assert.Single(
+            diagnosticSink.Events,
+            item => item.Code == "REMOTE_SESSION_INTERRUPTED");
+        var fields = Assert.IsAssignableFrom<IReadOnlyList<DiagnosticField>>(diagnostic.Fields);
+        Assert.Equal(
+            [("ProtocolFailureKind", "UnsupportedEncoding"), ("EncodingId", "16")],
+            fields.Select(field => (field.Name, field.Value)).ToArray());
+        Assert.All(fields, field => Assert.Equal(DiagnosticFieldCategory.Public, field.Category));
+    }
+
+    [Theory]
+    [MemberData(nameof(NonProtocolReceiveFailures))]
+    public async Task Non_protocol_receive_failures_do_not_export_protocol_fields(Exception exception)
+    {
+        var diagnosticSink = new RecordingDiagnosticSink();
+        await using var viewModel = new RemoteSessionViewModel(
+            new FailingWithExceptionRuntime(exception),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var diagnostic = Assert.Single(
+            diagnosticSink.Events,
+            item => item.Code == "REMOTE_SESSION_INTERRUPTED");
+        Assert.Empty(diagnostic.Fields ?? []);
+    }
+
+    [Fact]
+    public async Task Receive_protocol_failure_uses_outermost_failure_before_eof_base_exception()
+    {
+        const string secret = "decoder leaked-secret-payload inner-chain-secret";
+        var protocolException = new RfbProtocolException(
+                secret,
+                new EndOfStreamException("eof inner-chain-secret"))
+            .WithContext(new RfbProtocolFailureInfo(RfbProtocolFailureKind.TruncatedRead))
+            .WithContext(new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.DecoderFailure,
+                RfbProtocolReadStage.FramebufferRectanglePayload,
+                0,
+                7,
+                3));
+        Assert.IsType<EndOfStreamException>(protocolException.GetBaseException());
+        using var redactor = new SecretRedactor();
+        var safeDiagnosticSink = new InMemorySafeDiagnosticSink(redactor);
+        var diagnosticSink = new RecordingDiagnosticSink(safeDiagnosticSink);
+        await using var viewModel = new RemoteSessionViewModel(
+            new FailingWithExceptionRuntime(new IOException(
+                "transport wrapper inner-chain-secret",
+                protocolException)),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var diagnostic = Assert.Single(
+            diagnosticSink.Events,
+            item => item.Code == "REMOTE_SESSION_INTERRUPTED");
+        Assert.Same(protocolException, diagnostic.Exception);
+        Assert.Equal(
+            [
+                ("ProtocolFailureKind", "TruncatedRead"),
+                ("ProtocolReadStage", "FramebufferRectanglePayload"),
+                ("ServerMessageType", "0x00"),
+                ("EncodingId", "7"),
+                ("RectangleIndex", "3"),
+            ],
+            diagnostic.Fields!.Select(field => (field.Name, field.Value)).ToArray());
+        var storedJson = JsonSerializer.Serialize(Assert.Single(safeDiagnosticSink.Snapshot()));
+        Assert.DoesNotContain("leaked-secret-payload", storedJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("inner-chain-secret", storedJson, StringComparison.Ordinal);
+        Assert.DoesNotContain(nameof(EndOfStreamException), storedJson, StringComparison.Ordinal);
+    }
+
+    public static IEnumerable<object[]> NonProtocolReceiveFailures =>
+    [
+        [new IOException("network details")],
+        [new AggregateException(new OperationCanceledException("receive canceled"))],
+    ];
 
     [Fact]
     public async Task ThrowingDiagnosticSinkCannotSuppressTerminalErrorOrOwnershipRelease()
