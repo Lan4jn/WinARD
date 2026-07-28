@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using WinARD.ProtocolProbe;
+using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
@@ -171,11 +172,11 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
-    public async Task Pointer_smoke_probe_routes_889_initialization_then_sends_only_buttonless_center_move()
+    public async Task Pointer_smoke_probe_completes_full_889_control_script_before_pointer_action()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var serverTask = RunPointerSmokeServerAsync(listener);
+        var serverTask = RunFullArd889PointerSmokeServerAsync(listener);
         using var username = SecretMaterial.FromUtf8("pointer-user");
         using var password = SecretMaterial.FromUtf8("pointer-password");
 
@@ -188,6 +189,8 @@ public sealed class ProtocolProbeTests
             CancellationToken.None);
 
         Assert.Null(result.Capture);
+        Assert.Equal(RfbVersion.V3_889, result.Version);
+        Assert.Equal(RfbSecurityType.AppleRemoteDesktop, result.SecurityType);
         Assert.Equal(new ProbePointerSmoke(4, 2, 2, 1), result.PointerSmoke);
         await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
@@ -746,7 +749,7 @@ public sealed class ProtocolProbeTests
         stageReached.TrySetResult();
     }
 
-    private static async Task RunPointerSmokeServerAsync(TcpListener listener)
+    private static async Task RunFullArd889PointerSmokeServerAsync(TcpListener listener)
     {
         using var client = await listener.AcceptTcpClientAsync();
         await using var stream = client.GetStream();
@@ -769,7 +772,9 @@ public sealed class ProtocolProbeTests
         AddUInt16(serverInit, 2);
         serverInit.AddRange(PixelFormat.WinArdBgra32.ToWireBytes());
         var extendedName = new byte[26];
-        extendedName[5] = 2;
+        BinaryPrimitives.WriteUInt32BigEndian(
+            extendedName.AsSpan(2),
+            (uint)ArdServerFlags.MayControl);
         Encoding.UTF8.GetBytes("Mac").CopyTo(extendedName, 23);
         AddUInt32(serverInit, checked((uint)extendedName.Length));
         serverInit.AddRange(extendedName);

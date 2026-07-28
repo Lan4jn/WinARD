@@ -18,6 +18,9 @@ public sealed class RfbClientFactory : IRfbClientFactory
 
 internal sealed class RfbClient : IRfbClient
 {
+    private const byte ArdAckServerMessage = 0x04;
+    private const byte ArdNopServerMessage = 0x07;
+
     private readonly Stream _stream;
     private readonly FramebufferSnapshotFactory _snapshotFactory;
     private RfbHandshakeResult? _handshake;
@@ -100,26 +103,32 @@ internal sealed class RfbClient : IRfbClient
         ThrowIfDisposed();
         var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
         var updates = _framebufferUpdates ?? throw new InvalidOperationException("RFB initialization has not completed.");
+        var handshake = _handshake ?? throw new InvalidOperationException("RFB negotiation has not completed.");
         var reader = new RfbReader(_stream, ProtocolLimits.Default);
-        var type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-        switch (type)
+        while (true)
         {
-            case 0:
-                {
+            var type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            switch (type)
+            {
+                case 0:
                     return await updates.ApplyBodyAsync(
-                        _stream,
-                        (surface, update) => _snapshotFactory.CreateServerMessage(surface, update),
-                        cancellationToken).ConfigureAwait(false);
-                }
-            case 2:
-                return new RemoteBellMessage();
-            case 3:
-                return new RemoteClipboardMessage(
-                    await ClipboardProtocol.ReadServerCutTextBodyAsync(
-                        reader,
-                        cancellationToken).ConfigureAwait(false));
-            default:
-                throw new RfbProtocolException($"Unsupported RFB server message type {type}.");
+                            _stream,
+                            (surface, update) => _snapshotFactory.CreateServerMessage(surface, update),
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                case 2:
+                    return new RemoteBellMessage();
+                case 3:
+                    return new RemoteClipboardMessage(
+                        await ClipboardProtocol.ReadServerCutTextBodyAsync(
+                            reader,
+                            cancellationToken).ConfigureAwait(false));
+                case ArdAckServerMessage or ArdNopServerMessage
+                    when handshake.Version == RfbVersion.V3_889:
+                    continue;
+                default:
+                    throw new RfbProtocolException($"Unsupported RFB server message type {type}.");
+            }
         }
     }
 

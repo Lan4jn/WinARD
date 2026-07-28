@@ -2,12 +2,15 @@ using WinARD.Application.Ports;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
 using WinARD.Remote.Protocol.Ard;
+using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
+using WinARD.Remote.Protocol.Handshake;
 using WinARD.Remote.Protocol.IO;
 using WinARD.Remote.Protocol.Encodings;
 using Xunit;
 using System.Xml.Linq;
 using System.Buffers.Binary;
+using System.Globalization;
 
 #pragma warning disable CA1707
 
@@ -492,6 +495,117 @@ public sealed class FramePresentationTests
         Assert.Equal((byte)ArdClientInitFlags.Ard, stream.WrittenBytes[13]);
     }
 
+    [Theory]
+    [InlineData((byte)0x04)]
+    [InlineData((byte)0x07)]
+    public async Task Rfb_client_skips_zero_payload_ARD_control_message_before_framebuffer_update(
+        byte controlMessage)
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1), controlMessage, .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        using var message = Assert.IsType<RemoteCursorMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        using var cursor = message.TakeCursorOwnership();
+
+        Assert.Equal([1, 2, 3, 255], cursor.Bgra32.ToArray());
+    }
+
+    [Fact]
+    public async Task Rfb_client_skips_consecutive_ARD_ack_and_nop_messages()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1), 0x04, 0x07, .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        using var message = Assert.IsType<RemoteCursorMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+
+        Assert.NotNull(message.Cursor);
+    }
+
+    [Theory]
+    [InlineData("RFB 003.003\n", (byte)0x04)]
+    [InlineData("RFB 003.003\n", (byte)0x07)]
+    [InlineData("RFB 003.007\n", (byte)0x04)]
+    [InlineData("RFB 003.007\n", (byte)0x07)]
+    [InlineData("RFB 003.008\n", (byte)0x04)]
+    [InlineData("RFB 003.008\n", (byte)0x07)]
+    public async Task Rfb_client_rejects_ARD_control_messages_for_standard_RFB_versions(
+        string banner,
+        byte controlMessage)
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake(banner), .. ServerInit(2, 1), controlMessage]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Contains(
+            controlMessage.ToString(CultureInfo.InvariantCulture),
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rfb_client_rejects_unknown_ARD_message_without_consuming_following_framebuffer()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1), 0x08, .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+        using var message = Assert.IsType<RemoteCursorMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+
+        Assert.Contains("8", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rfb_client_reports_eof_after_skipped_ARD_ack()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1), 0x04]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.IsType<EndOfStreamException>(exception.InnerException);
+    }
+
+    [Fact]
+    public async Task Rfb_client_observes_cancellation_after_skipped_ARD_nop()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1), 0x07],
+            cancellation);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.ReceiveAsync(cancellation.Token).AsTask());
+    }
+
     [Fact]
     public async Task Mailbox_dispose_releases_pending_frame_and_cancels_reader()
     {
@@ -550,7 +664,9 @@ public sealed class FramePresentationTests
     }
 
     private static byte[] Handshake(string banner) =>
-        [.. System.Text.Encoding.ASCII.GetBytes(banner), 1, 30];
+        banner == "RFB 003.003\n"
+            ? [.. System.Text.Encoding.ASCII.GetBytes(banner), 0, 0, 0, 30]
+            : [.. System.Text.Encoding.ASCII.GetBytes(banner), 1, 30];
 
     private static byte[] ArdServerInit(ushort width, ushort height)
     {
@@ -602,7 +718,9 @@ public sealed class FramePresentationTests
         public void Dispose() => _buffer = null;
     }
 
-    private sealed class ScriptedDuplexStream(byte[] input) : Stream
+    private sealed class ScriptedDuplexStream(
+        byte[] input,
+        CancellationTokenSource? cancelAfterInput = null) : Stream
     {
         private readonly MemoryStream _input = new(input, writable: false);
         private readonly MemoryStream _output = new();
@@ -617,8 +735,18 @@ public sealed class FramePresentationTests
         public override void Flush() { }
         public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public override int Read(byte[] buffer, int offset, int count) => _input.Read(buffer, offset, count);
-        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
-            _input.ReadAsync(buffer, cancellationToken);
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            var read = await _input.ReadAsync(buffer, cancellationToken);
+            if (read > 0 && _input.Position == _input.Length)
+            {
+                cancelAfterInput?.Cancel();
+            }
+
+            return read;
+        }
         public override void Write(byte[] buffer, int offset, int count) => _output.Write(buffer, offset, count);
         public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
             _output.WriteAsync(buffer, cancellationToken);
