@@ -10,6 +10,18 @@ namespace WinARD.Remote.Protocol.Tests.Errors;
 public sealed class RfbProtocolFailureInfoTests
 {
     [Fact]
+    public void Kind_only_constructor_defaults_optional_context_to_null()
+    {
+        var failure = new RfbProtocolFailureInfo(RfbProtocolFailureKind.TruncatedRead);
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, failure.Kind);
+        Assert.Null(failure.ReadStage);
+        Assert.Null(failure.ServerMessageType);
+        Assert.Null(failure.EncodingId);
+        Assert.Null(failure.RectangleIndex);
+    }
+
+    [Fact]
     public void FillMissingFrom_preserves_inner_values_and_fills_null_values_from_outer_context()
     {
         var inner = new RfbProtocolFailureInfo(

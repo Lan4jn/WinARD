@@ -22,10 +22,10 @@ public enum RfbProtocolReadStage
 
 public sealed record RfbProtocolFailureInfo(
     RfbProtocolFailureKind Kind,
-    RfbProtocolReadStage? ReadStage,
-    byte? ServerMessageType,
-    int? EncodingId,
-    int? RectangleIndex)
+    RfbProtocolReadStage? ReadStage = null,
+    byte? ServerMessageType = null,
+    int? EncodingId = null,
+    int? RectangleIndex = null)
 {
     internal RfbProtocolFailureInfo FillMissingFrom(RfbProtocolFailureInfo outer)
     {
