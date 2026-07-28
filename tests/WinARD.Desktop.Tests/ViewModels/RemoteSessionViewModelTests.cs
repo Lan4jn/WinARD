@@ -275,6 +275,78 @@ public sealed class RemoteSessionViewModelTests
     ];
 
     [Fact]
+    public async Task Receive_failure_with_ten_thousand_exception_nodes_completes_safely()
+    {
+        var diagnostic = await RecordReceiveFailureAsync(
+            WrapExceptionChain(new IOException("leaf"), 10_000));
+
+        Assert.Empty(diagnostic.Fields ?? []);
+    }
+
+    [Fact]
+    public async Task Receive_failure_repeated_aggregate_reference_is_visited_once()
+    {
+        var sharedBranch = WrapExceptionChain(new IOException("shared leaf"), 200);
+        var firstFailure = RfbProtocolException.Create(
+            "first failure",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.MalformedClipboard));
+        var diagnostic = await RecordReceiveFailureAsync(new AggregateException(
+            sharedBranch,
+            sharedBranch,
+            firstFailure));
+
+        var field = Assert.Single(diagnostic.Fields!);
+        Assert.Equal("ProtocolFailureKind", field.Name);
+        Assert.Equal("MalformedClipboard", field.Value);
+    }
+
+    [Fact]
+    public async Task Receive_failure_aggregate_branches_use_original_depth_first_order()
+    {
+        var firstFailure = RfbProtocolException.Create(
+            "first failure",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.UnsupportedEncoding));
+        var secondFailure = RfbProtocolException.Create(
+            "second failure",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.DecoderFailure));
+        var diagnostic = await RecordReceiveFailureAsync(new AggregateException(
+            new IOException("first wrapper", firstFailure),
+            secondFailure));
+
+        var field = Assert.Single(diagnostic.Fields!);
+        Assert.Equal("ProtocolFailureKind", field.Name);
+        Assert.Equal("UnsupportedEncoding", field.Value);
+    }
+
+    [Fact]
+    public async Task Receive_failure_prefers_outer_protocol_failure()
+    {
+        var protocolException = RfbProtocolException.Create(
+                "outer failure",
+                new RfbProtocolFailureInfo(RfbProtocolFailureKind.TruncatedRead))
+            .WithContext(new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.DecoderFailure,
+                RfbProtocolReadStage.ClipboardPayload));
+        var diagnostic = await RecordReceiveFailureAsync(protocolException);
+
+        Assert.Equal(
+            [("ProtocolFailureKind", "TruncatedRead"), ("ProtocolReadStage", "ClipboardPayload")],
+            diagnostic.Fields!.Select(field => (field.Name, field.Value)).ToArray());
+    }
+
+    [Fact]
+    public async Task Receive_failure_does_not_scan_protocol_failure_beyond_node_limit()
+    {
+        var protocolException = RfbProtocolException.Create(
+            "too deep",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.DecoderFailure));
+        var diagnostic = await RecordReceiveFailureAsync(
+            WrapExceptionChain(protocolException, 1_000));
+
+        Assert.Empty(diagnostic.Fields ?? []);
+    }
+
+    [Fact]
     public async Task ThrowingDiagnosticSinkCannotSuppressTerminalErrorOrOwnershipRelease()
     {
         var lifetime = new TrackingLifetime();
@@ -815,6 +887,37 @@ public sealed class RemoteSessionViewModelTests
         _ = await Assert.ThrowsAsync<AggregateException>(
             () => viewModel.DisposeAsync().AsTask());
         Assert.Equal(1, cursorOwner.DisposeCount);
+    }
+
+    private static async Task<SafeDiagnosticEventInput> RecordReceiveFailureAsync(
+        Exception exception)
+    {
+        var diagnosticSink = new RecordingDiagnosticSink();
+        await using var viewModel = new RemoteSessionViewModel(
+            new FailingWithExceptionRuntime(exception),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        return Assert.Single(
+            diagnosticSink.Events,
+            item => item.Code == "REMOTE_SESSION_INTERRUPTED");
+    }
+
+    private static Exception WrapExceptionChain(Exception innermost, int wrapperCount)
+    {
+        var exception = innermost;
+        for (var index = 0; index < wrapperCount; index++)
+        {
+            exception = new IOException($"wrapper-{index}", exception);
+        }
+
+        return exception;
     }
 
     private sealed class BlockingRuntime : IRemoteSessionRuntime

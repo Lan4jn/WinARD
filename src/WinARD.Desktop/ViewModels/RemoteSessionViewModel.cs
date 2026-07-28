@@ -13,6 +13,8 @@ namespace WinARD.Desktop.ViewModels;
 
 public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 {
+    // Bound diagnostics work for malformed or adversarial exception graphs.
+    private const int MaxProtocolFailureExceptionNodes = 256;
     private readonly object _sync = new();
     private readonly IRemoteSessionRuntime _session;
     private readonly IAsyncDisposable _ownership;
@@ -356,26 +358,38 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             return null;
         }
 
-        if (exception is RfbProtocolException { Failure: not null } protocolException)
+        var pending = new Stack<Exception>();
+        var visited = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
+        pending.Push(exception);
+        var visitedCount = 0;
+        while (pending.Count > 0 && visitedCount < MaxProtocolFailureExceptionNodes)
         {
-            return protocolException;
-        }
-
-        if (exception is AggregateException aggregateException)
-        {
-            foreach (var innerException in aggregateException.InnerExceptions)
+            var current = pending.Pop();
+            if (!visited.Add(current))
             {
-                var match = FindProtocolFailureException(innerException);
-                if (match is not null)
-                {
-                    return match;
-                }
+                continue;
             }
 
-            return null;
+            visitedCount++;
+            if (current is RfbProtocolException { Failure: not null } protocolException)
+            {
+                return protocolException;
+            }
+
+            if (current is AggregateException aggregateException)
+            {
+                for (var index = aggregateException.InnerExceptions.Count - 1; index >= 0; index--)
+                {
+                    pending.Push(aggregateException.InnerExceptions[index]);
+                }
+            }
+            else if (current.InnerException is { } innerException)
+            {
+                pending.Push(innerException);
+            }
         }
 
-        return FindProtocolFailureException(exception.InnerException);
+        return null;
     }
 
     private static List<DiagnosticField>? GetProtocolFailureFields(
