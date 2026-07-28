@@ -652,6 +652,97 @@ public sealed class FramePresentationTests
             await client.ReceiveAsync(CancellationToken.None));
 
         Assert.Contains("8", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(RfbProtocolFailureKind.UnexpectedServerMessage, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ServerMessageType, exception.Failure?.ReadStage);
+        Assert.Equal((byte)0x08, exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
+    public async Task Rfb_client_adds_framebuffer_message_type_without_overwriting_inner_failure()
+    {
+        var snapshotFailure = RfbProtocolException.Create(
+            "Injected snapshot failure.",
+            new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.DecoderFailure,
+                RfbProtocolReadStage.FramebufferRectanglePayload,
+                EncodingId: 1105,
+                RectangleIndex: 2));
+        var snapshotFactory = new FramebufferSnapshotFactory(_ => throw snapshotFailure);
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.008\n"),
+                .. ServerInit(1, 1),
+                0, 0, 0, 1,
+                .. Header(0, 0, 1, 1, (int)RfbEncodingType.Raw),
+                1, 2, 3, 4,
+            ]);
+        await using var client = new RfbClient(stream, snapshotFactory);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.DecoderFailure, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.FramebufferRectanglePayload, exception.Failure?.ReadStage);
+        Assert.Equal((byte)0, exception.Failure?.ServerMessageType);
+        Assert.Equal(1105, exception.Failure?.EncodingId);
+        Assert.Equal(2, exception.Failure?.RectangleIndex);
+    }
+
+    [Fact]
+    public async Task Rfb_client_adds_clipboard_message_type_without_overwriting_truncation()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(1, 1), 3, 0, 0, 0, 0, 0, 0, 2, (byte)'a']);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ClipboardPayload, exception.Failure?.ReadStage);
+        Assert.Equal((byte)3, exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
+    public async Task Rfb_client_does_not_wrap_framebuffer_io_failure()
+    {
+        var expected = new IOException("Injected read failure.");
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(1, 1), 0],
+            exceptionAfterInput: expected);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var actual = await Assert.ThrowsAsync<IOException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Same(expected, actual);
+    }
+
+    [Fact]
+    public async Task Rfb_client_does_not_wrap_clipboard_cancellation()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(1, 1), 3],
+            cancellation);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.ReceiveAsync(cancellation.Token).AsTask());
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
     }
 
     [Fact]
@@ -782,6 +873,17 @@ public sealed class FramePresentationTests
         return bytes;
     }
 
+    private static byte[] Header(ushort x, ushort y, ushort width, ushort height, int encodingId)
+    {
+        var bytes = new byte[12];
+        BinaryPrimitives.WriteUInt16BigEndian(bytes, x);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2), y);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4), width);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(6), height);
+        BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(8), encodingId);
+        return bytes;
+    }
+
     private sealed class TestOwner(int sequence, List<int> disposed, int length = 4) : System.Buffers.IMemoryOwner<byte>
     {
         private byte[]? _buffer = new byte[length];
@@ -810,7 +912,8 @@ public sealed class FramePresentationTests
 
     private sealed class ScriptedDuplexStream(
         byte[] input,
-        CancellationTokenSource? cancelAfterInput = null) : Stream
+        CancellationTokenSource? cancelAfterInput = null,
+        IOException? exceptionAfterInput = null) : Stream
     {
         private readonly MemoryStream _input = new(input, writable: false);
         private readonly MemoryStream _output = new();
@@ -829,6 +932,11 @@ public sealed class FramePresentationTests
             Memory<byte> buffer,
             CancellationToken cancellationToken = default)
         {
+            if (_input.Position == _input.Length && exceptionAfterInput is not null)
+            {
+                throw exceptionAfterInput;
+            }
+
             var read = await _input.ReadAsync(buffer, cancellationToken);
             if (read > 0 && _input.Position == _input.Length)
             {

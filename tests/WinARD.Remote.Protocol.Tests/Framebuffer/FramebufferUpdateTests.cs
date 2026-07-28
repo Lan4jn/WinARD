@@ -736,6 +736,11 @@ public sealed class FramebufferUpdateTests
 
         Assert.Contains("Unexpected end", exception.Message, StringComparison.Ordinal);
         Assert.Equal(stream.Length, stream.Position);
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.FramebufferRectanglePayload, exception.Failure?.ReadStage);
+        Assert.Equal((byte)0, exception.Failure?.ServerMessageType);
+        Assert.Equal((int)RfbEncodingType.ArdDisplayInfo2, exception.Failure?.EncodingId);
+        Assert.Equal(0, exception.Failure?.RectangleIndex);
     }
 
     [Fact]
@@ -752,6 +757,77 @@ public sealed class FramebufferUpdateTests
                 CancellationToken.None));
 
         Assert.Contains("-777", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(RfbProtocolFailureKind.UnsupportedEncoding, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.FramebufferRectangleHeader, exception.Failure?.ReadStage);
+        Assert.Equal((byte)0, exception.Failure?.ServerMessageType);
+        Assert.Equal(encoding, exception.Failure?.EncodingId);
+        Assert.Equal(0, exception.Failure?.RectangleIndex);
+    }
+
+    [Fact]
+    public async Task Truncated_second_rectangle_header_reports_its_index()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var message = Update(Raw(0, 0, 1, 1, [1, 2, 3, 4]), [0, 0]);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(
+                new MemoryStream(message),
+                framebuffer,
+                PixelFormat.WinArdBgra32,
+                CancellationToken.None));
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.FramebufferRectangleHeader, exception.Failure?.ReadStage);
+        Assert.Equal((byte)0, exception.Failure?.ServerMessageType);
+        Assert.Null(exception.Failure?.EncodingId);
+        Assert.Equal(1, exception.Failure?.RectangleIndex);
+    }
+
+    [Fact]
+    public async Task Decoder_protocol_failure_reports_second_rectangle_context()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        const int encoding = 777;
+        var decoder = new ProtocolFailureDecoder(encoding);
+        var decoders = new Dictionary<int, IRfbEncodingDecoder>
+        {
+            [(int)RfbEncodingType.Raw] = CreateRawDecoder(),
+            [encoding] = decoder,
+        };
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(
+                new MemoryStream(Update(
+                    Raw(0, 0, 1, 1, [1, 2, 3, 4]),
+                    Header(0, 0, 1, 1, (RfbEncodingType)encoding))),
+                framebuffer,
+                decoders,
+                CancellationToken.None));
+
+        Assert.Equal(RfbProtocolFailureKind.DecoderFailure, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.FramebufferRectanglePayload, exception.Failure?.ReadStage);
+        Assert.Equal((byte)0, exception.Failure?.ServerMessageType);
+        Assert.Equal(encoding, exception.Failure?.EncodingId);
+        Assert.Equal(1, exception.Failure?.RectangleIndex);
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0 }, RfbProtocolReadStage.FramebufferHeader)]
+    [InlineData(new byte[] { 0, 0, 0, 1, 0 }, RfbProtocolReadStage.FramebufferRectangleHeader)]
+    public async Task Truncated_update_headers_report_stage(byte[] message, RfbProtocolReadStage expectedStage)
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(
+                new MemoryStream(message), framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None));
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(expectedStage, exception.Failure?.ReadStage);
+        Assert.Equal((byte)0, exception.Failure?.ServerMessageType);
+        Assert.Equal(expectedStage == RfbProtocolReadStage.FramebufferRectangleHeader ? 0 : null,
+            exception.Failure?.RectangleIndex);
     }
 
     [Fact]
@@ -969,6 +1045,18 @@ public sealed class FramebufferUpdateTests
         AddUInt16(bytes, 0);
         bytes.AddRange(Enumerable.Repeat(recordFill, checked(displayCount * 28)));
         return bytes.ToArray();
+    }
+
+    private sealed class ProtocolFailureDecoder(int encodingId) : IRfbEncodingDecoder
+    {
+        public int EncodingId { get; } = encodingId;
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            FramebufferModel framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromException<EncodingDecodeResult>(new RfbProtocolException("Injected decoder failure."));
     }
 
     private static byte[] ArdDisplayInfo2(ushort width, ushort height, byte[] payload)

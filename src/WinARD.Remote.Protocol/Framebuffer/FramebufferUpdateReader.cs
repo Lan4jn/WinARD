@@ -51,7 +51,12 @@ public static class FramebufferUpdateReader
         var messageType = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
         if (messageType != 0)
         {
-            throw new RfbProtocolException($"Expected FramebufferUpdate message type 0, received {messageType}.");
+            throw RfbProtocolException.Create(
+                $"Expected FramebufferUpdate message type 0, received {messageType}.",
+                new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.UnexpectedServerMessage,
+                    RfbProtocolReadStage.ServerMessageType,
+                    messageType));
         }
 
         return await ApplyBodyAsync(reader, framebuffer, decoders, cancellationToken).ConfigureAwait(false);
@@ -75,12 +80,28 @@ public static class FramebufferUpdateReader
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-        var rectangleCount = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+        ushort rectangleCount;
+        try
+        {
+            _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            rectangleCount = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RfbProtocolException exception)
+        {
+            throw exception.WithContext(new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.MalformedFramebufferUpdate,
+                RfbProtocolReadStage.FramebufferHeader,
+                0));
+        }
+
         if (rectangleCount > MaximumRectangleCount)
         {
-            throw new RfbProtocolException(
-                $"FramebufferUpdate rectangle count {rectangleCount} exceeds the limit of {MaximumRectangleCount}.");
+            throw RfbProtocolException.Create(
+                $"FramebufferUpdate rectangle count {rectangleCount} exceeds the limit of {MaximumRectangleCount}.",
+                new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.MalformedFramebufferUpdate,
+                    RfbProtocolReadStage.FramebufferHeader,
+                    0));
         }
 
         var dirtyRects = new List<FramebufferRect>(rectangleCount);
@@ -89,21 +110,52 @@ public static class FramebufferUpdateReader
         var desktopResized = false;
         for (var index = 0; index < rectangleCount; index++)
         {
-            var x = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-            var y = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-            var width = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-            var height = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-            var encodingId = await reader.ReadInt32Async(cancellationToken).ConfigureAwait(false);
+            ushort x;
+            ushort y;
+            ushort width;
+            ushort height;
+            int encodingId;
+            try
+            {
+                x = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+                y = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+                width = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+                height = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
+                encodingId = await reader.ReadInt32Async(cancellationToken).ConfigureAwait(false);
+            }
+            catch (RfbProtocolException exception)
+            {
+                throw exception.WithContext(new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.MalformedFramebufferUpdate,
+                    RfbProtocolReadStage.FramebufferRectangleHeader,
+                    0,
+                    RectangleIndex: index));
+            }
+
             var encoding = (RfbEncodingType)encodingId;
             if (!decoders.TryGetValue(encodingId, out var decoder))
             {
-                throw new RfbProtocolException($"Unsupported RFB encoding ID {encodingId}.");
+                throw RfbProtocolException.Create(
+                    $"Unsupported RFB encoding ID {encodingId}.",
+                    new RfbProtocolFailureInfo(
+                        RfbProtocolFailureKind.UnsupportedEncoding,
+                        RfbProtocolReadStage.FramebufferRectangleHeader,
+                        0,
+                        encodingId,
+                        index));
             }
 
             var isArdMetadata = encoding is RfbEncodingType.ArdDisplayInfo or RfbEncodingType.ArdDisplayInfo2;
             if (encoding != RfbEncodingType.Cursor && !isArdMetadata && (width == 0 || height == 0))
             {
-                throw new RfbProtocolException($"RFB encoding {encodingId} requires non-zero rectangle dimensions.");
+                throw RfbProtocolException.Create(
+                    $"RFB encoding {encodingId} requires non-zero rectangle dimensions.",
+                    new RfbProtocolFailureInfo(
+                        RfbProtocolFailureKind.MalformedFramebufferUpdate,
+                        RfbProtocolReadStage.FramebufferRectangleHeader,
+                        0,
+                        encodingId,
+                        index));
             }
 
             var previousWidth = framebuffer.Width;
@@ -116,8 +168,21 @@ public static class FramebufferUpdateReader
                     FramebufferRect.CreateMetadataRectangle(x, y, width, height),
                 _ => new FramebufferRect(x, y, width, height),
             };
-            var decodeResult = await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken)
-                .ConfigureAwait(false);
+            EncodingDecodeResult decodeResult;
+            try
+            {
+                decodeResult = await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (RfbProtocolException exception)
+            {
+                throw exception.WithContext(new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.DecoderFailure,
+                    RfbProtocolReadStage.FramebufferRectanglePayload,
+                    0,
+                    encodingId,
+                    index));
+            }
             dirtyRects.AddRange(decodeResult.DirtyRects);
             if (previousWidth != framebuffer.Width || previousHeight != framebuffer.Height)
             {

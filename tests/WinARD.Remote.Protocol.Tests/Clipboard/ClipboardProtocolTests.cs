@@ -145,25 +145,66 @@ public sealed class ClipboardProtocolTests
         message[9] = 0xAD;
         await using var stream = new MemoryStream(message);
 
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             ClipboardProtocol.ReadClientCutTextAsync(
                 new RfbReader(stream, ProtocolLimits.Default),
                 CancellationToken.None).AsTask());
 
         Assert.Equal(8, stream.Position);
+        Assert.Equal(RfbProtocolFailureKind.MalformedClipboard, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ClipboardHeader, exception.Failure?.ReadStage);
+        Assert.Null(exception.Failure?.ServerMessageType);
     }
 
     [Fact]
     public async Task Async_reader_rejects_truncation_and_invalid_utf8()
     {
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var truncated = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             ClipboardProtocol.ReadClientCutTextAsync(
                 Reader([6, 0, 0, 0, 0, 0, 0, 2, (byte)'a']),
                 CancellationToken.None).AsTask());
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var invalidUtf8 = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             ClipboardProtocol.ReadClientCutTextAsync(
                 Reader([6, 0, 0, 0, 0, 0, 0, 2, 0xC3, 0x28]),
                 CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, truncated.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ClipboardPayload, truncated.Failure?.ReadStage);
+        Assert.Null(truncated.Failure?.ServerMessageType);
+        Assert.Equal(RfbProtocolFailureKind.MalformedClipboard, invalidUtf8.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ClipboardPayload, invalidUtf8.Failure?.ReadStage);
+        Assert.Null(invalidUtf8.Failure?.ServerMessageType);
+    }
+
+    [Fact]
+    public async Task Server_reader_reports_malformed_padding_as_header_without_content_fields()
+    {
+        const string secretMarker = "SECRET-MARKER-DO-NOT-CAPTURE";
+        var message = ServerCutText(secretMarker);
+        message[1] = 1;
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            ClipboardProtocol.ReadServerCutTextAsync(Reader(message), CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.MalformedClipboard, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ClipboardHeader, exception.Failure?.ReadStage);
+        Assert.Equal((byte)3, exception.Failure?.ServerMessageType);
+        Assert.Null(exception.Failure?.EncodingId);
+        Assert.Null(exception.Failure?.RectangleIndex);
+        Assert.DoesNotContain(secretMarker, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Server_payload_truncation_preserves_eof_kind_and_server_type()
+    {
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            ClipboardProtocol.ReadServerCutTextAsync(
+                Reader([3, 0, 0, 0, 0, 0, 0, 2, (byte)'a']),
+                CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ClipboardPayload, exception.Failure?.ReadStage);
+        Assert.Equal((byte)3, exception.Failure?.ServerMessageType);
     }
 
     [Fact]

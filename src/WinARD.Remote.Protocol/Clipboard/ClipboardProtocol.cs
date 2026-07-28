@@ -79,16 +79,19 @@ public sealed class ClipboardProtocol
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxUtf8Bytes);
         if (message.Length < 8)
         {
-            throw new RfbProtocolException("ClientCutText message is truncated.");
+            throw MalformedClipboard(
+                "ClientCutText message is truncated.",
+                RfbProtocolReadStage.ClipboardHeader);
         }
 
         ValidateHeader(message[..4], expectedType: 6, "ClientCutText");
         var length = BinaryPrimitives.ReadUInt32BigEndian(message[4..8]);
-        var payloadLength = ValidateLength(length, maxUtf8Bytes);
+        var payloadLength = ValidateLength(length, maxUtf8Bytes, RfbProtocolReadStage.ClipboardHeader);
         if (message.Length != payloadLength + 8)
         {
-            throw new RfbProtocolException(
-                $"ClientCutText contains {message.Length - 8} payload bytes; expected {payloadLength}.");
+            throw MalformedClipboard(
+                $"ClientCutText contains {message.Length - 8} payload bytes; expected {payloadLength}.",
+                RfbProtocolReadStage.ClipboardPayload);
         }
 
         return DecodeText(message[8..], maxUtf8Bytes);
@@ -99,14 +102,19 @@ public sealed class ClipboardProtocol
         int maxUtf8Bytes = DefaultMaxUtf8Bytes)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxUtf8Bytes);
-        ValidateLength(checked((uint)payload.Length), maxUtf8Bytes);
+        ValidateLength(checked((uint)payload.Length), maxUtf8Bytes, RfbProtocolReadStage.ClipboardPayload);
         try
         {
             return NormalizeLineEndings(StrictUtf8.GetString(payload));
         }
         catch (DecoderFallbackException exception)
         {
-            throw new RfbProtocolException("Clipboard text is not valid UTF-8.", exception);
+            throw new RfbProtocolException(
+                "Clipboard text is not valid UTF-8.",
+                exception,
+                new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.MalformedClipboard,
+                    RfbProtocolReadStage.ClipboardPayload));
         }
     }
 
@@ -114,40 +122,67 @@ public sealed class ClipboardProtocol
         RfbReader reader,
         CancellationToken cancellationToken,
         int maxUtf8Bytes = DefaultMaxUtf8Bytes) =>
-        ReadMessageAsync(reader, expectedType: 6, "ClientCutText", maxUtf8Bytes, cancellationToken);
+        ReadMessageAsync(
+            reader,
+            expectedType: 6,
+            "ClientCutText",
+            maxUtf8Bytes,
+            serverMessageType: null,
+            cancellationToken);
 
     public static ValueTask<string> ReadServerCutTextAsync(
         RfbReader reader,
         CancellationToken cancellationToken,
         int maxUtf8Bytes = DefaultMaxUtf8Bytes) =>
-        ReadMessageAsync(reader, expectedType: 3, "ServerCutText", maxUtf8Bytes, cancellationToken);
+        ReadMessageAsync(
+            reader,
+            expectedType: 3,
+            "ServerCutText",
+            maxUtf8Bytes,
+            serverMessageType: 3,
+            cancellationToken);
 
     public static ValueTask<string> ReadServerCutTextBodyAsync(
         RfbReader reader,
         CancellationToken cancellationToken,
         int maxUtf8Bytes = DefaultMaxUtf8Bytes) =>
-        ReadMessageBodyAsync(reader, "ServerCutText", maxUtf8Bytes, cancellationToken);
+        ReadMessageBodyAsync(reader, "ServerCutText", maxUtf8Bytes, serverMessageType: 3, cancellationToken);
 
     private static async ValueTask<string> ReadMessageAsync(
         RfbReader reader,
         byte expectedType,
         string messageName,
         int maxUtf8Bytes,
+        byte? serverMessageType,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxUtf8Bytes);
-        var type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        byte type;
+        try
+        {
+            type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RfbProtocolException exception)
+        {
+            throw exception.WithContext(ClipboardContext(
+                RfbProtocolReadStage.ClipboardHeader,
+                serverMessageType));
+        }
+
         if (type != expectedType)
         {
-            throw new RfbProtocolException(
-                $"Expected {messageName} message type {expectedType}, received {type}.");
+            throw MalformedClipboard(
+                $"Expected {messageName} message type {expectedType}, received {type}.",
+                RfbProtocolReadStage.ClipboardHeader,
+                serverMessageType);
         }
 
         return await ReadMessageBodyAsync(
             reader,
             messageName,
             maxUtf8Bytes,
+            serverMessageType,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -155,20 +190,70 @@ public sealed class ClipboardProtocol
         RfbReader reader,
         string messageName,
         int maxUtf8Bytes,
+        byte? serverMessageType,
         CancellationToken cancellationToken)
     {
-        var padding = await reader.ReadBytesAsync(3, cancellationToken).ConfigureAwait(false);
-        if (padding[0] != 0 || padding[1] != 0 || padding[2] != 0)
-        {
-            throw new RfbProtocolException($"{messageName} padding bytes must be zero.");
-        }
-
-        var length = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
-        var payloadLength = ValidateLength(length, maxUtf8Bytes);
-        var payload = await reader.ReadBytesAsync(payloadLength, cancellationToken).ConfigureAwait(false);
+        byte[] padding;
         try
         {
-            return DecodeText(payload, maxUtf8Bytes);
+            padding = await reader.ReadBytesAsync(3, cancellationToken).ConfigureAwait(false);
+        }
+        catch (RfbProtocolException exception)
+        {
+            throw exception.WithContext(ClipboardContext(
+                RfbProtocolReadStage.ClipboardHeader,
+                serverMessageType));
+        }
+
+        if (padding[0] != 0 || padding[1] != 0 || padding[2] != 0)
+        {
+            throw MalformedClipboard(
+                $"{messageName} padding bytes must be zero.",
+                RfbProtocolReadStage.ClipboardHeader,
+                serverMessageType);
+        }
+
+        uint length;
+        try
+        {
+            length = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RfbProtocolException exception)
+        {
+            throw exception.WithContext(ClipboardContext(
+                RfbProtocolReadStage.ClipboardHeader,
+                serverMessageType));
+        }
+
+        var payloadLength = ValidateLength(
+            length,
+            maxUtf8Bytes,
+            RfbProtocolReadStage.ClipboardHeader,
+            serverMessageType);
+        byte[] payload;
+        try
+        {
+            payload = await reader.ReadBytesAsync(payloadLength, cancellationToken).ConfigureAwait(false);
+        }
+        catch (RfbProtocolException exception)
+        {
+            throw exception.WithContext(ClipboardContext(
+                RfbProtocolReadStage.ClipboardPayload,
+                serverMessageType));
+        }
+
+        try
+        {
+            try
+            {
+                return DecodeText(payload, maxUtf8Bytes);
+            }
+            catch (RfbProtocolException exception)
+            {
+                throw exception.WithContext(ClipboardContext(
+                    RfbProtocolReadStage.ClipboardPayload,
+                    serverMessageType));
+            }
         }
         finally
         {
@@ -183,26 +268,46 @@ public sealed class ClipboardProtocol
     {
         if (header[0] != expectedType)
         {
-            throw new RfbProtocolException(
-                $"Expected {messageName} message type {expectedType}, received {header[0]}.");
+            throw MalformedClipboard(
+                $"Expected {messageName} message type {expectedType}, received {header[0]}.",
+                RfbProtocolReadStage.ClipboardHeader);
         }
 
         if (header[1] != 0 || header[2] != 0 || header[3] != 0)
         {
-            throw new RfbProtocolException($"{messageName} padding bytes must be zero.");
+            throw MalformedClipboard(
+                $"{messageName} padding bytes must be zero.",
+                RfbProtocolReadStage.ClipboardHeader);
         }
     }
 
-    private static int ValidateLength(uint length, int maxUtf8Bytes)
+    private static int ValidateLength(
+        uint length,
+        int maxUtf8Bytes,
+        RfbProtocolReadStage readStage,
+        byte? serverMessageType = null)
     {
         if (length > int.MaxValue || length > maxUtf8Bytes)
         {
-            throw new RfbProtocolException(
-                $"Clipboard UTF-8 length {length} exceeds the configured limit of {maxUtf8Bytes} bytes.");
+            throw MalformedClipboard(
+                $"Clipboard UTF-8 length {length} exceeds the configured limit of {maxUtf8Bytes} bytes.",
+                readStage,
+                serverMessageType);
         }
 
         return checked((int)length);
     }
+
+    private static RfbProtocolFailureInfo ClipboardContext(
+        RfbProtocolReadStage readStage,
+        byte? serverMessageType = null) =>
+        new(RfbProtocolFailureKind.MalformedClipboard, readStage, serverMessageType);
+
+    private static RfbProtocolException MalformedClipboard(
+        string message,
+        RfbProtocolReadStage readStage,
+        byte? serverMessageType = null) =>
+        RfbProtocolException.Create(message, ClipboardContext(readStage, serverMessageType));
 
     private static string NormalizeLineEndings(string text) =>
         text.Replace("\r\n", "\n", StringComparison.Ordinal);

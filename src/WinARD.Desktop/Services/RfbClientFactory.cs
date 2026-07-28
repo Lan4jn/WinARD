@@ -117,24 +117,47 @@ internal sealed class RfbClient : IRfbClient
             switch (type)
             {
                 case 0:
-                    return await updates.ApplyBodyAsync(
-                            _stream,
-                            (surface, update) => _snapshotFactory.CreateServerMessage(surface, update),
-                            cancellationToken)
-                        .ConfigureAwait(false);
+                    try
+                    {
+                        return await updates.ApplyBodyAsync(
+                                _stream,
+                                (surface, update) => _snapshotFactory.CreateServerMessage(surface, update),
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (RfbProtocolException exception)
+                    {
+                        throw exception.WithContext(new RfbProtocolFailureInfo(
+                            RfbProtocolFailureKind.MalformedFramebufferUpdate,
+                            ServerMessageType: 0));
+                    }
                 case 2:
                     return new RemoteBellMessage();
                 case 3:
-                    return new RemoteClipboardMessage(
-                        await ClipboardProtocol.ReadServerCutTextBodyAsync(
-                            reader,
-                            cancellationToken).ConfigureAwait(false));
+                    try
+                    {
+                        return new RemoteClipboardMessage(
+                            await ClipboardProtocol.ReadServerCutTextBodyAsync(
+                                reader,
+                                cancellationToken).ConfigureAwait(false));
+                    }
+                    catch (RfbProtocolException exception)
+                    {
+                        throw exception.WithContext(new RfbProtocolFailureInfo(
+                            RfbProtocolFailureKind.MalformedClipboard,
+                            ServerMessageType: 3));
+                    }
                 case var ardControlMessage
                     when handshake.Version == RfbVersion.V3_889 &&
                          ArdServerMessage.IsZeroPayloadControl(ardControlMessage):
                     continue;
                 default:
-                    throw new RfbProtocolException($"Unsupported RFB server message type {type}.");
+                    throw RfbProtocolException.Create(
+                        $"Unsupported RFB server message type {type}.",
+                        new RfbProtocolFailureInfo(
+                            RfbProtocolFailureKind.UnexpectedServerMessage,
+                            RfbProtocolReadStage.ServerMessageType,
+                            type));
             }
         }
     }
