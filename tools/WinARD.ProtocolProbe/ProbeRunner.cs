@@ -36,7 +36,7 @@ public sealed class ProbeRunner
         ISecretMaterial username,
         ISecretMaterial password,
         CancellationToken cancellationToken) =>
-        await RunAsync(
+        await RunRequestAsync(
             host,
             port,
             username,
@@ -51,7 +51,7 @@ public sealed class ProbeRunner
         ISecretMaterial password,
         string? captureFirstFramePath,
         CancellationToken cancellationToken) =>
-        await RunAsync(
+        await RunRequestAsync(
             host,
             port,
             username,
@@ -61,7 +61,7 @@ public sealed class ProbeRunner
                 : new ProbeRequest(ProbeMode.CaptureFirstFrame, captureFirstFramePath),
             cancellationToken);
 
-    public async Task<ProbeResult> RunAsync(
+    public async Task<ProbeResult> RunRequestAsync(
         string host,
         int port,
         ISecretMaterial username,
@@ -75,6 +75,7 @@ public sealed class ProbeRunner
         ArgumentNullException.ThrowIfNull(username);
         ArgumentNullException.ThrowIfNull(password);
         ArgumentNullException.ThrowIfNull(request);
+        ValidateRequest(request);
 
         using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         operationCancellation.CancelAfter(_operationTimeout);
@@ -111,10 +112,10 @@ public sealed class ProbeRunner
                     pointerServer.Width,
                     pointerServer.Height,
                     operationCancellation.Token);
-                return new ProbeResult(
-                    handshake.Version,
-                    handshake.SecurityType,
-                    PointerSmoke: pointerSmoke);
+                return new ProbeResult(handshake.Version, handshake.SecurityType)
+                {
+                    PointerSmoke = pointerSmoke,
+                };
             }
 
             if (request.Mode != ProbeMode.CaptureFirstFrame)
@@ -122,8 +123,7 @@ public sealed class ProbeRunner
                 throw new ArgumentOutOfRangeException(nameof(request));
             }
 
-            var captureFirstFramePath = request.CaptureFirstFramePath;
-            ArgumentException.ThrowIfNullOrWhiteSpace(captureFirstFramePath);
+            var captureFirstFramePath = request.CaptureFirstFramePath!;
             var server = await RfbSessionInitializer.InitializeAsync(
                 stream,
                 ProtocolLimits.Default,
@@ -189,5 +189,35 @@ public sealed class ProbeRunner
             checked((ushort)framebuffer.Width),
             checked((ushort)framebuffer.Height),
             cancellationToken);
+
+    private static void ValidateRequest(ProbeRequest request)
+    {
+        if (!Enum.IsDefined(request.Mode))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(request),
+                request.Mode,
+                "The probe mode is not defined.");
+        }
+
+        if (request.Mode is ProbeMode.Authentication or ProbeMode.PointerSmoke)
+        {
+            if (request.CaptureFirstFramePath is not null)
+            {
+                throw new ArgumentException(
+                    $"{request.Mode} mode must not specify a capture path.",
+                    nameof(request));
+            }
+
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(request.CaptureFirstFramePath))
+        {
+            throw new ArgumentException(
+                "CaptureFirstFrame mode requires a non-blank capture path.",
+                nameof(request));
+        }
+    }
 
 }

@@ -97,6 +97,80 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
+    public async Task Legacy_capture_overload_accepts_null_literal_without_ambiguity()
+    {
+        using var username = SecretMaterial.FromUtf8("legacy-user");
+        using var password = SecretMaterial.FromUtf8("legacy-password");
+        var runner = new ProbeRunner(TimeSpan.FromSeconds(5));
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            runner.RunAsync(
+                " ",
+                5900,
+                username,
+                password,
+                null,
+                CancellationToken.None));
+    }
+
+    [Fact]
+    public void Probe_result_preserves_three_item_deconstruction()
+    {
+        var result = new ProbeResult(RfbVersion.V3_8, RfbSecurityType.AppleRemoteDesktop, null);
+
+        var (version, securityType, capture) = result;
+
+        Assert.Equal(RfbVersion.V3_8, version);
+        Assert.Equal(RfbSecurityType.AppleRemoteDesktop, securityType);
+        Assert.Null(capture);
+    }
+
+    [Theory]
+    [InlineData(ProbeMode.Authentication, "unexpected.bgra")]
+    [InlineData(ProbeMode.PointerSmoke, "unexpected.bgra")]
+    [InlineData(ProbeMode.CaptureFirstFrame, null)]
+    [InlineData(ProbeMode.CaptureFirstFrame, "")]
+    [InlineData(ProbeMode.CaptureFirstFrame, " ")]
+    public async Task Invalid_probe_request_shape_is_rejected_before_connect(
+        ProbeMode mode,
+        string? captureFirstFramePath)
+    {
+        using var username = SecretMaterial.FromUtf8("validation-user");
+        using var password = SecretMaterial.FromUtf8("validation-password");
+        var runner = new ProbeRunner(TimeSpan.FromSeconds(5));
+
+        var exception = await Assert.ThrowsAsync<ArgumentException>(() =>
+            runner.RunRequestAsync(
+                "must-not-resolve.invalid",
+                5900,
+                username,
+                password,
+                new ProbeRequest(mode, captureFirstFramePath),
+                CancellationToken.None));
+
+        Assert.Equal("request", exception.ParamName);
+    }
+
+    [Fact]
+    public async Task Undefined_probe_mode_is_rejected_before_connect()
+    {
+        using var username = SecretMaterial.FromUtf8("validation-user");
+        using var password = SecretMaterial.FromUtf8("validation-password");
+        var runner = new ProbeRunner(TimeSpan.FromSeconds(5));
+
+        var exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            runner.RunRequestAsync(
+                "must-not-resolve.invalid",
+                5900,
+                username,
+                password,
+                new ProbeRequest((ProbeMode)int.MaxValue),
+                CancellationToken.None));
+
+        Assert.Equal("request", exception.ParamName);
+    }
+
+    [Fact]
     public async Task Pointer_smoke_probe_initializes_then_sends_only_buttonless_center_move()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -105,7 +179,7 @@ public sealed class ProtocolProbeTests
         using var username = SecretMaterial.FromUtf8("pointer-user");
         using var password = SecretMaterial.FromUtf8("pointer-password");
 
-        var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+        var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunRequestAsync(
             IPAddress.Loopback.ToString(),
             GetPort(listener),
             username,

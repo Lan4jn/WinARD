@@ -8,6 +8,12 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 public sealed class PointerSmokeProbeTests
 {
     [Fact]
+    public void Pointer_smoke_probe_is_not_public_api()
+    {
+        Assert.False(typeof(PointerSmokeProbe).IsPublic);
+    }
+
+    [Fact]
     public async Task Pointer_smoke_writes_buttonless_move_to_framebuffer_center()
     {
         await using var stream = new MemoryStream();

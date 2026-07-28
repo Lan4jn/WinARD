@@ -6,8 +6,10 @@ namespace WinARD.ProtocolProbe;
 public sealed record ProbeResult(
     RfbVersion Version,
     RfbSecurityType SecurityType,
-    ProbeCapture? Capture = null,
-    ProbePointerSmoke? PointerSmoke = null);
+    ProbeCapture? Capture = null)
+{
+    public ProbePointerSmoke? PointerSmoke { get; init; }
+}
 
 public sealed record ProbePointerSmoke(int Width, int Height, int X, int Y);
 

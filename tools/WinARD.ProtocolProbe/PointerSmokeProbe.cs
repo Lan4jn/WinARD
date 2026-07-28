@@ -3,7 +3,7 @@ using WinARD.Remote.Protocol.IO;
 
 namespace WinARD.ProtocolProbe;
 
-public static class PointerSmokeProbe
+internal static class PointerSmokeProbe
 {
     public static async Task<ProbePointerSmoke> SendAsync(
         Stream stream,

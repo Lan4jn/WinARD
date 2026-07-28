@@ -38,7 +38,7 @@ internal static class Program
                 return 2;
             }
 
-            var result = await new ProbeRunner().RunAsync(
+            var result = await new ProbeRunner().RunRequestAsync(
                 host,
                 port,
                 username,
