@@ -47,9 +47,12 @@ dotnet run --project src/WinARD.Desktop/WinARD.Desktop.csproj -c Release -p:Plat
 
 ```powershell
 dotnet run --project tools/WinARD.ProtocolProbe/WinARD.ProtocolProbe.csproj -- <host> <ard-user> <output.bmp>
+dotnet run --project tools/WinARD.ProtocolProbe/WinARD.ProtocolProbe.csproj -c Release -- --pointer-smoke
 ```
 
 探测器会交互式读取秘密；不要把密码写入命令行、脚本、日志或仓库。
+
+`--pointer-smoke` 只发送一次按钮掩码为 0 的鼠标移动，将指针移动到远程画面中心，不会点击或拖动。运行时应观察 Mac 光标是否移动。输出 `written` 只表示完整 RFB 报文已写入流；RFB 协议不会返回服务端已执行该输入的确认。
 
 ## 连接方式
 
