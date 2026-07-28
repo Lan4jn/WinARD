@@ -2,7 +2,7 @@
 
 日期：2026-07-28
 
-状态：方案 A 已确认，等待书面规格审查
+状态：方案 A 已确认，实现计划已完成
 
 ## 1. 问题与根因
 
@@ -109,7 +109,7 @@ Extended ServerInit 未设置 `sessionSelect` 时，按固定顺序发送：
 3. `SetDisplay(combineAll=1, displayId=0)`；
 4. 现有 `SetPixelFormat`；
 5. 扩展后的 `SetEncodings`；
-6. 尺寸非零时发送首次完整 FramebufferUpdateRequest。
+6. 返回带非零尺寸的初始化结果，由现有会话接收循环发送首次完整 FramebufferUpdateRequest。
 
 `SetMode` 固定为 1。本次不引入观察、共享、独占的 UI 选择，避免把协议修复扩大为产品设置功能。
 
@@ -122,10 +122,14 @@ Extended ServerInit 未设置 `sessionSelect` 时，按固定顺序发送：
 3. 若允许 `ConnectToConsole`，发送 74 字节 SessionCommand，命令为 1；
 4. 若只允许 `RequestConsole`，发送命令 0；
 5. 读取一个或多个 SessionResult；状态 2 或 3 表示等待，状态 0 或 4 表示获准；
-6. 获准后执行与无 Session Select 相同的初始化序列；其他状态明确报“会话选择被拒绝”。
+6. 获准后执行与无 Session Select 相同的初始化序列；其他状态明确报“会话选择被拒绝”；
+7. 如果初始 ServerInit 尺寸为 `0×0`，不发送 FramebufferUpdateRequest；等待服务端主动发送
+   `DisplayInfo`（编码 1101）、`DisplayInfo2`（编码 1105）或标准 `DesktopSize`，取得非零尺寸后再创建
+   帧缓冲区并返回初始化结果，随后由现有接收循环请求完整画面。
 
 本次始终选择当前控制台，不自动创建虚拟显示。所有长度受 `ProtocolLimits` 约束，等待过程服从现有
-连接取消和超时，禁止无限分配或忙循环。
+连接取消和超时，禁止无限分配或忙循环。零尺寸只允许出现在要求 Session Select 的 ARD 会话中；
+其他会话仍按协议错误拒绝。任何路径都禁止发送宽或高为零的刷新请求。
 
 ### 4.3 ARD 控制消息
 
@@ -158,6 +162,8 @@ Extended ServerInit 未设置 `sessionSelect` 时，按固定顺序发送：
 - `RfbSessionInitializer`：根据握手结果选择标准或 ARD 初始化策略。
 - `ArdServerInitParser`：解析并校验扩展字段，不负责写消息。
 - `ArdSessionSelector`：完成控制台 Session Select 状态机。
+- `ArdDisplayBootstrapReader`：在 Session Select 的零尺寸路径中消费有限的初始化控制消息和显示尺寸
+  伪编码，返回首个有效桌面尺寸。
 - `ArdClientMessageWriter`：生成 ViewerInfo、SetMode、SetDisplay 和 SessionCommand。
 - `RfbClient` 与 `ProbeRunner`：只负责传递握手上下文，不各自复制 ARD 逻辑。
 - 正常收包层：消费已知零载荷 ARD 控制消息，现有帧缓冲区和输入写入接口保持不变。
@@ -189,10 +195,13 @@ Select、请求的控制模式和最终会话状态。诊断不得记录用户�
 5. 缺少扩展头或 `mayControl` 时返回对应错误；
 6. ViewerInfo、SetMode、SetDisplay 和 SessionCommand 与固定字节向量完全一致；
 7. Session Select 覆盖直接获准、等待后获准、请求控制台、拒绝、截断和超限长度；
-8. 初始化报文顺序严格为 ViewerInfo、SetMode、SetDisplay、像素格式、编码和首次刷新请求；
-9. Ack 与 NOP 被消费后，下一条 framebuffer 消息仍能正常读取；
-10. `RfbClient` 和 `ProbeRunner` 均把 `V3_889` 上下文传入同一初始化器；
-11. 现有 3.3、3.7、3.8、认证、抓帧、输入和桌面测试无回归。
+8. Session Select 的 `0×0` 路径不发送刷新请求，并能从 DisplayInfo、DisplayInfo2 或 DesktopSize
+   获取首个非零尺寸；
+9. 初始化报文顺序严格为 ViewerInfo、SetMode、SetDisplay、像素格式和编码，首次刷新请求继续由现有
+   会话接收循环发起；
+10. Ack 与 NOP 被消费后，下一条 framebuffer 消息仍能正常读取；
+11. `RfbClient` 和 `ProbeRunner` 均把 `V3_889` 上下文传入同一初始化器；
+12. 现有 3.3、3.7、3.8、认证、抓帧、输入和桌面测试无回归。
 
 完成实现后运行完整解决方案测试、Release/x64 编译和协议探针编译。自动化测试只证明报文字节和
 状态机符合设计，不能代替真实 macOS 26.5 控制验证。
