@@ -8,5 +8,7 @@ public sealed record RfbServerInit(
     int Height,
     PixelFormat PixelFormat,
     string Name,
-    bool IsNameTruncated,
-    ArdServerCapabilities? ArdCapabilities = null);
+    bool IsNameTruncated)
+{
+    public ArdServerCapabilities? ArdCapabilities { get; init; }
+}

@@ -41,5 +41,5 @@ public sealed class ArdExtendedServerInit
 
     public ArdServerCapabilities Capabilities { get; }
 
-    public ReadOnlyMemory<byte> DisplayNameBytes => _displayNameBytes;
+    public ReadOnlyMemory<byte> DisplayNameBytes => _displayNameBytes.ToArray();
 }
