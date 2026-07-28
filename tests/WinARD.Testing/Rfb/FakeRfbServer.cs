@@ -61,12 +61,12 @@ public sealed class FakeRfbServer : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(securityTypes);
         if (banner is not "RFB 003.007\n" and not "RFB 003.008\n" and not "RFB 003.889\n")
         {
-            throw new ArgumentException("The byte security type list overload is only valid for RFB 3.7 or 3.8.", nameof(banner));
+            throw new ArgumentException("The byte security type list overload is only valid for RFB 3.7, 3.8, or Apple 3.889.", nameof(banner));
         }
 
         if (securityTypes.Length is < 1 or > byte.MaxValue)
         {
-            throw new ArgumentOutOfRangeException(nameof(securityTypes), "RFB 3.7 and 3.8 require between one and 255 security types.");
+            throw new ArgumentOutOfRangeException(nameof(securityTypes), "RFB 3.7, 3.8, or Apple 3.889 require between one and 255 security types.");
         }
 
         var securityBytes = new byte[securityTypes.Length + 1];
