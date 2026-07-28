@@ -68,6 +68,24 @@ public sealed record ConnectionErrorViewModel(
                 error,
                 new("重新输入凭据", ConnectionErrorActionKind.ReenterCredentials),
                 export),
+            "ARD_CONTROL_NOT_ALLOWED" => Create(
+                "Mac 未授予控制权限",
+                "当前会话不能控制这台 Mac。可导出脱敏诊断以便排查。",
+                error,
+                export),
+            "ARD_SESSION_COMMAND_UNAVAILABLE" or "ARD_SESSION_DENIED" or "ARD_SESSION_MALFORMED" => Create(
+                "无法进入 Mac 控制台会话",
+                "无法选择 Mac 控制台会话。请重试；如果问题持续，可复制关联 ID 或导出脱敏诊断。",
+                error,
+                new("重试", ConnectionErrorActionKind.Retry),
+                new("复制关联 ID", ConnectionErrorActionKind.CopyCorrelationId),
+                export),
+            "ARD_EXTENDED_INIT_REQUIRED" => Create(
+                "需要完成 ARD 协议协商",
+                "Mac 要求先完成 Apple Remote Desktop 扩展初始化协议协商，当前连接无法继续。可复制关联 ID 或导出脱敏诊断。",
+                error,
+                new("复制关联 ID", ConnectionErrorActionKind.CopyCorrelationId),
+                export),
             "RFB_CONNECTION_REJECTED" => Create(
                 "远程服务拒绝连接",
                 "远程服务在认证前拒绝了连接。请检查服务状态和连接策略后重试。",

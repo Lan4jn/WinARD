@@ -77,6 +77,16 @@ public sealed class ErrorMapper : IErrorMapper
                 ("RFB_CONNECTION_REJECTED", "The server rejected the RFB connection."),
             "WinARD.Remote.Protocol.Errors.ArdAuthenticationRejectedException" =>
                 ("ARD_AUTH_REJECTED", "The Mac rejected the supplied credentials."),
+            "WinARD.Remote.Protocol.Errors.ArdExtendedInitializationRequiredException" =>
+                ("ARD_EXTENDED_INIT_REQUIRED", "The Mac requires Apple Remote Desktop extended initialization before control can begin."),
+            "WinARD.Remote.Protocol.Errors.ArdControlNotAllowedException" =>
+                ("ARD_CONTROL_NOT_ALLOWED", "The Mac did not allow control for this session."),
+            "WinARD.Remote.Protocol.Errors.ArdSessionCommandUnavailableException" =>
+                ("ARD_SESSION_COMMAND_UNAVAILABLE", "The Mac does not support selecting a console session."),
+            "WinARD.Remote.Protocol.Errors.ArdSessionDeniedException" =>
+                ("ARD_SESSION_DENIED", "The Mac denied access to the console session."),
+            "WinARD.Remote.Protocol.Errors.ArdSessionMalformedException" =>
+                ("ARD_SESSION_MALFORMED", "The Mac returned an invalid console session response."),
             "WinARD.Remote.Protocol.Errors.RfbProtocolException" =>
                 ("RFB_PROTOCOL_ERROR", "The server sent an invalid RFB protocol message."),
             _ => ("UNEXPECTED_CONNECTION_ERROR", "The connection failed unexpectedly."),

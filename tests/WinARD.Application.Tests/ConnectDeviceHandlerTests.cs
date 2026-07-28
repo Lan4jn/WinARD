@@ -32,6 +32,11 @@ public sealed class ConnectDeviceHandlerTests
         { new UnsupportedSecurityTypeException(RfbVersion.V3_8, [2]), "RFB_SECURITY_UNSUPPORTED" },
         { new RfbConnectionRejectedException(RfbVersion.V3_8, "secret reason", false), "RFB_CONNECTION_REJECTED" },
         { new ArdAuthenticationRejectedException(1, "secret reason", false), "ARD_AUTH_REJECTED" },
+        { new ArdExtendedInitializationRequiredException(), "ARD_EXTENDED_INIT_REQUIRED" },
+        { new ArdControlNotAllowedException(0xDEADBEEF), "ARD_CONTROL_NOT_ALLOWED" },
+        { new ArdSessionCommandUnavailableException(), "ARD_SESSION_COMMAND_UNAVAILABLE" },
+        { new ArdSessionDeniedException(0xCAFEBABE), "ARD_SESSION_DENIED" },
+        { new ArdSessionMalformedException(), "ARD_SESSION_MALFORMED" },
         { new RfbProtocolException("secret packet"), "RFB_PROTOCOL_ERROR" },
         { new OperationCanceledException("secret cancellation"), "CONNECTION_INTERRUPTED" },
     };
@@ -487,6 +492,27 @@ public sealed class ConnectDeviceHandlerTests
         Assert.DoesNotContain("private.example", error.UserMessage, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(typeof(ArdExtendedInitializationRequiredException), "ARD_EXTENDED_INIT_REQUIRED", "The Mac requires Apple Remote Desktop extended initialization before control can begin.")]
+    [InlineData(typeof(ArdControlNotAllowedException), "ARD_CONTROL_NOT_ALLOWED", "The Mac did not allow control for this session.")]
+    [InlineData(typeof(ArdSessionCommandUnavailableException), "ARD_SESSION_COMMAND_UNAVAILABLE", "The Mac does not support selecting a console session.")]
+    [InlineData(typeof(ArdSessionDeniedException), "ARD_SESSION_DENIED", "The Mac denied access to the console session.")]
+    [InlineData(typeof(ArdSessionMalformedException), "ARD_SESSION_MALFORMED", "The Mac returned an invalid console session response.")]
+    public void Error_mapper_returns_fixed_safe_summary_for_control_negotiation_failures(
+        Type exceptionType,
+        string expectedCode,
+        string expectedMessage)
+    {
+        var exception = CreateControlNegotiationException(exceptionType);
+        var mapper = new ErrorMapper(() => "control-correlation-id");
+
+        var error = mapper.Map(exception, ConnectionStage.Initializing);
+
+        Assert.Equal(expectedCode, error.Code);
+        Assert.Equal(expectedMessage, error.UserMessage);
+        Assert.DoesNotContain(exception.Message, error.UserMessage, StringComparison.Ordinal);
+    }
+
     private static ConnectionProfile CreateProfile() =>
         ConnectionProfile.Create(Guid.NewGuid(), "Office Mac", "mac.local", 5900, "alice");
 
@@ -496,6 +522,19 @@ public sealed class ConnectDeviceHandlerTests
         var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQID");
         return new SshHostKeyUnknownException(SshHostKeyVerifier.Verify(candidate, pin: null));
     }
+
+    private static Exception CreateControlNegotiationException(Type exceptionType) =>
+        exceptionType == typeof(ArdExtendedInitializationRequiredException)
+            ? new ArdExtendedInitializationRequiredException()
+            : exceptionType == typeof(ArdControlNotAllowedException)
+                ? new ArdControlNotAllowedException(0xDEADBEEF)
+                : exceptionType == typeof(ArdSessionCommandUnavailableException)
+                    ? new ArdSessionCommandUnavailableException()
+                    : exceptionType == typeof(ArdSessionDeniedException)
+                        ? new ArdSessionDeniedException(0xCAFEBABE)
+                        : exceptionType == typeof(ArdSessionMalformedException)
+                            ? new ArdSessionMalformedException()
+                            : throw new ArgumentOutOfRangeException(nameof(exceptionType));
 
     private sealed class TestSecretProvider(
         ISecret secret,

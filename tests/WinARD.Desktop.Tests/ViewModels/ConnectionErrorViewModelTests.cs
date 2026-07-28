@@ -93,4 +93,61 @@ public sealed class ConnectionErrorViewModelTests
         Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.Retry);
         Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.CopyCorrelationId);
     }
+
+    [Fact]
+    public void ControlNotAllowedShowsFixedSafeControlPermissionCard()
+    {
+        var error = WinArdError.Create(
+            ConnectionStage.Initializing,
+            "ARD_CONTROL_NOT_ALLOWED",
+            "flags=0xDEADBEEF; private diagnostic",
+            "corr-control");
+
+        var viewModel = ConnectionErrorViewModel.FromError(error);
+
+        Assert.Equal("Mac 未授予控制权限", viewModel.Title);
+        Assert.Equal("当前会话不能控制这台 Mac。可导出脱敏诊断以便排查。", viewModel.Summary);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.ExportDiagnostics);
+        Assert.DoesNotContain(error.UserMessage, viewModel.Summary, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("ARD_SESSION_COMMAND_UNAVAILABLE")]
+    [InlineData("ARD_SESSION_DENIED")]
+    [InlineData("ARD_SESSION_MALFORMED")]
+    public void SessionSelectFailuresShowFixedSafeConsoleSessionCard(string code)
+    {
+        var error = WinArdError.Create(
+            ConnectionStage.Initializing,
+            code,
+            "status=0xCAFEBABE; private diagnostic",
+            "corr-session-select");
+
+        var viewModel = ConnectionErrorViewModel.FromError(error);
+
+        Assert.Equal("无法进入 Mac 控制台会话", viewModel.Title);
+        Assert.Equal("无法选择 Mac 控制台会话。请重试；如果问题持续，可复制关联 ID 或导出脱敏诊断。", viewModel.Summary);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.Retry);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.CopyCorrelationId);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.ExportDiagnostics);
+        Assert.DoesNotContain(error.UserMessage, viewModel.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ExtendedInitializationRequiredShowsFixedSafeProtocolNegotiationCard()
+    {
+        var error = WinArdError.Create(
+            ConnectionStage.Initializing,
+            "ARD_EXTENDED_INIT_REQUIRED",
+            "private protocol state",
+            "corr-extended-init");
+
+        var viewModel = ConnectionErrorViewModel.FromError(error);
+
+        Assert.Equal("需要完成 ARD 协议协商", viewModel.Title);
+        Assert.Equal("Mac 要求先完成 Apple Remote Desktop 扩展初始化协议协商，当前连接无法继续。可复制关联 ID 或导出脱敏诊断。", viewModel.Summary);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.CopyCorrelationId);
+        Assert.Contains(viewModel.Actions, action => action.Kind == ConnectionErrorActionKind.ExportDiagnostics);
+        Assert.DoesNotContain(error.UserMessage, viewModel.Summary, StringComparison.Ordinal);
+    }
 }
