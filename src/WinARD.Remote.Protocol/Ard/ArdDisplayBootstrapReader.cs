@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.IO;
@@ -16,10 +15,6 @@ public static class ArdDisplayBootstrapReader
     private const int MaximumRectanglesPerFramebufferUpdate = 4096;
     private const int FramebufferUpdateHeaderBytes = 4;
     private const int RectangleHeaderBytes = 12;
-    private const int DisplayInfoHeaderBytes = 8;
-    private const int DisplayInfoRecordBytes = 28;
-    private const int DisplayInfo2SizeBytes = 2;
-    private const int SkipBufferBytes = 4096;
 
     public static async Task<ArdDisplaySize> ReadAsync(
         Stream stream,
@@ -108,11 +103,18 @@ public static class ArdDisplayBootstrapReader
                     candidate = new ArdDisplaySize(rectangleWidth, rectangleHeight);
                     break;
                 case RfbEncodingType.ArdDisplayInfo:
-                    candidate = await ReadDisplayInfoAsync(reader, budget, cancellationToken)
+                    candidate = await ArdDisplayMetadataReader.ReadDisplayInfoAsync(
+                            reader,
+                            budget.Reserve,
+                            cancellationToken)
                         .ConfigureAwait(false);
                     break;
                 case RfbEncodingType.ArdDisplayInfo2:
-                    await ReadDisplayInfo2Async(reader, budget, cancellationToken).ConfigureAwait(false);
+                    await ArdDisplayMetadataReader.ReadDisplayInfo2Async(
+                            reader,
+                            budget.Reserve,
+                            cancellationToken)
+                        .ConfigureAwait(false);
                     candidate = new ArdDisplaySize(rectangleWidth, rectangleHeight);
                     break;
                 default:
@@ -126,49 +128,6 @@ public static class ArdDisplayBootstrapReader
         }
 
         return firstNonzeroSize;
-    }
-
-    private static async ValueTask<ArdDisplaySize> ReadDisplayInfoAsync(
-        RfbReader reader,
-        ReadBudget budget,
-        CancellationToken cancellationToken)
-    {
-        budget.Reserve(DisplayInfoHeaderBytes);
-        var width = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-        var height = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-        var displayCount = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-        _ = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-
-        var displayBytes = checked((int)displayCount * DisplayInfoRecordBytes);
-        budget.Reserve(displayBytes);
-        await SkipAsync(reader, displayBytes, cancellationToken).ConfigureAwait(false);
-        return new ArdDisplaySize(width, height);
-    }
-
-    private static async ValueTask ReadDisplayInfo2Async(
-        RfbReader reader,
-        ReadBudget budget,
-        CancellationToken cancellationToken)
-    {
-        budget.Reserve(DisplayInfo2SizeBytes);
-        var payloadSize = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-        budget.Reserve(payloadSize);
-        await SkipAsync(reader, payloadSize, cancellationToken).ConfigureAwait(false);
-    }
-
-    private static async ValueTask SkipAsync(
-        RfbReader reader,
-        int byteCount,
-        CancellationToken cancellationToken)
-    {
-        var remaining = byteCount;
-        while (remaining > 0)
-        {
-            var chunkLength = Math.Min(remaining, SkipBufferBytes);
-            var chunk = await reader.ReadBytesAsync(chunkLength, cancellationToken).ConfigureAwait(false);
-            CryptographicOperations.ZeroMemory(chunk);
-            remaining -= chunkLength;
-        }
     }
 
     private sealed class ReadBudget

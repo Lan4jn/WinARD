@@ -232,6 +232,8 @@ public sealed class ArdSessionSelectorTests
         { SessionInfo(1u << 1, "alice"u8.ToArray(), version: 2), ProtocolLimits.Default },
         { SizedBody(10, new byte[5]), ProtocolLimits.Default },
         { SessionInfo(1u << 1, [0xC3, 0x28]), ProtocolLimits.Default },
+        { SessionInfo(1u << 1, "alice"u8.ToArray(), reserved: 1), ProtocolLimits.Default },
+        { SessionInfo(1u << 1, "alice"u8.ToArray(), terminateUsername: false), ProtocolLimits.Default },
     };
 
     public static TheoryData<byte[], ProtocolLimits> MalformedSessionResults => new()
@@ -244,12 +246,17 @@ public sealed class ArdSessionSelectorTests
 
     private static ProtocolLimits Limits(int maxMessageBytes) => new(maxMessageBytes, 1024);
 
-    private static byte[] SessionInfo(uint allowedCommands, byte[] username, ushort version = 1)
+    private static byte[] SessionInfo(
+        uint allowedCommands,
+        byte[] username,
+        ushort version = 1,
+        uint reserved = 0,
+        bool terminateUsername = true)
     {
-        var body = new byte[10 + username.Length];
+        var body = new byte[10 + username.Length + (terminateUsername ? 1 : 0)];
         BinaryPrimitives.WriteUInt16BigEndian(body, version);
         BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(2), allowedCommands);
-        BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(6), 0);
+        BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(6), reserved);
         username.CopyTo(body, 10);
         return SizedBody(checked((ushort)body.Length), body);
     }

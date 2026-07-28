@@ -100,7 +100,8 @@ public static class FramebufferUpdateReader
                 throw new RfbProtocolException($"Unsupported RFB encoding ID {encodingId}.");
             }
 
-            if (encoding != RfbEncodingType.Cursor && (width == 0 || height == 0))
+            var isArdMetadata = encoding is RfbEncodingType.ArdDisplayInfo or RfbEncodingType.ArdDisplayInfo2;
+            if (encoding != RfbEncodingType.Cursor && !isArdMetadata && (width == 0 || height == 0))
             {
                 throw new RfbProtocolException($"RFB encoding {encodingId} requires non-zero rectangle dimensions.");
             }
@@ -108,9 +109,13 @@ public static class FramebufferUpdateReader
             var previousWidth = framebuffer.Width;
             var previousHeight = framebuffer.Height;
             var previousCursor = framebuffer.Cursor;
-            var rectangle = encoding == RfbEncodingType.Cursor
-                ? FramebufferRect.CreateCursorRectangle(x, y, width, height)
-                : new FramebufferRect(x, y, width, height);
+            var rectangle = encoding switch
+            {
+                RfbEncodingType.Cursor => FramebufferRect.CreateCursorRectangle(x, y, width, height),
+                RfbEncodingType.ArdDisplayInfo or RfbEncodingType.ArdDisplayInfo2 =>
+                    FramebufferRect.CreateMetadataRectangle(x, y, width, height),
+                _ => new FramebufferRect(x, y, width, height),
+            };
             var decodeResult = await decoder.DecodeAsync(reader, framebuffer, rectangle, cancellationToken)
                 .ConfigureAwait(false);
             dirtyRects.AddRange(decodeResult.DirtyRects);
@@ -142,6 +147,8 @@ public static class FramebufferUpdateReader
             new ZrleEncoding(pixelFormat),
             new DesktopSizeEncoding(),
             new CursorEncoding(pixelFormat),
+            new ArdDisplayInfoEncoding(),
+            new ArdDisplayInfo2Encoding(),
         }.ToDictionary(decoder => decoder.EncodingId);
 
     private static Dictionary<int, IRfbEncodingDecoder> CreateOneShotDecoders(PixelFormat pixelFormat) =>
@@ -152,6 +159,8 @@ public static class FramebufferUpdateReader
             new SessionRequiredZrleEncoding(),
             new DesktopSizeEncoding(),
             new CursorEncoding(pixelFormat),
+            new ArdDisplayInfoEncoding(),
+            new ArdDisplayInfo2Encoding(),
         }.ToDictionary(decoder => decoder.EncodingId);
 
     private sealed class SessionRequiredZrleEncoding : IRfbEncodingDecoder

@@ -26,6 +26,9 @@ public readonly record struct FramebufferRect
             ? new FramebufferRect(x, y, width, height, allowEmpty: true)
             : new FramebufferRect(x, y, width, height);
 
+    internal static FramebufferRect CreateMetadataRectangle(int x, int y, int width, int height) =>
+        new(x, y, width, height, allowEmpty: true);
+
     public void ValidateWithin(int framebufferWidth, int framebufferHeight)
     {
         try

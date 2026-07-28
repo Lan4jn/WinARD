@@ -1,6 +1,7 @@
 using WinARD.Application.Ports;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
+using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.IO;
 using WinARD.Remote.Protocol.Encodings;
@@ -449,11 +450,12 @@ public sealed class FramePresentationTests
     {
         var snapshotCopies = 0;
         await using var stream = new ScriptedDuplexStream(
-            [.. ServerInit(2, 1), .. CursorOnlyUpdate()]);
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1), .. CursorOnlyUpdate()]);
         await using var client = new RfbClient(
             stream,
             new FramebufferSnapshotFactory(copyObserver: _ => snapshotCopies++));
 
+        await client.NegotiateAsync(CancellationToken.None);
         await client.InitializeAsync(CancellationToken.None);
         using var message = Assert.IsType<RemoteCursorMessage>(
             await client.ReceiveAsync(CancellationToken.None));
@@ -461,6 +463,33 @@ public sealed class FramePresentationTests
 
         Assert.Equal(0, snapshotCopies);
         Assert.Equal([1, 2, 3, 255], cursor.Bgra32.ToArray());
+    }
+
+    [Fact]
+    public async Task Rfb_client_initialize_before_negotiate_fails_without_io()
+    {
+        await using var stream = new ScriptedDuplexStream([]);
+        await using var client = new RfbClient(stream);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.InitializeAsync(CancellationToken.None));
+
+        Assert.Contains("negotiation", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(stream.WrittenBytes);
+    }
+
+    [Fact]
+    public async Task Rfb_client_routes_889_handshake_to_ARD_initializer()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        Assert.Equal(new RemoteFramebufferSize(2, 1), client.FramebufferSize);
+        Assert.Equal((byte)ArdClientInitFlags.Ard, stream.WrittenBytes[13]);
     }
 
     [Fact]
@@ -520,6 +549,17 @@ public sealed class FramePresentationTests
         return bytes;
     }
 
+    private static byte[] Handshake(string banner) =>
+        [.. System.Text.Encoding.ASCII.GetBytes(banner), 1, 30];
+
+    private static byte[] ArdServerInit(ushort width, ushort height)
+    {
+        byte[] name = [0, 0, 0, 0, 0, 2, .. new byte[16], 0, (byte)'M', (byte)'a', (byte)'c'];
+        var header = ServerInit(width, height);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(20), checked((uint)name.Length));
+        return [.. header, .. name];
+    }
+
     private static byte[] CursorOnlyUpdate()
     {
         var bytes = new byte[22];
@@ -566,6 +606,8 @@ public sealed class FramePresentationTests
     {
         private readonly MemoryStream _input = new(input, writable: false);
         private readonly MemoryStream _output = new();
+
+        public byte[] WrittenBytes => _output.ToArray();
 
         public override bool CanRead => true;
         public override bool CanSeek => false;

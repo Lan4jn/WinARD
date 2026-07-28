@@ -20,13 +20,19 @@ public sealed class DesktopSizeEncoding : IRfbEncodingDecoder
             throw new RfbProtocolException("DesktopSize rectangle origin must be (0,0).");
         }
 
-        var framebufferBytes = PixelConverter.CheckedBgraLength(
-            rectangle.Width,
-            rectangle.Height,
-            framebuffer.Limits);
+        ResizeFramebuffer(reader, framebuffer, rectangle.Width, rectangle.Height);
+        return ValueTask.FromResult(new EncodingDecodeResult([rectangle], []));
+    }
+
+    internal static void ResizeFramebuffer(
+        RfbReader reader,
+        Framebuffer.Framebuffer framebuffer,
+        int width,
+        int height)
+    {
+        var framebufferBytes = PixelConverter.CheckedBgraLength(width, height, framebuffer.Limits);
         reader.ReserveDesktopSizeRectangle();
         reader.ReserveFramebufferUpdateWorkBytes(framebufferBytes);
-        framebuffer.Resize(rectangle.Width, rectangle.Height);
-        return ValueTask.FromResult(new EncodingDecodeResult([rectangle], []));
+        framebuffer.Resize(width, height);
     }
 }

@@ -171,7 +171,7 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
-    public async Task Pointer_smoke_probe_initializes_then_sends_only_buttonless_center_move()
+    public async Task Pointer_smoke_probe_routes_889_initialization_then_sends_only_buttonless_center_move()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -750,8 +750,8 @@ public sealed class ProtocolProbeTests
     {
         using var client = await listener.AcceptTcpClientAsync();
         await using var stream = client.GetStream();
-        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
-        Assert.Equal(Encoding.ASCII.GetBytes("RFB 003.008\n"), await ReadExactlyAsync(stream, 12));
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.889\n"));
+        Assert.Equal(Encoding.ASCII.GetBytes("RFB 003.889\n"), await ReadExactlyAsync(stream, 12));
         await stream.WriteAsync(new byte[] { 1, (byte)RfbSecurityType.AppleRemoteDesktop });
         Assert.Equal(new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop }, await ReadExactlyAsync(stream, 1));
 
@@ -763,15 +763,21 @@ public sealed class ProtocolProbeTests
         _ = await ReadExactlyAsync(stream, 128 + 64);
         await stream.WriteAsync(new byte[4]);
 
-        Assert.Equal(new byte[] { 1 }, await ReadExactlyAsync(stream, 1));
+        Assert.Equal(new byte[] { 0xC1 }, await ReadExactlyAsync(stream, 1));
         var serverInit = new List<byte>();
         AddUInt16(serverInit, 4);
         AddUInt16(serverInit, 2);
         serverInit.AddRange(PixelFormat.WinArdBgra32.ToWireBytes());
-        AddUInt32(serverInit, 3);
-        serverInit.AddRange(Encoding.UTF8.GetBytes("Mac"));
+        var extendedName = new byte[26];
+        extendedName[5] = 2;
+        Encoding.UTF8.GetBytes("Mac").CopyTo(extendedName, 23);
+        AddUInt32(serverInit, checked((uint)extendedName.Length));
+        serverInit.AddRange(extendedName);
         await stream.WriteAsync(serverInit.ToArray());
 
+        Assert.Equal(0x21, (await ReadExactlyAsync(stream, 66))[0]);
+        Assert.Equal(new byte[] { 0x0A, 0, 0, 1 }, await ReadExactlyAsync(stream, 4));
+        Assert.Equal(new byte[] { 0x0D, 1, 0, 0, 0, 0, 0, 0 }, await ReadExactlyAsync(stream, 8));
         var declarationHeader = await ReadExactlyAsync(stream, 24);
         Assert.Equal((byte)0, declarationHeader[0]);
         Assert.Equal((byte)2, declarationHeader[20]);

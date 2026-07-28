@@ -64,7 +64,7 @@ public static class ArdSessionSelector
         try
         {
             var bodySize = await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false);
-            ValidateBodySize(bodySize, 10, limits);
+            ValidateBodySize(bodySize, 11, limits);
             var body = await reader.ReadBytesAsync(bodySize, cancellationToken).ConfigureAwait(false);
             return ParseSessionInfo(body);
         }
@@ -99,13 +99,20 @@ public static class ArdSessionSelector
             throw new ArdSessionMalformedException();
         }
 
+        if (BinaryPrimitives.ReadUInt32BigEndian(body[6..]) != 0)
+        {
+            throw new ArdSessionMalformedException();
+        }
+
         var allowedCommands = BinaryPrimitives.ReadUInt32BigEndian(body[2..]);
         var usernameBytes = body[10..];
         var nulIndex = usernameBytes.IndexOf((byte)0);
-        if (nulIndex >= 0)
+        if (nulIndex < 0)
         {
-            usernameBytes = usernameBytes[..nulIndex];
+            throw new ArdSessionMalformedException();
         }
+
+        usernameBytes = usernameBytes[..nulIndex];
 
         try
         {

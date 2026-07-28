@@ -621,6 +621,124 @@ public sealed class FramebufferUpdateTests
     }
 
     [Fact]
+    public async Task Session_consumes_late_ARD_display_metadata_updates_then_continues_with_raw()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32);
+        await using var stream = new MemoryStream(
+            [
+                .. Update(ArdDisplayInfo(0, 0, 2, 1, displayCount: 0)),
+                .. Update(ArdDisplayInfo2(3, 1, [0xAA, 0xBB])),
+                .. Update(Raw(0, 0, 3, 1, [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])),
+            ]);
+
+        var displayInfo = await session.ApplyAsync(stream, CancellationToken.None);
+        var displayInfo2 = await session.ApplyAsync(stream, CancellationToken.None);
+        var raw = await session.ApplyAsync(stream, CancellationToken.None);
+
+        Assert.True(displayInfo.DesktopResized);
+        Assert.True(displayInfo2.DesktopResized);
+        Assert.Empty(displayInfo.DirtyRects);
+        Assert.Empty(displayInfo2.DirtyRects);
+        Assert.False(raw.DesktopResized);
+        Assert.Equal(new FramebufferRect(0, 0, 3, 1), Assert.Single(raw.DirtyRects));
+        Assert.Equal(3u, framebuffer.GetBgra32(2, 0) & 0xFF);
+        Assert.Equal(stream.Length, stream.Position);
+    }
+
+    [Fact]
+    public async Task Same_update_applies_ARD_metadata_resize_before_following_raw_rectangle()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var message = Update(
+            ArdDisplayInfo(0, 0, 2, 1, displayCount: 1, recordFill: 0xA5),
+            Raw(0, 0, 2, 1, [4, 0, 0, 0, 5, 0, 0, 0]));
+
+        var result = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(message),
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            CancellationToken.None);
+
+        Assert.True(result.DesktopResized);
+        Assert.Equal(new FramebufferRect(0, 0, 2, 1), Assert.Single(result.DirtyRects));
+        Assert.Equal(new FramebufferRect(0, 0, 2, 1), Assert.Single(result.PixelContentRects));
+        Assert.Equal(5u, framebuffer.GetBgra32(1, 0) & 0xFF);
+    }
+
+    [Theory]
+    [InlineData(RfbEncodingType.ArdDisplayInfo)]
+    [InlineData(RfbEncodingType.ArdDisplayInfo2)]
+    public async Task Same_size_ARD_metadata_preserves_pixels_before_following_partial_raw(
+        RfbEncodingType encoding)
+    {
+        using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32);
+        var metadata = encoding == RfbEncodingType.ArdDisplayInfo
+            ? ArdDisplayInfo(0, 0, 2, 1, displayCount: 0)
+            : ArdDisplayInfo2(2, 1, [0xAA]);
+        await using var stream = new MemoryStream(
+            [
+                .. Update(Raw(0, 0, 2, 1, [1, 0, 0, 0, 2, 0, 0, 0])),
+                .. Update(metadata),
+                .. Update(Raw(0, 0, 1, 1, [3, 0, 0, 0])),
+            ]);
+
+        _ = await session.ApplyAsync(stream, CancellationToken.None);
+        var metadataResult = await session.ApplyAsync(stream, CancellationToken.None);
+
+        Assert.False(metadataResult.DesktopResized);
+        Assert.Empty(metadataResult.DirtyRects);
+        Assert.Equal(1u, framebuffer.GetBgra32(0, 0) & 0xFF);
+        Assert.Equal(2u, framebuffer.GetBgra32(1, 0) & 0xFF);
+
+        _ = await session.ApplyAsync(stream, CancellationToken.None);
+
+        Assert.Equal(3u, framebuffer.GetBgra32(0, 0) & 0xFF);
+        Assert.Equal(2u, framebuffer.GetBgra32(1, 0) & 0xFF);
+    }
+
+    [Fact]
+    public async Task ARD_display_info_payload_over_update_budget_is_rejected_before_records()
+    {
+        var limits = new ProtocolLimits(64, 64, 16);
+        using var framebuffer = new FramebufferModel(1, 1, limits);
+        var message = Update(ArdDisplayInfo(0, 0, 2, 1, displayCount: 1, recordFill: 0x5A));
+        await using var stream = new MemoryStream(message);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(
+                stream,
+                framebuffer,
+                PixelFormat.WinArdBgra32,
+                CancellationToken.None));
+
+        Assert.Contains("36", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(24, stream.Position);
+        Assert.Equal((1, 1), (framebuffer.Width, framebuffer.Height));
+    }
+
+    [Fact]
+    public async Task Truncated_ARD_display_info_two_payload_is_protocol_failure()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var rectangle = new List<byte>(Header(0, 0, 2, 1, RfbEncodingType.ArdDisplayInfo2));
+        AddUInt16(rectangle, 4);
+        rectangle.AddRange([0xDE, 0xAD]);
+        await using var stream = new MemoryStream(Update(rectangle.ToArray()));
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(
+                stream,
+                framebuffer,
+                PixelFormat.WinArdBgra32,
+                CancellationToken.None));
+
+        Assert.Contains("Unexpected end", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(stream.Length, stream.Position);
+    }
+
+    [Fact]
     public async Task Unknown_encoding_reports_signed_id()
     {
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
@@ -830,6 +948,36 @@ public sealed class FramebufferUpdateTests
 
     private static byte[] Raw(ushort x, ushort y, ushort width, ushort height, byte[] pixels) =>
         [.. Header(x, y, width, height, RfbEncodingType.Raw), .. pixels];
+
+    private static byte[] ArdDisplayInfo(
+        ushort rectangleWidth,
+        ushort rectangleHeight,
+        ushort width,
+        ushort height,
+        ushort displayCount,
+        byte recordFill = 0)
+    {
+        var bytes = new List<byte>(Header(
+            0,
+            0,
+            rectangleWidth,
+            rectangleHeight,
+            RfbEncodingType.ArdDisplayInfo));
+        AddUInt16(bytes, width);
+        AddUInt16(bytes, height);
+        AddUInt16(bytes, displayCount);
+        AddUInt16(bytes, 0);
+        bytes.AddRange(Enumerable.Repeat(recordFill, checked(displayCount * 28)));
+        return bytes.ToArray();
+    }
+
+    private static byte[] ArdDisplayInfo2(ushort width, ushort height, byte[] payload)
+    {
+        var bytes = new List<byte>(Header(0, 0, width, height, RfbEncodingType.ArdDisplayInfo2));
+        AddUInt16(bytes, checked((ushort)payload.Length));
+        bytes.AddRange(payload);
+        return bytes.ToArray();
+    }
 
     private static byte[] CopyRect(ushort x, ushort y, ushort width, ushort height, ushort sourceX, ushort sourceY)
     {

@@ -22,25 +22,15 @@ public static class RfbSessionInitializer
     ];
     private static readonly int[] ArdBootstrapRequestedEncodings =
     [
-        .. RequestedEncodings,
         (int)RfbEncodingType.ArdDisplayInfo,
         (int)RfbEncodingType.ArdDisplayInfo2,
+        (int)RfbEncodingType.DesktopSize,
     ];
 
     /// <summary>
     /// Sends ClientInit, consumes ServerInit, and declares WinARD's pixel format and encodings.
     /// The write-through stream is neither flushed nor disposed.
     /// </summary>
-    public static Task<RfbServerInit> InitializeAsync(
-        Stream stream,
-        ProtocolLimits limits,
-        CancellationToken cancellationToken) =>
-        InitializeAsync(
-            stream,
-            new RfbHandshakeResult(RfbVersion.V3_8, RfbSecurityType.AppleRemoteDesktop),
-            limits,
-            cancellationToken);
-
     public static async Task<RfbServerInit> InitializeAsync(
         Stream stream,
         RfbHandshakeResult handshake,

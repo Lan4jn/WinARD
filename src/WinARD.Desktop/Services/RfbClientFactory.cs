@@ -66,8 +66,10 @@ internal sealed class RfbClient : IRfbClient
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        var handshake = _handshake ?? throw new InvalidOperationException("RFB negotiation has not completed.");
         _serverInit = await RfbSessionInitializer.InitializeAsync(
             _stream,
+            handshake,
             ProtocolLimits.Default,
             cancellationToken).ConfigureAwait(false);
         _framebuffer = new Framebuffer(

@@ -105,6 +105,7 @@ public sealed class ProbeRunner
             {
                 var pointerServer = await RfbSessionInitializer.InitializeAsync(
                     stream,
+                    handshake,
                     ProtocolLimits.Default,
                     operationCancellation.Token);
                 var pointerSmoke = await PointerSmokeProbe.SendAsync(
@@ -126,6 +127,7 @@ public sealed class ProbeRunner
             var captureFirstFramePath = request.CaptureFirstFramePath!;
             var server = await RfbSessionInitializer.InitializeAsync(
                 stream,
+                handshake,
                 ProtocolLimits.Default,
                 operationCancellation.Token);
             using var framebuffer = new Framebuffer(server.Width, server.Height, ProtocolLimits.Default);
