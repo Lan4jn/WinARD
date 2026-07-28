@@ -3,20 +3,23 @@ namespace WinARD.Remote.Protocol.Errors;
 public sealed class RfbProtocolException : Exception
 {
     public RfbProtocolException(string message)
-        : base(RequireMessage(message))
+        : base(message)
     {
     }
 
     public RfbProtocolException(string message, Exception innerException)
-        : base(RequireMessage(message), RequireInnerException(innerException))
+        : base(message, innerException)
     {
     }
 
-    public RfbProtocolException(string message, RfbProtocolFailureInfo failure)
+    private RfbProtocolException(string message, RfbProtocolFailureInfo failure)
         : base(RequireMessage(message))
     {
         Failure = RequireFailure(failure);
     }
+
+    public static RfbProtocolException Create(string message, RfbProtocolFailureInfo failure) =>
+        new(message, failure);
 
     internal RfbProtocolException(
         string message,

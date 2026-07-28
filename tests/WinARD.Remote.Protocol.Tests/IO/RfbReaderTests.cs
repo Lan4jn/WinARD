@@ -168,6 +168,19 @@ public sealed class RfbReaderTests
     }
 
     [Fact]
+    public async Task ReadBytes_propagates_io_exception_without_protocol_wrapping()
+    {
+        var ioException = new IOException("read failed");
+        var reader = new RfbReader(new IOExceptionOnReadStream(ioException), ProtocolLimits.Default);
+
+        var thrown = await Assert.ThrowsAsync<IOException>(() =>
+            reader.ReadBytesAsync(1, CancellationToken.None).AsTask());
+
+        Assert.Same(ioException, thrown);
+        Assert.IsNotType<RfbProtocolException>(thrown);
+    }
+
+    [Fact]
     public async Task ReadBytes_zeroes_partially_filled_buffer_before_propagating_cancellation()
     {
         var echoedSecret = Encoding.UTF8.GetBytes("cancelled-failure-secret");
@@ -334,6 +347,22 @@ public sealed class RfbReaderTests
             ReadAttempted = true;
             throw new InvalidOperationException("The stream must not be read.");
         }
+    }
+
+    private sealed class IOExceptionOnReadStream(IOException exception) : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => throw new NotSupportedException();
+        public override int Read(byte[] buffer, int offset, int count) => throw exception;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            ValueTask.FromException<int>(exception);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private sealed class CapturingPartialReadStream : Stream

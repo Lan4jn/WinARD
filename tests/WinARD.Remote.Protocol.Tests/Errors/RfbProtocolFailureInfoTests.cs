@@ -74,7 +74,7 @@ public sealed class RfbProtocolFailureInfoTests
             null,
             null,
             null);
-        var exception = new RfbProtocolException("failure", failure);
+        var exception = RfbProtocolException.Create("failure", failure);
         var context = new RfbProtocolFailureInfo(
             RfbProtocolFailureKind.MalformedFramebufferUpdate,
             RfbProtocolReadStage.FramebufferRectanglePayload,
@@ -112,16 +112,24 @@ public sealed class RfbProtocolFailureInfoTests
     }
 
     [Fact]
-    public void Exception_api_rejects_null_arguments()
+    public void Existing_constructors_preserve_null_argument_behavior()
+    {
+        var messageOnly = new RfbProtocolException(null!);
+        var nullInner = new RfbProtocolException("message", (Exception)null!);
+
+        Assert.NotNull(messageOnly);
+        Assert.Null(messageOnly.InnerException);
+        Assert.Null(nullInner.InnerException);
+    }
+
+    [Fact]
+    public void Structured_failure_api_rejects_null_arguments()
     {
         var failure = new RfbProtocolFailureInfo(RfbProtocolFailureKind.DecoderFailure, null, null, null, null);
         var inner = new InvalidOperationException();
 
-        Assert.Throws<ArgumentNullException>(() => new RfbProtocolException(null!));
-        Assert.Throws<ArgumentNullException>(() => new RfbProtocolException(null!, inner));
-        Assert.Throws<ArgumentNullException>(() => new RfbProtocolException("message", (Exception)null!));
-        Assert.Throws<ArgumentNullException>(() => new RfbProtocolException(null!, failure));
-        Assert.Throws<ArgumentNullException>(() => new RfbProtocolException("message", (RfbProtocolFailureInfo)null!));
+        Assert.Throws<ArgumentNullException>(() => RfbProtocolException.Create(null!, failure));
+        Assert.Throws<ArgumentNullException>(() => RfbProtocolException.Create("message", null!));
         Assert.Throws<ArgumentNullException>(() => new RfbProtocolException("message", inner, null!));
         Assert.Throws<ArgumentNullException>(() => new RfbProtocolException("message", null!, failure));
         Assert.Throws<ArgumentNullException>(() => new RfbProtocolException(null!, inner, failure));
