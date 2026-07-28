@@ -1,0 +1,94 @@
+using System.Buffers.Binary;
+using System.Text;
+using WinARD.Remote.Protocol.IO;
+
+namespace WinARD.Remote.Protocol.Ard;
+
+public sealed class ArdClientMessageWriter
+{
+    private const int ViewerInfoLength = 66;
+    private const int SessionCommandLength = 74;
+    private const int SessionCommandUsernameOffset = 10;
+    private const int SessionCommandUsernameLength = 63;
+
+    private readonly RfbWriter _writer;
+
+    public ArdClientMessageWriter(RfbWriter writer)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        _writer = writer;
+    }
+
+    public ValueTask WriteViewerInfoAsync(CancellationToken cancellationToken)
+    {
+        var message = new byte[ViewerInfoLength];
+        message[0] = ArdProtocolConstants.ViewerInfo;
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(2), 62);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(4), 1);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(6), 2);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(10), 6);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(14), 1);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(18), 0);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(22), 15);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(26), 0);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(30), 0);
+        message[34] = 0xB0;
+        message[36] = 0x0C;
+        message[37] = 0x03;
+        message[38] = 0x90;
+        message[44] = 0x40;
+        return _writer.WriteMessageAsync(message, cancellationToken);
+    }
+
+    public ValueTask WriteSetModeAsync(ArdControlMode mode, CancellationToken cancellationToken)
+    {
+        if (mode is not ArdControlMode.Observe and not ArdControlMode.Shared and not ArdControlMode.Exclusive)
+        {
+            throw new ArgumentOutOfRangeException(nameof(mode));
+        }
+
+        return _writer.WriteMessageAsync(
+            new byte[] { ArdProtocolConstants.SetMode, 0, 0, (byte)mode },
+            cancellationToken);
+    }
+
+    public ValueTask WriteSetDisplayAsync(CancellationToken cancellationToken) =>
+        _writer.WriteMessageAsync(
+            new byte[] { ArdProtocolConstants.SetDisplay, 1, 0, 0, 0, 0, 0, 0 },
+            cancellationToken);
+
+    public ValueTask WriteSessionCommandAsync(
+        byte command,
+        string username,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(username);
+        if (command > 2)
+        {
+            throw new ArgumentOutOfRangeException(nameof(command));
+        }
+
+        var message = new byte[SessionCommandLength];
+        BinaryPrimitives.WriteUInt16BigEndian(message, 72);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(2), 1);
+        message[8] = command;
+        WriteUsername(message.AsSpan(SessionCommandUsernameOffset, SessionCommandUsernameLength), username);
+        return _writer.WriteMessageAsync(message, cancellationToken);
+    }
+
+    private static void WriteUsername(Span<byte> destination, string username)
+    {
+        var bytesWritten = 0;
+        foreach (var rune in username.EnumerateRunes())
+        {
+            var encodedLength = rune.Utf8SequenceLength;
+            if (bytesWritten + encodedLength > destination.Length)
+            {
+                break;
+            }
+
+            rune.EncodeToUtf8(destination[bytesWritten..]);
+            bytesWritten += encodedLength;
+        }
+    }
+}
