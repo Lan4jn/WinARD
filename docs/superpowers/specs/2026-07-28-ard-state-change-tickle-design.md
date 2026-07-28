@@ -111,11 +111,13 @@ Tickle 响应字段：
 4. 有界跳过 `size - 4` 字节。
 5. 返回结构化结果。
 
-截断、非法长度和超过预算必须抛出 `RfbProtocolException`，并由调用方补充：
+非法长度和超过预算必须抛出 `RfbProtocolException`，并使用：
 
 - `ProtocolFailureKind=MalformedArdStateChange`，追加到现有枚举末尾；
 - `ProtocolReadStage=ArdStateChangeHeader` 或 `ArdStateChangePayload`，追加到现有枚举末尾；
 - `ServerMessageType=0x14`。
+
+截断继续保留底层 `ProtocolFailureKind=TruncatedRead`，只补充对应的 ARD StateChange 读取阶段和 `ServerMessageType=0x14`，遵循现有失败上下文“保留内层根因、只填充缺失字段”的规则。
 
 ### ArdClientMessageWriter
 
@@ -147,7 +149,7 @@ Tickle 响应字段：
 - payload 超过配置的消息预算：在分配或跳过前失败。
 - 未知 `status`：不是协议结构错误；完整消费并继续。
 - 非 `003.889` 会话中的 `0x14`：仍按未知顶层服务端消息处理。
-- Tickle 响应写入失败：保留原始 I/O 异常；顶层中断诊断额外写入 `ArdStateChangeStatus=4` 和 `ArdStateChangeAction=AutoFBUpdateFailed`，不把写失败误标为读取失败。
+- Tickle 响应写入失败：先写入独立的安全诊断事件 `ARD_STATE_CHANGE`，字段包含 `Status=4` 和 `Action=AutoFBUpdateFailed`，然后保留原始 I/O 异常交给现有顶层中断诊断；不把写失败误标为读取失败。
 - 取消：遵循现有取消语义，不包装为协议失败。
 
 ## 并发与生命周期
