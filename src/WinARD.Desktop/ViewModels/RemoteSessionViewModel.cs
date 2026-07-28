@@ -15,6 +15,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 {
     // Bound diagnostics work for malformed or adversarial exception graphs.
     private const int MaxProtocolFailureExceptionNodes = 256;
+    private const int MaxProtocolFailureExceptionEdgeInspections =
+        MaxProtocolFailureExceptionNodes * 2;
     private readonly object _sync = new();
     private readonly IRemoteSessionRuntime _session;
     private readonly IAsyncDisposable _ownership;
@@ -359,33 +361,58 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         }
 
         var pending = new Stack<Exception>();
-        var visited = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
+        var scheduled = new HashSet<Exception>(ReferenceEqualityComparer.Instance)
+        {
+            exception,
+        };
         pending.Push(exception);
-        var visitedCount = 0;
-        while (pending.Count > 0 && visitedCount < MaxProtocolFailureExceptionNodes)
+        var inspectedEdges = 0;
+        while (pending.Count > 0)
         {
             var current = pending.Pop();
-            if (!visited.Add(current))
-            {
-                continue;
-            }
-
-            visitedCount++;
             if (current is RfbProtocolException { Failure: not null } protocolException)
             {
                 return protocolException;
             }
 
+            if (scheduled.Count >= MaxProtocolFailureExceptionNodes ||
+                inspectedEdges >= MaxProtocolFailureExceptionEdgeInspections)
+            {
+                continue;
+            }
+
             if (current is AggregateException aggregateException)
             {
-                for (var index = aggregateException.InnerExceptions.Count - 1; index >= 0; index--)
+                var remainingNodes = MaxProtocolFailureExceptionNodes - scheduled.Count;
+                var children = new List<Exception>(Math.Min(
+                    remainingNodes,
+                    aggregateException.InnerExceptions.Count));
+                for (var index = 0;
+                     index < aggregateException.InnerExceptions.Count &&
+                     inspectedEdges < MaxProtocolFailureExceptionEdgeInspections &&
+                     scheduled.Count < MaxProtocolFailureExceptionNodes;
+                     index++)
                 {
-                    pending.Push(aggregateException.InnerExceptions[index]);
+                    inspectedEdges++;
+                    var child = aggregateException.InnerExceptions[index];
+                    if (scheduled.Add(child))
+                    {
+                        children.Add(child);
+                    }
+                }
+
+                for (var index = children.Count - 1; index >= 0; index--)
+                {
+                    pending.Push(children[index]);
                 }
             }
             else if (current.InnerException is { } innerException)
             {
-                pending.Push(innerException);
+                inspectedEdges++;
+                if (scheduled.Add(innerException))
+                {
+                    pending.Push(innerException);
+                }
             }
         }
 

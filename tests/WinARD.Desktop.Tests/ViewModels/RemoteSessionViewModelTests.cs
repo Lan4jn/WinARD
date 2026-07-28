@@ -347,6 +347,72 @@ public sealed class RemoteSessionViewModelTests
     }
 
     [Fact]
+    public async Task Receive_failure_wide_aggregate_does_not_find_failure_beyond_node_budget()
+    {
+        var children = new Exception[10_000];
+        for (var index = 0; index < children.Length - 1; index++)
+        {
+            children[index] = new IOException($"branch-{index}");
+        }
+
+        children[^1] = RfbProtocolException.Create(
+            "too wide",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.DecoderFailure));
+        var diagnostic = await RecordReceiveFailureAsync(new AggregateException(children));
+
+        Assert.Empty(diagnostic.Fields ?? []);
+    }
+
+    [Fact]
+    public async Task Receive_failure_wide_aggregate_finds_first_child_failure()
+    {
+        var children = new Exception[10_000];
+        children[0] = RfbProtocolException.Create(
+            "first child",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.UnsupportedEncoding));
+        for (var index = 1; index < children.Length; index++)
+        {
+            children[index] = new IOException($"branch-{index}");
+        }
+
+        var diagnostic = await RecordReceiveFailureAsync(new AggregateException(children));
+
+        var field = Assert.Single(diagnostic.Fields!);
+        Assert.Equal("ProtocolFailureKind", field.Name);
+        Assert.Equal("UnsupportedEncoding", field.Value);
+    }
+
+    [Fact]
+    public async Task Receive_failure_repeated_references_do_not_consume_unique_node_budget()
+    {
+        var shared = new IOException("shared");
+        var children = new Exception[501];
+        Array.Fill(children, shared, 0, 500);
+        children[^1] = RfbProtocolException.Create(
+            "after repeated references",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.MalformedClipboard));
+        var diagnostic = await RecordReceiveFailureAsync(new AggregateException(children));
+
+        var field = Assert.Single(diagnostic.Fields!);
+        Assert.Equal("ProtocolFailureKind", field.Name);
+        Assert.Equal("MalformedClipboard", field.Value);
+    }
+
+    [Fact]
+    public async Task Receive_failure_does_not_inspect_unbounded_repeated_aggregate_edges()
+    {
+        var shared = new IOException("shared");
+        var children = new Exception[10_000];
+        Array.Fill(children, shared, 0, children.Length - 1);
+        children[^1] = RfbProtocolException.Create(
+            "beyond edge budget",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.DecoderFailure));
+        var diagnostic = await RecordReceiveFailureAsync(new AggregateException(children));
+
+        Assert.Empty(diagnostic.Fields ?? []);
+    }
+
+    [Fact]
     public async Task ThrowingDiagnosticSinkCannotSuppressTerminalErrorOrOwnershipRelease()
     {
         var lifetime = new TrackingLifetime();
