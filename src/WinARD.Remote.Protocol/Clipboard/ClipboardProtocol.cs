@@ -165,9 +165,7 @@ public sealed class ClipboardProtocol
         }
         catch (RfbProtocolException exception)
         {
-            throw exception.WithContext(ClipboardContext(
-                RfbProtocolReadStage.ClipboardHeader,
-                serverMessageType));
+            throw exception.WithContext(ClipboardContext(RfbProtocolReadStage.ClipboardHeader));
         }
 
         if (type != expectedType)
@@ -175,7 +173,7 @@ public sealed class ClipboardProtocol
             throw MalformedClipboard(
                 $"Expected {messageName} message type {expectedType}, received {type}.",
                 RfbProtocolReadStage.ClipboardHeader,
-                serverMessageType);
+                serverMessageType is null ? null : type);
         }
 
         return await ReadMessageBodyAsync(

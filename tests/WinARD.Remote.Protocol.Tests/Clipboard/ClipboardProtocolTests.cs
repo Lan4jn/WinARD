@@ -136,6 +136,28 @@ public sealed class ClipboardProtocolTests
     }
 
     [Fact]
+    public async Task Server_reader_type_eof_has_header_stage_without_inventing_type()
+    {
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            ClipboardProtocol.ReadServerCutTextAsync(Reader([]), CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ClipboardHeader, exception.Failure?.ReadStage);
+        Assert.Null(exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
+    public async Task Server_reader_type_mismatch_reports_actual_type()
+    {
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            ClipboardProtocol.ReadServerCutTextAsync(Reader([0x08]), CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.MalformedClipboard, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ClipboardHeader, exception.Failure?.ReadStage);
+        Assert.Equal((byte)0x08, exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
     public async Task Async_reader_rejects_malicious_length_before_payload_read()
     {
         var message = new byte[10];

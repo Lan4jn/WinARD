@@ -92,7 +92,28 @@ public sealed class RfbProtocolFailureInfoTests
                 16,
                 4),
             wrapped.Failure);
+        Assert.NotSame(exception, wrapped);
         Assert.Same(exception, wrapped.InnerException);
+    }
+
+    [Fact]
+    public void WithContext_returns_same_exception_when_context_adds_no_fields()
+    {
+        var failure = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.MalformedClipboard,
+            RfbProtocolReadStage.ClipboardPayload,
+            3);
+        var exception = RfbProtocolException.Create("failure", failure);
+        var redundantContext = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.DecoderFailure,
+            RfbProtocolReadStage.ClipboardHeader,
+            3);
+
+        var result = exception.WithContext(redundantContext);
+
+        Assert.Same(exception, result);
+        Assert.Same(failure, result.Failure);
+        Assert.Null(result.InnerException);
     }
 
     [Fact]

@@ -36,10 +36,21 @@ public sealed class RfbProtocolException : Exception
     {
         ArgumentNullException.ThrowIfNull(context);
 
+        if (Failure is not null)
+        {
+            var mergedFailure = Failure.FillMissingFrom(context);
+            if (mergedFailure == Failure)
+            {
+                return this;
+            }
+
+            return new RfbProtocolException(Message, this, mergedFailure);
+        }
+
         return new RfbProtocolException(
             Message,
             this,
-            Failure?.FillMissingFrom(context) ?? context);
+            context);
     }
 
     private static string RequireMessage(string message)

@@ -870,6 +870,20 @@ public sealed class FramebufferUpdateTests
     }
 
     [Fact]
+    public async Task Update_message_type_eof_reports_server_message_stage_without_type()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(
+                new MemoryStream(), framebuffer, PixelFormat.WinArdBgra32, CancellationToken.None));
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ServerMessageType, exception.Failure?.ReadStage);
+        Assert.Null(exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
     public async Task Pending_update_read_propagates_cancellation()
     {
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);

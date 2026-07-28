@@ -48,7 +48,18 @@ public static class FramebufferUpdateReader
         cancellationToken.ThrowIfCancellationRequested();
 
         var reader = new RfbReader(stream, framebuffer.Limits);
-        var messageType = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        byte messageType;
+        try
+        {
+            messageType = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RfbProtocolException exception)
+        {
+            throw exception.WithContext(new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.UnexpectedServerMessage,
+                RfbProtocolReadStage.ServerMessageType));
+        }
+
         if (messageType != 0)
         {
             throw RfbProtocolException.Create(

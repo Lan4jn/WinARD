@@ -694,8 +694,15 @@ public sealed class FramePresentationTests
     [Fact]
     public async Task Rfb_client_adds_clipboard_message_type_without_overwriting_truncation()
     {
+        const string secretMarker = "SECRET-CLIPBOARD-MARKER";
+        var payload = System.Text.Encoding.ASCII.GetBytes(secretMarker);
+        var clipboardBody = new byte[7 + payload.Length];
+        BinaryPrimitives.WriteUInt32BigEndian(
+            clipboardBody.AsSpan(3),
+            checked((uint)payload.Length + 1));
+        payload.CopyTo(clipboardBody, 7);
         await using var stream = new ScriptedDuplexStream(
-            [.. Handshake("RFB 003.008\n"), .. ServerInit(1, 1), 3, 0, 0, 0, 0, 0, 0, 2, (byte)'a']);
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(1, 1), 3, .. clipboardBody]);
         await using var client = new RfbClient(stream);
 
         await client.NegotiateAsync(CancellationToken.None);
@@ -707,6 +714,16 @@ public sealed class FramePresentationTests
         Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
         Assert.Equal(RfbProtocolReadStage.ClipboardPayload, exception.Failure?.ReadStage);
         Assert.Equal((byte)3, exception.Failure?.ServerMessageType);
+
+        var chain = new List<Exception>();
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            chain.Add(current);
+        }
+
+        Assert.Equal(2, chain.Count(item => item is RfbProtocolException));
+        Assert.IsType<EndOfStreamException>(chain[^1]);
+        Assert.All(chain, item => Assert.DoesNotContain(secretMarker, item.Message, StringComparison.Ordinal));
     }
 
     [Fact]
@@ -758,7 +775,33 @@ public sealed class FramePresentationTests
         var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             client.ReceiveAsync(CancellationToken.None).AsTask());
 
-        Assert.IsType<EndOfStreamException>(exception.InnerException);
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ServerMessageType, exception.Failure?.ReadStage);
+        Assert.Null(exception.Failure?.ServerMessageType);
+        var readFailure = Assert.IsType<RfbProtocolException>(exception.InnerException);
+        var endOfStream = Assert.IsType<EndOfStreamException>(readFailure.InnerException);
+        Assert.Null(endOfStream.InnerException);
+    }
+
+    [Fact]
+    public async Task Rfb_client_reports_top_level_type_eof_without_inventing_type()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(1, 1)]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ServerMessageType, exception.Failure?.ReadStage);
+        Assert.Null(exception.Failure?.ServerMessageType);
+        var readFailure = Assert.IsType<RfbProtocolException>(exception.InnerException);
+        var endOfStream = Assert.IsType<EndOfStreamException>(readFailure.InnerException);
+        Assert.Null(endOfStream.InnerException);
     }
 
     [Fact]

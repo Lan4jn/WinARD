@@ -113,7 +113,18 @@ internal sealed class RfbClient : IRfbClient
         var reader = new RfbReader(_stream, ProtocolLimits.Default);
         while (true)
         {
-            var type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            byte type;
+            try
+            {
+                type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (RfbProtocolException exception)
+            {
+                throw exception.WithContext(new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.UnexpectedServerMessage,
+                    RfbProtocolReadStage.ServerMessageType));
+            }
+
             switch (type)
             {
                 case 0:
