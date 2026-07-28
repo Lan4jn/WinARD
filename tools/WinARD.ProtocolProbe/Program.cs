@@ -16,9 +16,15 @@ internal static class Program
 
         try
         {
-            if (!TryReadCapturePath(args, out var capturePath))
+            if (!ProbeCommandLine.TryParse(args, out var request))
             {
                 PrintUsage();
+                return 2;
+            }
+
+            if (request.Mode == ProbeMode.PointerSmoke)
+            {
+                Console.Error.WriteLine("Pointer smoke mode is not supported yet.");
                 return 2;
             }
 
@@ -43,7 +49,7 @@ internal static class Program
                 port,
                 username,
                 password,
-                capturePath,
+                request.CaptureFirstFramePath,
                 cancellation.Token);
 
             Console.WriteLine($"Version: {result.Version.Major}.{result.Version.Minor}");
@@ -99,29 +105,7 @@ internal static class Program
         return int.TryParse(value, out port) && port is >= 1 and <= ushort.MaxValue;
     }
 
-    private static bool TryReadCapturePath(string[] args, out string? capturePath)
-    {
-        capturePath = null;
-        if (args.Length == 0)
-        {
-            return true;
-        }
-
-        if (args.Length != 2 || !string.Equals(args[0], "--capture-first-frame", StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        if (string.IsNullOrWhiteSpace(args[1]))
-        {
-            return false;
-        }
-
-        capturePath = args[1];
-        return true;
-    }
-
     private static void PrintUsage() =>
         Console.Error.WriteLine(
-            "Usage: WinARD.ProtocolProbe [--capture-first-frame <path.bgra|path.bmp>]. Set WINARD_HOST and WINARD_USERNAME (optional WINARD_PORT, default 5900), then run from an interactive console so the password can be read without echo.");
+            "Usage: WinARD.ProtocolProbe [--capture-first-frame <path.bgra|path.bmp> | --pointer-smoke]. Set WINARD_HOST and WINARD_USERNAME (optional WINARD_PORT, default 5900), then run from an interactive console so the password can be read without echo.");
 }

@@ -19,6 +19,60 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 public sealed class ProtocolProbeTests
 {
     [Fact]
+    public void Probe_command_line_defaults_to_authentication()
+    {
+        Assert.True(ProbeCommandLine.TryParse([], out var request));
+
+        Assert.Equal(new ProbeRequest(ProbeMode.Authentication), request);
+    }
+
+    [Fact]
+    public void Probe_command_line_parses_pointer_smoke()
+    {
+        Assert.True(ProbeCommandLine.TryParse(["--pointer-smoke"], out var request));
+
+        Assert.Equal(new ProbeRequest(ProbeMode.PointerSmoke), request);
+        Assert.Null(request.CaptureFirstFramePath);
+    }
+
+    [Fact]
+    public void Probe_command_line_parses_capture_path_without_changing_it()
+    {
+        const string path = "captures/first frame.bmp";
+
+        Assert.True(ProbeCommandLine.TryParse(["--capture-first-frame", path], out var request));
+
+        Assert.Equal(new ProbeRequest(ProbeMode.CaptureFirstFrame, path), request);
+    }
+
+    [Theory]
+    [InlineData("--unknown")]
+    [InlineData("--pointer-smoke", "extra")]
+    [InlineData("--capture-first-frame")]
+    [InlineData("--capture-first-frame", "frame.bgra", "extra")]
+    [InlineData("--pointer-smoke", "--capture-first-frame", "frame.bgra")]
+    [InlineData("--capture-first-frame", "frame.bgra", "--pointer-smoke")]
+    public void Probe_command_line_rejects_invalid_arguments(params string[] args)
+    {
+        Assert.False(ProbeCommandLine.TryParse(args, out _));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("\t")]
+    public void Probe_command_line_rejects_blank_capture_path(string path)
+    {
+        Assert.False(ProbeCommandLine.TryParse(["--capture-first-frame", path], out _));
+    }
+
+    [Fact]
+    public void Probe_command_line_rejects_null_arguments()
+    {
+        Assert.Throws<ArgumentNullException>(() => ProbeCommandLine.TryParse(null!, out _));
+    }
+
+    [Fact]
     public async Task Default_probe_exits_after_authentication_without_initializing_framebuffer()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
