@@ -17,6 +17,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private const int MaxProtocolFailureExceptionNodes = 256;
     private const int MaxProtocolFailureExceptionEdgeInspections =
         MaxProtocolFailureExceptionNodes * 2;
+    private const int MaxProtocolFailureExceptionFrames =
+        MaxProtocolFailureExceptionNodes + 1;
     private readonly object _sync = new();
     private readonly IRemoteSessionRuntime _session;
     private readonly IAsyncDisposable _ownership;
@@ -360,64 +362,119 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             return null;
         }
 
-        var pending = new Stack<Exception>();
-        var scheduled = new HashSet<Exception>(ReferenceEqualityComparer.Instance)
-        {
-            exception,
-        };
-        pending.Push(exception);
+        var pending = new Stack<ExceptionTraversalFrame>();
+        var visited = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
+        pending.Push(new ExceptionTraversalFrame(exception, SelfVisited: false, NextChildIndex: 0));
         var inspectedEdges = 0;
         while (pending.Count > 0)
         {
-            var current = pending.Pop();
-            if (current is RfbProtocolException { Failure: not null } protocolException)
+            var frame = pending.Pop();
+            if (!frame.SelfVisited)
             {
-                return protocolException;
+                if (visited.Count >= MaxProtocolFailureExceptionNodes)
+                {
+                    if (visited.Contains(frame.Exception))
+                    {
+                        continue;
+                    }
+
+                    return null;
+                }
+
+                if (!visited.Add(frame.Exception))
+                {
+                    continue;
+                }
+
+                if (frame.Exception is RfbProtocolException { Failure: not null } protocolException)
+                {
+                    return protocolException;
+                }
+
+                if (visited.Count >= MaxProtocolFailureExceptionNodes)
+                {
+                    return null;
+                }
+
+                if (frame.Exception is AggregateException aggregateException)
+                {
+                    if (aggregateException.InnerExceptions.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    if (inspectedEdges >= MaxProtocolFailureExceptionEdgeInspections ||
+                        pending.Count > MaxProtocolFailureExceptionFrames - 2)
+                    {
+                        return null;
+                    }
+
+                    inspectedEdges++;
+                    pending.Push(new ExceptionTraversalFrame(
+                        frame.Exception,
+                        SelfVisited: true,
+                        NextChildIndex: 1));
+                    pending.Push(new ExceptionTraversalFrame(
+                        aggregateException.InnerExceptions[0],
+                        SelfVisited: false,
+                        NextChildIndex: 0));
+                }
+                else if (frame.Exception.InnerException is { } innerException)
+                {
+                    if (inspectedEdges >= MaxProtocolFailureExceptionEdgeInspections ||
+                        pending.Count >= MaxProtocolFailureExceptionFrames)
+                    {
+                        return null;
+                    }
+
+                    inspectedEdges++;
+                    pending.Push(new ExceptionTraversalFrame(
+                        innerException,
+                        SelfVisited: false,
+                        NextChildIndex: 0));
+                }
+
+                continue;
             }
 
-            if (scheduled.Count >= MaxProtocolFailureExceptionNodes ||
+            if (visited.Count >= MaxProtocolFailureExceptionNodes ||
                 inspectedEdges >= MaxProtocolFailureExceptionEdgeInspections)
+            {
+                return null;
+            }
+
+            var aggregate = (AggregateException)frame.Exception;
+            if (frame.NextChildIndex >= aggregate.InnerExceptions.Count)
             {
                 continue;
             }
 
-            if (current is AggregateException aggregateException)
+            var hasMoreChildren = frame.NextChildIndex + 1 < aggregate.InnerExceptions.Count;
+            var requiredFrames = hasMoreChildren ? 2 : 1;
+            if (pending.Count > MaxProtocolFailureExceptionFrames - requiredFrames)
             {
-                var remainingNodes = MaxProtocolFailureExceptionNodes - scheduled.Count;
-                var children = new List<Exception>(Math.Min(
-                    remainingNodes,
-                    aggregateException.InnerExceptions.Count));
-                for (var index = 0;
-                     index < aggregateException.InnerExceptions.Count &&
-                     inspectedEdges < MaxProtocolFailureExceptionEdgeInspections &&
-                     scheduled.Count < MaxProtocolFailureExceptionNodes;
-                     index++)
-                {
-                    inspectedEdges++;
-                    var child = aggregateException.InnerExceptions[index];
-                    if (scheduled.Add(child))
-                    {
-                        children.Add(child);
-                    }
-                }
+                return null;
+            }
 
-                for (var index = children.Count - 1; index >= 0; index--)
-                {
-                    pending.Push(children[index]);
-                }
-            }
-            else if (current.InnerException is { } innerException)
+            inspectedEdges++;
+            if (hasMoreChildren)
             {
-                inspectedEdges++;
-                if (scheduled.Add(innerException))
-                {
-                    pending.Push(innerException);
-                }
+                pending.Push(frame with { NextChildIndex = frame.NextChildIndex + 1 });
             }
+
+            pending.Push(new ExceptionTraversalFrame(
+                aggregate.InnerExceptions[frame.NextChildIndex],
+                SelfVisited: false,
+                NextChildIndex: 0));
         }
 
         return null;
     }
+
+    private readonly record struct ExceptionTraversalFrame(
+        Exception Exception,
+        bool SelfVisited,
+        int NextChildIndex);
 
     private static List<DiagnosticField>? GetProtocolFailureFields(
         RfbProtocolException? exception)

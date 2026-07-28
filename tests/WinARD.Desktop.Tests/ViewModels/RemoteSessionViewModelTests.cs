@@ -319,6 +319,26 @@ public sealed class RemoteSessionViewModelTests
     }
 
     [Fact]
+    public async Task Receive_failure_aggregate_cross_reference_follows_first_subtree_before_siblings()
+    {
+        var sharedFailure = RfbProtocolException.Create(
+            "shared failure",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.MalformedClipboard));
+        var firstBranch = new IOException("first branch", sharedFailure);
+        var siblingFailure = RfbProtocolException.Create(
+            "sibling failure",
+            new RfbProtocolFailureInfo(RfbProtocolFailureKind.UnsupportedEncoding));
+        var diagnostic = await RecordReceiveFailureAsync(new AggregateException(
+            firstBranch,
+            siblingFailure,
+            sharedFailure));
+
+        var field = Assert.Single(diagnostic.Fields!);
+        Assert.Equal("ProtocolFailureKind", field.Name);
+        Assert.Equal("MalformedClipboard", field.Value);
+    }
+
+    [Fact]
     public async Task Receive_failure_prefers_outer_protocol_failure()
     {
         var protocolException = RfbProtocolException.Create(
