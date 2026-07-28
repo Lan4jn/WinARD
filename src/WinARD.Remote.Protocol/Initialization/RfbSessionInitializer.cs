@@ -26,6 +26,12 @@ public static class RfbSessionInitializer
         (int)RfbEncodingType.ArdDisplayInfo2,
         (int)RfbEncodingType.DesktopSize,
     ];
+    private static readonly int[] ArdRequestedEncodings =
+    [
+        .. RequestedEncodings,
+        (int)RfbEncodingType.ArdDisplayInfo,
+        (int)RfbEncodingType.ArdDisplayInfo2,
+    ];
 
     /// <summary>
     /// Sends ClientInit, consumes ServerInit, and declares WinARD's pixel format and encodings.
@@ -139,7 +145,7 @@ public static class RfbSessionInitializer
         await WriteSetPixelFormatAsync(writer, cancellationToken).ConfigureAwait(false);
         await WriteSetEncodingsAsync(
                 writer,
-                requiresBootstrap ? ArdBootstrapRequestedEncodings : RequestedEncodings,
+                requiresBootstrap ? ArdBootstrapRequestedEncodings : ArdRequestedEncodings,
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -149,7 +155,7 @@ public static class RfbSessionInitializer
                 .ConfigureAwait(false);
             width = displaySize.Width;
             height = displaySize.Height;
-            await WriteSetEncodingsAsync(writer, cancellationToken).ConfigureAwait(false);
+            await WriteSetEncodingsAsync(writer, ArdRequestedEncodings, cancellationToken).ConfigureAwait(false);
         }
 
         return new RfbServerInit(width, height, serverPixelFormat, name, isTruncated)

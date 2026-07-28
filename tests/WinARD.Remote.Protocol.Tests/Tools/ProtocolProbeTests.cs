@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
@@ -238,6 +239,82 @@ public sealed class ProtocolProbeTests
             Assert.Equal(new FramebufferRect(0, 0, 1, 1), Assert.Single(capture.DirtyRects));
             Assert.Contains("Dirty: (0,0) 1x1", ProbeOutput.FormatCapture(capture), StringComparison.Ordinal);
             Assert.Equal([0, 0, 255, 255], await File.ReadAllBytesAsync(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_probe_skips_889_ack_and_nop_before_framebuffer_update()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, CaptureScenario.FullRaw, ard889: true, [0x04, 0x07]);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            var result = await new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                IPAddress.Loopback.ToString(), GetPort(listener), username, password, path, CancellationToken.None);
+
+            Assert.Equal(RfbVersion.V3_889, result.Version);
+            Assert.Equal([0, 0, 255, 255], await File.ReadAllBytesAsync(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Theory]
+    [InlineData((byte)0x04)]
+    [InlineData((byte)0x07)]
+    public async Task Capture_probe_rejects_ard_control_messages_for_standard_rfb(byte messageType)
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, CaptureScenario.FullRaw, messagesBeforeUpdate: [messageType]);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+                new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                    IPAddress.Loopback.ToString(), GetPort(listener), username, password, path, CancellationToken.None));
+
+            Assert.Contains(messageType.ToString(CultureInfo.InvariantCulture), exception.Message, StringComparison.Ordinal);
+            Assert.False(File.Exists(path));
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_probe_rejects_unknown_889_message_without_guessing_payload()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = RunCaptureServerAsync(listener, CaptureScenario.FullRaw, ard889: true, [0x08]);
+        using var username = SecretMaterial.FromUtf8("capture-user");
+        using var password = SecretMaterial.FromUtf8("capture-password");
+        var path = Path.Combine(Path.GetTempPath(), $"winard-capture-{Guid.NewGuid():N}.bgra");
+        try
+        {
+            var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+                new ProbeRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                    IPAddress.Loopback.ToString(), GetPort(listener), username, password, path, CancellationToken.None));
+
+            Assert.Contains("8", exception.Message, StringComparison.Ordinal);
+            Assert.False(File.Exists(path));
             await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
         }
         finally
@@ -786,7 +863,7 @@ public sealed class ProtocolProbeTests
         var declarationHeader = await ReadExactlyAsync(stream, 24);
         Assert.Equal((byte)0, declarationHeader[0]);
         Assert.Equal((byte)2, declarationHeader[20]);
-        Assert.Equal(5, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
+        Assert.Equal(7, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
         Assert.Equal(
             [
                 0, 0, 0, 16,
@@ -795,7 +872,7 @@ public sealed class ProtocolProbeTests
                 0xFF, 0xFF, 0xFF, 0x11,
                 0xFF, 0xFF, 0xFF, 0x21,
             ],
-            await ReadExactlyAsync(stream, 20));
+            (await ReadExactlyAsync(stream, 28))[..20]);
         Assert.Equal(new byte[] { 5, 0, 0, 2, 0, 1 }, await ReadExactlyAsync(stream, 6));
         await AssertClientClosedWithoutAnotherRequestAsync(stream);
     }
@@ -814,12 +891,15 @@ public sealed class ProtocolProbeTests
 
     private static async Task RunCaptureServerAsync(
         TcpListener listener,
-        CaptureScenario scenario)
+        CaptureScenario scenario,
+        bool ard889 = false,
+        byte[]? messagesBeforeUpdate = null)
     {
         using var client = await listener.AcceptTcpClientAsync();
         await using var stream = client.GetStream();
-        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
-        Assert.Equal(Encoding.ASCII.GetBytes("RFB 003.008\n"), await ReadExactlyAsync(stream, 12));
+        var banner = Encoding.ASCII.GetBytes(ard889 ? "RFB 003.889\n" : "RFB 003.008\n");
+        await stream.WriteAsync(banner);
+        Assert.Equal(banner, await ReadExactlyAsync(stream, 12));
         await stream.WriteAsync(new byte[] { 1, (byte)RfbSecurityType.AppleRemoteDesktop });
         Assert.Equal(new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop }, await ReadExactlyAsync(stream, 1));
 
@@ -831,20 +911,34 @@ public sealed class ProtocolProbeTests
         _ = await ReadExactlyAsync(stream, 128 + 64);
         await stream.WriteAsync(new byte[4]);
 
-        Assert.Equal(new byte[] { 1 }, await ReadExactlyAsync(stream, 1));
+        Assert.Equal(new byte[] { ard889 ? (byte)0xC1 : (byte)1 }, await ReadExactlyAsync(stream, 1));
         var initialWidth = scenario == CaptureScenario.PartialRawAcrossUpdates ? (ushort)2 : (ushort)1;
         var serverInit = new List<byte>();
         AddUInt16(serverInit, initialWidth);
         AddUInt16(serverInit, 1);
         serverInit.AddRange(PixelFormat.WinArdBgra32.ToWireBytes());
-        AddUInt32(serverInit, 3);
-        serverInit.AddRange(Encoding.UTF8.GetBytes("Mac"));
+        var name = ard889 ? new byte[26] : Encoding.UTF8.GetBytes("Mac");
+        if (ard889)
+        {
+            BinaryPrimitives.WriteUInt32BigEndian(name.AsSpan(2), (uint)ArdServerFlags.MayControl);
+            Encoding.UTF8.GetBytes("Mac").CopyTo(name, 23);
+        }
+        AddUInt32(serverInit, checked((uint)name.Length));
+        serverInit.AddRange(name);
         await stream.WriteAsync(serverInit.ToArray());
+
+        if (ard889)
+        {
+            Assert.Equal(0x21, (await ReadExactlyAsync(stream, 66))[0]);
+            Assert.Equal(new byte[] { 0x0A, 0, 0, 1 }, await ReadExactlyAsync(stream, 4));
+            Assert.Equal(new byte[] { 0x0D, 1, 0, 0, 0, 0, 0, 0 }, await ReadExactlyAsync(stream, 8));
+        }
 
         var declarationHeader = await ReadExactlyAsync(stream, 24);
         Assert.Equal((byte)0, declarationHeader[0]);
         Assert.Equal((byte)2, declarationHeader[20]);
-        Assert.Equal(5, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
+        var encodingCount = ard889 ? 7 : 5;
+        Assert.Equal(encodingCount, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
         Assert.Equal(
             [
                 0, 0, 0, 16,
@@ -853,9 +947,14 @@ public sealed class ProtocolProbeTests
                 0xFF, 0xFF, 0xFF, 0x11,
                 0xFF, 0xFF, 0xFF, 0x21,
             ],
-            await ReadExactlyAsync(stream, 20));
+            (await ReadExactlyAsync(stream, encodingCount * 4))[..20]);
         var request = await ReadExactlyAsync(stream, 10);
         Assert.Equal(CreateFullRequest(initialWidth, 1), request);
+
+        if (messagesBeforeUpdate is not null)
+        {
+            await stream.WriteAsync(messagesBeforeUpdate);
+        }
 
         if (scenario is CaptureScenario.CompleteOnSixtyFourthUpdate or CaptureScenario.IncompleteAfterSixtyFourUpdates)
         {

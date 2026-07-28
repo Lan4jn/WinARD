@@ -125,9 +125,9 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal((uint)ArdServerFlags.MayControl, server.ArdCapabilities.RawFlags);
         Assert.Equal(bitmap, server.ArdCapabilities.CommandBitmap.ToArray());
         Assert.Equal(
-            [ClientInitArd(), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), StandardSetEncodingsMessage()],
+            [ClientInitArd(), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), ArdSetEncodingsMessage()],
             stream.Writes);
-        Assert.Equal([1, 66, 4, 8, 20, 24], stream.WriteLengths);
+        Assert.Equal([1, 66, 4, 8, 20, 32], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
     }
@@ -253,12 +253,12 @@ public sealed class RfbSessionInitializerTests
         await initialization.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(
-            [ClientInitArd(), SessionCommand("alice", command: 1), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), StandardSetEncodingsMessage()],
+            [ClientInitArd(), SessionCommand("alice", command: 1), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), ArdSetEncodingsMessage()],
             stream.Writes);
     }
 
     [Fact]
-    public async Task Ard_zero_size_session_bootstraps_with_extended_encodings_then_restores_standard_encodings()
+    public async Task Ard_zero_size_session_bootstraps_with_minimal_encodings_then_restores_ard_encodings()
     {
         var serverInit = ServerInit(
             0,
@@ -282,9 +282,9 @@ public sealed class RfbSessionInitializerTests
 
         Assert.Equal((1920, 1080), (server.Width, server.Height));
         Assert.Equal(
-            [ClientInitArd(), SessionCommand("alice", command: 1), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), BootstrapSetEncodingsMessage(), StandardSetEncodingsMessage()],
+            [ClientInitArd(), SessionCommand("alice", command: 1), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), BootstrapSetEncodingsMessage(), ArdSetEncodingsMessage()],
             stream.Writes);
-        Assert.Equal([1, 74, 66, 4, 8, 20, 16, 24], stream.WriteLengths);
+        Assert.Equal([1, 74, 66, 4, 8, 20, 16, 32], stream.WriteLengths);
         Assert.All(stream.Writes, message => Assert.NotEqual(3, message[0]));
         Assert.Equal(serverInit.Length + sessionInfo.Length + sessionResult.Length + bootstrap.Length, stream.ReadPosition);
         Assert.Equal(0, stream.FlushCount);
@@ -323,7 +323,7 @@ public sealed class RfbSessionInitializerTests
         var server = await initialization.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal((1920, 1080), (server.Width, server.Height));
-        Assert.Equal(StandardSetEncodingsMessage(), stream.Writes[^1]);
+        Assert.Equal(ArdSetEncodingsMessage(), stream.Writes[^1]);
     }
 
     [Fact]
@@ -351,7 +351,7 @@ public sealed class RfbSessionInitializerTests
 
         Assert.Equal((800, 600), (server.Width, server.Height));
         Assert.Equal(serverInit.Length + sessionInfo.Length + sessionResult.Length, stream.ReadPosition);
-        Assert.Equal(StandardSetEncodingsMessage(), stream.Writes[^1]);
+        Assert.Equal(ArdSetEncodingsMessage(), stream.Writes[^1]);
         Assert.DoesNotContain(stream.Writes, message => message.SequenceEqual(BootstrapSetEncodingsMessage()));
     }
 
@@ -649,6 +649,16 @@ public sealed class RfbSessionInitializerTests
             (int)RfbEncodingType.CopyRect,
             (int)RfbEncodingType.Cursor,
             (int)RfbEncodingType.DesktopSize);
+
+    private static byte[] ArdSetEncodingsMessage() =>
+        SetEncodingsMessage(
+            (int)RfbEncodingType.Zrle,
+            (int)RfbEncodingType.Raw,
+            (int)RfbEncodingType.CopyRect,
+            (int)RfbEncodingType.Cursor,
+            (int)RfbEncodingType.DesktopSize,
+            (int)RfbEncodingType.ArdDisplayInfo,
+            (int)RfbEncodingType.ArdDisplayInfo2);
 
     private static byte[] BootstrapSetEncodingsMessage() =>
         SetEncodingsMessage(

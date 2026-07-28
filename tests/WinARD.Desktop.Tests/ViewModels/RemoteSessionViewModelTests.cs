@@ -322,6 +322,34 @@ public sealed class RemoteSessionViewModelTests
     }
 
     [Fact]
+    public async Task Metadata_resize_requests_full_new_size_then_resumes_incremental_updates()
+    {
+        var runtime = new ScriptedRuntime(
+            new RemoteFramebufferMessage(
+                new RemoteFramebufferSize(2, 1),
+                new byte[8],
+                8,
+                []),
+            new RemoteFramebufferMessage(
+                new RemoteFramebufferSize(2, 1),
+                new byte[8],
+                8,
+                [new RemoteRectangle(0, 0, 2, 1)]));
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.MessagesConsumed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await viewModel.DisposeAsync();
+
+        Assert.Equal([(false, 0), (false, 1), (true, 2)], runtime.UpdateRequests);
+    }
+
+    [Fact]
     public async Task Cursor_only_update_is_published_and_requests_the_next_incremental_update()
     {
         var owner = new TrackingMemoryOwner([1, 2, 3, 4]);

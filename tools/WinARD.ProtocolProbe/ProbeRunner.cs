@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using WinARD.Remote.Protocol.Authentication;
+using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
@@ -139,8 +140,10 @@ public sealed class ProbeRunner
             for (var updateCount = 0; updateCount < MaximumInitialFramebufferUpdates; updateCount++)
             {
                 await WriteFullFramebufferUpdateRequestAsync(stream, framebuffer, operationCancellation.Token);
-                var update = await framebufferUpdates.ApplyAsync(
+                var update = await ReadFramebufferUpdateAsync(
                     stream,
+                    framebufferUpdates,
+                    handshake.Version,
                     operationCancellation.Token);
                 dirtyRects.AddRange(update.DirtyRects);
                 if (update.DesktopResized)
@@ -191,6 +194,30 @@ public sealed class ProbeRunner
             checked((ushort)framebuffer.Width),
             checked((ushort)framebuffer.Height),
             cancellationToken);
+
+    private static async Task<FramebufferUpdateResult> ReadFramebufferUpdateAsync(
+        Stream stream,
+        FramebufferUpdateSession updates,
+        RfbVersion version,
+        CancellationToken cancellationToken)
+    {
+        var reader = new RfbReader(stream, ProtocolLimits.Default);
+        while (true)
+        {
+            var messageType = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            if (messageType == 0)
+            {
+                return await updates.ApplyBodyAsync(stream, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (version == RfbVersion.V3_889 && ArdServerMessage.IsZeroPayloadControl(messageType))
+            {
+                continue;
+            }
+
+            throw new RfbProtocolException($"Expected FramebufferUpdate message type 0, received {messageType}.");
+        }
+    }
 
     private static void ValidateRequest(ProbeRequest request)
     {

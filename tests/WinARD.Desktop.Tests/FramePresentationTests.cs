@@ -7,6 +7,7 @@ using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
 using WinARD.Remote.Protocol.IO;
 using WinARD.Remote.Protocol.Encodings;
+using WinARD.Infrastructure.Diagnostics;
 using Xunit;
 using System.Xml.Linq;
 using System.Buffers.Binary;
@@ -495,6 +496,65 @@ public sealed class FramePresentationTests
         Assert.Equal((byte)ArdClientInitFlags.Ard, stream.WrittenBytes[13]);
     }
 
+    [Fact]
+    public async Task Rfb_client_records_successful_889_control_negotiation_without_remote_identity()
+    {
+        var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream, diagnosticSink: sink);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var diagnostic = Assert.Single(sink.Snapshot());
+        Assert.Equal("RFB_SESSION_NEGOTIATED", diagnostic.Code);
+        Assert.Contains(diagnostic.Fields, field => field.Name == "ProtocolVersion" && field.Value == "003.889");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "ClientInit" && field.Value == "0xC1");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "MayControl" && field.Value == "True");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "SessionSelectRequired" && field.Value == "False");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "SessionSelectCompleted" && field.Value == "False");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "RequestedMode" && field.Value == "Shared");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "FinalState" && field.Value == "SharedControlNegotiated");
+        Assert.DoesNotContain("Mac", string.Join('|', diagnostic.Fields.Select(field => field.Value)), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rfb_client_records_standard_initialization_without_ard_claims()
+    {
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream, diagnosticSink: sink);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var diagnostic = Assert.Single(sink.Snapshot());
+        Assert.Contains(diagnostic.Fields, field => field.Name == "ProtocolVersion" && field.Value == "003.008");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "ClientInit" && field.Value == "0x01");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "MayControl" && field.Value == "NotApplicable");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "FinalState" && field.Value == "Initialized");
+    }
+
+    [Fact]
+    public async Task Failed_889_initialization_does_not_record_success_or_display_name()
+    {
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        var serverInit = ArdServerInit(2, 1);
+        serverInit[29] = 0;
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. serverInit]);
+        await using var client = new RfbClient(stream, diagnosticSink: sink);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await Assert.ThrowsAsync<ArdControlNotAllowedException>(() =>
+            client.InitializeAsync(CancellationToken.None));
+
+        Assert.Empty(sink.Snapshot());
+    }
+
     [Theory]
     [InlineData((byte)0x04)]
     [InlineData((byte)0x07)]
@@ -527,6 +587,26 @@ public sealed class FramePresentationTests
             await client.ReceiveAsync(CancellationToken.None));
 
         Assert.NotNull(message.Cursor);
+    }
+
+    [Fact]
+    public async Task Rfb_client_uses_resized_dimensions_and_requested_incremental_flag()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(1, 1), .. DesktopSizeUpdate(2, 1)]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        using var frame = Assert.IsType<RemoteFramebufferMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        await client.RequestFramebufferUpdateAsync(incremental: false, CancellationToken.None);
+        await client.RequestFramebufferUpdateAsync(incremental: true, CancellationToken.None);
+
+        Assert.Equal(new RemoteFramebufferSize(2, 1), frame.Size);
+        Assert.Equal(
+            [3, 0, 0, 0, 0, 0, 0, 2, 0, 1, 3, 1, 0, 0, 0, 0, 0, 2, 0, 1],
+            stream.WrittenBytes[^20..]);
     }
 
     [Theory]
@@ -689,6 +769,16 @@ public sealed class FramePresentationTests
         bytes[18] = 3;
         bytes[19] = 0;
         bytes[20] = 0x80;
+        return bytes;
+    }
+
+    private static byte[] DesktopSizeUpdate(ushort width, ushort height)
+    {
+        var bytes = new byte[16];
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2), 1);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(8), width);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(10), height);
+        BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(12), (int)RfbEncodingType.DesktopSize);
         return bytes;
     }
 

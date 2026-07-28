@@ -183,12 +183,13 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 switch (message)
                 {
                     case RemoteFramebufferMessage frame:
+                        var framebufferResized = FramebufferSize != frame.Size;
                         using (frame)
                         {
                             var cursor = frame.TakeCursorOwnership();
                             try
                             {
-                                if (FramebufferSize != frame.Size)
+                                if (framebufferResized)
                                 {
                                     await _dispatcher.InvokeAsync(
                                         () => FramebufferSize = frame.Size,
@@ -213,7 +214,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                             }
                         }
                         await _session.RequestFramebufferUpdateAsync(
-                            incremental: true,
+                            incremental: !framebufferResized,
                             cancellationToken).ConfigureAwait(false);
                         break;
                     case RemoteCursorMessage cursorMessage:

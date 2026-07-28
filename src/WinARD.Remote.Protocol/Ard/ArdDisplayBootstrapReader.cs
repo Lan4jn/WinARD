@@ -9,8 +9,6 @@ public readonly record struct ArdDisplaySize(ushort Width, ushort Height);
 public static class ArdDisplayBootstrapReader
 {
     private const byte FramebufferUpdateMessageType = 0x00;
-    private const byte AckMessageType = 0x04;
-    private const byte NopMessageType = 0x07;
     private const int MaximumTopLevelMessages = 64;
     private const int MaximumRectanglesPerFramebufferUpdate = 4096;
     private const int FramebufferUpdateHeaderBytes = 4;
@@ -32,11 +30,13 @@ public static class ArdDisplayBootstrapReader
             for (var messageIndex = 0; messageIndex < MaximumTopLevelMessages; messageIndex++)
             {
                 var messageType = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+                if (ArdServerMessage.IsZeroPayloadControl(messageType))
+                {
+                    continue;
+                }
+
                 switch (messageType)
                 {
-                    case AckMessageType:
-                    case NopMessageType:
-                        continue;
                     case FramebufferUpdateMessageType:
                         {
                             var size = await ReadFramebufferUpdateAsync(reader, limits, cancellationToken)

@@ -1,6 +1,8 @@
 using System.Buffers;
+using System.Globalization;
 using WinARD.Application.Ports;
 using WinARD.Remote.Protocol.Authentication;
+using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Clipboard;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
@@ -8,31 +10,34 @@ using WinARD.Remote.Protocol.Handshake;
 using WinARD.Remote.Protocol.Initialization;
 using WinARD.Remote.Protocol.Input;
 using WinARD.Remote.Protocol.IO;
+using WinARD.Infrastructure.Diagnostics;
 
 namespace WinARD.Desktop.Services;
 
-public sealed class RfbClientFactory : IRfbClientFactory
+public sealed class RfbClientFactory(ISafeDiagnosticSink? diagnosticSink = null) : IRfbClientFactory
 {
-    public IRfbClient Create(Stream stream) => new RfbClient(stream);
+    public IRfbClient Create(Stream stream) => new RfbClient(stream, diagnosticSink: diagnosticSink);
 }
 
 internal sealed class RfbClient : IRfbClient
 {
-    private const byte ArdAckServerMessage = 0x04;
-    private const byte ArdNopServerMessage = 0x07;
-
     private readonly Stream _stream;
     private readonly FramebufferSnapshotFactory _snapshotFactory;
+    private readonly ISafeDiagnosticSink? _diagnosticSink;
     private RfbHandshakeResult? _handshake;
     private RfbServerInit? _serverInit;
     private Framebuffer? _framebuffer;
     private FramebufferUpdateSession? _framebufferUpdates;
     private bool _disposed;
 
-    public RfbClient(Stream stream, FramebufferSnapshotFactory? snapshotFactory = null)
+    public RfbClient(
+        Stream stream,
+        FramebufferSnapshotFactory? snapshotFactory = null,
+        ISafeDiagnosticSink? diagnosticSink = null)
     {
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _snapshotFactory = snapshotFactory ?? new FramebufferSnapshotFactory();
+        _diagnosticSink = diagnosticSink;
     }
 
     public RemoteFramebufferSize FramebufferSize
@@ -82,6 +87,7 @@ internal sealed class RfbClient : IRfbClient
         _framebufferUpdates = FramebufferUpdateReader.CreateSession(
             _framebuffer,
             PixelFormat.WinArdBgra32);
+        WriteNegotiationDiagnostic(handshake, _serverInit);
     }
 
     public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
@@ -123,8 +129,9 @@ internal sealed class RfbClient : IRfbClient
                         await ClipboardProtocol.ReadServerCutTextBodyAsync(
                             reader,
                             cancellationToken).ConfigureAwait(false));
-                case ArdAckServerMessage or ArdNopServerMessage
-                    when handshake.Version == RfbVersion.V3_889:
+                case var ardControlMessage
+                    when handshake.Version == RfbVersion.V3_889 &&
+                         ArdServerMessage.IsZeroPayloadControl(ardControlMessage):
                     continue;
                 default:
                     throw new RfbProtocolException($"Unsupported RFB server message type {type}.");
@@ -183,6 +190,28 @@ internal sealed class RfbClient : IRfbClient
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    private void WriteNegotiationDiagnostic(RfbHandshakeResult handshake, RfbServerInit serverInit)
+    {
+        var ard = serverInit.ArdCapabilities;
+        var isArd = handshake.Version == RfbVersion.V3_889;
+        _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
+            "RFB_SESSION_NEGOTIATED",
+            Guid.NewGuid().ToString("N"),
+            "RFB session initialization completed.",
+            [
+                new("ProtocolVersion", $"{handshake.Version.Major:D3}.{handshake.Version.Minor:D3}"),
+                new("ClientInit", isArd ? "0xC1" : "0x01"),
+                new("ServerFlags", ard is null
+                    ? "NotApplicable"
+                    : $"0x{ard.RawFlags.ToString("X8", CultureInfo.InvariantCulture)}"),
+                new("MayControl", ard is null ? "NotApplicable" : ard.MayControl.ToString()),
+                new("SessionSelectRequired", (ard?.RequiresSessionSelection ?? false).ToString()),
+                new("SessionSelectCompleted", (ard?.RequiresSessionSelection ?? false).ToString()),
+                new("RequestedMode", isArd ? "Shared" : "StandardShared"),
+                new("FinalState", isArd ? "SharedControlNegotiated" : "Initialized"),
+            ]));
+    }
 
     private sealed class ApplicationSecretMaterial(ISecret secret) : ISecretMaterial
     {
