@@ -41,28 +41,22 @@
 
 ```csharp
 [Fact]
-public async Task Authenticate_returns_owned_authentication_key_and_dispose_clears_it()
+public void Authentication_result_uses_owned_key_and_dispose_clears_it()
 {
-    var stream = CreateSuccessfulArdAuthenticationStream();
-    using var username = SecretMaterial.FromUtf8("alice");
-    using var password = SecretMaterial.FromUtf8("secret");
+    var owned = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
+    var plaintext = new byte[16];
+    using var expectedAes = Aes.Create();
+    expectedAes.Key = owned.ToArray();
+    var ciphertext = expectedAes.EncryptEcb(plaintext, PaddingMode.None);
+    var decrypted = new byte[16];
+    var result = new ArdAuthenticationResult(owned);
 
-    var result = await new ArdAuthenticator(new FixedRandomSource(0x2A)).AuthenticateAsync(
-        stream,
-        RfbVersion.V3_889,
-        username,
-        password,
-        CancellationToken.None);
-
-    var observed = result.DangerousCopyKeyForTest();
-    var owned = result.DangerousOwnedBufferForTest;
-    Assert.Equal(16, observed.Length);
-    Assert.Contains(observed, value => value != 0);
-
+    result.DecryptEcb(ciphertext, decrypted);
     result.Dispose();
 
-    Assert.Throws<ObjectDisposedException>(() => result.DangerousCopyKeyForTest());
+    Assert.Equal(plaintext, decrypted);
     Assert.All(owned, value => Assert.Equal(0, value));
+    Assert.Throws<ObjectDisposedException>(() => result.DecryptEcb(ciphertext, decrypted));
 }
 ```
 
@@ -88,9 +82,6 @@ public sealed class ArdAuthenticationResult : IDisposable
     internal ArdAuthenticationResult(byte[] key) { /* validate 16 bytes; take ownership */ }
 
     internal void DecryptEcb(ReadOnlySpan<byte> ciphertext, Span<byte> plaintext) { /* AES-ECB, no padding */ }
-
-    internal byte[] DangerousCopyKeyForTest() { /* throw if disposed; return copy */ }
-    internal byte[] DangerousOwnedBufferForTest { get; /* throw if disposed */ }
 
     public void Dispose() { /* Interlocked.Exchange; CryptographicOperations.ZeroMemory */ }
 }
