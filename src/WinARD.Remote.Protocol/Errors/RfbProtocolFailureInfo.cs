@@ -10,6 +10,9 @@ public enum RfbProtocolFailureKind
     DecoderFailure = 5,
     MalformedArdStateChange = 6,
     RemoteSessionClosed = 7,
+    ArdEncryptionNegotiation = 8,
+    ArdEncryptionPacket = 9,
+    ArdEncryptionIntegrity = 10,
 }
 
 public enum RfbProtocolReadStage
