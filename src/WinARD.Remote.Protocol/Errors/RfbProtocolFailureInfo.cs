@@ -27,12 +27,34 @@ public enum RfbProtocolReadStage
     ArdStateChangePayload = 7,
 }
 
+public enum ArdEncryptedPacketDirection
+{
+    Send,
+    Receive,
+}
+
+public enum ArdEncryptedPacketFailureStage
+{
+    OuterLength,
+    TruncatedCiphertext,
+    CbcDecrypt,
+    PlaintextTooShort,
+    PayloadLength,
+    Padding,
+    Integrity,
+    StateCommit,
+}
+
 public sealed record RfbProtocolFailureInfo(
     RfbProtocolFailureKind Kind,
     RfbProtocolReadStage? ReadStage = null,
     byte? ServerMessageType = null,
     int? EncodingId = null,
-    int? RectangleIndex = null)
+    int? RectangleIndex = null,
+    ArdEncryptedPacketFailureStage? ArdEncryptionStage = null,
+    ArdEncryptedPacketDirection? ArdEncryptionDirection = null,
+    uint? ArdEncryptionSequence = null,
+    int? ArdCiphertextLength = null)
 {
     internal RfbProtocolFailureInfo FillMissingFrom(RfbProtocolFailureInfo outer)
     {
@@ -44,6 +66,10 @@ public sealed record RfbProtocolFailureInfo(
             ServerMessageType = ServerMessageType ?? outer.ServerMessageType,
             EncodingId = EncodingId ?? outer.EncodingId,
             RectangleIndex = RectangleIndex ?? outer.RectangleIndex,
+            ArdEncryptionStage = ArdEncryptionStage ?? outer.ArdEncryptionStage,
+            ArdEncryptionDirection = ArdEncryptionDirection ?? outer.ArdEncryptionDirection,
+            ArdEncryptionSequence = ArdEncryptionSequence ?? outer.ArdEncryptionSequence,
+            ArdCiphertextLength = ArdCiphertextLength ?? outer.ArdCiphertextLength,
         };
     }
 }

@@ -19,6 +19,10 @@ public sealed class RfbProtocolFailureInfoTests
         Assert.Null(failure.ServerMessageType);
         Assert.Null(failure.EncodingId);
         Assert.Null(failure.RectangleIndex);
+        Assert.Null(failure.ArdEncryptionStage);
+        Assert.Null(failure.ArdEncryptionDirection);
+        Assert.Null(failure.ArdEncryptionSequence);
+        Assert.Null(failure.ArdCiphertextLength);
     }
 
     [Fact]
@@ -44,6 +48,32 @@ public sealed class RfbProtocolFailureInfoTests
         Assert.Equal((byte)0, result.ServerMessageType);
         Assert.Equal(16, result.EncodingId);
         Assert.Equal(3, result.RectangleIndex);
+    }
+
+    [Fact]
+    public void FillMissingFrom_preserves_inner_ard_packet_context_and_fills_read_stage_from_outer_context()
+    {
+        var inner = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.ArdEncryptionPacket,
+            ArdEncryptionStage: ArdEncryptedPacketFailureStage.Padding,
+            ArdEncryptionDirection: ArdEncryptedPacketDirection.Receive,
+            ArdEncryptionSequence: 1,
+            ArdCiphertextLength: 48);
+        var outer = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.ArdEncryptionPacket,
+            RfbProtocolReadStage.ArdStateChangePayload,
+            ArdEncryptionStage: ArdEncryptedPacketFailureStage.OuterLength,
+            ArdEncryptionDirection: ArdEncryptedPacketDirection.Send,
+            ArdEncryptionSequence: 9,
+            ArdCiphertextLength: 64);
+
+        var result = inner.FillMissingFrom(outer);
+
+        Assert.Equal(RfbProtocolReadStage.ArdStateChangePayload, result.ReadStage);
+        Assert.Equal(ArdEncryptedPacketFailureStage.Padding, result.ArdEncryptionStage);
+        Assert.Equal(ArdEncryptedPacketDirection.Receive, result.ArdEncryptionDirection);
+        Assert.Equal((uint)1, result.ArdEncryptionSequence);
+        Assert.Equal(48, result.ArdCiphertextLength);
     }
 
     [Fact]
@@ -120,6 +150,12 @@ public sealed class RfbProtocolFailureInfoTests
     public void Existing_constructors_remain_compatible()
     {
         var inner = new InvalidOperationException("inner");
+        var legacyFailure = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.TruncatedRead,
+            RfbProtocolReadStage.FramebufferHeader,
+            0,
+            16,
+            2);
 
         var messageOnly = new RfbProtocolException("message");
         var withInner = new RfbProtocolException("message", inner);
@@ -130,6 +166,10 @@ public sealed class RfbProtocolFailureInfoTests
         Assert.Equal("message", withInner.Message);
         Assert.Same(inner, withInner.InnerException);
         Assert.Null(withInner.Failure);
+        Assert.Null(legacyFailure.ArdEncryptionStage);
+        Assert.Null(legacyFailure.ArdEncryptionDirection);
+        Assert.Null(legacyFailure.ArdEncryptionSequence);
+        Assert.Null(legacyFailure.ArdCiphertextLength);
     }
 
     [Fact]
@@ -168,13 +208,21 @@ public sealed class RfbProtocolFailureInfoTests
             RfbProtocolReadStage.ClipboardPayload,
             3,
             null,
-            null);
+            null,
+            ArdEncryptedPacketFailureStage.Integrity,
+            ArdEncryptedPacketDirection.Receive,
+            7,
+            32);
         var second = new RfbProtocolFailureInfo(
             RfbProtocolFailureKind.MalformedClipboard,
             RfbProtocolReadStage.ClipboardPayload,
             3,
             null,
-            null);
+            null,
+            ArdEncryptedPacketFailureStage.Integrity,
+            ArdEncryptedPacketDirection.Receive,
+            7,
+            32);
 
         Assert.Equal(first, second);
         Assert.NotSame(first, second);
