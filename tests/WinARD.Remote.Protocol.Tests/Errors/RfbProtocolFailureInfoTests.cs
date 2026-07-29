@@ -10,6 +10,22 @@ namespace WinARD.Remote.Protocol.Tests.Errors;
 public sealed class RfbProtocolFailureInfoTests
 {
     [Fact]
+    public void Ard_encrypted_packet_enum_values_are_stable()
+    {
+        Assert.Equal(0, (int)ArdEncryptedPacketDirection.Send);
+        Assert.Equal(1, (int)ArdEncryptedPacketDirection.Receive);
+
+        Assert.Equal(0, (int)ArdEncryptedPacketFailureStage.OuterLength);
+        Assert.Equal(1, (int)ArdEncryptedPacketFailureStage.TruncatedCiphertext);
+        Assert.Equal(2, (int)ArdEncryptedPacketFailureStage.CbcDecrypt);
+        Assert.Equal(3, (int)ArdEncryptedPacketFailureStage.PlaintextTooShort);
+        Assert.Equal(4, (int)ArdEncryptedPacketFailureStage.PayloadLength);
+        Assert.Equal(5, (int)ArdEncryptedPacketFailureStage.Padding);
+        Assert.Equal(6, (int)ArdEncryptedPacketFailureStage.Integrity);
+        Assert.Equal(7, (int)ArdEncryptedPacketFailureStage.StateCommit);
+    }
+
+    [Fact]
     public void Kind_only_constructor_defaults_optional_context_to_null()
     {
         var failure = new RfbProtocolFailureInfo(RfbProtocolFailureKind.TruncatedRead);
@@ -70,6 +86,25 @@ public sealed class RfbProtocolFailureInfoTests
         var result = inner.FillMissingFrom(outer);
 
         Assert.Equal(RfbProtocolReadStage.ArdStateChangePayload, result.ReadStage);
+        Assert.Equal(ArdEncryptedPacketFailureStage.Padding, result.ArdEncryptionStage);
+        Assert.Equal(ArdEncryptedPacketDirection.Receive, result.ArdEncryptionDirection);
+        Assert.Equal((uint)1, result.ArdEncryptionSequence);
+        Assert.Equal(48, result.ArdCiphertextLength);
+    }
+
+    [Fact]
+    public void FillMissingFrom_fills_missing_inner_ard_packet_context_from_outer_context()
+    {
+        var inner = new RfbProtocolFailureInfo(RfbProtocolFailureKind.ArdEncryptionPacket);
+        var outer = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.ArdEncryptionPacket,
+            ArdEncryptionStage: ArdEncryptedPacketFailureStage.Padding,
+            ArdEncryptionDirection: ArdEncryptedPacketDirection.Receive,
+            ArdEncryptionSequence: 1,
+            ArdCiphertextLength: 48);
+
+        var result = inner.FillMissingFrom(outer);
+
         Assert.Equal(ArdEncryptedPacketFailureStage.Padding, result.ArdEncryptionStage);
         Assert.Equal(ArdEncryptedPacketDirection.Receive, result.ArdEncryptionDirection);
         Assert.Equal((uint)1, result.ArdEncryptionSequence);
@@ -170,6 +205,40 @@ public sealed class RfbProtocolFailureInfoTests
         Assert.Null(legacyFailure.ArdEncryptionDirection);
         Assert.Null(legacyFailure.ArdEncryptionSequence);
         Assert.Null(legacyFailure.ArdCiphertextLength);
+    }
+
+    [Fact]
+    public void Five_parameter_failure_info_constructor_is_preserved_for_binary_compatibility()
+    {
+        var constructor = typeof(RfbProtocolFailureInfo).GetConstructor(
+            [
+                typeof(RfbProtocolFailureKind),
+                typeof(RfbProtocolReadStage?),
+                typeof(byte?),
+                typeof(int?),
+                typeof(int?),
+            ]);
+
+        Assert.NotNull(constructor);
+    }
+
+    [Fact]
+    public void Five_element_failure_info_deconstruction_remains_source_compatible()
+    {
+        var failure = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.TruncatedRead,
+            RfbProtocolReadStage.FramebufferRectanglePayload,
+            0,
+            16,
+            3);
+
+        var (kind, readStage, serverMessageType, encodingId, rectangleIndex) = failure;
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, kind);
+        Assert.Equal(RfbProtocolReadStage.FramebufferRectanglePayload, readStage);
+        Assert.Equal((byte)0, serverMessageType);
+        Assert.Equal(16, encodingId);
+        Assert.Equal(3, rectangleIndex);
     }
 
     [Fact]

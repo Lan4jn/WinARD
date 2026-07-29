@@ -29,20 +29,20 @@ public enum RfbProtocolReadStage
 
 public enum ArdEncryptedPacketDirection
 {
-    Send,
-    Receive,
+    Send = 0,
+    Receive = 1,
 }
 
 public enum ArdEncryptedPacketFailureStage
 {
-    OuterLength,
-    TruncatedCiphertext,
-    CbcDecrypt,
-    PlaintextTooShort,
-    PayloadLength,
-    Padding,
-    Integrity,
-    StateCommit,
+    OuterLength = 0,
+    TruncatedCiphertext = 1,
+    CbcDecrypt = 2,
+    PlaintextTooShort = 3,
+    PayloadLength = 4,
+    Padding = 5,
+    Integrity = 6,
+    StateCommit = 7,
 }
 
 public sealed record RfbProtocolFailureInfo(
@@ -56,6 +56,39 @@ public sealed record RfbProtocolFailureInfo(
     uint? ArdEncryptionSequence = null,
     int? ArdCiphertextLength = null)
 {
+    public RfbProtocolFailureInfo(
+        RfbProtocolFailureKind Kind,
+        RfbProtocolReadStage? ReadStage,
+        byte? ServerMessageType,
+        int? EncodingId,
+        int? RectangleIndex)
+        : this(
+            Kind,
+            ReadStage,
+            ServerMessageType,
+            EncodingId,
+            RectangleIndex,
+            null,
+            null,
+            null,
+            null)
+    {
+    }
+
+    public void Deconstruct(
+        out RfbProtocolFailureKind Kind,
+        out RfbProtocolReadStage? ReadStage,
+        out byte? ServerMessageType,
+        out int? EncodingId,
+        out int? RectangleIndex)
+    {
+        Kind = this.Kind;
+        ReadStage = this.ReadStage;
+        ServerMessageType = this.ServerMessageType;
+        EncodingId = this.EncodingId;
+        RectangleIndex = this.RectangleIndex;
+    }
+
     internal RfbProtocolFailureInfo FillMissingFrom(RfbProtocolFailureInfo outer)
     {
         ArgumentNullException.ThrowIfNull(outer);
