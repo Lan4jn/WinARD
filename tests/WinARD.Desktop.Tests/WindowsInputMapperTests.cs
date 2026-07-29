@@ -172,6 +172,15 @@ public sealed class WindowsInputMapperTests
         Assert.Equal((byte)0b0001_0001, WindowsInputMapper.WithWheel(0b0000_0001, -120));
     }
 
+    [Theory]
+    [InlineData(RemotePointerButtons.Left, (byte)1)]
+    [InlineData(RemotePointerButtons.Right, (byte)2)]
+    [InlineData(RemotePointerButtons.Middle, (byte)4)]
+    public void Pointer_buttons_use_apple_ard_bit_order(RemotePointerButtons buttons, byte expected)
+    {
+        Assert.Equal(expected, WindowsInputMapper.ToPointerMask(buttons));
+    }
+
     [Fact]
     public async Task Secure_attention_sequence_is_sent_remotely_in_order()
     {

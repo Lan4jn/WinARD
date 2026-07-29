@@ -178,8 +178,8 @@ public sealed class WindowsInputMapper : IAsyncDisposable
     {
         byte mask = 0;
         if ((buttons & RemotePointerButtons.Left) != 0) mask |= 1;
-        if ((buttons & RemotePointerButtons.Middle) != 0) mask |= 2;
-        if ((buttons & RemotePointerButtons.Right) != 0) mask |= 4;
+        if ((buttons & RemotePointerButtons.Right) != 0) mask |= 2;
+        if ((buttons & RemotePointerButtons.Middle) != 0) mask |= 4;
         return mask;
     }
 

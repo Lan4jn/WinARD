@@ -1031,6 +1031,29 @@ public sealed class RemoteSessionViewModelTests
             item => item.Code == "REMOTE_SESSION_INTERRUPTED");
     }
 
+    [Theory]
+    [InlineData(RfbProtocolFailureKind.ArdEncryptionNegotiation)]
+    [InlineData(RfbProtocolFailureKind.ArdEncryptionPacket)]
+    [InlineData(RfbProtocolFailureKind.ArdEncryptionIntegrity)]
+    public async Task Encryption_failures_emit_only_safe_protocol_metadata(
+        RfbProtocolFailureKind kind)
+    {
+        var diagnostic = await RecordReceiveFailureAsync(
+            RfbProtocolException.Create(
+                "ARD encryption failed.",
+                new RfbProtocolFailureInfo(kind)));
+
+        var field = Assert.Single(diagnostic.Fields!);
+        Assert.Equal("ProtocolFailureKind", field.Name);
+        Assert.Equal(kind.ToString(), field.Value);
+        Assert.DoesNotContain(
+            diagnostic.Fields!,
+            candidate =>
+                candidate.Name.Contains("Key", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Name.Contains("Iv", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Name.Contains("Payload", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static Exception WrapExceptionChain(Exception innermost, int wrapperCount)
     {
         var exception = innermost;

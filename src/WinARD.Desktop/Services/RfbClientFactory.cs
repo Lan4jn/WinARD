@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using WinARD.Application.Ports;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Ard;
@@ -21,23 +22,28 @@ public sealed class RfbClientFactory(ISafeDiagnosticSink? diagnosticSink = null)
 
 internal sealed class RfbClient : IRfbClient
 {
-    private readonly Stream _stream;
+    private readonly ArdEncryptedStream _transport;
     private readonly FramebufferSnapshotFactory _snapshotFactory;
     private readonly ISafeDiagnosticSink? _diagnosticSink;
     private RfbHandshakeResult? _handshake;
     private RfbServerInit? _serverInit;
     private Framebuffer? _framebuffer;
     private FramebufferUpdateSession? _framebufferUpdates;
+    private ArdAuthenticationResult? _authenticationResult;
+    private ArdSessionEncryption? _sessionEncryption;
     private bool _disposed;
 
     public RfbClient(
         Stream stream,
         FramebufferSnapshotFactory? snapshotFactory = null,
-        ISafeDiagnosticSink? diagnosticSink = null)
+        ISafeDiagnosticSink? diagnosticSink = null,
+        ArdAuthenticationResult? authenticationResult = null)
     {
-        _stream = stream ?? throw new ArgumentNullException(nameof(stream));
+        ArgumentNullException.ThrowIfNull(stream);
+        _transport = new ArdEncryptedStream(stream, ProtocolLimits.Default);
         _snapshotFactory = snapshotFactory ?? new FramebufferSnapshotFactory();
         _diagnosticSink = diagnosticSink;
+        _authenticationResult = authenticationResult;
     }
 
     public RemoteFramebufferSize FramebufferSize
@@ -53,7 +59,7 @@ internal sealed class RfbClient : IRfbClient
     public async Task NegotiateAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        _handshake = await RfbHandshake.NegotiateAsync(_stream, cancellationToken).ConfigureAwait(false);
+        _handshake = await RfbHandshake.NegotiateAsync(_transport, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken)
@@ -61,10 +67,15 @@ internal sealed class RfbClient : IRfbClient
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(secret);
         var handshake = _handshake ?? throw new InvalidOperationException("RFB negotiation has not completed.");
+        if (_authenticationResult is not null || _sessionEncryption is not null)
+        {
+            throw new InvalidOperationException("RFB authentication has already completed.");
+        }
+
         using var usernameMaterial = SecretMaterial.FromUtf8(username);
         using var passwordMaterial = new ApplicationSecretMaterial(secret);
-        await new ArdAuthenticator().AuthenticateAsync(
-            _stream,
+        _authenticationResult = await new ArdAuthenticator().AuthenticateAsync(
+            _transport,
             handshake.Version,
             usernameMaterial,
             passwordMaterial,
@@ -75,18 +86,36 @@ internal sealed class RfbClient : IRfbClient
     {
         ThrowIfDisposed();
         var handshake = _handshake ?? throw new InvalidOperationException("RFB negotiation has not completed.");
-        _serverInit = await RfbSessionInitializer.InitializeAsync(
-            _stream,
-            handshake,
-            ProtocolLimits.Default,
-            cancellationToken).ConfigureAwait(false);
+        if (handshake.Version == RfbVersion.V3_889 && _authenticationResult is not null)
+        {
+            _sessionEncryption = new ArdSessionEncryption(_transport, _authenticationResult);
+            _authenticationResult = null;
+            _serverInit = await RfbSessionInitializer.InitializeAsync(
+                _transport,
+                handshake,
+                ProtocolLimits.Default,
+                _sessionEncryption,
+                cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            _serverInit = await RfbSessionInitializer.InitializeAsync(
+                _transport,
+                handshake,
+                ProtocolLimits.Default,
+                cancellationToken).ConfigureAwait(false);
+        }
+
         _framebuffer = new Framebuffer(
             _serverInit.Width,
             _serverInit.Height,
             ProtocolLimits.Default);
-        _framebufferUpdates = FramebufferUpdateReader.CreateSession(
-            _framebuffer,
-            PixelFormat.WinArdBgra32);
+        _framebufferUpdates = _sessionEncryption is null
+            ? FramebufferUpdateReader.CreateSession(_framebuffer, PixelFormat.WinArdBgra32)
+            : FramebufferUpdateReader.CreateSession(
+                _framebuffer,
+                PixelFormat.WinArdBgra32,
+                _sessionEncryption.CreateDecoder());
         WriteNegotiationDiagnostic(handshake, _serverInit);
     }
 
@@ -95,7 +124,7 @@ internal sealed class RfbClient : IRfbClient
         ThrowIfDisposed();
         var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
         return new ValueTask(RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
-            _stream,
+            _transport,
             incremental,
             0,
             0,
@@ -110,7 +139,7 @@ internal sealed class RfbClient : IRfbClient
         var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
         var updates = _framebufferUpdates ?? throw new InvalidOperationException("RFB initialization has not completed.");
         var handshake = _handshake ?? throw new InvalidOperationException("RFB negotiation has not completed.");
-        var reader = new RfbReader(_stream, ProtocolLimits.Default);
+        var reader = new RfbReader(_transport, ProtocolLimits.Default);
         while (true)
         {
             byte type;
@@ -130,11 +159,17 @@ internal sealed class RfbClient : IRfbClient
                 case 0:
                     try
                     {
-                        return await updates.ApplyBodyAsync(
-                                _stream,
-                                (surface, update) => _snapshotFactory.CreateServerMessage(surface, update),
+                        var update = await updates.ApplyBodyAsync(
+                                _transport,
                                 cancellationToken)
                             .ConfigureAwait(false);
+                        if (_sessionEncryption is not null)
+                        {
+                            await _sessionEncryption.CompleteFramebufferUpdateAsync(cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+
+                        return _snapshotFactory.CreateServerMessage(framebuffer, update);
                     }
                     catch (RfbProtocolException exception)
                     {
@@ -179,7 +214,7 @@ internal sealed class RfbClient : IRfbClient
                     {
                         try
                         {
-                            await new ArdClientMessageWriter(new RfbWriter(_stream))
+                            await new ArdClientMessageWriter(new RfbWriter(_transport))
                                 .WriteAutoFramebufferUpdateAsync(
                                     checked((ushort)framebuffer.Width),
                                     checked((ushort)framebuffer.Height),
@@ -235,7 +270,7 @@ internal sealed class RfbClient : IRfbClient
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        return new PointerEventWriter(new RfbWriter(_stream)).WriteAsync(
+        return new PointerEventWriter(new RfbWriter(_transport)).WriteAsync(
             buttons,
             x,
             y,
@@ -248,7 +283,7 @@ internal sealed class RfbClient : IRfbClient
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        return new KeyEventWriter(new RfbWriter(_stream)).WriteAsync(
+        return new KeyEventWriter(new RfbWriter(_transport)).WriteAsync(
             down,
             keysym,
             cancellationToken);
@@ -257,7 +292,7 @@ internal sealed class RfbClient : IRfbClient
     public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        return new ClipboardProtocol(new RfbWriter(_stream)).WriteClientCutTextAsync(
+        return new ClipboardProtocol(new RfbWriter(_transport)).WriteClientCutTextAsync(
             text,
             cancellationToken);
     }
@@ -270,12 +305,43 @@ internal sealed class RfbClient : IRfbClient
         }
 
         _disposed = true;
-        if (_framebufferUpdates is not null)
+        Exception? failure = null;
+        try
         {
-            await _framebufferUpdates.DisposeAsync().ConfigureAwait(false);
+            if (_framebufferUpdates is not null)
+            {
+                await _framebufferUpdates.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
         }
 
+        try
+        {
+            if (_sessionEncryption is not null)
+            {
+                await _sessionEncryption.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception exception) when (failure is not null)
+        {
+            _ = exception;
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        _authenticationResult?.Dispose();
+        _authenticationResult = null;
         _framebuffer?.Dispose();
+        await _transport.DisposeAsync().ConfigureAwait(false);
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);

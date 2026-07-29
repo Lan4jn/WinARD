@@ -2,6 +2,7 @@ using WinARD.Application.Ports;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
 using WinARD.Remote.Protocol.Ard;
+using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
@@ -13,6 +14,7 @@ using System.Xml.Linq;
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Text.Json;
+using System.Security.Cryptography;
 
 #pragma warning disable CA1707
 
@@ -495,6 +497,52 @@ public sealed class FramePresentationTests
 
         Assert.Equal(new RemoteFramebufferSize(2, 1), client.FramebufferSize);
         Assert.Equal((byte)ArdClientInitFlags.Ard, stream.WrittenBytes[13]);
+    }
+
+    [Fact]
+    public async Task Rfb_client_encrypts_pointer_and_key_after_1103_activation()
+    {
+        var authenticationKey = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
+        var sessionKey = Enumerable.Range(32, 16).Select(value => (byte)value).ToArray();
+        var sessionIv = Enumerable.Range(64, 16).Select(value => (byte)value).ToArray();
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                .. ArdSessionEncryptionUpdate(authenticationKey, sessionKey, sessionIv),
+            ]);
+        await using var client = new RfbClient(
+            stream,
+            authenticationResult: new ArdAuthenticationResult(authenticationKey));
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        using var frame = Assert.IsType<RemoteFramebufferMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        await client.SendPointerAsync(0, 100, 200, CancellationToken.None);
+        await client.SendKeyAsync(0x61, true, CancellationToken.None);
+
+        var wire = stream.WrittenBytes;
+        byte[] acknowledgement = [0x12, 0, 0, 2, 0, 1, 0, 0];
+        var acknowledgementOffset = FindSequence(wire, acknowledgement);
+        Assert.True(acknowledgementOffset >= 0);
+        var encrypted = wire[(acknowledgementOffset + acknowledgement.Length)..];
+        var firstLength = BinaryPrimitives.ReadUInt16BigEndian(encrypted);
+        using var pointer = ArdEncryptedPacketCodec.Decrypt(
+            sessionKey,
+            sessionIv,
+            0,
+            encrypted.AsSpan(2, firstLength));
+        var secondOffset = 2 + firstLength;
+        var secondLength = BinaryPrimitives.ReadUInt16BigEndian(encrypted.AsSpan(secondOffset));
+        using var key = ArdEncryptedPacketCodec.Decrypt(
+            sessionKey,
+            pointer.NextIv,
+            1,
+            encrypted.AsSpan(secondOffset + 2, secondLength));
+
+        Assert.Equal(new byte[] { 5, 0, 0, 100, 0, 200 }, pointer.Payload);
+        Assert.Equal(new byte[] { 4, 1, 0, 0, 0, 0, 0, 0x61 }, key.Payload);
     }
 
     [Fact]
@@ -1144,6 +1192,39 @@ public sealed class FramePresentationTests
         BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(6), status);
         extra.CopyTo(bytes, 8);
         return bytes;
+    }
+
+    private static byte[] ArdSessionEncryptionUpdate(
+        byte[] authenticationKey,
+        byte[] sessionKey,
+        byte[] sessionIv)
+    {
+        var bytes = new byte[4 + 12 + 36];
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2), 1);
+        BinaryPrimitives.WriteInt32BigEndian(
+            bytes.AsSpan(12),
+            (int)RfbEncodingType.ArdSessionEncryption);
+        BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(16), 1);
+#pragma warning disable CA5358 // AES-ECB is required to construct the ARD session-encryption fixture.
+        using var aes = Aes.Create();
+        aes.Key = authenticationKey;
+        aes.EncryptEcb(sessionKey, PaddingMode.None).CopyTo(bytes, 20);
+        aes.EncryptEcb(sessionIv, PaddingMode.None).CopyTo(bytes, 36);
+#pragma warning restore CA5358
+        return bytes;
+    }
+
+    private static int FindSequence(byte[] source, byte[] sequence)
+    {
+        for (var offset = 0; offset <= source.Length - sequence.Length; offset++)
+        {
+            if (source.AsSpan(offset, sequence.Length).SequenceEqual(sequence))
+            {
+                return offset;
+            }
+        }
+
+        return -1;
     }
 
     private static byte[] CursorOnlyUpdate()

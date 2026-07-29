@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <InternalsVisibleTo Include="WinARD.Remote.Protocol.Tests" />
+    <InternalsVisibleTo Include="WinARD.Desktop.Tests" />
   </ItemGroup>
 </Project>
