@@ -1,0 +1,204 @@
+using System.Buffers.Binary;
+using WinARD.Remote.Protocol.Ard;
+using WinARD.Remote.Protocol.IO;
+using Xunit;
+
+#pragma warning disable CA1707
+
+namespace WinARD.Remote.Protocol.Tests.Ard;
+
+public sealed class ArdEncryptedStreamTests
+{
+    private static readonly byte[] Key = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
+    private static readonly byte[] InitialIv = Enumerable.Range(16, 16).Select(value => (byte)value).ToArray();
+
+    [Fact]
+    public async Task Plaintext_mode_forwards_reads_and_writes_unchanged()
+    {
+        await using var inner = new ScriptedDuplexStream([1, 2, 3], maxRead: 1);
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        var read = new byte[3];
+
+        await ReadExactlyAsync(stream, read);
+        await stream.WriteAsync(new byte[] { 4, 5, 6 });
+
+        Assert.Equal(new byte[] { 1, 2, 3 }, read);
+        Assert.Equal(new byte[] { 4, 5, 6 }, inner.WrittenBytes);
+    }
+
+    [Fact]
+    public async Task Activate_encrypts_all_later_writes_after_existing_plaintext()
+    {
+        await using var inner = new ScriptedDuplexStream([]);
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        await stream.WriteAsync(new byte[] { 0x12, 0, 0, 2, 0, 1, 0, 0 });
+        stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
+
+        var pointer = new byte[] { 5, 0, 0, 100, 0, 200 };
+        await stream.WriteAsync(pointer);
+
+        var encryptedWire = inner.WrittenBytes[8..];
+        var ciphertextLength = BinaryPrimitives.ReadUInt16BigEndian(encryptedWire);
+        Assert.Equal(encryptedWire.Length - 2, ciphertextLength);
+        using var decoded = ArdEncryptedPacketCodec.Decrypt(
+            Key,
+            InitialIv,
+            0,
+            encryptedWire.AsSpan(2));
+        Assert.Equal(pointer, decoded.Payload);
+    }
+
+    [Fact]
+    public async Task ReadAsync_reassembles_fragmented_encrypted_packets_and_chains_iv()
+    {
+        var firstPayload = new byte[] { 0, 0, 0, 1 };
+        var secondPayload = new byte[] { 2, 3, 4, 5, 6 };
+        var first = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 0, firstPayload);
+        var nextIv = first[^16..];
+        var second = ArdEncryptedPacketCodec.Encrypt(Key, nextIv, 1, secondPayload);
+        await using var inner = new ScriptedDuplexStream([.. first, .. second], maxRead: 3);
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
+        var output = new byte[firstPayload.Length + secondPayload.Length];
+
+        await ReadExactlyAsync(stream, output);
+
+        Assert.Equal(firstPayload.Concat(secondPayload), output);
+    }
+
+    [Fact]
+    public async Task ReadAsync_skips_empty_encrypted_payload_without_reporting_end_of_stream()
+    {
+        var empty = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 0, []);
+        var nextIv = empty[^16..];
+        var payload = new byte[] { 9, 8, 7 };
+        var data = ArdEncryptedPacketCodec.Encrypt(Key, nextIv, 1, payload);
+        await using var inner = new ScriptedDuplexStream([.. empty, .. data], maxRead: 2);
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
+        var output = new byte[payload.Length];
+
+        var received = await stream.ReadAsync(output);
+
+        Assert.Equal(payload.Length, received);
+        Assert.Equal(payload, output);
+    }
+
+    [Fact]
+    public async Task WriteAsync_splits_payloads_that_exceed_one_encrypted_packet()
+    {
+        await using var inner = new ScriptedDuplexStream([]);
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
+        var payload = Enumerable.Range(0, ArdEncryptedPacketCodec.MaximumPayloadLength + 37)
+            .Select(value => (byte)value)
+            .ToArray();
+
+        await stream.WriteAsync(payload);
+
+        Assert.Equal(payload, DecodeClientPackets(inner.WrittenBytes).SelectMany(value => value));
+        Assert.Equal(2, DecodeClientPackets(inner.WrittenBytes).Count);
+    }
+
+    [Fact]
+    public async Task Concurrent_writes_use_distinct_sequences_and_chained_ivs()
+    {
+        await using var inner = new ScriptedDuplexStream([]);
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
+        var writes = Enumerable.Range(0, 100)
+            .Select(value => stream.WriteAsync(new byte[] { checked((byte)value) }).AsTask())
+            .ToArray();
+
+        await Task.WhenAll(writes);
+
+        var decoded = DecodeClientPackets(inner.WrittenBytes);
+        Assert.Equal(100, decoded.Count);
+        Assert.Equal(Enumerable.Range(0, 100), decoded.Select(payload => (int)payload[0]).Order());
+    }
+
+    private static List<byte[]> DecodeClientPackets(byte[] wire)
+    {
+        var decoded = new List<byte[]>();
+        var offset = 0;
+        var sequence = 0u;
+        var iv = InitialIv.ToArray();
+        while (offset < wire.Length)
+        {
+            var length = BinaryPrimitives.ReadUInt16BigEndian(wire.AsSpan(offset));
+            using var packet = ArdEncryptedPacketCodec.Decrypt(
+                Key,
+                iv,
+                sequence,
+                wire.AsSpan(offset + 2, length));
+            decoded.Add(packet.Payload.ToArray());
+            iv = packet.NextIv.ToArray();
+            offset += 2 + length;
+            sequence++;
+        }
+
+        return decoded;
+    }
+
+    private static async Task ReadExactlyAsync(Stream stream, Memory<byte> destination)
+    {
+        var read = 0;
+        while (read < destination.Length)
+        {
+            var received = await stream.ReadAsync(destination[read..]);
+            Assert.True(received > 0);
+            read += received;
+        }
+    }
+
+    private sealed class ScriptedDuplexStream(byte[] input, int maxRead = int.MaxValue) : Stream
+    {
+        private readonly MemoryStream _input = new(input, writable: false);
+        private readonly MemoryStream _output = new();
+        private readonly object _writeSync = new();
+
+        public byte[] WrittenBytes
+        {
+            get
+            {
+                lock (_writeSync)
+                {
+                    return _output.ToArray();
+                }
+            }
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            _input.Read(buffer, offset, Math.Min(count, maxRead));
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default) =>
+            _input.ReadAsync(buffer[..Math.Min(buffer.Length, maxRead)], cancellationToken);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            lock (_writeSync)
+            {
+                _output.Write(buffer, offset, count);
+            }
+        }
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            lock (_writeSync)
+            {
+                _output.Write(buffer.Span);
+            }
+
+            return ValueTask.CompletedTask;
+        }
+    }
+}
