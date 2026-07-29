@@ -238,32 +238,42 @@ public sealed class ArdEncryptedStream : Stream
         ReadOnlyMemory<byte> payload,
         CancellationToken cancellationToken)
     {
-        ArdSessionCipherMaterial material;
-        byte[] sendIv;
-        uint sequence;
-        lock (_stateSync)
-        {
-            ThrowIfUnavailableLocked();
-            material = _material ?? throw new InvalidOperationException("ARD stream encryption is not active.");
-            sendIv = _sendIv ?? throw new InvalidOperationException("ARD send IV is unavailable.");
-            sequence = _sendSequence;
-        }
-
-        var packet = ArdEncryptedPacketCodec.Encrypt(material.Key, sendIv, sequence, payload.Span);
+        byte[]? key = null;
+        byte[]? sendIv = null;
+        byte[]? packet = null;
+        byte[]? nextIv = null;
         try
         {
-            await _inner.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
-            var nextIv = packet[^16..].ToArray();
+            uint sequence;
             lock (_stateSync)
             {
+                ThrowIfUnavailableLocked();
+                var material = _material ??
+                    throw new InvalidOperationException("ARD stream encryption is not active.");
+                key = material.Key.ToArray();
+                sendIv = (_sendIv ??
+                    throw new InvalidOperationException("ARD send IV is unavailable.")).ToArray();
+                sequence = _sendSequence;
+            }
+
+            packet = ArdEncryptedPacketCodec.Encrypt(key, sendIv, sequence, payload.Span);
+            await _inner.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
+            nextIv = packet[^16..].ToArray();
+            lock (_stateSync)
+            {
+                ThrowIfUnavailableLocked();
                 CryptographicOperations.ZeroMemory(_sendIv!);
                 _sendIv = nextIv;
+                nextIv = null;
                 _sendSequence++;
             }
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(packet);
+            ClearAndNull(ref key);
+            ClearAndNull(ref sendIv);
+            ClearAndNull(ref nextIv);
+            ClearAndNull(ref packet);
         }
     }
 
@@ -271,6 +281,10 @@ public sealed class ArdEncryptedStream : Stream
     {
         var header = new byte[sizeof(ushort)];
         byte[]? ciphertext = null;
+        byte[]? key = null;
+        byte[]? receiveIv = null;
+        byte[]? payload = null;
+        byte[]? nextIv = null;
         try
         {
             await ReadExactlyFromInnerAsync(header, cancellationToken).ConfigureAwait(false);
@@ -287,27 +301,30 @@ public sealed class ArdEncryptedStream : Stream
             ciphertext = new byte[ciphertextLength];
             await ReadExactlyFromInnerAsync(ciphertext, cancellationToken).ConfigureAwait(false);
 
-            ArdSessionCipherMaterial material;
-            byte[] receiveIv;
             uint sequence;
             lock (_stateSync)
             {
                 ThrowIfUnavailableLocked();
-                material = _material ?? throw new InvalidOperationException("ARD stream encryption is not active.");
-                receiveIv = _receiveIv ?? throw new InvalidOperationException("ARD receive IV is unavailable.");
+                var material = _material ?? throw new InvalidOperationException("ARD stream encryption is not active.");
+                key = material.Key.ToArray();
+                receiveIv = (_receiveIv ??
+                    throw new InvalidOperationException("ARD receive IV is unavailable.")).ToArray();
                 sequence = _receiveSequence;
             }
 
-            using var decoded = ArdEncryptedPacketCodec.Decrypt(material.Key, receiveIv, sequence, ciphertext);
-            var payload = decoded.Payload.ToArray();
-            var nextIv = decoded.NextIv.ToArray();
+            using var decoded = ArdEncryptedPacketCodec.Decrypt(key, receiveIv, sequence, ciphertext);
+            payload = decoded.Payload.ToArray();
+            nextIv = decoded.NextIv.ToArray();
             lock (_stateSync)
             {
+                ThrowIfUnavailableLocked();
                 ClearDecryptedPayloadLocked();
                 CryptographicOperations.ZeroMemory(_receiveIv!);
                 _decryptedPayload = payload;
+                payload = null;
                 _decryptedOffset = 0;
                 _receiveIv = nextIv;
+                nextIv = null;
                 _receiveSequence++;
             }
         }
@@ -318,6 +335,11 @@ public sealed class ArdEncryptedStream : Stream
             {
                 CryptographicOperations.ZeroMemory(ciphertext);
             }
+
+            ClearAndNull(ref payload);
+            ClearAndNull(ref nextIv);
+            ClearAndNull(ref key);
+            ClearAndNull(ref receiveIv);
         }
     }
 
@@ -368,6 +390,7 @@ public sealed class ArdEncryptedStream : Stream
         lock (_stateSync)
         {
             _faulted = true;
+            ClearCipherStateLocked();
         }
     }
 
@@ -422,11 +445,7 @@ public sealed class ArdEncryptedStream : Stream
                     }
 
                     _disposed = true;
-                    _material?.Dispose();
-                    _material = null;
-                    ClearAndNull(ref _sendIv);
-                    ClearAndNull(ref _receiveIv);
-                    ClearDecryptedPayloadLocked();
+                    ClearCipherStateLocked();
                 }
             }
             finally
@@ -444,6 +463,17 @@ public sealed class ArdEncryptedStream : Stream
     {
         ClearAndNull(ref _decryptedPayload);
         _decryptedOffset = 0;
+    }
+
+    private void ClearCipherStateLocked()
+    {
+        _material?.Dispose();
+        _material = null;
+        ClearAndNull(ref _sendIv);
+        ClearAndNull(ref _receiveIv);
+        ClearDecryptedPayloadLocked();
+        _sendSequence = 0;
+        _receiveSequence = 0;
     }
 
     private static void ClearAndNull(ref byte[]? value)

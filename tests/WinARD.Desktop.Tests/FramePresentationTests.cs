@@ -500,6 +500,21 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Rfb_client_rejects_889_initialization_without_authentication_material()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClientFactory().Create(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.InitializeAsync(CancellationToken.None));
+
+        Assert.Equal(RfbProtocolFailureKind.ArdEncryptionNegotiation, exception.Failure?.Kind);
+    }
+
+    [Fact]
     public async Task Rfb_client_encrypts_pointer_and_key_after_1103_activation()
     {
         var authenticationKey = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();

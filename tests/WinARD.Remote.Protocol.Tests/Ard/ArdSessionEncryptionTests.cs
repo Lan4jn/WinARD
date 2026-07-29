@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Encodings;
+using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.IO;
 using Xunit;
@@ -106,6 +107,25 @@ public sealed class ArdSessionEncryptionTests
         Assert.Equal(new byte[] { 0x12, 0, 0, 2, 0, 1, 0, 0 }, wire[12..20]);
         using var decoded = ArdEncryptedPacketCodec.Decrypt(SessionKey, SessionIv, 0, wire.AsSpan(22));
         Assert.Equal(pointer, decoded.Payload);
+    }
+
+    [Fact]
+    public async Task First_completed_framebuffer_update_without_1103_fails_closed()
+    {
+        await using var inner = new ScriptedDuplexStream([]);
+        await using var transport = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        await using var encryption = new ArdSessionEncryption(
+            transport,
+            new ArdAuthenticationResult(AuthenticationKey.ToArray()));
+        await encryption.RequestAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            encryption.CompleteFramebufferUpdateAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(
+            RfbProtocolFailureKind.ArdEncryptionNegotiation,
+            exception.Failure?.Kind);
+        Assert.False(transport.IsEncrypted);
     }
 
     private static byte[] CreateSessionEncryptionUpdate()

@@ -82,6 +82,12 @@ public sealed class ArdSessionEncryption : IAsyncDisposable
         try
         {
             ThrowIfDisposed();
+            if (_state == ArdSessionEncryptionState.Requested)
+            {
+                throw NegotiationFailure(
+                    "The first ARD framebuffer update did not provide session encryption material.");
+            }
+
             if (_state != ArdSessionEncryptionState.PendingActivation)
             {
                 return;

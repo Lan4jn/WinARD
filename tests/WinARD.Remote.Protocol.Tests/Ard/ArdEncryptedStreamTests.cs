@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using WinARD.Remote.Protocol.Ard;
+using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.IO;
 using Xunit;
 
@@ -117,6 +118,40 @@ public sealed class ArdEncryptedStreamTests
         Assert.Equal(Enumerable.Range(0, 100), decoded.Select(payload => (int)payload[0]).Order());
     }
 
+    [Fact]
+    public async Task Write_failure_immediately_clears_active_cipher_material()
+    {
+        var key = Key.ToArray();
+        var initialIv = InitialIv.ToArray();
+        await using var inner = new ScriptedDuplexStream([], writeException: new IOException("write failed"));
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        stream.Activate(new ArdSessionCipherMaterial(key, initialIv));
+
+        await Assert.ThrowsAsync<IOException>(() => stream.WriteAsync(new byte[] { 1 }).AsTask());
+
+        Assert.False(stream.IsEncrypted);
+        Assert.All(key, value => Assert.Equal(0, value));
+        Assert.All(initialIv, value => Assert.Equal(0, value));
+    }
+
+    [Fact]
+    public async Task Integrity_failure_immediately_clears_active_cipher_material()
+    {
+        var key = Key.ToArray();
+        var initialIv = InitialIv.ToArray();
+        var packet = ArdEncryptedPacketCodec.Encrypt(key, initialIv, 0, [1, 2, 3]);
+        packet[^1] ^= 0x80;
+        await using var inner = new ScriptedDuplexStream(packet);
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        stream.Activate(new ArdSessionCipherMaterial(key, initialIv));
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() => stream.ReadAsync(new byte[3]).AsTask());
+
+        Assert.False(stream.IsEncrypted);
+        Assert.All(key, value => Assert.Equal(0, value));
+        Assert.All(initialIv, value => Assert.Equal(0, value));
+    }
+
     private static List<byte[]> DecodeClientPackets(byte[] wire)
     {
         var decoded = new List<byte[]>();
@@ -151,7 +186,10 @@ public sealed class ArdEncryptedStreamTests
         }
     }
 
-    private sealed class ScriptedDuplexStream(byte[] input, int maxRead = int.MaxValue) : Stream
+    private sealed class ScriptedDuplexStream(
+        byte[] input,
+        int maxRead = int.MaxValue,
+        Exception? writeException = null) : Stream
     {
         private readonly MemoryStream _input = new(input, writable: false);
         private readonly MemoryStream _output = new();
@@ -193,6 +231,11 @@ public sealed class ArdEncryptedStreamTests
             ReadOnlyMemory<byte> buffer,
             CancellationToken cancellationToken = default)
         {
+            if (writeException is not null)
+            {
+                return ValueTask.FromException(writeException);
+            }
+
             lock (_writeSync)
             {
                 _output.Write(buffer.Span);

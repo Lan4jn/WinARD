@@ -17,7 +17,10 @@ namespace WinARD.Desktop.Services;
 
 public sealed class RfbClientFactory(ISafeDiagnosticSink? diagnosticSink = null) : IRfbClientFactory
 {
-    public IRfbClient Create(Stream stream) => new RfbClient(stream, diagnosticSink: diagnosticSink);
+    public IRfbClient Create(Stream stream) => new RfbClient(
+        stream,
+        diagnosticSink: diagnosticSink,
+        requireArdAuthentication: true);
 }
 
 internal sealed class RfbClient : IRfbClient
@@ -25,6 +28,7 @@ internal sealed class RfbClient : IRfbClient
     private readonly ArdEncryptedStream _transport;
     private readonly FramebufferSnapshotFactory _snapshotFactory;
     private readonly ISafeDiagnosticSink? _diagnosticSink;
+    private readonly bool _requireArdAuthentication;
     private RfbHandshakeResult? _handshake;
     private RfbServerInit? _serverInit;
     private Framebuffer? _framebuffer;
@@ -37,13 +41,15 @@ internal sealed class RfbClient : IRfbClient
         Stream stream,
         FramebufferSnapshotFactory? snapshotFactory = null,
         ISafeDiagnosticSink? diagnosticSink = null,
-        ArdAuthenticationResult? authenticationResult = null)
+        ArdAuthenticationResult? authenticationResult = null,
+        bool requireArdAuthentication = false)
     {
         ArgumentNullException.ThrowIfNull(stream);
         _transport = new ArdEncryptedStream(stream, ProtocolLimits.Default);
         _snapshotFactory = snapshotFactory ?? new FramebufferSnapshotFactory();
         _diagnosticSink = diagnosticSink;
         _authenticationResult = authenticationResult;
+        _requireArdAuthentication = requireArdAuthentication;
     }
 
     public RemoteFramebufferSize FramebufferSize
@@ -86,6 +92,15 @@ internal sealed class RfbClient : IRfbClient
     {
         ThrowIfDisposed();
         var handshake = _handshake ?? throw new InvalidOperationException("RFB negotiation has not completed.");
+        if (handshake.Version == RfbVersion.V3_889 &&
+            _authenticationResult is null &&
+            _requireArdAuthentication)
+        {
+            throw RfbProtocolException.Create(
+                "ARD 003.889 initialization requires authenticated session encryption material.",
+                new RfbProtocolFailureInfo(RfbProtocolFailureKind.ArdEncryptionNegotiation));
+        }
+
         if (handshake.Version == RfbVersion.V3_889 && _authenticationResult is not null)
         {
             _sessionEncryption = new ArdSessionEncryption(_transport, _authenticationResult);
