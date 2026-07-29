@@ -484,7 +484,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             return null;
         }
 
-        var fields = new List<DiagnosticField>(5)
+        var fields = new List<DiagnosticField>(9)
         {
             new(
                 "ProtocolFailureKind",
@@ -520,6 +520,38 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             fields.Add(new DiagnosticField(
                 "RectangleIndex",
                 rectangleIndex.ToString(CultureInfo.InvariantCulture),
+                DiagnosticFieldCategory.Public));
+        }
+
+        if (failure.ArdEncryptionStage is { } ardEncryptionStage)
+        {
+            fields.Add(new DiagnosticField(
+                "ArdEncryptionStage",
+                ardEncryptionStage.ToString(),
+                DiagnosticFieldCategory.Public));
+        }
+
+        if (failure.ArdEncryptionDirection is { } ardEncryptionDirection)
+        {
+            fields.Add(new DiagnosticField(
+                "ArdEncryptionDirection",
+                ardEncryptionDirection.ToString(),
+                DiagnosticFieldCategory.Public));
+        }
+
+        if (failure.ArdEncryptionSequence is { } ardEncryptionSequence)
+        {
+            fields.Add(new DiagnosticField(
+                "ArdEncryptionSequence",
+                ardEncryptionSequence.ToString(CultureInfo.InvariantCulture),
+                DiagnosticFieldCategory.Public));
+        }
+
+        if (failure.ArdCiphertextLength is { } ardCiphertextLength)
+        {
+            fields.Add(new DiagnosticField(
+                "ArdCiphertextLength",
+                ardCiphertextLength.ToString(CultureInfo.InvariantCulture),
                 DiagnosticFieldCategory.Public));
         }
 

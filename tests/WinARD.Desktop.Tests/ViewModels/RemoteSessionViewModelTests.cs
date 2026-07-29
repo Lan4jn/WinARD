@@ -1054,6 +1054,73 @@ public sealed class RemoteSessionViewModelTests
                 candidate.Name.Contains("Payload", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public async Task Encryption_failures_with_packet_context_export_only_safe_ard_packet_metadata()
+    {
+        const string secret = "ard-encryption-secret-marker";
+        var diagnostic = await RecordReceiveFailureAsync(
+            RfbProtocolException.Create(
+                $"ARD encryption failed: {secret}",
+                new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.ArdEncryptionPacket,
+                    RfbProtocolReadStage.ServerMessageType,
+                    ArdEncryptionStage: ArdEncryptedPacketFailureStage.Padding,
+                    ArdEncryptionDirection: ArdEncryptedPacketDirection.Receive,
+                    ArdEncryptionSequence: 1,
+                    ArdCiphertextLength: 48)));
+
+        var fields = diagnostic.Fields!;
+        Assert.Collection(
+            fields,
+            field =>
+            {
+                Assert.Equal("ProtocolFailureKind", field.Name);
+                Assert.Equal("ArdEncryptionPacket", field.Value);
+                Assert.Equal(DiagnosticFieldCategory.Public, field.Category);
+            },
+            field =>
+            {
+                Assert.Equal("ProtocolReadStage", field.Name);
+                Assert.Equal("ServerMessageType", field.Value);
+                Assert.Equal(DiagnosticFieldCategory.Public, field.Category);
+            },
+            field =>
+            {
+                Assert.Equal("ArdEncryptionStage", field.Name);
+                Assert.Equal("Padding", field.Value);
+                Assert.Equal(DiagnosticFieldCategory.Public, field.Category);
+            },
+            field =>
+            {
+                Assert.Equal("ArdEncryptionDirection", field.Name);
+                Assert.Equal("Receive", field.Value);
+                Assert.Equal(DiagnosticFieldCategory.Public, field.Category);
+            },
+            field =>
+            {
+                Assert.Equal("ArdEncryptionSequence", field.Name);
+                Assert.Equal("1", field.Value);
+                Assert.Equal(DiagnosticFieldCategory.Public, field.Category);
+            },
+            field =>
+            {
+                Assert.Equal("ArdCiphertextLength", field.Name);
+                Assert.Equal("48", field.Value);
+                Assert.Equal(DiagnosticFieldCategory.Public, field.Category);
+            });
+        Assert.DoesNotContain(
+            fields,
+            candidate =>
+                candidate.Name.StartsWith("Key", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Name.StartsWith("Iv", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Name.StartsWith("Payload", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Name.StartsWith("CiphertextBytes", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Name.StartsWith("Plaintext", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Name.StartsWith("Digest", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Name.StartsWith("Hash", StringComparison.OrdinalIgnoreCase) ||
+                candidate.Value?.Contains(secret, StringComparison.Ordinal) == true);
+    }
+
     private static Exception WrapExceptionChain(Exception innermost, int wrapperCount)
     {
         var exception = innermost;
