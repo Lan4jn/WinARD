@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Security.Cryptography;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Errors;
 using Xunit;
@@ -11,6 +13,7 @@ public sealed class ArdEncryptedPacketCodecTests
     private static readonly byte[] Key = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
     private static readonly byte[] InitialIv = Enumerable.Range(16, 16).Select(value => (byte)value).ToArray();
     private static readonly byte[] PointerPayload = [5, 0, 0, 100, 0, 200];
+    private const uint Sequence = 0x10203040;
 
     [Fact]
     public void Encrypt_matches_independent_known_answer_vector()
@@ -37,25 +40,83 @@ public sealed class ArdEncryptedPacketCodecTests
     [Fact]
     public void Decrypt_rejects_sha1_mismatch()
     {
-        var packet = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 0, PointerPayload);
+        var packet = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, Sequence, PointerPayload);
         packet[^1] ^= 0x01;
 
         var exception = Assert.Throws<RfbProtocolException>(() =>
-            ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, 0, packet.AsSpan(2)));
+            ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, Sequence, packet.AsSpan(2)));
 
-        Assert.Equal(RfbProtocolFailureKind.ArdEncryptionIntegrity, exception.Failure?.Kind);
+        AssertFailure(
+            exception,
+            RfbProtocolFailureKind.ArdEncryptionIntegrity,
+            ArdEncryptedPacketFailureStage.Integrity,
+            packet.Length - sizeof(ushort));
     }
 
     [Theory]
     [InlineData(0)]
     [InlineData(15)]
     [InlineData(17)]
-    public void Decrypt_rejects_empty_or_unaligned_ciphertext(int length)
+    [InlineData(65536)]
+    public void Decrypt_rejects_invalid_ciphertext_length(int length)
     {
         var exception = Assert.Throws<RfbProtocolException>(() =>
-            ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, 0, new byte[length]));
+            ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, Sequence, new byte[length]));
 
-        Assert.Equal(RfbProtocolFailureKind.ArdEncryptionPacket, exception.Failure?.Kind);
+        AssertFailure(
+            exception,
+            RfbProtocolFailureKind.ArdEncryptionPacket,
+            ArdEncryptedPacketFailureStage.OuterLength,
+            length);
+    }
+
+    [Fact]
+    public void Decrypt_rejects_plaintext_that_is_too_short()
+    {
+        var ciphertext = EncryptFixturePlaintext(new byte[16]);
+
+        var exception = Assert.Throws<RfbProtocolException>(() =>
+            ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, Sequence, ciphertext));
+
+        AssertFailure(
+            exception,
+            RfbProtocolFailureKind.ArdEncryptionPacket,
+            ArdEncryptedPacketFailureStage.PlaintextTooShort,
+            ciphertext.Length);
+    }
+
+    [Fact]
+    public void Decrypt_rejects_payload_length_beyond_digest()
+    {
+        var plaintext = new byte[32];
+        BinaryPrimitives.WriteUInt16BigEndian(plaintext, 11);
+        var ciphertext = EncryptFixturePlaintext(plaintext);
+
+        var exception = Assert.Throws<RfbProtocolException>(() =>
+            ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, Sequence, ciphertext));
+
+        AssertFailure(
+            exception,
+            RfbProtocolFailureKind.ArdEncryptionPacket,
+            ArdEncryptedPacketFailureStage.PayloadLength,
+            ciphertext.Length);
+    }
+
+    [Fact]
+    public void Decrypt_rejects_non_zero_padding()
+    {
+        var plaintext = new byte[32];
+        plaintext[2] = 0x01;
+        var ciphertext = EncryptFixturePlaintext(plaintext);
+
+        var exception = Assert.Throws<RfbProtocolException>(() =>
+            ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, Sequence, ciphertext));
+
+        AssertFailure(
+            exception,
+            RfbProtocolFailureKind.ArdEncryptionPacket,
+            ArdEncryptedPacketFailureStage.Padding,
+            ciphertext.Length);
     }
 
     [Fact]
@@ -78,5 +139,27 @@ public sealed class ArdEncryptedPacketCodecTests
 
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 0, payload));
+    }
+
+    private static byte[] EncryptFixturePlaintext(ReadOnlySpan<byte> plaintext)
+    {
+#pragma warning disable CA5358 // AES-CBC is required by the Apple Remote Desktop encrypted packet format.
+        using var aes = Aes.Create();
+        aes.Key = Key;
+        return aes.EncryptCbc(plaintext, InitialIv, PaddingMode.None);
+#pragma warning restore CA5358
+    }
+
+    private static void AssertFailure(
+        RfbProtocolException exception,
+        RfbProtocolFailureKind kind,
+        ArdEncryptedPacketFailureStage stage,
+        int ciphertextLength)
+    {
+        Assert.Equal(kind, exception.Failure?.Kind);
+        Assert.Equal(stage, exception.Failure?.ArdEncryptionStage);
+        Assert.Equal(ArdEncryptedPacketDirection.Receive, exception.Failure?.ArdEncryptionDirection);
+        Assert.Equal(Sequence, exception.Failure?.ArdEncryptionSequence);
+        Assert.Equal(ciphertextLength, exception.Failure?.ArdCiphertextLength);
     }
 }

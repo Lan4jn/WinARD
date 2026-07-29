@@ -75,7 +75,12 @@ internal static class ArdEncryptedPacketCodec
         ValidateKeyAndIv(key, iv);
         if (ciphertext.IsEmpty || ciphertext.Length % BlockLength != 0 || ciphertext.Length > ushort.MaxValue)
         {
-            throw PacketFailure("ARD encrypted packet ciphertext length is invalid.");
+            throw PacketFailure(
+                "ARD encrypted packet ciphertext length is invalid.",
+                RfbProtocolFailureKind.ArdEncryptionPacket,
+                ArdEncryptedPacketFailureStage.OuterLength,
+                sequence,
+                ciphertext.Length);
         }
 
         var plaintext = new byte[ciphertext.Length];
@@ -92,7 +97,12 @@ internal static class ArdEncryptedPacketCodec
 #pragma warning restore CA5358
             if (plaintext.Length < HeaderLength + DigestLength)
             {
-                throw PacketFailure("ARD encrypted packet plaintext is too short.");
+                throw PacketFailure(
+                    "ARD encrypted packet plaintext is too short.",
+                    RfbProtocolFailureKind.ArdEncryptionPacket,
+                    ArdEncryptedPacketFailureStage.PlaintextTooShort,
+                    sequence,
+                    ciphertext.Length);
             }
 
             var payloadLength = BinaryPrimitives.ReadUInt16BigEndian(plaintext);
@@ -100,12 +110,22 @@ internal static class ArdEncryptedPacketCodec
             var payloadEnd = HeaderLength + payloadLength;
             if (payloadEnd > digestOffset)
             {
-                throw PacketFailure("ARD encrypted packet payload length exceeds the decrypted packet.");
+                throw PacketFailure(
+                    "ARD encrypted packet payload length exceeds the decrypted packet.",
+                    RfbProtocolFailureKind.ArdEncryptionPacket,
+                    ArdEncryptedPacketFailureStage.PayloadLength,
+                    sequence,
+                    ciphertext.Length);
             }
 
             if (plaintext.AsSpan(payloadEnd, digestOffset - payloadEnd).ContainsAnyExcept((byte)0))
             {
-                throw PacketFailure("ARD encrypted packet padding is invalid.");
+                throw PacketFailure(
+                    "ARD encrypted packet padding is invalid.",
+                    RfbProtocolFailureKind.ArdEncryptionPacket,
+                    ArdEncryptedPacketFailureStage.Padding,
+                    sequence,
+                    ciphertext.Length);
             }
 
             BinaryPrimitives.WriteUInt32BigEndian(hashInput, sequence);
@@ -118,9 +138,12 @@ internal static class ArdEncryptedPacketCodec
                     expectedDigest,
                     plaintext.AsSpan(digestOffset, DigestLength)))
             {
-                throw RfbProtocolException.Create(
+                throw PacketFailure(
                     "ARD encrypted packet integrity validation failed.",
-                    new RfbProtocolFailureInfo(RfbProtocolFailureKind.ArdEncryptionIntegrity));
+                    RfbProtocolFailureKind.ArdEncryptionIntegrity,
+                    ArdEncryptedPacketFailureStage.Integrity,
+                    sequence,
+                    ciphertext.Length);
             }
 
             payload = plaintext.AsSpan(HeaderLength, payloadLength).ToArray();
@@ -130,16 +153,20 @@ internal static class ArdEncryptedPacketCodec
             nextIv = null;
             return result;
         }
-        catch (RfbProtocolException)
+        catch (RfbProtocolException exception)
         {
-            throw;
+            throw exception.WithContext(DecryptFailureInfo(sequence, ciphertext.Length));
         }
         catch (CryptographicException exception)
         {
             throw new RfbProtocolException(
                 "ARD encrypted packet decryption failed.",
                 exception,
-                new RfbProtocolFailureInfo(RfbProtocolFailureKind.ArdEncryptionPacket));
+                DecryptFailureInfo(
+                    sequence,
+                    ciphertext.Length,
+                    RfbProtocolFailureKind.ArdEncryptionPacket,
+                    ArdEncryptedPacketFailureStage.CbcDecrypt));
         }
         finally
         {
@@ -173,10 +200,27 @@ internal static class ArdEncryptedPacketCodec
         }
     }
 
-    private static RfbProtocolException PacketFailure(string message) =>
+    private static RfbProtocolException PacketFailure(
+        string message,
+        RfbProtocolFailureKind kind,
+        ArdEncryptedPacketFailureStage stage,
+        uint sequence,
+        int ciphertextLength) =>
         RfbProtocolException.Create(
             message,
-            new RfbProtocolFailureInfo(RfbProtocolFailureKind.ArdEncryptionPacket));
+            DecryptFailureInfo(sequence, ciphertextLength, kind, stage));
+
+    private static RfbProtocolFailureInfo DecryptFailureInfo(
+        uint sequence,
+        int ciphertextLength,
+        RfbProtocolFailureKind kind = RfbProtocolFailureKind.ArdEncryptionPacket,
+        ArdEncryptedPacketFailureStage? stage = null) =>
+        new(
+            kind,
+            ArdEncryptionStage: stage,
+            ArdEncryptionDirection: ArdEncryptedPacketDirection.Receive,
+            ArdEncryptionSequence: sequence,
+            ArdCiphertextLength: ciphertextLength);
 }
 
 internal sealed class ArdDecryptedPacket : IDisposable
