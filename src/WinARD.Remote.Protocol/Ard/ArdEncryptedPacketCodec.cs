@@ -159,14 +159,7 @@ internal static class ArdEncryptedPacketCodec
         }
         catch (CryptographicException exception)
         {
-            throw new RfbProtocolException(
-                "ARD encrypted packet decryption failed.",
-                exception,
-                DecryptFailureInfo(
-                    sequence,
-                    ciphertext.Length,
-                    RfbProtocolFailureKind.ArdEncryptionPacket,
-                    ArdEncryptedPacketFailureStage.CbcDecrypt));
+            throw CreateCbcDecryptFailure(exception, sequence, ciphertext.Length);
         }
         finally
         {
@@ -184,6 +177,19 @@ internal static class ArdEncryptedPacketCodec
             }
         }
     }
+
+    internal static RfbProtocolException CreateCbcDecryptFailure(
+        CryptographicException exception,
+        uint sequence,
+        int ciphertextLength) =>
+        new(
+            "ARD encrypted packet decryption failed.",
+            exception,
+            DecryptFailureInfo(
+                sequence,
+                ciphertextLength,
+                RfbProtocolFailureKind.ArdEncryptionPacket,
+                ArdEncryptedPacketFailureStage.CbcDecrypt));
 
     private static int AlignToBlock(int length) => checked(((length + BlockLength - 1) / BlockLength) * BlockLength);
 

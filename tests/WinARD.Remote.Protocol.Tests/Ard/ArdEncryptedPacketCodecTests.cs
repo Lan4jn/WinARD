@@ -120,6 +120,24 @@ public sealed class ArdEncryptedPacketCodecTests
     }
 
     [Fact]
+    public void CreateCbcDecryptFailure_preserves_inner_exception_and_safe_receive_context()
+    {
+        const string secretMarker = "cbc-secret-marker-8A2B7F";
+        var innerException = new CryptographicException(secretMarker);
+
+        var exception = ArdEncryptedPacketCodec.CreateCbcDecryptFailure(innerException, 7, 48);
+
+        Assert.Same(innerException, exception.InnerException);
+        Assert.Equal(RfbProtocolFailureKind.ArdEncryptionPacket, exception.Failure?.Kind);
+        Assert.Equal(ArdEncryptedPacketFailureStage.CbcDecrypt, exception.Failure?.ArdEncryptionStage);
+        Assert.Equal(ArdEncryptedPacketDirection.Receive, exception.Failure?.ArdEncryptionDirection);
+        Assert.Equal(7U, exception.Failure?.ArdEncryptionSequence);
+        Assert.Equal(48, exception.Failure?.ArdCiphertextLength);
+        Assert.DoesNotContain(secretMarker, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(secretMarker, exception.Failure?.ToString() ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Cipher_material_takes_ownership_and_clears_key_and_iv()
     {
         var key = Key.ToArray();
