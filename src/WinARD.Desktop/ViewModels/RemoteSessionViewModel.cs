@@ -543,6 +543,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 var protocolException = ReferenceEquals(completed, receive)
                     ? FindProtocolFailureException(completed.Exception)
                     : null;
+                var remoteSessionClosed = protocolException?.Failure?.Kind ==
+                    RfbProtocolFailureKind.RemoteSessionClosed;
                 var exception = protocolException ?? completed.Exception?.GetBaseException() ??
                     new InvalidOperationException("Remote session terminated unexpectedly.");
                 var error = WinArdError.Create(
@@ -550,11 +552,11 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                     ReferenceEquals(completed, present)
                         ? "REMOTE_PRESENTATION_FAILED"
                         : "REMOTE_SESSION_INTERRUPTED",
-                    "远程会话已中断。",
+                    remoteSessionClosed ? "远程主机已结束共享会话。" : "远程会话已中断。",
                     Guid.NewGuid().ToString("N"));
                 var status = ReferenceEquals(completed, present)
                     ? "画面呈现失败，会话正在关闭。"
-                    : "连接已中断。";
+                    : remoteSessionClosed ? "远程主机已结束会话。" : "连接已中断。";
                 try
                 {
                     await _dispatcher.InvokeAsync(

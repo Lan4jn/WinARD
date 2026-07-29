@@ -168,6 +168,42 @@ public sealed class RemoteSessionViewModelTests
     }
 
     [Fact]
+    public async Task Remote_session_closed_failure_reports_specific_user_message_and_diagnostics()
+    {
+        var protocolException = RfbProtocolException.Create(
+            "remote closed",
+            new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.RemoteSessionClosed,
+                RfbProtocolReadStage.ArdStateChangePayload,
+                0x14));
+        var diagnosticSink = new RecordingDiagnosticSink();
+        await using var viewModel = new RemoteSessionViewModel(
+            new FailingWithExceptionRuntime(protocolException),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal("远程主机已结束会话。", viewModel.StatusMessage);
+        Assert.Equal("远程主机已结束共享会话。", viewModel.Error?.UserMessage);
+        Assert.Equal("REMOTE_SESSION_INTERRUPTED", viewModel.Error?.Code);
+        var diagnostic = Assert.Single(
+            diagnosticSink.Events,
+            item => item.Code == "REMOTE_SESSION_INTERRUPTED");
+        Assert.Equal(
+            [
+                ("ProtocolFailureKind", "RemoteSessionClosed"),
+                ("ProtocolReadStage", "ArdStateChangePayload"),
+                ("ServerMessageType", "0x14"),
+            ],
+            diagnostic.Fields!.Select(field => (field.Name, field.Value)).ToArray());
+    }
+
+    [Fact]
     public async Task Receive_protocol_failure_exports_only_present_optional_fields()
     {
         var diagnosticSink = new RecordingDiagnosticSink();
