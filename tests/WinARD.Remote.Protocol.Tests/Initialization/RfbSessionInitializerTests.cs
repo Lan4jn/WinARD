@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using WinARD.Remote.Protocol.Ard;
+using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
@@ -130,6 +131,41 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal([1, 66, 4, 8, 20, 32], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
+    }
+
+    [Fact]
+    public async Task Ard_encryption_aware_initialization_advertises_1103_then_requests_encryption()
+    {
+        var nameField = ExtendedNameField(
+            (uint)ArdServerFlags.MayControl,
+            new byte[16],
+            "Studio Mac");
+        await using var inner = new ScriptedDuplexStream(
+            ServerInit(1440, 900, PixelFormat.WinArdBgra32, nameField));
+        await using var transport = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        await using var encryption = new ArdSessionEncryption(
+            transport,
+            new ArdAuthenticationResult(new byte[16]));
+
+        _ = await RfbSessionInitializer.InitializeAsync(
+            transport,
+            Handshake(RfbVersion.V3_889),
+            ProtocolLimits.Default,
+            encryption,
+            CancellationToken.None);
+
+        Assert.Equal(
+            [
+                ClientInitArd(),
+                ViewerInfoMessage(),
+                SetModeSharedMessage(),
+                SetDisplayAllMessage(),
+                SetPixelFormatMessage(),
+                EncryptedArdSetEncodingsMessage(),
+                new byte[] { 0x12, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1 },
+            ],
+            inner.Writes);
+        Assert.Equal(ArdSessionEncryptionState.Requested, encryption.State);
     }
 
     [Fact]
@@ -659,6 +695,17 @@ public sealed class RfbSessionInitializerTests
             (int)RfbEncodingType.DesktopSize,
             (int)RfbEncodingType.ArdDisplayInfo,
             (int)RfbEncodingType.ArdDisplayInfo2);
+
+    private static byte[] EncryptedArdSetEncodingsMessage() =>
+        SetEncodingsMessage(
+            (int)RfbEncodingType.Zrle,
+            (int)RfbEncodingType.Raw,
+            (int)RfbEncodingType.CopyRect,
+            (int)RfbEncodingType.Cursor,
+            (int)RfbEncodingType.DesktopSize,
+            (int)RfbEncodingType.ArdDisplayInfo,
+            (int)RfbEncodingType.ArdDisplayInfo2,
+            (int)RfbEncodingType.ArdSessionEncryption);
 
     private static byte[] BootstrapSetEncodingsMessage() =>
         SetEncodingsMessage(

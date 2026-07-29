@@ -32,15 +32,28 @@ public static class RfbSessionInitializer
         (int)RfbEncodingType.ArdDisplayInfo,
         (int)RfbEncodingType.ArdDisplayInfo2,
     ];
+    private static readonly int[] ArdEncryptedRequestedEncodings =
+    [
+        .. ArdRequestedEncodings,
+        (int)RfbEncodingType.ArdSessionEncryption,
+    ];
 
     /// <summary>
     /// Sends ClientInit, consumes ServerInit, and declares WinARD's pixel format and encodings.
     /// The write-through stream is neither flushed nor disposed.
     /// </summary>
+    public static Task<RfbServerInit> InitializeAsync(
+        Stream stream,
+        RfbHandshakeResult handshake,
+        ProtocolLimits limits,
+        CancellationToken cancellationToken) =>
+        InitializeAsync(stream, handshake, limits, null, cancellationToken);
+
     public static async Task<RfbServerInit> InitializeAsync(
         Stream stream,
         RfbHandshakeResult handshake,
         ProtocolLimits limits,
+        ArdSessionEncryption? sessionEncryption,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
@@ -58,8 +71,21 @@ public static class RfbSessionInitializer
         var writer = new RfbWriter(stream);
         if (handshake.Version == RfbVersion.V3_889)
         {
-            return await InitializeArdAsync(stream, reader, writer, limits, cancellationToken)
+            return await InitializeArdAsync(
+                    stream,
+                    reader,
+                    writer,
+                    limits,
+                    sessionEncryption,
+                    cancellationToken)
                 .ConfigureAwait(false);
+        }
+
+        if (sessionEncryption is not null)
+        {
+            throw new ArgumentException(
+                "ARD session encryption is supported only by the Apple 3.889 protocol path.",
+                nameof(sessionEncryption));
         }
 
         return await InitializeStandardAsync(reader, writer, limits, cancellationToken).ConfigureAwait(false);
@@ -103,6 +129,7 @@ public static class RfbSessionInitializer
         RfbReader reader,
         RfbWriter writer,
         ProtocolLimits limits,
+        ArdSessionEncryption? sessionEncryption,
         CancellationToken cancellationToken)
     {
         await writer.WriteByteAsync((byte)ArdClientInitFlags.Ard, cancellationToken).ConfigureAwait(false);
@@ -145,7 +172,9 @@ public static class RfbSessionInitializer
         await WriteSetPixelFormatAsync(writer, cancellationToken).ConfigureAwait(false);
         await WriteSetEncodingsAsync(
                 writer,
-                requiresBootstrap ? ArdBootstrapRequestedEncodings : ArdRequestedEncodings,
+                requiresBootstrap
+                    ? ArdBootstrapRequestedEncodings
+                    : SelectArdRequestedEncodings(sessionEncryption),
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -155,7 +184,16 @@ public static class RfbSessionInitializer
                 .ConfigureAwait(false);
             width = displaySize.Width;
             height = displaySize.Height;
-            await WriteSetEncodingsAsync(writer, ArdRequestedEncodings, cancellationToken).ConfigureAwait(false);
+            await WriteSetEncodingsAsync(
+                    writer,
+                    SelectArdRequestedEncodings(sessionEncryption),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (sessionEncryption is not null)
+        {
+            await sessionEncryption.RequestAsync(cancellationToken).ConfigureAwait(false);
         }
 
         return new RfbServerInit(width, height, serverPixelFormat, name, isTruncated)
@@ -163,6 +201,9 @@ public static class RfbSessionInitializer
             ArdCapabilities = capabilities,
         };
     }
+
+    private static int[] SelectArdRequestedEncodings(ArdSessionEncryption? sessionEncryption) =>
+        sessionEncryption is null ? ArdRequestedEncodings : ArdEncryptedRequestedEncodings;
 
     public static async Task WriteFramebufferUpdateRequestAsync(
         Stream stream,
