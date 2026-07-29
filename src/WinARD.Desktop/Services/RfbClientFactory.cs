@@ -158,6 +158,61 @@ internal sealed class RfbClient : IRfbClient
                             RfbProtocolFailureKind.MalformedClipboard,
                             ServerMessageType: 3));
                     }
+                case ArdServerMessage.StateChangeType when handshake.Version == RfbVersion.V3_889:
+                    var stateChange = await ArdStateChangeReader.ReadBodyAsync(
+                            reader,
+                            ProtocolLimits.Default,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    if (stateChange.Status == (ushort)ArdStateChangeStatus.LocalUserClosed)
+                    {
+                        WriteArdStateChangeDiagnostic(stateChange, "RemoteSessionClosed");
+                        throw RfbProtocolException.Create(
+                            "The remote ARD session was closed.",
+                            new RfbProtocolFailureInfo(
+                                RfbProtocolFailureKind.RemoteSessionClosed,
+                                RfbProtocolReadStage.ArdStateChangePayload,
+                                ArdServerMessage.StateChangeType));
+                    }
+
+                    if (stateChange.Status == (ushort)ArdStateChangeStatus.Tickle)
+                    {
+                        try
+                        {
+                            await new ArdClientMessageWriter(new RfbWriter(_stream))
+                                .WriteAutoFramebufferUpdateAsync(
+                                    checked((ushort)framebuffer.Width),
+                                    checked((ushort)framebuffer.Height),
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception exception)
+                        {
+                            WriteArdStateChangeDiagnostic(stateChange, "AutoFBUpdateFailed", exception);
+                            throw;
+                        }
+
+                        WriteArdStateChangeDiagnostic(stateChange, "AutoFBUpdateSent");
+                    }
+                    else
+                    {
+                        var action = stateChange.Status is
+                            (ushort)ArdStateChangeStatus.PasteboardChanged or
+                            (ushort)ArdStateChangeStatus.PasteboardDataNeeded or
+                            (ushort)ArdStateChangeStatus.Sleep or
+                            (ushort)ArdStateChangeStatus.Wake or
+                            (ushort)ArdStateChangeStatus.CursorHidden or
+                            (ushort)ArdStateChangeStatus.CursorVisible
+                                ? "Consumed"
+                                : "UnknownConsumed";
+                        WriteArdStateChangeDiagnostic(stateChange, action);
+                    }
+
+                    continue;
                 case var ardControlMessage
                     when handshake.Version == RfbVersion.V3_889 &&
                          ArdServerMessage.IsZeroPayloadControl(ardControlMessage):
@@ -245,6 +300,24 @@ internal sealed class RfbClient : IRfbClient
                 new("RequestedMode", isArd ? "Shared" : "StandardShared"),
                 new("FinalState", isArd ? "SharedControlNegotiated" : "Initialized"),
             ]));
+    }
+
+    private void WriteArdStateChangeDiagnostic(
+        ArdStateChange stateChange,
+        string action,
+        Exception? exception = null)
+    {
+        _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
+            "ARD_STATE_CHANGE",
+            Guid.NewGuid().ToString("N"),
+            "ARD StateChange message processed.",
+            [
+                new("Status", stateChange.Status.ToString(CultureInfo.InvariantCulture)),
+                new("Flags", $"0x{stateChange.Flags.ToString("X4", CultureInfo.InvariantCulture)}"),
+                new("PayloadSize", stateChange.PayloadSize.ToString(CultureInfo.InvariantCulture)),
+                new("Action", action),
+            ],
+            exception));
     }
 
     private sealed class ApplicationSecretMaterial(ISecret secret) : ISecretMaterial

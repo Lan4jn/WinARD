@@ -12,6 +12,7 @@ using Xunit;
 using System.Xml.Linq;
 using System.Buffers.Binary;
 using System.Globalization;
+using System.Text.Json;
 
 #pragma warning disable CA1707
 
@@ -590,6 +591,249 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Rfb_client_replies_to_ARD_tickle_and_continues_to_framebuffer_update()
+    {
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                .. ArdStateChange(flags: 0x1234, status: 4, extra: [0xAA]),
+                .. CursorOnlyUpdate(),
+            ]);
+        await using var client = new RfbClient(stream, diagnosticSink: sink);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        var outputOffset = stream.WrittenBytes.Length;
+        using var message = Assert.IsType<RemoteCursorMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        using var cursor = message.TakeCursorOwnership();
+
+        Assert.Equal([1, 2, 3, 255], cursor.Bgra32.ToArray());
+        Assert.Equal(
+            [0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1],
+            stream.WrittenBytes[outputOffset..]);
+        var diagnostic = Assert.Single(sink.Snapshot(), item => item.Code == "ARD_STATE_CHANGE");
+        Assert.Equal("ARD StateChange message processed.", diagnostic.Message);
+        Assert.Equal(
+            new[]
+            {
+                ("Status", "4"),
+                ("Flags", "0x1234"),
+                ("PayloadSize", "5"),
+                ("Action", "AutoFBUpdateSent"),
+            },
+            diagnostic.Fields.Select(field => (field.Name, field.Value)));
+        Assert.All(diagnostic.Fields, field => Assert.Equal(DiagnosticFieldCategory.Public, field.Category));
+    }
+
+    [Theory]
+    [InlineData((ushort)2, "Consumed")]
+    [InlineData((ushort)3, "Consumed")]
+    [InlineData((ushort)5, "Consumed")]
+    [InlineData((ushort)6, "Consumed")]
+    [InlineData((ushort)11, "Consumed")]
+    [InlineData((ushort)12, "Consumed")]
+    [InlineData((ushort)0x7FFF, "UnknownConsumed")]
+    public async Task Rfb_client_consumes_nonterminating_ARD_state_changes(
+        ushort status,
+        string expectedAction)
+    {
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                .. ArdStateChange(flags: 0x00F1, status, extra: [0x5A]),
+                .. CursorOnlyUpdate(),
+            ]);
+        await using var client = new RfbClient(stream, diagnosticSink: sink);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        using var message = Assert.IsType<RemoteCursorMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+
+        var diagnostic = Assert.Single(sink.Snapshot(), item => item.Code == "ARD_STATE_CHANGE");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Status" && field.Value == status.ToString(CultureInfo.InvariantCulture));
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Flags" && field.Value == "0x00F1");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "PayloadSize" && field.Value == "5");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Action" && field.Value == expectedAction);
+        Assert.DoesNotContain(diagnostic.Fields, field => field.Name is "Padding" or "Extra" or "ExtraPayload");
+    }
+
+    [Fact]
+    public async Task Rfb_client_reports_ARD_local_user_closed_as_remote_session_closed()
+    {
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                .. ArdStateChange(flags: 0xABCD, status: 1, extra: [0x11, 0x22]),
+            ]);
+        await using var client = new RfbClient(stream, diagnosticSink: sink);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.RemoteSessionClosed, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ArdStateChangePayload, exception.Failure?.ReadStage);
+        Assert.Equal(ArdServerMessage.StateChangeType, exception.Failure?.ServerMessageType);
+        var diagnostic = Assert.Single(sink.Snapshot(), item => item.Code == "ARD_STATE_CHANGE");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Status" && field.Value == "1");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Flags" && field.Value == "0xABCD");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "PayloadSize" && field.Value == "6");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Action" && field.Value == "RemoteSessionClosed");
+    }
+
+    [Fact]
+    public async Task Rfb_client_propagates_ARD_tickle_write_failure_and_records_safe_diagnostic()
+    {
+        const string privateMarker = "PRIVATE-STATE-CHANGE-EXTRA";
+        var expected = new IOException("Injected AutoFBUpdate failure.");
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                .. ArdStateChange(
+                    flags: 0x3456,
+                    status: 4,
+                    extra: System.Text.Encoding.ASCII.GetBytes(privateMarker)),
+            ]);
+        await using var client = new RfbClient(stream, diagnosticSink: sink);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        stream.FailNextWrite(expected);
+
+        var actual = await Assert.ThrowsAsync<IOException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Same(expected, actual);
+        var diagnostic = Assert.Single(sink.Snapshot(), item => item.Code == "ARD_STATE_CHANGE");
+        Assert.Equal("IOException", diagnostic.Exception?.Type);
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Status" && field.Value == "4");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Flags" && field.Value == "0x3456");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "PayloadSize" && field.Value == "30");
+        Assert.Contains(diagnostic.Fields, field => field.Name == "Action" && field.Value == "AutoFBUpdateFailed");
+        Assert.DoesNotContain(privateMarker, JsonSerializer.Serialize(sink.Snapshot()), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rfb_client_does_not_record_ARD_tickle_write_cancellation_as_failure()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                .. ArdStateChange(flags: 0, status: 4, extra: [0xAA]),
+            ],
+            cancellation);
+        await using var client = new RfbClient(stream, diagnosticSink: sink);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.ReceiveAsync(cancellation.Token).AsTask());
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.DoesNotContain(sink.Snapshot(), item => item.Code == "ARD_STATE_CHANGE");
+    }
+
+    [Fact]
+    public async Task Rfb_client_rejects_ARD_state_change_for_standard_RFB_version()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1), .. ArdStateChange(flags: 0, status: 4)]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.UnexpectedServerMessage, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ServerMessageType, exception.Failure?.ReadStage);
+        Assert.Equal(ArdServerMessage.StateChangeType, exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
+    public async Task Rfb_client_rejects_ARD_state_change_payload_smaller_than_fixed_fields()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                ArdServerMessage.StateChangeType, 0, 0, 3,
+            ]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.MalformedArdStateChange, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ArdStateChangeHeader, exception.Failure?.ReadStage);
+        Assert.Equal(ArdServerMessage.StateChangeType, exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
+    public async Task Rfb_client_preserves_ARD_state_change_fixed_payload_truncation()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                ArdServerMessage.StateChangeType, 0, 0, 4, 0x12, 0x34, 0,
+            ]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ArdStateChangePayload, exception.Failure?.ReadStage);
+        Assert.Equal(ArdServerMessage.StateChangeType, exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
+    public async Task Rfb_client_preserves_ARD_state_change_extra_payload_truncation()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                ArdServerMessage.StateChangeType, 0, 0, 6, 0x12, 0x34, 0, 4, 0xAA,
+            ]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveAsync(CancellationToken.None).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ArdStateChangePayload, exception.Failure?.ReadStage);
+        Assert.Equal(ArdServerMessage.StateChangeType, exception.Failure?.ServerMessageType);
+    }
+
+    [Fact]
     public async Task Rfb_client_uses_resized_dimensions_and_requested_incremental_flag()
     {
         await using var stream = new ScriptedDuplexStream(
@@ -890,6 +1134,18 @@ public sealed class FramePresentationTests
         return [.. header, .. name];
     }
 
+    private static byte[] ArdStateChange(ushort flags, ushort status, byte[]? extra = null)
+    {
+        extra ??= [];
+        var bytes = new byte[8 + extra.Length];
+        bytes[0] = ArdServerMessage.StateChangeType;
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2), checked((ushort)(4 + extra.Length)));
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4), flags);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(6), status);
+        extra.CopyTo(bytes, 8);
+        return bytes;
+    }
+
     private static byte[] CursorOnlyUpdate()
     {
         var bytes = new byte[22];
@@ -960,8 +1216,18 @@ public sealed class FramePresentationTests
     {
         private readonly MemoryStream _input = new(input, writable: false);
         private readonly MemoryStream _output = new();
+        private IOException? _nextWriteFailure;
 
         public byte[] WrittenBytes => _output.ToArray();
+
+        public void FailNextWrite(IOException exception)
+        {
+            ArgumentNullException.ThrowIfNull(exception);
+            if (Interlocked.CompareExchange(ref _nextWriteFailure, exception, null) is not null)
+            {
+                throw new InvalidOperationException("A write failure is already pending.");
+            }
+        }
 
         public override bool CanRead => true;
         public override bool CanSeek => false;
@@ -989,8 +1255,13 @@ public sealed class FramePresentationTests
             return read;
         }
         public override void Write(byte[] buffer, int offset, int count) => _output.Write(buffer, offset, count);
-        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
-            _output.WriteAsync(buffer, cancellationToken);
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var failure = Interlocked.Exchange(ref _nextWriteFailure, null);
+            return failure is null
+                ? _output.WriteAsync(buffer, cancellationToken)
+                : ValueTask.FromException(failure);
+        }
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
 

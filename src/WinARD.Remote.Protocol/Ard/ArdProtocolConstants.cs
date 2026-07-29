@@ -26,7 +26,7 @@ internal static class ArdProtocolConstants
     internal const byte AutoFramebufferUpdate = 0x09;
     internal const byte SetMode = 0x0A;
     internal const byte SetDisplay = 0x0D;
-    internal const byte StateChange = 0x14;
+    internal const byte StateChange = ArdServerMessage.StateChangeType;
     internal const byte ServerMayControl = 0x02;
     internal const byte ServerSessionSelect = 0x04;
     internal const int DisplayInfoEncoding = 1101;
