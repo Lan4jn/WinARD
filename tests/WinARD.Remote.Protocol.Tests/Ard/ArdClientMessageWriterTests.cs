@@ -25,6 +25,35 @@ public sealed class ArdClientMessageWriterTests
     }
 
     [Fact]
+    public async Task Auto_framebuffer_update_writes_the_exact_full_screen_request()
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await writer.WriteAutoFramebufferUpdateAsync(0x1234, 0x5678, CancellationToken.None);
+
+        Assert.Equal(
+            [0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78],
+            stream.ToArray());
+        Assert.Equal(1, stream.WriteCount);
+    }
+
+    [Theory]
+    [InlineData((ushort)0, (ushort)1)]
+    [InlineData((ushort)1, (ushort)0)]
+    public async Task Auto_framebuffer_update_rejects_zero_dimensions_before_writing(ushort width, ushort height)
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            writer.WriteAutoFramebufferUpdateAsync(width, height, CancellationToken.None).AsTask());
+
+        Assert.Empty(stream.ToArray());
+        Assert.Equal(0, stream.WriteCount);
+    }
+
+    [Fact]
     public async Task Viewer_info_writes_expected_header_versions_and_bitmap()
     {
         await using var stream = new TrackingMemoryStream();

@@ -11,6 +11,7 @@ public sealed class ArdClientMessageWriter
     private const int SessionCommandLength = 74;
     private const int SessionCommandUsernameOffset = 10;
     private const int SessionCommandUsernameLength = 63;
+    private const int AutoFramebufferUpdateLength = 16;
 
     private readonly RfbWriter _writer;
 
@@ -18,6 +19,32 @@ public sealed class ArdClientMessageWriter
     {
         ArgumentNullException.ThrowIfNull(writer);
         _writer = writer;
+    }
+
+    public ValueTask WriteAutoFramebufferUpdateAsync(
+        ushort width,
+        ushort height,
+        CancellationToken cancellationToken)
+    {
+        if (width == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width));
+        }
+
+        if (height == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(height));
+        }
+
+        var message = new byte[AutoFramebufferUpdateLength];
+        message[0] = ArdProtocolConstants.AutoFramebufferUpdate;
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(2), 1);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(4), 0);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(8), 0);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(10), 0);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(12), width);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(14), height);
+        return _writer.WriteMessageAsync(message, cancellationToken);
     }
 
     public ValueTask WriteViewerInfoAsync(CancellationToken cancellationToken)
