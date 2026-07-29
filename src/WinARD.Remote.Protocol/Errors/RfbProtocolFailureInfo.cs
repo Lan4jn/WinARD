@@ -8,6 +8,8 @@ public enum RfbProtocolFailureKind
     MalformedFramebufferUpdate = 3,
     MalformedClipboard = 4,
     DecoderFailure = 5,
+    MalformedArdStateChange = 6,
+    RemoteSessionClosed = 7,
 }
 
 public enum RfbProtocolReadStage
@@ -18,6 +20,8 @@ public enum RfbProtocolReadStage
     FramebufferRectanglePayload = 3,
     ClipboardHeader = 4,
     ClipboardPayload = 5,
+    ArdStateChangeHeader = 6,
+    ArdStateChangePayload = 7,
 }
 
 public sealed record RfbProtocolFailureInfo(
