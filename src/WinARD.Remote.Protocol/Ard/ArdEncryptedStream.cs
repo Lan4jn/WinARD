@@ -287,6 +287,13 @@ public sealed class ArdEncryptedStream : Stream
         byte[]? nextIv = null;
         try
         {
+            uint sequence;
+            lock (_stateSync)
+            {
+                ThrowIfUnavailableLocked();
+                sequence = _receiveSequence;
+            }
+
             await ReadExactlyFromInnerAsync(header, cancellationToken).ConfigureAwait(false);
             var ciphertextLength = BinaryPrimitives.ReadUInt16BigEndian(header);
             if (ciphertextLength == 0 ||
@@ -295,13 +302,28 @@ public sealed class ArdEncryptedStream : Stream
             {
                 throw RfbProtocolException.Create(
                     "ARD encrypted stream packet length is invalid.",
-                    new RfbProtocolFailureInfo(RfbProtocolFailureKind.ArdEncryptionPacket));
+                    ReceivePacketFailureInfo(
+                        RfbProtocolFailureKind.ArdEncryptionPacket,
+                        ArdEncryptedPacketFailureStage.OuterLength,
+                        sequence,
+                        ciphertextLength));
             }
 
             ciphertext = new byte[ciphertextLength];
-            await ReadExactlyFromInnerAsync(ciphertext, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await ReadExactlyFromInnerAsync(ciphertext, cancellationToken).ConfigureAwait(false);
+            }
+            catch (RfbProtocolException exception) when (
+                exception.Failure?.Kind == RfbProtocolFailureKind.TruncatedRead)
+            {
+                throw exception.WithContext(ReceivePacketFailureInfo(
+                    RfbProtocolFailureKind.TruncatedRead,
+                    ArdEncryptedPacketFailureStage.TruncatedCiphertext,
+                    sequence,
+                    ciphertextLength));
+            }
 
-            uint sequence;
             lock (_stateSync)
             {
                 ThrowIfUnavailableLocked();
@@ -309,23 +331,33 @@ public sealed class ArdEncryptedStream : Stream
                 key = material.Key.ToArray();
                 receiveIv = (_receiveIv ??
                     throw new InvalidOperationException("ARD receive IV is unavailable.")).ToArray();
-                sequence = _receiveSequence;
             }
 
             using var decoded = ArdEncryptedPacketCodec.Decrypt(key, receiveIv, sequence, ciphertext);
             payload = decoded.Payload.ToArray();
             nextIv = decoded.NextIv.ToArray();
-            lock (_stateSync)
+            try
             {
-                ThrowIfUnavailableLocked();
-                ClearDecryptedPayloadLocked();
-                CryptographicOperations.ZeroMemory(_receiveIv!);
-                _decryptedPayload = payload;
-                payload = null;
-                _decryptedOffset = 0;
-                _receiveIv = nextIv;
-                nextIv = null;
-                _receiveSequence++;
+                lock (_stateSync)
+                {
+                    ThrowIfUnavailableLocked();
+                    ClearDecryptedPayloadLocked();
+                    CryptographicOperations.ZeroMemory(_receiveIv!);
+                    _decryptedPayload = payload;
+                    payload = null;
+                    _decryptedOffset = 0;
+                    _receiveIv = nextIv;
+                    nextIv = null;
+                    _receiveSequence++;
+                }
+            }
+            catch (RfbProtocolException exception)
+            {
+                throw exception.WithContext(ReceivePacketFailureInfo(
+                    RfbProtocolFailureKind.ArdEncryptionPacket,
+                    ArdEncryptedPacketFailureStage.StateCommit,
+                    sequence,
+                    ciphertextLength));
             }
         }
         finally
@@ -384,6 +416,18 @@ public sealed class ArdEncryptedStream : Stream
             read += received;
         }
     }
+
+    private static RfbProtocolFailureInfo ReceivePacketFailureInfo(
+        RfbProtocolFailureKind kind,
+        ArdEncryptedPacketFailureStage stage,
+        uint sequence,
+        int ciphertextLength) =>
+        new(
+            kind,
+            ArdEncryptionStage: stage,
+            ArdEncryptionDirection: ArdEncryptedPacketDirection.Receive,
+            ArdEncryptionSequence: sequence,
+            ArdCiphertextLength: ciphertextLength);
 
     private void Fault()
     {
