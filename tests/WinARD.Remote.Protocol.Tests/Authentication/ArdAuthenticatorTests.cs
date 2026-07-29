@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Numerics;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using WinARD.ProtocolProbe;
 using WinARD.Remote.Protocol.Authentication;
@@ -21,6 +22,63 @@ public sealed class ArdAuthenticatorTests
 {
     private const string FixtureModulusHex =
         "D2652EF10104A3DDC1219700EDFBD1E19F7678B4A4F6D5952634BD8BF1D60326322B5D32366DC25CB4E8E73AF4312A70D2DCAF2747EB89D7E88553EECD6A283D";
+
+    [Fact]
+    public void Authentication_result_uses_owned_key_and_dispose_clears_it()
+    {
+        var owned = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
+        var expectedKey = owned.ToArray();
+        var plaintext = Enumerable.Range(16, 16).Select(value => (byte)value).ToArray();
+        byte[] ciphertext;
+        using (var aes = Aes.Create())
+        {
+            aes.Key = expectedKey;
+            ciphertext = aes.EncryptEcb(plaintext, PaddingMode.None);
+        }
+
+        var decrypted = new byte[16];
+        var result = new ArdAuthenticationResult(owned);
+
+        result.DecryptEcb(ciphertext, decrypted);
+        result.Dispose();
+
+        Assert.Equal(plaintext, decrypted);
+        Assert.All(owned, value => Assert.Equal(0, value));
+        Assert.Throws<ObjectDisposedException>(DecryptAfterDispose);
+
+        void DecryptAfterDispose() => result.DecryptEcb(ciphertext, decrypted);
+    }
+
+    [Fact]
+    public async Task Authenticate_returns_the_type_30_derived_key()
+    {
+        await using var server = ArdServerFixture.Create();
+        using var username = SecretMaterial.FromUtf8("operator");
+        using var password = SecretMaterial.FromUtf8("password");
+
+        using var result = await new ArdAuthenticator(new PrivateExponentTwoRandomSource()).AuthenticateAsync(
+            server.ClientStream,
+            RfbVersion.V3_8,
+            username,
+            password,
+            CancellationToken.None);
+
+#pragma warning disable CA5351 // MD5 is required to verify the Apple Remote Desktop Type 30 key derivation.
+        var expectedKey = MD5.HashData(server.GetSharedSecret());
+#pragma warning restore CA5351
+        var plaintext = new byte[16];
+        var decrypted = new byte[16];
+        byte[] ciphertext;
+        using (var aes = Aes.Create())
+        {
+            aes.Key = expectedKey;
+            ciphertext = aes.EncryptEcb(plaintext, PaddingMode.None);
+        }
+
+        result.DecryptEcb(ciphertext, decrypted);
+
+        Assert.Equal(plaintext, decrypted);
+    }
 
     [Fact]
     public async Task Authenticates_and_sends_encrypted_credentials_before_fixed_width_client_public_key()

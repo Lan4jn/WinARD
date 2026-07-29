@@ -30,7 +30,7 @@ public sealed class ArdAuthenticator
         _randomSource = randomSource;
     }
 
-    public Task AuthenticateAsync(
+    public Task<ArdAuthenticationResult> AuthenticateAsync(
         Stream stream,
         RfbVersion version,
         ISecretMaterial username,
@@ -38,7 +38,7 @@ public sealed class ArdAuthenticator
         CancellationToken cancellationToken) =>
         AuthenticateAsync(stream, version, username, password, ProtocolLimits.Default, cancellationToken);
 
-    public async Task AuthenticateAsync(
+    public async Task<ArdAuthenticationResult> AuthenticateAsync(
         Stream stream,
         RfbVersion version,
         ISecretMaterial username,
@@ -56,6 +56,7 @@ public sealed class ArdAuthenticator
         byte[]? usernameBytes = null;
         byte[]? passwordBytes = null;
         byte[]? responseMessage = null;
+        byte[]? authenticationKey = null;
         try
         {
             usernameBytes = CopyCredential(username, nameof(username));
@@ -64,7 +65,7 @@ public sealed class ArdAuthenticator
             var reader = new RfbReader(stream, limits);
             var writer = new RfbWriter(stream);
             var challenge = await ReadChallengeAsync(reader, cancellationToken).ConfigureAwait(false);
-            responseMessage = CreateResponseMessage(challenge, usernameBytes, passwordBytes);
+            (responseMessage, authenticationKey) = CreateResponseMessage(challenge, usernameBytes, passwordBytes);
             await writer.WriteMessageAsync(responseMessage, cancellationToken).ConfigureAwait(false);
             await ReadSecurityResultAsync(
                 reader,
@@ -73,12 +74,16 @@ public sealed class ArdAuthenticator
                 usernameBytes,
                 passwordBytes,
                 cancellationToken).ConfigureAwait(false);
+            var result = new ArdAuthenticationResult(authenticationKey);
+            authenticationKey = null;
+            return result;
         }
         finally
         {
             ZeroMemory(usernameBytes);
             ZeroMemory(passwordBytes);
             ZeroMemory(responseMessage);
+            ZeroMemory(authenticationKey);
         }
     }
 
@@ -101,14 +106,14 @@ public sealed class ArdAuthenticator
         return challenge;
     }
 
-    private byte[] CreateResponseMessage(
+    private (byte[] ResponseMessage, byte[] AuthenticationKey) CreateResponseMessage(
         ArdChallenge challenge,
         ReadOnlySpan<byte> username,
         ReadOnlySpan<byte> password)
     {
         var privateExponentBytes = new byte[challenge.KeyLength];
         var sharedSecret = new byte[challenge.KeyLength];
-        var aesKey = new byte[16];
+        var authenticationKey = new byte[16];
         var plaintextCredentials = new byte[CredentialPlaintextLength];
         var encryptedCredentials = new byte[CredentialPlaintextLength];
         var clientPublicKey = new byte[challenge.KeyLength];
@@ -117,24 +122,24 @@ public sealed class ArdAuthenticator
         try
         {
             ComputeDhValues(challenge, privateExponentBytes, clientPublicKey, sharedSecret);
-            DeriveAesKey(sharedSecret, aesKey);
+            DeriveAesKey(sharedSecret, authenticationKey);
             CreatePlaintextCredentials(username, password, plaintextCredentials);
-            EncryptCredentials(plaintextCredentials, aesKey, encryptedCredentials);
+            EncryptCredentials(plaintextCredentials, authenticationKey, encryptedCredentials);
             responseMessage = new byte[encryptedCredentials.Length + clientPublicKey.Length];
             encryptedCredentials.CopyTo(responseMessage, 0);
             clientPublicKey.CopyTo(responseMessage, encryptedCredentials.Length);
-            return responseMessage;
+            return (responseMessage, authenticationKey);
         }
         catch
         {
             ZeroMemory(responseMessage);
+            CryptographicOperations.ZeroMemory(authenticationKey);
             throw;
         }
         finally
         {
             CryptographicOperations.ZeroMemory(privateExponentBytes);
             CryptographicOperations.ZeroMemory(sharedSecret);
-            CryptographicOperations.ZeroMemory(aesKey);
             CryptographicOperations.ZeroMemory(plaintextCredentials);
             CryptographicOperations.ZeroMemory(encryptedCredentials);
             CryptographicOperations.ZeroMemory(clientPublicKey);
