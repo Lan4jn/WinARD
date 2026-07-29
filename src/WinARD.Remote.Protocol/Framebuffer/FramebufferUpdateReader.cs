@@ -29,11 +29,25 @@ public static class FramebufferUpdateReader
 
     public static FramebufferUpdateSession CreateSession(
         Framebuffer framebuffer,
-        PixelFormat pixelFormat)
+        PixelFormat pixelFormat,
+        params IRfbEncodingDecoder[] additionalDecoders)
     {
         ArgumentNullException.ThrowIfNull(framebuffer);
         ArgumentNullException.ThrowIfNull(pixelFormat);
-        return new FramebufferUpdateSession(framebuffer, CreateDecoders(pixelFormat));
+        ArgumentNullException.ThrowIfNull(additionalDecoders);
+        var decoders = CreateDecoders(pixelFormat);
+        foreach (var decoder in additionalDecoders)
+        {
+            ArgumentNullException.ThrowIfNull(decoder);
+            if (!decoders.TryAdd(decoder.EncodingId, decoder))
+            {
+                throw new ArgumentException(
+                    $"An RFB decoder for encoding ID {decoder.EncodingId} is already registered.",
+                    nameof(additionalDecoders));
+            }
+        }
+
+        return new FramebufferUpdateSession(framebuffer, decoders);
     }
 
     internal static async Task<FramebufferUpdateResult> ApplyAsync(
@@ -156,7 +170,10 @@ public static class FramebufferUpdateReader
                         index));
             }
 
-            var isArdMetadata = encoding is RfbEncodingType.ArdDisplayInfo or RfbEncodingType.ArdDisplayInfo2;
+            var isArdMetadata = encoding is
+                RfbEncodingType.ArdDisplayInfo or
+                RfbEncodingType.ArdSessionEncryption or
+                RfbEncodingType.ArdDisplayInfo2;
             if (encoding != RfbEncodingType.Cursor && !isArdMetadata && (width == 0 || height == 0))
             {
                 throw RfbProtocolException.Create(
@@ -175,7 +192,9 @@ public static class FramebufferUpdateReader
             var rectangle = encoding switch
             {
                 RfbEncodingType.Cursor => FramebufferRect.CreateCursorRectangle(x, y, width, height),
-                RfbEncodingType.ArdDisplayInfo or RfbEncodingType.ArdDisplayInfo2 =>
+                RfbEncodingType.ArdDisplayInfo or
+                RfbEncodingType.ArdSessionEncryption or
+                RfbEncodingType.ArdDisplayInfo2 =>
                     FramebufferRect.CreateMetadataRectangle(x, y, width, height),
                 _ => new FramebufferRect(x, y, width, height),
             };

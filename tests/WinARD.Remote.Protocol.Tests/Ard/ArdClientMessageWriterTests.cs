@@ -10,6 +10,24 @@ namespace WinARD.Remote.Protocol.Tests.Ard;
 public sealed class ArdClientMessageWriterTests
 {
     [Fact]
+    public async Task Set_encryption_request_and_acknowledgement_write_exact_messages()
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await writer.WriteSetEncryptionRequestAsync(CancellationToken.None);
+        await writer.WriteSetEncryptionAcknowledgementAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [
+                0x12, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                0x12, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00,
+            ],
+            stream.ToArray());
+        Assert.Equal(2, stream.WriteCount);
+    }
+
+    [Fact]
     public async Task Set_mode_shared_and_set_display_write_exact_control_messages()
     {
         await using var stream = new TrackingMemoryStream();

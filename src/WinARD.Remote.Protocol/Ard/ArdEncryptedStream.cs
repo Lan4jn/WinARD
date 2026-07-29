@@ -65,18 +65,7 @@ public sealed class ArdEncryptedStream : Stream
             _readGate.Wait();
             try
             {
-                lock (_stateSync)
-                {
-                    ThrowIfUnavailableLocked();
-                    if (_material is not null)
-                    {
-                        throw new InvalidOperationException("ARD stream encryption is already active.");
-                    }
-
-                    _sendIv = material.InitialIv.ToArray();
-                    _receiveIv = material.InitialIv.ToArray();
-                    _material = material;
-                }
+                ActivateLocked(material);
             }
             finally
             {
@@ -86,6 +75,45 @@ public sealed class ArdEncryptedStream : Stream
         catch
         {
             material.Dispose();
+            throw;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async ValueTask WritePlaintextAndActivateAsync(
+        ReadOnlyMemory<byte> plaintext,
+        ArdSessionCipherMaterial material,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(material);
+        ThrowIfUnavailable();
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfUnavailable();
+            if (IsEncrypted)
+            {
+                throw new InvalidOperationException("ARD stream encryption is already active.");
+            }
+
+            await _inner.WriteAsync(plaintext, cancellationToken).ConfigureAwait(false);
+            await _readGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ActivateLocked(material);
+            }
+            finally
+            {
+                _readGate.Release();
+            }
+        }
+        catch
+        {
+            material.Dispose();
+            Fault();
             throw;
         }
         finally
@@ -340,6 +368,22 @@ public sealed class ArdEncryptedStream : Stream
         lock (_stateSync)
         {
             _faulted = true;
+        }
+    }
+
+    private void ActivateLocked(ArdSessionCipherMaterial material)
+    {
+        lock (_stateSync)
+        {
+            ThrowIfUnavailableLocked();
+            if (_material is not null)
+            {
+                throw new InvalidOperationException("ARD stream encryption is already active.");
+            }
+
+            _sendIv = material.InitialIv.ToArray();
+            _receiveIv = material.InitialIv.ToArray();
+            _material = material;
         }
     }
 

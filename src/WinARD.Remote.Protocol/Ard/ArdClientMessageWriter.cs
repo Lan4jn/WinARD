@@ -15,6 +15,9 @@ public sealed class ArdClientMessageWriter
 
     private readonly RfbWriter _writer;
 
+    internal static ReadOnlyMemory<byte> SetEncryptionAcknowledgementMessage =>
+        new byte[] { ArdProtocolConstants.SetEncryption, 0, 0, 2, 0, 1, 0, 0 };
+
     public ArdClientMessageWriter(RfbWriter writer)
     {
         ArgumentNullException.ThrowIfNull(writer);
@@ -46,6 +49,21 @@ public sealed class ArdClientMessageWriter
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(14), height);
         return _writer.WriteMessageAsync(message, cancellationToken);
     }
+
+    public ValueTask WriteSetEncryptionRequestAsync(CancellationToken cancellationToken) =>
+        _writer.WriteMessageAsync(
+            new byte[]
+            {
+                ArdProtocolConstants.SetEncryption, 0,
+                0, 1,
+                0, 1,
+                0, 1,
+                0, 0, 0, 1,
+            },
+            cancellationToken);
+
+    public ValueTask WriteSetEncryptionAcknowledgementAsync(CancellationToken cancellationToken) =>
+        _writer.WriteMessageAsync(SetEncryptionAcknowledgementMessage, cancellationToken);
 
     public ValueTask WriteViewerInfoAsync(CancellationToken cancellationToken)
     {
