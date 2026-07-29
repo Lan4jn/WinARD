@@ -191,6 +191,53 @@ public sealed class ArdEncryptedStreamTests
     }
 
     [Fact]
+    public async Task ReadAsync_reports_sequence_one_when_second_ciphertext_is_truncated()
+    {
+        var firstPayload = new byte[] { 0x2A };
+        var firstPacket = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 0, firstPayload);
+        await using var inner = new ScriptedDuplexStream([.. firstPacket, 0, 32, .. new byte[16]]);
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
+        var firstOutput = new byte[firstPayload.Length];
+
+        await ReadExactlyAsync(stream, firstOutput);
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() => stream.ReadAsync(new byte[1]).AsTask());
+
+        Assert.Equal(firstPayload, firstOutput);
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(ArdEncryptedPacketFailureStage.TruncatedCiphertext, exception.Failure?.ArdEncryptionStage);
+        Assert.Equal(ArdEncryptedPacketDirection.Receive, exception.Failure?.ArdEncryptionDirection);
+        Assert.Equal((uint)1, exception.Failure?.ArdEncryptionSequence);
+        Assert.Equal(32, exception.Failure?.ArdCiphertextLength);
+    }
+
+    [Fact]
+    public async Task CommitDecryptedPacket_fault_contextualizes_failure_and_clears_owned_arrays()
+    {
+        await using var inner = new ScriptedDuplexStream([], writeException: new IOException("write failed"));
+        await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
+        await Assert.ThrowsAsync<IOException>(() => stream.WriteAsync(new byte[] { 1 }).AsTask());
+        var payloadReference = new byte[] { 1, 2, 3 };
+        var nextIvReference = Enumerable.Range(32, 16).Select(value => (byte)value).ToArray();
+        byte[]? payload = payloadReference;
+        byte[]? nextIv = nextIvReference;
+
+        var exception = Assert.Throws<RfbProtocolException>(() =>
+            stream.CommitDecryptedPacket(ref payload, ref nextIv, sequence: 3, ciphertextLength: 48));
+
+        Assert.Equal(RfbProtocolFailureKind.ArdEncryptionPacket, exception.Failure?.Kind);
+        Assert.Equal(ArdEncryptedPacketFailureStage.StateCommit, exception.Failure?.ArdEncryptionStage);
+        Assert.Equal(ArdEncryptedPacketDirection.Receive, exception.Failure?.ArdEncryptionDirection);
+        Assert.Equal((uint)3, exception.Failure?.ArdEncryptionSequence);
+        Assert.Equal(48, exception.Failure?.ArdCiphertextLength);
+        Assert.Null(payload);
+        Assert.Null(nextIv);
+        Assert.All(payloadReference, value => Assert.Equal(0, value));
+        Assert.All(nextIvReference, value => Assert.Equal(0, value));
+    }
+
+    [Fact]
     public async Task ReadAsync_ard_packet_context_is_retained_when_server_message_context_is_added()
     {
         await using var inner = new ScriptedDuplexStream([0, 0]);

@@ -336,29 +336,7 @@ public sealed class ArdEncryptedStream : Stream
             using var decoded = ArdEncryptedPacketCodec.Decrypt(key, receiveIv, sequence, ciphertext);
             payload = decoded.Payload.ToArray();
             nextIv = decoded.NextIv.ToArray();
-            try
-            {
-                lock (_stateSync)
-                {
-                    ThrowIfUnavailableLocked();
-                    ClearDecryptedPayloadLocked();
-                    CryptographicOperations.ZeroMemory(_receiveIv!);
-                    _decryptedPayload = payload;
-                    payload = null;
-                    _decryptedOffset = 0;
-                    _receiveIv = nextIv;
-                    nextIv = null;
-                    _receiveSequence++;
-                }
-            }
-            catch (RfbProtocolException exception)
-            {
-                throw exception.WithContext(ReceivePacketFailureInfo(
-                    RfbProtocolFailureKind.ArdEncryptionPacket,
-                    ArdEncryptedPacketFailureStage.StateCommit,
-                    sequence,
-                    ciphertextLength));
-            }
+            CommitDecryptedPacket(ref payload, ref nextIv, sequence, ciphertextLength);
         }
         finally
         {
@@ -372,6 +350,46 @@ public sealed class ArdEncryptedStream : Stream
             ClearAndNull(ref nextIv);
             ClearAndNull(ref key);
             ClearAndNull(ref receiveIv);
+        }
+    }
+
+    internal void CommitDecryptedPacket(
+        ref byte[]? payload,
+        ref byte[]? nextIv,
+        uint sequence,
+        int ciphertextLength)
+    {
+        try
+        {
+            lock (_stateSync)
+            {
+                ThrowIfUnavailableLocked();
+                var payloadToCommit = payload ??
+                    throw new InvalidOperationException("ARD decrypted payload is unavailable.");
+                var nextIvToCommit = nextIv ??
+                    throw new InvalidOperationException("ARD next receive IV is unavailable.");
+                ClearDecryptedPayloadLocked();
+                CryptographicOperations.ZeroMemory(_receiveIv!);
+                _decryptedPayload = payloadToCommit;
+                payload = null;
+                _decryptedOffset = 0;
+                _receiveIv = nextIvToCommit;
+                nextIv = null;
+                _receiveSequence++;
+            }
+        }
+        catch (RfbProtocolException exception)
+        {
+            throw exception.WithContext(ReceivePacketFailureInfo(
+                RfbProtocolFailureKind.ArdEncryptionPacket,
+                ArdEncryptedPacketFailureStage.StateCommit,
+                sequence,
+                ciphertextLength));
+        }
+        finally
+        {
+            ClearAndNull(ref payload);
+            ClearAndNull(ref nextIv);
         }
     }
 
