@@ -49,7 +49,8 @@ public static class RfbHandshake
             throw exception.WithContext(HandshakeFailureInfo(
                 RfbHandshakeStage.VersionParse,
                 VersionBannerLength,
-                VersionBannerLength));
+                VersionBannerLength,
+                RfbProtocolFailureKind.MalformedHandshake));
         }
 
         await writer.WriteMessageAsync(Encoding.ASCII.GetBytes(version.Banner), cancellationToken)
@@ -144,9 +145,10 @@ public static class RfbHandshake
     private static RfbProtocolFailureInfo HandshakeFailureInfo(
         RfbHandshakeStage stage,
         int? expectedByteCount = null,
-        int? actualByteCount = null) =>
+        int? actualByteCount = null,
+        RfbProtocolFailureKind kind = RfbProtocolFailureKind.TruncatedRead) =>
         new(
-            RfbProtocolFailureKind.TruncatedRead,
+            kind,
             HandshakeStage: stage,
             ExpectedByteCount: expectedByteCount,
             ActualByteCount: actualByteCount);

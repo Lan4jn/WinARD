@@ -10,6 +10,12 @@ namespace WinARD.Remote.Protocol.Tests.Errors;
 public sealed class RfbProtocolFailureInfoTests
 {
     [Fact]
+    public void New_protocol_failure_kind_is_appended_for_compatibility()
+    {
+        Assert.Equal(11, (int)RfbProtocolFailureKind.MalformedHandshake);
+    }
+
+    [Fact]
     public void Ard_encrypted_packet_enum_values_are_stable()
     {
         Assert.Equal(0, (int)ArdEncryptedPacketDirection.Send);
@@ -246,6 +252,25 @@ public sealed class RfbProtocolFailureInfoTests
     }
 
     [Fact]
+    public void Nine_parameter_failure_info_constructor_is_preserved_for_binary_compatibility()
+    {
+        var constructor = typeof(RfbProtocolFailureInfo).GetConstructor(
+            [
+                typeof(RfbProtocolFailureKind),
+                typeof(RfbProtocolReadStage?),
+                typeof(byte?),
+                typeof(int?),
+                typeof(int?),
+                typeof(ArdEncryptedPacketFailureStage?),
+                typeof(ArdEncryptedPacketDirection?),
+                typeof(uint?),
+                typeof(int?),
+            ]);
+
+        Assert.NotNull(constructor);
+    }
+
+    [Fact]
     public void Five_element_failure_info_deconstruction_remains_source_compatible()
     {
         var failure = new RfbProtocolFailureInfo(
@@ -262,6 +287,42 @@ public sealed class RfbProtocolFailureInfoTests
         Assert.Equal((byte)0, serverMessageType);
         Assert.Equal(16, encodingId);
         Assert.Equal(3, rectangleIndex);
+    }
+
+    [Fact]
+    public void Nine_element_failure_info_deconstruction_remains_source_compatible()
+    {
+        var failure = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.ArdEncryptionPacket,
+            RfbProtocolReadStage.ServerMessageType,
+            0,
+            16,
+            3,
+            ArdEncryptedPacketFailureStage.Padding,
+            ArdEncryptedPacketDirection.Receive,
+            1,
+            48);
+
+        var (
+            kind,
+            readStage,
+            serverMessageType,
+            encodingId,
+            rectangleIndex,
+            encryptionStage,
+            encryptionDirection,
+            encryptionSequence,
+            ciphertextLength) = failure;
+
+        Assert.Equal(RfbProtocolFailureKind.ArdEncryptionPacket, kind);
+        Assert.Equal(RfbProtocolReadStage.ServerMessageType, readStage);
+        Assert.Equal((byte)0, serverMessageType);
+        Assert.Equal(16, encodingId);
+        Assert.Equal(3, rectangleIndex);
+        Assert.Equal(ArdEncryptedPacketFailureStage.Padding, encryptionStage);
+        Assert.Equal(ArdEncryptedPacketDirection.Receive, encryptionDirection);
+        Assert.Equal((uint)1, encryptionSequence);
+        Assert.Equal(48, ciphertextLength);
     }
 
     [Fact]

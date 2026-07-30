@@ -48,7 +48,7 @@ public enum RfbHandshakeStage
 }
 ```
 
-在精确读取提前结束时记录安全计数，并在握手边界通过 `WithContext` 附加阶段。完整畸形 Banner 转换为带 `VersionParse` 上下文的 `RfbProtocolException`。
+在精确读取提前结束时记录安全计数，并在握手边界通过 `WithContext` 附加阶段。完整畸形 Banner 转换为 `MalformedHandshake + VersionParse`；显式保留旧 9 参数构造和 9 元解构以维持公开 API 兼容性。
 
 - [ ] **步骤 4：验证绿灯**
 

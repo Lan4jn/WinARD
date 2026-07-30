@@ -87,6 +87,19 @@ public sealed class RfbHandshakeTests
         Assert.True(exception is RfbProtocolException or UnsupportedRfbVersionException);
     }
 
+    [Theory]
+    [InlineData("RFB 003.009\n")]
+    [InlineData("RFB 004.000\n")]
+    public async Task Preserves_unsupported_version_classification(string serverBanner)
+    {
+        await using var server = FakeRfbServer.ForBytes(Encoding.ASCII.GetBytes(serverBanner));
+
+        var exception = await Assert.ThrowsAsync<UnsupportedRfbVersionException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(serverBanner.Replace("\n", "\\x0A", StringComparison.Ordinal), exception.ServerBanner);
+    }
+
     [Fact]
     public async Task Rejects_short_server_banner()
     {
@@ -109,6 +122,7 @@ public sealed class RfbHandshakeTests
         var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
 
+        Assert.Equal(RfbProtocolFailureKind.MalformedHandshake, exception.Failure?.Kind);
         Assert.Equal(RfbHandshakeStage.VersionParse, exception.Failure?.HandshakeStage);
         Assert.Equal(12, exception.Failure?.ExpectedByteCount);
         Assert.Equal(12, exception.Failure?.ActualByteCount);
@@ -139,6 +153,21 @@ public sealed class RfbHandshakeTests
         Assert.Equal(RfbHandshakeStage.SecurityTypes, exception.Failure?.HandshakeStage);
         Assert.Equal(3, exception.Failure?.ExpectedByteCount);
         Assert.Equal(1, exception.Failure?.ActualByteCount);
+    }
+
+    [Fact]
+    public async Task Reports_truncated_rfb33_security_type()
+    {
+        await using var server = FakeRfbServer.ForBytes(
+            [.. Encoding.ASCII.GetBytes("RFB 003.003\n"), 0, 0]);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, exception.Failure?.Kind);
+        Assert.Equal(RfbHandshakeStage.SecurityType33, exception.Failure?.HandshakeStage);
+        Assert.Equal(4, exception.Failure?.ExpectedByteCount);
+        Assert.Equal(2, exception.Failure?.ActualByteCount);
     }
 
     [Theory]

@@ -13,6 +13,7 @@ public enum RfbProtocolFailureKind
     ArdEncryptionNegotiation = 8,
     ArdEncryptionPacket = 9,
     ArdEncryptionIntegrity = 10,
+    MalformedHandshake = 11,
 }
 
 public enum RfbProtocolReadStage
@@ -73,6 +74,32 @@ public sealed record RfbProtocolFailureInfo(
         RfbProtocolReadStage? ReadStage,
         byte? ServerMessageType,
         int? EncodingId,
+        int? RectangleIndex,
+        ArdEncryptedPacketFailureStage? ArdEncryptionStage,
+        ArdEncryptedPacketDirection? ArdEncryptionDirection,
+        uint? ArdEncryptionSequence,
+        int? ArdCiphertextLength)
+        : this(
+            Kind,
+            ReadStage,
+            ServerMessageType,
+            EncodingId,
+            RectangleIndex,
+            ArdEncryptionStage,
+            ArdEncryptionDirection,
+            ArdEncryptionSequence,
+            ArdCiphertextLength,
+            null,
+            null,
+            null)
+    {
+    }
+
+    public RfbProtocolFailureInfo(
+        RfbProtocolFailureKind Kind,
+        RfbProtocolReadStage? ReadStage,
+        byte? ServerMessageType,
+        int? EncodingId,
         int? RectangleIndex)
         : this(
             Kind,
@@ -102,6 +129,28 @@ public sealed record RfbProtocolFailureInfo(
         ServerMessageType = this.ServerMessageType;
         EncodingId = this.EncodingId;
         RectangleIndex = this.RectangleIndex;
+    }
+
+    public void Deconstruct(
+        out RfbProtocolFailureKind Kind,
+        out RfbProtocolReadStage? ReadStage,
+        out byte? ServerMessageType,
+        out int? EncodingId,
+        out int? RectangleIndex,
+        out ArdEncryptedPacketFailureStage? ArdEncryptionStage,
+        out ArdEncryptedPacketDirection? ArdEncryptionDirection,
+        out uint? ArdEncryptionSequence,
+        out int? ArdCiphertextLength)
+    {
+        Kind = this.Kind;
+        ReadStage = this.ReadStage;
+        ServerMessageType = this.ServerMessageType;
+        EncodingId = this.EncodingId;
+        RectangleIndex = this.RectangleIndex;
+        ArdEncryptionStage = this.ArdEncryptionStage;
+        ArdEncryptionDirection = this.ArdEncryptionDirection;
+        ArdEncryptionSequence = this.ArdEncryptionSequence;
+        ArdCiphertextLength = this.ArdCiphertextLength;
     }
 
     internal RfbProtocolFailureInfo FillMissingFrom(RfbProtocolFailureInfo outer)
