@@ -50,13 +50,12 @@ public sealed class ArdEncryptedStreamTests
     }
 
     [Fact]
-    public async Task ReadAsync_reassembles_fragmented_encrypted_packets_and_chains_iv()
+    public async Task ReadAsync_reassembles_fragmented_encrypted_packets_with_fixed_initial_iv()
     {
         var firstPayload = new byte[] { 0, 0, 0, 1 };
         var secondPayload = new byte[] { 2, 3, 4, 5, 6 };
         var first = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 0, firstPayload);
-        var nextIv = first[^16..];
-        var second = ArdEncryptedPacketCodec.Encrypt(Key, nextIv, 1, secondPayload);
+        var second = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 1, secondPayload);
         await using var inner = new ScriptedDuplexStream([.. first, .. second], maxRead: 3);
         await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
         stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
@@ -71,9 +70,8 @@ public sealed class ArdEncryptedStreamTests
     public async Task ReadAsync_skips_empty_encrypted_payload_without_reporting_end_of_stream()
     {
         var empty = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 0, []);
-        var nextIv = empty[^16..];
         var payload = new byte[] { 9, 8, 7 };
-        var data = ArdEncryptedPacketCodec.Encrypt(Key, nextIv, 1, payload);
+        var data = ArdEncryptedPacketCodec.Encrypt(Key, InitialIv, 1, payload);
         await using var inner = new ScriptedDuplexStream([.. empty, .. data], maxRead: 2);
         await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
         stream.Activate(new ArdSessionCipherMaterial(Key.ToArray(), InitialIv.ToArray()));
@@ -102,7 +100,7 @@ public sealed class ArdEncryptedStreamTests
     }
 
     [Fact]
-    public async Task Concurrent_writes_use_distinct_sequences_and_chained_ivs()
+    public async Task Concurrent_writes_use_distinct_sequences_and_fixed_initial_iv()
     {
         await using var inner = new ScriptedDuplexStream([]);
         await using var stream = new ArdEncryptedStream(inner, ProtocolLimits.Default);
@@ -263,17 +261,15 @@ public sealed class ArdEncryptedStreamTests
         var decoded = new List<byte[]>();
         var offset = 0;
         var sequence = 0u;
-        var iv = InitialIv.ToArray();
         while (offset < wire.Length)
         {
             var length = BinaryPrimitives.ReadUInt16BigEndian(wire.AsSpan(offset));
             using var packet = ArdEncryptedPacketCodec.Decrypt(
                 Key,
-                iv,
+                InitialIv,
                 sequence,
                 wire.AsSpan(offset + 2, length));
             decoded.Add(packet.Payload.ToArray());
-            iv = packet.NextIv.ToArray();
             offset += 2 + length;
             sequence++;
         }

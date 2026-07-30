@@ -552,7 +552,7 @@ public sealed class FramePresentationTests
         var secondLength = BinaryPrimitives.ReadUInt16BigEndian(encrypted.AsSpan(secondOffset));
         using var key = ArdEncryptedPacketCodec.Decrypt(
             sessionKey,
-            pointer.NextIv,
+            sessionIv,
             1,
             encrypted.AsSpan(secondOffset + 2, secondLength));
 

@@ -241,7 +241,6 @@ public sealed class ArdEncryptedStream : Stream
         byte[]? key = null;
         byte[]? sendIv = null;
         byte[]? packet = null;
-        byte[]? nextIv = null;
         try
         {
             uint sequence;
@@ -258,13 +257,9 @@ public sealed class ArdEncryptedStream : Stream
 
             packet = ArdEncryptedPacketCodec.Encrypt(key, sendIv, sequence, payload.Span);
             await _inner.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
-            nextIv = packet[^16..].ToArray();
             lock (_stateSync)
             {
                 ThrowIfUnavailableLocked();
-                CryptographicOperations.ZeroMemory(_sendIv!);
-                _sendIv = nextIv;
-                nextIv = null;
                 _sendSequence++;
             }
         }
@@ -272,7 +267,6 @@ public sealed class ArdEncryptedStream : Stream
         {
             ClearAndNull(ref key);
             ClearAndNull(ref sendIv);
-            ClearAndNull(ref nextIv);
             ClearAndNull(ref packet);
         }
     }
@@ -369,11 +363,10 @@ public sealed class ArdEncryptedStream : Stream
                 var nextIvToCommit = nextIv ??
                     throw new InvalidOperationException("ARD next receive IV is unavailable.");
                 ClearDecryptedPayloadLocked();
-                CryptographicOperations.ZeroMemory(_receiveIv!);
                 _decryptedPayload = payloadToCommit;
                 payload = null;
                 _decryptedOffset = 0;
-                _receiveIv = nextIvToCommit;
+                CryptographicOperations.ZeroMemory(nextIvToCommit);
                 nextIv = null;
                 _receiveSequence++;
             }
