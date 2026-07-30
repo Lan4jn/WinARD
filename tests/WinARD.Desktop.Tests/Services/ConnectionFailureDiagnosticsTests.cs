@@ -8,6 +8,7 @@ using WinARD.Desktop.Services;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Sessions;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Remote.Protocol.Errors;
 using WinARD.Transport.Ssh;
 using Xunit;
 
@@ -18,6 +19,54 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
     private readonly string _directory = Path.Combine(
         Path.GetTempPath(),
         $"winard-failure-diagnostics-{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task HandshakeFailureExportsOnlySafeStageAndByteCounts()
+    {
+        const string secretMarker = "raw-banner-secret-marker";
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        var secret = new TrackingSecret("password");
+        var transportLifetime = new TrackingLifetime();
+        var failure = RfbProtocolException.Create(
+            $"Malformed banner: {secretMarker}",
+            new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.TruncatedRead,
+                HandshakeStage: RfbHandshakeStage.VersionBanner,
+                ExpectedByteCount: 12,
+                ActualByteCount: 10));
+        var handler = new ConnectDeviceHandler(
+            new TransportFactory(transportLifetime),
+            new SecretProvider(new RegisteredSecret(secret, redactor)),
+            new ClientFactory(new NegotiationFailingClient(failure)),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt(), sink);
+
+        _ = await workflow.AttemptAsync(
+            Profile(),
+            stageChanged: null,
+            acceptedHostKey: null,
+            CancellationToken.None);
+
+        var diagnostic = Assert.Single(sink.Snapshot());
+        Assert.Equal(
+            new[]
+            {
+                ("stage", "Negotiating"),
+                ("ProtocolFailureKind", "TruncatedRead"),
+                ("RfbHandshakeStage", "VersionBanner"),
+                ("ExpectedByteCount", "12"),
+                ("ActualByteCount", "10"),
+            },
+            diagnostic.Fields.Select(field => (field.Name, field.Value)));
+        Assert.DoesNotContain(
+            diagnostic.Fields,
+            field =>
+                field.Name.Contains("Banner", StringComparison.OrdinalIgnoreCase) &&
+                field.Name != "RfbHandshakeStage" ||
+                field.Value.Contains(secretMarker, StringComparison.Ordinal));
+        Assert.DoesNotContain(secretMarker, JsonSerializer.Serialize(diagnostic), StringComparison.Ordinal);
+    }
 
     [Fact]
     public async Task AuthenticationFailureIsRecordedBeforeRegisteredSecretIsReleased()
@@ -179,6 +228,15 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
             DisposeCount++;
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class NegotiationFailingClient(Exception exception) : IRfbClient
+    {
+        public Task NegotiateAsync(CancellationToken cancellationToken) => Task.FromException(exception);
+        public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+        public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class TrackingSecret(string value) : ISecret

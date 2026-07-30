@@ -57,8 +57,8 @@ public enum RfbHandshakeStage
 ### 任务 2：桌面安全诊断导出
 
 **文件：**
-- 修改：`src/WinARD.Desktop/ViewModels/RemoteSessionViewModel.cs`
-- 测试：`tests/WinARD.Desktop.Tests/ViewModels/RemoteSessionViewModelTests.cs`
+- 修改：`src/WinARD.Desktop/Services/ConnectionAttemptWorkflow.cs`
+- 测试：`tests/WinARD.Desktop.Tests/Services/ConnectionFailureDiagnosticsTests.cs`
 
 - [ ] **步骤 1：编写失败测试**
 
@@ -76,7 +76,7 @@ dotnet test tests/WinARD.Desktop.Tests/WinARD.Desktop.Tests.csproj -c Release --
 
 - [ ] **步骤 3：实现最少导出代码**
 
-在 `GetProtocolFailureFields` 中按固定顺序导出三个新字段，并使用 invariant 整数格式；不导出异常消息或网络字节。
+在连接失败观察器中按固定顺序导出协议失败类型、握手阶段和两个计数字段，并使用 invariant 整数格式；不导出异常消息或网络字节。
 
 - [ ] **步骤 4：验证绿灯**
 

@@ -12,7 +12,7 @@
 
 ## 数据流
 
-底层精确读取失败先产生 `TruncatedRead + ExpectedByteCount + ActualByteCount`；握手层使用现有 `WithContext` 补充 `HandshakeStage`。桌面诊断导出层仅把这些枚举和整数作为 Public 字段写入诊断 ZIP。
+底层精确读取失败先产生 `TruncatedRead + ExpectedByteCount + ActualByteCount`；握手层使用现有 `WithContext` 补充 `HandshakeStage`。桌面的 `ConnectionAttemptWorkflow` 仅把这些枚举和整数作为 Public 字段写入连接失败诊断 ZIP。
 
 格式异常但读取完整时使用 `VersionParse`，字节计数为 12/12；不受支持的合法版本仍保持现有 `UnsupportedRfbVersionException`，不伪装成格式错误。
 

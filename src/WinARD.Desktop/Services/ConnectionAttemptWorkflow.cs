@@ -1,7 +1,9 @@
+using System.Globalization;
 using WinARD.Application.Sessions;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Remote.Protocol.Errors;
 using WinARD.Transport.Ssh;
 
 namespace WinARD.Desktop.Services;
@@ -56,7 +58,7 @@ public sealed class ConnectionAttemptWorkflow(
                         observation.Error.Code,
                         observation.Error.CorrelationId,
                         "Connection attempt stage failed.",
-                        [new("stage", observation.Error.Stage.ToString())],
+                        CreateFailureFields(observation.Error.Stage, observation.Exception),
                         observation.Exception));
                     return ValueTask.CompletedTask;
                 },
@@ -114,6 +116,42 @@ public sealed class ConnectionAttemptWorkflow(
             isChanged ? profile.SshProfile?.HostKeyPin?.Fingerprint : null,
             isChanged);
         return new HostKeyFailure(verification, request);
+    }
+
+    private static List<DiagnosticField> CreateFailureFields(
+        ConnectionStage stage,
+        Exception exception)
+    {
+        var fields = new List<DiagnosticField>(5)
+        {
+            new("stage", stage.ToString()),
+        };
+        if (exception is not RfbProtocolException { Failure: { } failure })
+        {
+            return fields;
+        }
+
+        fields.Add(new DiagnosticField("ProtocolFailureKind", failure.Kind.ToString()));
+        if (failure.HandshakeStage is { } handshakeStage)
+        {
+            fields.Add(new DiagnosticField("RfbHandshakeStage", handshakeStage.ToString()));
+        }
+
+        if (failure.ExpectedByteCount is { } expectedByteCount)
+        {
+            fields.Add(new DiagnosticField(
+                "ExpectedByteCount",
+                expectedByteCount.ToString(CultureInfo.InvariantCulture)));
+        }
+
+        if (failure.ActualByteCount is { } actualByteCount)
+        {
+            fields.Add(new DiagnosticField(
+                "ActualByteCount",
+                actualByteCount.ToString(CultureInfo.InvariantCulture)));
+        }
+
+        return fields;
     }
 
     private sealed record HostKeyFailure(
