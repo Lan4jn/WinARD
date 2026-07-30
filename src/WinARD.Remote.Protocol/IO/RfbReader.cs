@@ -150,7 +150,9 @@ public sealed class RfbReader
                     null,
                     null,
                     null,
-                    null));
+                    null,
+                    ExpectedByteCount: expectedByteCount,
+                    ActualByteCount: read));
         }
         catch
         {

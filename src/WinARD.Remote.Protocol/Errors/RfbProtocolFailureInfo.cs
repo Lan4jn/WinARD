@@ -27,6 +27,15 @@ public enum RfbProtocolReadStage
     ArdStateChangePayload = 7,
 }
 
+public enum RfbHandshakeStage
+{
+    VersionBanner = 0,
+    VersionParse = 1,
+    SecurityType33 = 2,
+    SecurityTypeCount = 3,
+    SecurityTypes = 4,
+}
+
 public enum ArdEncryptedPacketDirection
 {
     Send = 0,
@@ -54,7 +63,10 @@ public sealed record RfbProtocolFailureInfo(
     ArdEncryptedPacketFailureStage? ArdEncryptionStage = null,
     ArdEncryptedPacketDirection? ArdEncryptionDirection = null,
     uint? ArdEncryptionSequence = null,
-    int? ArdCiphertextLength = null)
+    int? ArdCiphertextLength = null,
+    RfbHandshakeStage? HandshakeStage = null,
+    int? ExpectedByteCount = null,
+    int? ActualByteCount = null)
 {
     public RfbProtocolFailureInfo(
         RfbProtocolFailureKind Kind,
@@ -68,6 +80,9 @@ public sealed record RfbProtocolFailureInfo(
             ServerMessageType,
             EncodingId,
             RectangleIndex,
+            null,
+            null,
+            null,
             null,
             null,
             null,
@@ -103,6 +118,9 @@ public sealed record RfbProtocolFailureInfo(
             ArdEncryptionDirection = ArdEncryptionDirection ?? outer.ArdEncryptionDirection,
             ArdEncryptionSequence = ArdEncryptionSequence ?? outer.ArdEncryptionSequence,
             ArdCiphertextLength = ArdCiphertextLength ?? outer.ArdCiphertextLength,
+            HandshakeStage = HandshakeStage ?? outer.HandshakeStage,
+            ExpectedByteCount = ExpectedByteCount ?? outer.ExpectedByteCount,
+            ActualByteCount = ActualByteCount ?? outer.ActualByteCount,
         };
     }
 }

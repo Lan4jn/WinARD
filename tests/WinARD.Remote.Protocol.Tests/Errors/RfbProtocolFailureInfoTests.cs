@@ -39,6 +39,9 @@ public sealed class RfbProtocolFailureInfoTests
         Assert.Null(failure.ArdEncryptionDirection);
         Assert.Null(failure.ArdEncryptionSequence);
         Assert.Null(failure.ArdCiphertextLength);
+        Assert.Null(failure.HandshakeStage);
+        Assert.Null(failure.ExpectedByteCount);
+        Assert.Null(failure.ActualByteCount);
     }
 
     [Fact]
@@ -109,6 +112,26 @@ public sealed class RfbProtocolFailureInfoTests
         Assert.Equal(ArdEncryptedPacketDirection.Receive, result.ArdEncryptionDirection);
         Assert.Equal((uint)1, result.ArdEncryptionSequence);
         Assert.Equal(48, result.ArdCiphertextLength);
+    }
+
+    [Fact]
+    public void FillMissingFrom_preserves_read_counts_and_fills_handshake_stage()
+    {
+        var inner = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.TruncatedRead,
+            ExpectedByteCount: 12,
+            ActualByteCount: 10);
+        var outer = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.TruncatedRead,
+            HandshakeStage: RfbHandshakeStage.VersionBanner,
+            ExpectedByteCount: 99,
+            ActualByteCount: 98);
+
+        var result = inner.FillMissingFrom(outer);
+
+        Assert.Equal(RfbHandshakeStage.VersionBanner, result.HandshakeStage);
+        Assert.Equal(12, result.ExpectedByteCount);
+        Assert.Equal(10, result.ActualByteCount);
     }
 
     [Fact]

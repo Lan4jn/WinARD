@@ -90,10 +90,55 @@ public sealed class RfbHandshakeTests
     [Fact]
     public async Task Rejects_short_server_banner()
     {
-        await using var server = FakeRfbServer.ForBytes(Encoding.ASCII.GetBytes("RFB 003.00"));
+        var banner = Encoding.ASCII.GetBytes("RFB 003.00");
+        await using var server = FakeRfbServer.ForBytes(banner);
 
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(RfbHandshakeStage.VersionBanner, exception.Failure?.HandshakeStage);
+        Assert.Equal(12, exception.Failure?.ExpectedByteCount);
+        Assert.Equal(banner.Length, exception.Failure?.ActualByteCount);
+    }
+
+    [Fact]
+    public async Task Reports_complete_malformed_banner_without_exporting_banner_bytes()
+    {
+        await using var server = FakeRfbServer.ForBytes(Encoding.ASCII.GetBytes("XYZ 003.008\n"));
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(RfbHandshakeStage.VersionParse, exception.Failure?.HandshakeStage);
+        Assert.Equal(12, exception.Failure?.ExpectedByteCount);
+        Assert.Equal(12, exception.Failure?.ActualByteCount);
+    }
+
+    [Fact]
+    public async Task Reports_missing_security_type_count()
+    {
+        await using var server = FakeRfbServer.ForBytes(Encoding.ASCII.GetBytes("RFB 003.889\n"));
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(RfbHandshakeStage.SecurityTypeCount, exception.Failure?.HandshakeStage);
+        Assert.Equal(1, exception.Failure?.ExpectedByteCount);
+        Assert.Equal(0, exception.Failure?.ActualByteCount);
+    }
+
+    [Fact]
+    public async Task Reports_truncated_security_type_list()
+    {
+        await using var server = FakeRfbServer.ForBytes(
+            [.. Encoding.ASCII.GetBytes("RFB 003.889\n"), 3, 1]);
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbHandshake.NegotiateAsync(server.ClientStream, CancellationToken.None));
+
+        Assert.Equal(RfbHandshakeStage.SecurityTypes, exception.Failure?.HandshakeStage);
+        Assert.Equal(3, exception.Failure?.ExpectedByteCount);
+        Assert.Equal(1, exception.Failure?.ActualByteCount);
     }
 
     [Theory]
