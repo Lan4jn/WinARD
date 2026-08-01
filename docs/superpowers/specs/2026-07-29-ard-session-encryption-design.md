@@ -82,15 +82,15 @@ u16be(ciphertextLength) || AES-128-CBC(ciphertext)
 Before encryption, the packet plaintext is built as:
 
 ```text
-u16be(payloadLength) || payload || zeroPadding || sha1[20]
+u16be(payloadLength) || payload || sha1[20] || zeroPadding
 ```
 
-The total plaintext length is the smallest multiple of 16 that can hold the two-byte length, payload, padding, and 20-byte digest. Payload and ciphertext lengths are bounded by protocol limits and the two-byte wire length.
+The digest immediately follows the declared payload. Zero padding follows the digest and extends the plaintext to the smallest multiple of 16. Payload and ciphertext lengths are bounded by protocol limits and the two-byte wire length.
 
 The digest is SHA-1 over:
 
 ```text
-u32be(directionSequence) || plaintextWithoutFinalDigest
+u32be(directionSequence) || u16be(payloadLength) || payload
 ```
 
 Send and receive directions maintain independent sequence counters and chaining IVs. After each packet, the next IV is the last ciphertext block from that direction. Counters begin at zero when encryption activates and increment exactly once per successfully processed packet.

@@ -42,8 +42,8 @@ The diagnostic model will distinguish at least:
 2. `TruncatedCiphertext`: end of stream before the declared ciphertext completes.
 3. `CbcDecrypt`: the platform CBC primitive rejected the packet.
 4. `PlaintextTooShort`: decrypted data cannot contain framing and digest.
-5. `PayloadLength`: the declared payload overlaps padding or digest.
-6. `Padding`: non-zero bytes occur between payload and digest.
+5. `PayloadLength`: the declared payload leaves insufficient room for the digest.
+6. `Padding`: non-zero bytes occur after the digest in the trailing block-alignment area.
 7. `Integrity`: SHA-1 comparison failed.
 8. `StateCommit`: the stream faulted or was disposed before sequence/IV state could commit.
 

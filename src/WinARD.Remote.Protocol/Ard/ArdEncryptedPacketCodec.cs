@@ -26,9 +26,10 @@ internal static class ArdEncryptedPacketCodec
                 $"ARD encrypted packet payloads must not exceed {MaximumPayloadLength} bytes.");
         }
 
-        var ciphertextLength = AlignToBlock(HeaderLength + payload.Length + DigestLength);
+        var authenticatedLength = HeaderLength + payload.Length;
+        var ciphertextLength = AlignToBlock(authenticatedLength + DigestLength);
         var plaintext = new byte[ciphertextLength];
-        var hashInput = new byte[SequenceLength + ciphertextLength - DigestLength];
+        var hashInput = new byte[SequenceLength + authenticatedLength];
         var wire = new byte[HeaderLength + ciphertextLength];
         var keyBytes = key.ToArray();
         try
@@ -36,9 +37,9 @@ internal static class ArdEncryptedPacketCodec
             BinaryPrimitives.WriteUInt16BigEndian(plaintext, checked((ushort)payload.Length));
             payload.CopyTo(plaintext.AsSpan(HeaderLength));
             BinaryPrimitives.WriteUInt32BigEndian(hashInput, sequence);
-            plaintext.AsSpan(0, ciphertextLength - DigestLength).CopyTo(hashInput.AsSpan(SequenceLength));
+            plaintext.AsSpan(0, authenticatedLength).CopyTo(hashInput.AsSpan(SequenceLength));
 #pragma warning disable CA5350 // SHA-1 is required by the Apple Remote Desktop encrypted packet format.
-            _ = SHA1.HashData(hashInput, plaintext.AsSpan(ciphertextLength - DigestLength));
+            _ = SHA1.HashData(hashInput, plaintext.AsSpan(authenticatedLength, DigestLength));
 #pragma warning restore CA5350
 
             BinaryPrimitives.WriteUInt16BigEndian(wire, checked((ushort)ciphertextLength));
@@ -84,7 +85,7 @@ internal static class ArdEncryptedPacketCodec
         }
 
         var plaintext = new byte[ciphertext.Length];
-        var hashInput = new byte[SequenceLength + ciphertext.Length - DigestLength];
+        byte[]? hashInput = null;
         var keyBytes = key.ToArray();
         byte[]? payload = null;
         byte[]? nextIv = null;
@@ -106,9 +107,9 @@ internal static class ArdEncryptedPacketCodec
             }
 
             var payloadLength = BinaryPrimitives.ReadUInt16BigEndian(plaintext);
-            var digestOffset = plaintext.Length - DigestLength;
             var payloadEnd = HeaderLength + payloadLength;
-            if (payloadEnd > digestOffset)
+            var digestEnd = payloadEnd + DigestLength;
+            if (digestEnd > plaintext.Length)
             {
                 throw PacketFailure(
                     "ARD encrypted packet payload length exceeds the decrypted packet.",
@@ -118,7 +119,7 @@ internal static class ArdEncryptedPacketCodec
                     ciphertext.Length);
             }
 
-            if (plaintext.AsSpan(payloadEnd, digestOffset - payloadEnd).ContainsAnyExcept((byte)0))
+            if (plaintext.AsSpan(digestEnd).ContainsAnyExcept((byte)0))
             {
                 throw PacketFailure(
                     "ARD encrypted packet padding is invalid.",
@@ -128,15 +129,16 @@ internal static class ArdEncryptedPacketCodec
                     ciphertext.Length);
             }
 
+            hashInput = new byte[SequenceLength + payloadEnd];
             BinaryPrimitives.WriteUInt32BigEndian(hashInput, sequence);
-            plaintext.AsSpan(0, digestOffset).CopyTo(hashInput.AsSpan(SequenceLength));
+            plaintext.AsSpan(0, payloadEnd).CopyTo(hashInput.AsSpan(SequenceLength));
             Span<byte> expectedDigest = stackalloc byte[DigestLength];
 #pragma warning disable CA5350 // SHA-1 is required by the Apple Remote Desktop encrypted packet format.
             _ = SHA1.HashData(hashInput, expectedDigest);
 #pragma warning restore CA5350
             if (!CryptographicOperations.FixedTimeEquals(
                     expectedDigest,
-                    plaintext.AsSpan(digestOffset, DigestLength)))
+                    plaintext.AsSpan(payloadEnd, DigestLength)))
             {
                 throw PacketFailure(
                     "ARD encrypted packet integrity validation failed.",
@@ -164,7 +166,11 @@ internal static class ArdEncryptedPacketCodec
         finally
         {
             CryptographicOperations.ZeroMemory(plaintext);
-            CryptographicOperations.ZeroMemory(hashInput);
+            if (hashInput is not null)
+            {
+                CryptographicOperations.ZeroMemory(hashInput);
+            }
+
             CryptographicOperations.ZeroMemory(keyBytes);
             if (payload is not null)
             {
