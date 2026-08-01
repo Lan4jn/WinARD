@@ -278,38 +278,56 @@ internal sealed class RfbClient : IRfbClient
         }
     }
 
-    public ValueTask SendPointerAsync(
+    public async ValueTask SendPointerAsync(
         byte buttons,
         int x,
         int y,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        return new PointerEventWriter(new RfbWriter(_transport)).WriteAsync(
-            buttons,
-            x,
-            y,
-            cancellationToken);
+        if (_sessionEncryption is not null)
+        {
+            await _sessionEncryption.WaitUntilEncryptedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await new PointerEventWriter(new RfbWriter(_transport)).WriteAsync(
+                buttons,
+                x,
+                y,
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
-    public ValueTask SendKeyAsync(
+    public async ValueTask SendKeyAsync(
         uint keysym,
         bool down,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        return new KeyEventWriter(new RfbWriter(_transport)).WriteAsync(
-            down,
-            keysym,
-            cancellationToken);
+        if (_sessionEncryption is not null)
+        {
+            await _sessionEncryption.WaitUntilEncryptedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await new KeyEventWriter(new RfbWriter(_transport)).WriteAsync(
+                down,
+                keysym,
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
-    public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken)
+    public async ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        return new ClipboardProtocol(new RfbWriter(_transport)).WriteClientCutTextAsync(
-            text,
-            cancellationToken);
+        if (_sessionEncryption is not null)
+        {
+            await _sessionEncryption.WaitUntilEncryptedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await new ClipboardProtocol(new RfbWriter(_transport)).WriteClientCutTextAsync(
+                text,
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()

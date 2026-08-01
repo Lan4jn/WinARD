@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Encodings;
@@ -12,6 +13,7 @@ public enum ArdSessionEncryptionState
     Requested,
     PendingActivation,
     Encrypted,
+    Failed,
 }
 
 public sealed class ArdSessionEncryption : IAsyncDisposable
@@ -19,7 +21,10 @@ public sealed class ArdSessionEncryption : IAsyncDisposable
     private readonly ArdEncryptedStream _transport;
     private readonly ArdAuthenticationResult _authentication;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly TaskCompletionSource<bool> _activationCompletion =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private ArdSessionCipherMaterial? _pendingMaterial;
+    private ExceptionDispatchInfo? _activationFailure;
     private ArdSessionEncryptionState _state;
     private bool _disposed;
 
@@ -82,12 +87,6 @@ public sealed class ArdSessionEncryption : IAsyncDisposable
         try
         {
             ThrowIfDisposed();
-            if (_state == ArdSessionEncryptionState.Requested)
-            {
-                throw NegotiationFailure(
-                    "The first ARD framebuffer update did not provide session encryption material.");
-            }
-
             if (_state != ArdSessionEncryptionState.PendingActivation)
             {
                 return;
@@ -96,16 +95,54 @@ public sealed class ArdSessionEncryption : IAsyncDisposable
             var material = _pendingMaterial ??
                 throw NegotiationFailure("ARD session encryption material is unavailable.");
             _pendingMaterial = null;
-            await _transport.WritePlaintextAndActivateAsync(
-                    ArdClientMessageWriter.SetEncryptionAcknowledgementMessage,
-                    material,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            _state = ArdSessionEncryptionState.Encrypted;
+            try
+            {
+                await _transport.WritePlaintextAndActivateAsync(
+                        ArdClientMessageWriter.SetEncryptionAcknowledgementMessage,
+                        material,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                _state = ArdSessionEncryptionState.Encrypted;
+                _activationCompletion.TrySetResult(true);
+            }
+            catch (Exception exception)
+            {
+                _state = ArdSessionEncryptionState.Failed;
+                _activationFailure = ExceptionDispatchInfo.Capture(exception);
+                _activationCompletion.TrySetResult(false);
+                throw;
+            }
         }
         finally
         {
             _gate.Release();
+        }
+    }
+
+    public async ValueTask WaitUntilEncryptedAsync(CancellationToken cancellationToken)
+    {
+        Task<bool> activationTask;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            if (_state == ArdSessionEncryptionState.Encrypted)
+            {
+                return;
+            }
+
+            activationTask = _activationCompletion.Task;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        var activated = await activationTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (!activated)
+        {
+            _activationFailure?.Throw();
+            ObjectDisposedException.ThrowIf(true, this);
         }
     }
 
@@ -166,6 +203,7 @@ public sealed class ArdSessionEncryption : IAsyncDisposable
             _pendingMaterial?.Dispose();
             _pendingMaterial = null;
             _authentication.Dispose();
+            _activationCompletion.TrySetResult(false);
         }
         finally
         {

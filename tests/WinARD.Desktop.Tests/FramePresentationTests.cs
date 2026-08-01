@@ -3,6 +3,7 @@ using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
+using WinARD.Remote.Protocol.Clipboard;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
@@ -558,6 +559,70 @@ public sealed class FramePresentationTests
 
         Assert.Equal(new byte[] { 5, 0, 0, 100, 0, 200 }, pointer.Payload);
         Assert.Equal(new byte[] { 4, 1, 0, 0, 0, 0, 0, 0x61 }, key.Payload);
+    }
+
+    [Fact]
+    public async Task Rfb_client_waits_for_later_1103_before_sending_sensitive_messages()
+    {
+        var authenticationKey = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
+        var sessionKey = Enumerable.Range(32, 16).Select(value => (byte)value).ToArray();
+        var sessionIv = Enumerable.Range(64, 16).Select(value => (byte)value).ToArray();
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                0, 0, 0, 0,
+                .. ArdSessionEncryptionUpdate(authenticationKey, sessionKey, sessionIv),
+            ]);
+        await using var client = new RfbClient(
+            stream,
+            authenticationResult: new ArdAuthenticationResult(authenticationKey));
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        using var firstFrame = Assert.IsType<RemoteFramebufferMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        var plaintextLength = stream.WrittenBytes.Length;
+
+        var pointerWrite = client.SendPointerAsync(0, 100, 200, CancellationToken.None).AsTask();
+        var keyWrite = client.SendKeyAsync(0x61, true, CancellationToken.None).AsTask();
+        var clipboardWrite = client.SendClipboardTextAsync("local", CancellationToken.None).AsTask();
+
+        Assert.False(pointerWrite.IsCompleted);
+        Assert.False(keyWrite.IsCompleted);
+        Assert.False(clipboardWrite.IsCompleted);
+        Assert.Equal(plaintextLength, stream.WrittenBytes.Length);
+
+        using var encryptionFrame = Assert.IsType<RemoteFramebufferMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        await Task.WhenAll(pointerWrite, keyWrite, clipboardWrite);
+
+        byte[] acknowledgement = [0x12, 0, 0, 2, 0, 1, 0, 0];
+        var acknowledgementOffset = FindSequence(stream.WrittenBytes, acknowledgement);
+        Assert.True(acknowledgementOffset >= plaintextLength);
+        var encrypted = stream.WrittenBytes[(acknowledgementOffset + acknowledgement.Length)..];
+        var decodedPayloads = new List<byte[]>();
+        var offset = 0;
+        var sequence = 0u;
+        var iv = sessionIv.ToArray();
+        while (offset < encrypted.Length)
+        {
+            var length = BinaryPrimitives.ReadUInt16BigEndian(encrypted.AsSpan(offset));
+            using var packet = ArdEncryptedPacketCodec.Decrypt(
+                sessionKey,
+                iv,
+                sequence,
+                encrypted.AsSpan(offset + 2, length));
+            decodedPayloads.Add(packet.Payload.ToArray());
+            iv = packet.NextIv.ToArray();
+            offset += 2 + length;
+            sequence++;
+        }
+
+        Assert.Equal(3, decodedPayloads.Count);
+        Assert.Contains(decodedPayloads, payload => payload.SequenceEqual(new byte[] { 5, 0, 0, 100, 0, 200 }));
+        Assert.Contains(decodedPayloads, payload => payload.SequenceEqual(new byte[] { 4, 1, 0, 0, 0, 0, 0, 0x61 }));
+        Assert.Contains(decodedPayloads, payload => payload.SequenceEqual(ClipboardProtocol.EncodeClientCutText("local")));
     }
 
     [Fact]

@@ -110,7 +110,7 @@ public sealed class ArdSessionEncryptionTests
     }
 
     [Fact]
-    public async Task First_completed_framebuffer_update_without_1103_fails_closed()
+    public async Task Completed_framebuffer_update_without_1103_remains_requested()
     {
         await using var inner = new ScriptedDuplexStream([]);
         await using var transport = new ArdEncryptedStream(inner, ProtocolLimits.Default);
@@ -119,12 +119,74 @@ public sealed class ArdSessionEncryptionTests
             new ArdAuthenticationResult(AuthenticationKey.ToArray()));
         await encryption.RequestAsync(CancellationToken.None);
 
-        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
-            encryption.CompleteFramebufferUpdateAsync(CancellationToken.None).AsTask());
+        await encryption.CompleteFramebufferUpdateAsync(CancellationToken.None);
 
-        Assert.Equal(
-            RfbProtocolFailureKind.ArdEncryptionNegotiation,
-            exception.Failure?.Kind);
+        Assert.Equal(ArdSessionEncryptionState.Requested, encryption.State);
+        Assert.False(transport.IsEncrypted);
+    }
+
+    [Fact]
+    public async Task WaitUntilEncryptedAsync_honors_cancellation_before_material_arrives()
+    {
+        await using var inner = new ScriptedDuplexStream([]);
+        await using var transport = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        await using var encryption = new ArdSessionEncryption(
+            transport,
+            new ArdAuthenticationResult(AuthenticationKey.ToArray()));
+        await encryption.RequestAsync(CancellationToken.None);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            encryption.WaitUntilEncryptedAsync(cancellation.Token).AsTask());
+    }
+
+    [Fact]
+    public async Task WaitUntilEncryptedAsync_fails_when_controller_is_disposed_before_activation()
+    {
+        await using var inner = new ScriptedDuplexStream([]);
+        await using var transport = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        var encryption = new ArdSessionEncryption(
+            transport,
+            new ArdAuthenticationResult(AuthenticationKey.ToArray()));
+        await encryption.RequestAsync(CancellationToken.None);
+
+        var wait = encryption.WaitUntilEncryptedAsync(CancellationToken.None).AsTask();
+        await encryption.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => wait);
+    }
+
+    [Fact]
+    public async Task Activation_write_failure_releases_waiters_with_the_same_terminal_failure()
+    {
+        var expectedFailure = new IOException("ack write failed");
+        await using var inner = new ScriptedDuplexStream(
+            CreateSessionEncryptionUpdate(),
+            maxRead: 3,
+            failedWriteNumber: 2,
+            writeException: expectedFailure);
+        await using var transport = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        await using var encryption = new ArdSessionEncryption(
+            transport,
+            new ArdAuthenticationResult(AuthenticationKey.ToArray()));
+        await encryption.RequestAsync(CancellationToken.None);
+        using var framebuffer = new FramebufferModel(10, 10, ProtocolLimits.Default);
+        await using var updates = FramebufferUpdateReader.CreateSession(
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            encryption.CreateDecoder());
+        _ = await updates.ApplyAsync(transport, CancellationToken.None);
+        var wait = encryption.WaitUntilEncryptedAsync(CancellationToken.None).AsTask();
+
+        var activationFailure = await Assert.ThrowsAsync<IOException>(() =>
+            encryption.CompleteFramebufferUpdateAsync(CancellationToken.None).AsTask());
+        var waiterFailure = await Assert.ThrowsAsync<IOException>(() =>
+            wait.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.Same(expectedFailure, activationFailure);
+        Assert.Same(expectedFailure, waiterFailure);
+        Assert.Equal(ArdSessionEncryptionState.Failed, encryption.State);
         Assert.False(transport.IsEncrypted);
     }
 
@@ -152,7 +214,9 @@ public sealed class ArdSessionEncryptionTests
     private sealed class ScriptedDuplexStream(
         byte[] input,
         int maxRead = int.MaxValue,
-        int blockedWriteNumber = 0) : Stream
+        int blockedWriteNumber = 0,
+        int failedWriteNumber = 0,
+        IOException? writeException = null) : Stream
     {
         private readonly MemoryStream _input = new(input, writable: false);
         private readonly MemoryStream _output = new();
@@ -182,6 +246,11 @@ public sealed class ArdSessionEncryptionTests
             CancellationToken cancellationToken = default)
         {
             var writeNumber = Interlocked.Increment(ref _writeCount);
+            if (writeNumber == failedWriteNumber && writeException is not null)
+            {
+                throw writeException;
+            }
+
             if (writeNumber == blockedWriteNumber)
             {
                 _blockedWriteStarted.TrySetResult();

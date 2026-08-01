@@ -44,7 +44,8 @@ This is rejected because there is no evidence that the request is malformed or l
 4. Pointer, keyboard, and clipboard writers wait on a single activation completion signal. They do not write any bytes while the state is `Requested` or `PendingActivation`.
 5. A valid 1103 rectangle decrypts the session key and IV and enters `PendingActivation`.
 6. Completion of that framebuffer update writes SetEncryption command 2, activates `ArdEncryptedStream`, enters `Encrypted`, and releases waiting sensitive writers. Their writes then pass through the encrypted stream.
-7. Disposal, cancellation, malformed 1103, transport failure, or connection closure remains terminal. Waiting writers are released by cancellation or disposal rather than falling back to plaintext.
+7. ACK or transport activation failure enters terminal `Failed` state and releases every waiter with the same failure.
+8. Disposal, cancellation, malformed 1103, transport failure, or connection closure remains terminal. Waiting writers are released by failure, cancellation, or disposal rather than falling back to plaintext.
 
 The activation signal uses asynchronous continuations and is completed only after the acknowledgement write and transport activation both succeed.
 

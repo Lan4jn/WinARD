@@ -60,6 +60,8 @@ version=u32be(1), encryptedSessionKey[16], encryptedIV[16]
 
 The two encrypted fields are decrypted independently with AES-128-ECB using the type 30 authentication key. An unsupported version, missing authentication key, or malformed payload is a fatal protocol error.
 
+The server may have an ordinary framebuffer update already queued when it processes SetEncryption command 1. Therefore 1103 is not required to appear in the first update after the request. Valid ordinary updates leave the negotiation in `Requested`; framebuffer requests and required ARD liveness replies may continue so that the server can deliver 1103, while pointer, keyboard, and clipboard writes wait for encryption activation and never fall back to plaintext.
+
 Encryption activation is deferred until every rectangle in the current framebuffer update has been consumed. WinARD then writes the plaintext SetEncryption acknowledgement and waits for that write to complete:
 
 ```text
@@ -107,14 +109,15 @@ The ARD right/middle button ordering difference is separate from the current tot
 
 ## State Model
 
-The connection has four encryption states:
+The connection has five encryption states:
 
 1. `Plaintext`: authenticated but no encryption request has been sent.
-2. `Requested`: SetEncryption command 1 was sent; pseudo-encoding 1103 is expected.
+2. `Requested`: SetEncryption command 1 was sent; pseudo-encoding 1103 is expected in a subsequent framebuffer update, but ordinary updates may arrive first.
 3. `PendingActivation`: valid session key and IV were decrypted; the current framebuffer update is still being consumed.
 4. `Encrypted`: plaintext acknowledgement completed and all subsequent transport reads and writes use encrypted packets.
+5. `Failed`: acknowledgement or transport activation failed; the state is terminal and all activation waiters observe the same failure.
 
-State transitions are one-way. Duplicate or out-of-order encryption material, a second activation, or ordinary plaintext traffic observed after activation is a protocol failure. Disposal is permitted from every state and clears all owned secret material.
+State transitions are one-way. Duplicate or out-of-order encryption material, a second activation, or ordinary plaintext traffic observed after activation is a protocol failure. Disposal is permitted from every state and clears all owned secret material. No input writer may remain blocked after activation enters `Failed`.
 
 ## Error Handling and Diagnostics
 
@@ -157,6 +160,7 @@ All secret arrays and buffered decrypted plaintext are cleared on normal disconn
 
 - ARD encodings contain 1103 and initialization sends SetEncryption command 1 before the first framebuffer request.
 - A 1103 rectangle is fully consumed without prematurely decrypting remaining rectangles as encrypted transport.
+- Ordinary framebuffer updates before 1103 keep the transport plaintext for negotiation traffic while sensitive client input remains blocked.
 - Completion of that framebuffer update sends plaintext command 2 before switching transport state.
 - PointerEvent, KeyEvent, AutoFBUpdate, Tickle response, clipboard message, and framebuffer request are encrypted after activation and do not appear as plaintext on the underlying stream.
 - Existing ARD session-selection, display bootstrap, state-change, framebuffer decoding, and remote-close tests remain green.
