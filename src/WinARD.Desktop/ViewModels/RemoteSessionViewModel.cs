@@ -29,6 +29,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private readonly CancellationTokenSource _lifetime = new();
     private readonly WindowsInputMapper _inputMapper;
     private readonly ISafeDiagnosticSink? _diagnosticSink;
+    private readonly ConnectionQualityTracker _connectionQualityTracker;
+    private readonly ConnectionQualityPublicationGate _connectionQualityPublicationGate = new();
     private readonly TaskCompletionSource _completion =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Task? _receiveTask;
@@ -36,10 +38,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private Task? _monitorTask;
     private Task? _disposeTask;
     private Task? _ownershipDisposeTask;
+    private ConnectionQualitySnapshot? _pendingFrameQuality;
     private long _sequence;
     private RemoteFramebufferSize _framebufferSize;
     private RemoteCursorUpdate? _remoteCursor;
     private string _statusMessage = "已连接。";
+    private ConnectionQualitySnapshot _connectionQuality;
     private WinArdError? _error;
 
     public RemoteSessionViewModel(
@@ -48,7 +52,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         IFramePresenter presenter,
         IUiDispatcher dispatcher,
         WindowsClipboardBridge? clipboardBridge,
-        ISafeDiagnosticSink? diagnosticSink = null)
+        ISafeDiagnosticSink? diagnosticSink = null,
+        TimeProvider? timeProvider = null)
     {
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _ownership = ownership ?? throw new ArgumentNullException(nameof(ownership));
@@ -56,6 +61,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _clipboardBridge = clipboardBridge;
         _diagnosticSink = diagnosticSink;
+        _connectionQualityTracker = new ConnectionQualityTracker(timeProvider ?? TimeProvider.System);
+        _connectionQuality = _connectionQualityTracker.Current;
         _inputMapper = new WindowsInputMapper(_session.SendKeyAsync);
         _framebufferSize = session.FramebufferSize;
     }
@@ -70,6 +77,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     {
         get => _statusMessage;
         private set => SetProperty(ref _statusMessage, value);
+    }
+
+    public ConnectionQualitySnapshot ConnectionQuality
+    {
+        get => _connectionQuality;
+        private set => SetProperty(ref _connectionQuality, value);
     }
 
     public RemoteCursorUpdate? RemoteCursor
@@ -181,7 +194,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     {
         try
         {
-            await _session.RequestFramebufferUpdateAsync(
+            await RequestFramebufferUpdateTrackedAsync(
                 incremental: false,
                 cancellationToken).ConfigureAwait(false);
             while (true)
@@ -191,6 +204,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 switch (message)
                 {
                     case RemoteFramebufferMessage frame:
+                        var frameQuality = _connectionQualityTracker.CompleteResponse();
                         var framebufferResized = FramebufferSize != frame.Size;
                         using (frame)
                         {
@@ -204,9 +218,11 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                                         cancellationToken).ConfigureAwait(false);
                                 }
 
-                                _frames.Publish(FramePacket.TakeFrom(
+                                var packet = FramePacket.TakeFrom(
                                     Interlocked.Increment(ref _sequence),
-                                    frame));
+                                    frame);
+                                Interlocked.Exchange(ref _pendingFrameQuality, frameQuality);
+                                _frames.Publish(packet);
                                 if (cursor is not null)
                                 {
                                     await PublishCursorAsync(cursor, cancellationToken).ConfigureAwait(false);
@@ -221,18 +237,20 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                                 }
                             }
                         }
-                        await _session.RequestFramebufferUpdateAsync(
+                        await RequestFramebufferUpdateTrackedAsync(
                             incremental: !framebufferResized,
                             cancellationToken).ConfigureAwait(false);
                         break;
                     case RemoteCursorMessage cursorMessage:
+                        var cursorQuality = _connectionQualityTracker.CompleteResponse();
                         using (cursorMessage)
                         {
                             await PublishCursorAsync(
                                 cursorMessage.TakeCursorOwnership(),
-                                cancellationToken).ConfigureAwait(false);
+                                cancellationToken,
+                                cursorQuality).ConfigureAwait(false);
                         }
-                        await _session.RequestFramebufferUpdateAsync(
+                        await RequestFramebufferUpdateTrackedAsync(
                             incremental: true,
                             cancellationToken).ConfigureAwait(false);
                         break;
@@ -260,6 +278,11 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 using var frame = await _frames.ReadLatestAsync(cancellationToken).ConfigureAwait(false);
                 await _dispatcher.InvokeAsync(() =>
                 {
+                    if (Interlocked.Exchange(ref _pendingFrameQuality, null) is { } quality)
+                    {
+                        PublishConnectionQuality(quality);
+                    }
+
                     _presenter.Resize(frame.Width, frame.Height);
                     _presenter.Present(frame.Pixels.Span, frame.Stride, frame.DirtyRectangles);
                 }, cancellationToken).ConfigureAwait(false);
@@ -268,6 +291,15 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
+    }
+
+    private async ValueTask RequestFramebufferUpdateTrackedAsync(
+        bool incremental,
+        CancellationToken cancellationToken)
+    {
+        _connectionQualityTracker.BeginRequest();
+        await _session.RequestFramebufferUpdateAsync(incremental, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private async Task DisposeCoreAsync()
@@ -282,6 +314,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         }
         else
         {
+            await PublishDisconnectedBestEffortAsync().ConfigureAwait(false);
             _completion.TrySetResult();
         }
 
@@ -620,7 +653,23 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         }
         finally
         {
+            await PublishDisconnectedBestEffortAsync().ConfigureAwait(false);
             _completion.TrySetResult();
+        }
+    }
+
+    private async Task PublishDisconnectedBestEffortAsync()
+    {
+        try
+        {
+            var disconnected = _connectionQualityTracker.Disconnect();
+            await _dispatcher.InvokeAsync(
+                () => PublishConnectionQuality(disconnected),
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Terminal cleanup must not depend on quality status reporting.
         }
     }
 
@@ -637,7 +686,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
     private async Task PublishCursorAsync(
         RemoteCursorUpdate cursor,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ConnectionQualitySnapshot? quality = null)
     {
         try
         {
@@ -645,13 +695,27 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             {
                 cursor.Dispose();
                 await _dispatcher.InvokeAsync(
-                    () => RemoteCursor = null,
+                    () =>
+                    {
+                        RemoteCursor = null;
+                        if (quality is not null)
+                        {
+                            PublishConnectionQuality(quality);
+                        }
+                    },
                     cancellationToken).ConfigureAwait(false);
                 return;
             }
 
             await _dispatcher.InvokeAsync(
-                () => RemoteCursor = cursor,
+                () =>
+                {
+                    RemoteCursor = cursor;
+                    if (quality is not null)
+                    {
+                        PublishConnectionQuality(quality);
+                    }
+                },
                 cancellationToken).ConfigureAwait(false);
         }
         catch
@@ -662,6 +726,14 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             }
 
             throw;
+        }
+    }
+
+    private void PublishConnectionQuality(ConnectionQualitySnapshot quality)
+    {
+        if (_connectionQualityPublicationGate.TryAccept(quality))
+        {
+            ConnectionQuality = quality;
         }
     }
 

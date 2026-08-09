@@ -1,8 +1,10 @@
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Input;
+using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using System.Runtime.InteropServices.WindowsRuntime;
 using WinARD.Application.Ports;
@@ -23,16 +25,26 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly IUiDispatcher _dispatcher;
     private readonly WindowsClipboardBridge _clipboardBridge;
     private readonly RemoteInputOperationRunner _inputOperations;
+    private readonly RemoteInputDiagnosticTracker _inputDiagnostics;
     private readonly RemoteCursorVisibilityController _cursorVisibility;
     private readonly RemoteTextInputBuffer _textInput = new();
     private readonly AppWindow _appWindow;
     private readonly DiagnosticExportService? _diagnosticExportService;
+    private readonly RemoteSessionDiagnosticExportState _diagnosticExportState;
     private readonly ConnectionErrorActionHandler _errorActionHandler;
     private readonly RemoteSessionWindowLifecycle _windowLifecycle;
+    private readonly KeyEventHandler _keyDownHandler;
+    private readonly KeyEventHandler _keyUpHandler;
+    private readonly PointerEventHandler _pointerPressedHandler;
+    private readonly PointerEventHandler _pointerMovedHandler;
+    private readonly PointerEventHandler _pointerReleasedHandler;
+    private readonly PointerEventHandler _pointerCanceledHandler;
+    private readonly PointerEventHandler _pointerWheelChangedHandler;
     private RemoteFramebufferSize _remoteSize;
     private ViewportScaleMode _scaleMode = ViewportScaleMode.Fit;
     private byte _pointerMask;
     private RemotePoint _lastPointer;
+    private int _closingStarted;
     private bool _fullscreen;
     private bool _allowClose;
 
@@ -50,7 +62,11 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(ownership);
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _diagnosticExportService = diagnosticExportService;
+        _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
+        _diagnosticExportState = new RemoteSessionDiagnosticExportState(
+            serviceAvailable: diagnosticExportService is not null);
         InitializeComponent();
+        RefreshDiagnosticExportState();
         _remoteSize = session.FramebufferSize;
         presenter ??= new D3DFramePresenter(FramePanel);
         _clipboardBridge = new WindowsClipboardBridge(dispatcher, session.SendClipboardTextAsync);
@@ -66,7 +82,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             () => ViewModel.Error is not null,
             StopSessionCoreAsync,
             CloseWindowCoreAsync,
-            retryRequested);
+            retryRequested,
+            BeginClosingDiagnostics);
         var handlers = new Dictionary<ConnectionErrorActionKind, Func<CancellationToken, Task>>
         {
             [ConnectionErrorActionKind.CopyCorrelationId] = CopyCorrelationIdAsync,
@@ -90,7 +107,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             dispatcher,
             ViewModel.ReportInputFailureAsync,
             _windowLifecycle.StopSessionAsync,
-            () => _lifetime.IsCancellationRequested || _windowLifecycle.IsSessionStopped,
+            IsInputClosing,
             ViewModel.ObserveInputFailure);
         _cursorVisibility = new RemoteCursorVisibilityController(
             InputSurface.SetHostCursorHidden,
@@ -102,6 +119,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             Source = ViewModel,
             Path = new PropertyPath(nameof(RemoteSessionViewModel.StatusMessage)),
         });
+        UpdateConnectionQualityVisual();
 
         var windowHandle = WindowNative.GetWindowHandle(this);
         var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(windowHandle);
@@ -110,14 +128,42 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _appWindow.Closing += OnClosing;
         Closed += OnClosed;
         Activated += OnActivated;
-        InputSurface.KeyDown += OnKeyDown;
-        InputSurface.KeyUp += OnKeyUp;
+        _keyDownHandler = OnKeyDown;
+        _keyUpHandler = OnKeyUp;
+        _pointerPressedHandler = OnPointerPressed;
+        _pointerMovedHandler = OnPointerMoved;
+        _pointerReleasedHandler = OnPointerReleased;
+        _pointerCanceledHandler = OnPointerCanceled;
+        _pointerWheelChangedHandler = OnPointerWheelChanged;
+        InputSurface.AddHandler(
+            UIElement.KeyDownEvent,
+            _keyDownHandler,
+            handledEventsToo: true);
+        InputSurface.AddHandler(
+            UIElement.KeyUpEvent,
+            _keyUpHandler,
+            handledEventsToo: true);
         InputSurface.CharacterReceived += OnCharacterReceived;
-        InputSurface.PointerPressed += OnPointerPressed;
-        InputSurface.PointerMoved += OnPointerMoved;
-        InputSurface.PointerReleased += OnPointerReleased;
-        InputSurface.PointerCanceled += OnPointerCanceled;
-        InputSurface.PointerWheelChanged += OnPointerWheelChanged;
+        FrameSurface.AddHandler(
+            UIElement.PointerPressedEvent,
+            _pointerPressedHandler,
+            handledEventsToo: true);
+        FrameSurface.AddHandler(
+            UIElement.PointerMovedEvent,
+            _pointerMovedHandler,
+            handledEventsToo: true);
+        FrameSurface.AddHandler(
+            UIElement.PointerReleasedEvent,
+            _pointerReleasedHandler,
+            handledEventsToo: true);
+        FrameSurface.AddHandler(
+            UIElement.PointerCanceledEvent,
+            _pointerCanceledHandler,
+            handledEventsToo: true);
+        FrameSurface.AddHandler(
+            UIElement.PointerWheelChangedEvent,
+            _pointerWheelChangedHandler,
+            handledEventsToo: true);
         FramePanel.Loaded += OnFramePanelLoaded;
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
         FrameScrollViewer.SizeChanged += (_, _) => UpdateFrameSizing();
@@ -158,6 +204,44 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private void OnClipboardClicked(object sender, RoutedEventArgs args) =>
         _clipboardBridge.IsEnabled = ClipboardButton.IsChecked == true;
 
+    private async void OnExportDiagnosticsClicked(object sender, RoutedEventArgs args)
+    {
+        if (_diagnosticExportService is null || !_diagnosticExportState.TryBeginExport())
+        {
+            return;
+        }
+
+        RefreshDiagnosticExportState();
+        try
+        {
+            await ExportDiagnosticsAsync(_lifetime.Token);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            StatusText.Text = "诊断导出失败。";
+        }
+        finally
+        {
+            _diagnosticExportState.CompleteExport();
+            RefreshDiagnosticExportState();
+        }
+    }
+
+    private void RefreshDiagnosticExportState() =>
+        ExportDiagnosticsButton.IsEnabled = _diagnosticExportState.IsEnabled;
+
+    private void BeginClosingDiagnostics()
+    {
+        _ = Interlocked.Exchange(ref _closingStarted, 1);
+        _diagnosticExportState.BeginClosing();
+        _ = ObserveFailureAsync(_dispatcher.InvokeAsync(
+            RefreshDiagnosticExportState,
+            CancellationToken.None));
+    }
+
     private void OnFullscreenClicked(object sender, RoutedEventArgs args)
     {
         _fullscreen = !_fullscreen;
@@ -170,11 +254,19 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs args)
     {
-        if (_lifetime.IsCancellationRequested || !CurrentTransform().IsValid)
+        if (IsInputClosing())
         {
+            RecordKeyboardDropped(RemoteInputDropReason.SessionClosing);
             return;
         }
 
+        if (!CurrentTransform().IsValid)
+        {
+            RecordKeyboardDropped(RemoteInputDropReason.InvalidTransform);
+            return;
+        }
+
+        RecordKeyboardCaptured();
         args.Handled = true;
         _textInput.OnPhysicalKeyDown(
             args.Key,
@@ -191,6 +283,13 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnKeyUp(object sender, KeyRoutedEventArgs args)
     {
+        if (IsInputClosing())
+        {
+            RecordKeyboardDropped(RemoteInputDropReason.SessionClosing);
+            return;
+        }
+
+        RecordKeyboardCaptured();
         args.Handled = true;
         _textInput.OnPhysicalKeyUp(
             args.Key,
@@ -207,11 +306,13 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnCharacterReceived(object sender, CharacterReceivedRoutedEventArgs args)
     {
-        if (_lifetime.IsCancellationRequested)
+        if (IsInputClosing())
         {
+            RecordKeyboardDropped(RemoteInputDropReason.SessionClosing);
             return;
         }
 
+        RecordKeyboardCaptured();
         args.Handled = true;
         var text = _textInput.AcceptCharacter(args.Character);
         if (text is null)
@@ -226,7 +327,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private void OnPointerPressed(object sender, PointerRoutedEventArgs args)
     {
         _ = InputSurface.Focus(FocusState.Pointer);
-        _ = InputSurface.CapturePointer(args.Pointer);
+        _ = FrameSurface.CapturePointer(args.Pointer);
         QueuePointerSend(args);
         args.Handled = true;
     }
@@ -236,13 +337,22 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnPointerReleased(object sender, PointerRoutedEventArgs args)
     {
-        InputSurface.ReleasePointerCapture(args.Pointer);
+        FrameSurface.ReleasePointerCapture(args.Pointer);
         QueuePointerSend(args);
         args.Handled = true;
     }
 
-    private void OnPointerCanceled(object sender, PointerRoutedEventArgs args) =>
+    private void OnPointerCanceled(object sender, PointerRoutedEventArgs args)
+    {
+        if (IsInputClosing())
+        {
+            RecordPointerDropped(RemoteInputDropReason.SessionClosing);
+            return;
+        }
+
+        RecordPointerCaptured();
         _ = _inputOperations.RunAsync(() => ReleaseInputAsync(_lifetime.Token));
+    }
 
     private void OnPointerWheelChanged(object sender, PointerRoutedEventArgs args)
     {
@@ -252,12 +362,20 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void QueueWheelSend(PointerRoutedEventArgs args)
     {
-        if (!TryGetRemotePoint(args, out var point))
+        if (IsInputClosing())
         {
+            RecordPointerDropped(RemoteInputDropReason.SessionClosing);
             return;
         }
 
-        var properties = args.GetCurrentPoint(InputSurface).Properties;
+        if (!TryGetRemotePoint(args, out var point))
+        {
+            RecordPointerDropped(RemoteInputDropReason.InvalidTransform);
+            return;
+        }
+
+        RecordPointerCaptured();
+        var properties = args.GetCurrentPoint(FrameSurface).Properties;
         var baseMask = WindowsInputMapper.ToPointerMask(ToButtons(properties));
         var wheelMask = WindowsInputMapper.WithWheel(baseMask, properties.MouseWheelDelta);
         _ = RemotePointerDispatch.RunAsync(
@@ -272,13 +390,21 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void QueuePointerSend(PointerRoutedEventArgs args)
     {
-        if (!TryGetRemotePoint(args, out var point))
+        if (IsInputClosing())
         {
+            RecordPointerDropped(RemoteInputDropReason.SessionClosing);
             return;
         }
 
+        if (!TryGetRemotePoint(args, out var point))
+        {
+            RecordPointerDropped(RemoteInputDropReason.InvalidTransform);
+            return;
+        }
+
+        RecordPointerCaptured();
         var pointerMask = WindowsInputMapper.ToPointerMask(
-            ToButtons(args.GetCurrentPoint(InputSurface).Properties));
+            ToButtons(args.GetCurrentPoint(FrameSurface).Properties));
         _ = RemotePointerDispatch.RunAsync(
             () => UpdateLocalPointerState(point, pointerMask),
             _inputOperations,
@@ -287,6 +413,25 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                 point,
                 _lifetime.Token).AsTask());
     }
+
+    private void RecordKeyboardCaptured() => _inputDiagnostics.Record(
+        RemoteInputKind.Keyboard,
+        RemoteInputBoundary.UiCaptured);
+
+    private void RecordPointerCaptured() => _inputDiagnostics.Record(
+        RemoteInputKind.Pointer,
+        RemoteInputBoundary.UiCaptured);
+
+    private void RecordKeyboardDropped(RemoteInputDropReason reason) =>
+        _inputDiagnostics.RecordDropped(RemoteInputKind.Keyboard, reason);
+
+    private void RecordPointerDropped(RemoteInputDropReason reason) =>
+        _inputDiagnostics.RecordDropped(RemoteInputKind.Pointer, reason);
+
+    private bool IsInputClosing() =>
+        Volatile.Read(ref _closingStarted) != 0 ||
+        _lifetime.IsCancellationRequested ||
+        _windowLifecycle.IsSessionStopped;
 
     private void UpdateLocalPointerState(RemotePoint point, byte pointerMask)
     {
@@ -423,6 +568,10 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         {
             WriteSmokeMarker("WINARD_REMOTE_SMOKE_STATUS_MARKER", ViewModel.StatusMessage);
         }
+        else if (args.PropertyName == nameof(RemoteSessionViewModel.ConnectionQuality))
+        {
+            UpdateConnectionQualityVisual();
+        }
         else if (args.PropertyName == nameof(RemoteSessionViewModel.Error))
         {
             var error = ViewModel.Error;
@@ -435,6 +584,23 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                 TriggerSmokeErrorAction();
             }
         }
+    }
+
+    private void UpdateConnectionQualityVisual()
+    {
+        var quality = ViewModel.ConnectionQuality;
+        var color = quality.Level switch
+        {
+            ConnectionQualityLevel.Good => Microsoft.UI.Colors.LimeGreen,
+            ConnectionQualityLevel.Fair => Microsoft.UI.Colors.Goldenrod,
+            ConnectionQualityLevel.Poor or ConnectionQualityLevel.Disconnected =>
+                Microsoft.UI.Colors.IndianRed,
+            _ => Microsoft.UI.Colors.Gray,
+        };
+        QualityIndicator.Fill = new SolidColorBrush(color);
+        QualityText.Text = quality.DisplayText;
+        AutomationProperties.SetName(QualityPanel, $"连接质量：{quality.DisplayText}");
+        AutomationProperties.SetName(QualityIndicator, $"连接质量：{quality.DisplayText}");
     }
 
     private void TriggerSmokeErrorAction()
@@ -521,6 +687,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
     {
+        BeginClosingDiagnostics();
         if (_allowClose)
         {
             return;
@@ -621,6 +788,13 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private void OnClosed(object sender, WindowEventArgs args)
     {
         _appWindow.Closing -= OnClosing;
+        InputSurface.RemoveHandler(UIElement.KeyDownEvent, _keyDownHandler);
+        InputSurface.RemoveHandler(UIElement.KeyUpEvent, _keyUpHandler);
+        FrameSurface.RemoveHandler(UIElement.PointerPressedEvent, _pointerPressedHandler);
+        FrameSurface.RemoveHandler(UIElement.PointerMovedEvent, _pointerMovedHandler);
+        FrameSurface.RemoveHandler(UIElement.PointerReleasedEvent, _pointerReleasedHandler);
+        FrameSurface.RemoveHandler(UIElement.PointerCanceledEvent, _pointerCanceledHandler);
+        FrameSurface.RemoveHandler(UIElement.PointerWheelChangedEvent, _pointerWheelChangedHandler);
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
         SessionErrorCard.ActionRequested -= OnErrorActionRequested;
         _windowLifecycle.Dispose();

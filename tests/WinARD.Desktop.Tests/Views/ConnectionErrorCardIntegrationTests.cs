@@ -71,6 +71,42 @@ public sealed class ConnectionErrorCardIntegrationTests
     }
 
     [Fact]
+    public void RemoteSessionToolbarExposesCurrentSessionDiagnosticExport()
+    {
+        var xaml = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml"));
+        var window = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Contains("RemoteExportDiagnosticsButton", xaml, StringComparison.Ordinal);
+        Assert.Contains("Click=\"OnExportDiagnosticsClicked\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("ExportDiagnosticsButton.IsEnabled", window, StringComparison.Ordinal);
+        Assert.Contains("ExportDiagnosticsAsync", window, StringComparison.Ordinal);
+        Assert.Contains("BeginClosingDiagnostics);", window, StringComparison.Ordinal);
+        Assert.Contains("_diagnosticExportState.BeginClosing()", window, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RemoteSessionStatusExposesAccessibleConnectionQualityIndicator()
+    {
+        var xaml = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml"));
+        var window = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Contains("RemoteConnectionQualityIndicator", xaml, StringComparison.Ordinal);
+        Assert.Contains("<Ellipse", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"QualityIndicator\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"QualityText\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("UpdateConnectionQualityVisual", window, StringComparison.Ordinal);
+        Assert.Contains(
+            "nameof(RemoteSessionViewModel.ConnectionQuality)",
+            window,
+            StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.SetName", window, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ErrorPresentationDoesNotReadRawExceptionMessage()
     {
         var files = new[]

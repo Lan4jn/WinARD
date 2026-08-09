@@ -34,6 +34,11 @@
                 IsChecked="True"
                 Label="剪贴板" />
             <AppBarButton
+                x:Name="ExportDiagnosticsButton"
+                AutomationProperties.AutomationId="RemoteExportDiagnosticsButton"
+                Click="OnExportDiagnosticsClicked"
+                Label="导出诊断" />
+            <AppBarButton
                 AutomationProperties.AutomationId="RemoteFullscreenButton"
                 Click="OnFullscreenClicked"
                 Label="全屏" />
@@ -52,7 +57,11 @@
                 VerticalScrollBarVisibility="Disabled"
                 VerticalScrollMode="Disabled"
                 ZoomMode="Disabled">
-                <Grid x:Name="FrameSurface" HorizontalAlignment="Left" VerticalAlignment="Top">
+                <Grid
+                    x:Name="FrameSurface"
+                    Background="Transparent"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Top">
                     <Viewbox
                         x:Name="FrameViewbox"
                         HorizontalAlignment="Stretch"
@@ -108,13 +117,24 @@
                 x:Name="StatusText"
                 AutomationProperties.AutomationId="RemoteSessionStatus"
                 VerticalAlignment="Center" />
-            <TextBlock
-                x:Name="QualityText"
+            <StackPanel
+                x:Name="QualityPanel"
                 Grid.Column="1"
-                AutomationProperties.AutomationId="RemoteConnectionQuality"
-                Opacity="0.7"
-                Text="单会话 · 增量更新"
-                VerticalAlignment="Center" />
+                AutomationProperties.AutomationId="RemoteConnectionQualityIndicator"
+                Orientation="Horizontal"
+                Spacing="8"
+                VerticalAlignment="Center">
+                <Ellipse
+                    x:Name="QualityIndicator"
+                    Width="10"
+                    Height="10"
+                    Fill="Gray" />
+                <TextBlock
+                    x:Name="QualityText"
+                    Opacity="0.8"
+                    Text="等待测量"
+                    VerticalAlignment="Center" />
+            </StackPanel>
         </Grid>
     </Grid>
 </Window>

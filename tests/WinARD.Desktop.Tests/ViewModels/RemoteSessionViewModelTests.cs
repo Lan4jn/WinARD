@@ -16,6 +16,21 @@ namespace WinARD.Desktop.Tests.ViewModels;
 public sealed class RemoteSessionViewModelTests
 {
     [Fact]
+    public async Task Dispose_before_start_reports_disconnected_quality()
+    {
+        var viewModel = new RemoteSessionViewModel(
+            new BlockingRuntime(),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.DisposeAsync();
+
+        Assert.Equal(ConnectionQualityLevel.Disconnected, viewModel.ConnectionQuality.Level);
+    }
+
+    [Fact]
     public async Task Dispose_cancels_single_receive_loop_and_releases_resources_once()
     {
         var runtime = new BlockingRuntime();
@@ -80,8 +95,39 @@ public sealed class RemoteSessionViewModelTests
         await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.Equal("连接已中断。", viewModel.StatusMessage);
+        Assert.Equal(ConnectionQualityLevel.Disconnected, viewModel.ConnectionQuality.Level);
         Assert.DoesNotContain("sensitive", viewModel.StatusMessage, StringComparison.Ordinal);
         Assert.Equal(1, lifetime.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Framebuffer_response_updates_connection_quality_from_tracked_request()
+    {
+        var time = new ManualTimestampProvider();
+        var runtime = new TimedFrameRuntime(time, TimeSpan.FromMilliseconds(80));
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            timeProvider: time);
+        var qualityUpdated = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(RemoteSessionViewModel.ConnectionQuality) &&
+                viewModel.ConnectionQuality.Level == ConnectionQualityLevel.Good)
+            {
+                qualityUpdated.TrySetResult();
+            }
+        };
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await qualityUpdated.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(80, viewModel.ConnectionQuality.ResponseMilliseconds);
+        Assert.Equal("良好 · 80 ms", viewModel.ConnectionQuality.DisplayText);
     }
 
     [Fact]
@@ -1301,6 +1347,51 @@ public sealed class RemoteSessionViewModelTests
         public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class TimedFrameRuntime(
+        ManualTimestampProvider timeProvider,
+        TimeSpan responseTime) : IRemoteSessionRuntime
+    {
+        private int _receiveCount;
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+
+        public ValueTask RequestFramebufferUpdateAsync(
+            bool incremental,
+            CancellationToken cancellationToken) => ValueTask.CompletedTask;
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _receiveCount) == 1)
+            {
+                timeProvider.Advance(responseTime);
+                return new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1),
+                    [0, 0, 0, 255],
+                    4,
+                    [new RemoteRectangle(0, 0, 1, 1)]);
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException();
+        }
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class ManualTimestampProvider : TimeProvider
+    {
+        private long _timestamp;
+
+        public override long TimestampFrequency => 1_000;
+
+        public override long GetTimestamp() => _timestamp;
+
+        public void Advance(TimeSpan duration) =>
+            _timestamp = checked(_timestamp + (long)duration.TotalMilliseconds);
     }
 
     private sealed class TrackingLifetime : IAsyncDisposable

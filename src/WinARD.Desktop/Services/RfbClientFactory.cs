@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Globalization;
 using System.Runtime.ExceptionServices;
 using WinARD.Application.Ports;
+using WinARD.Desktop.Input;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Clipboard;
@@ -28,6 +29,7 @@ internal sealed class RfbClient : IRfbClient
     private readonly ArdEncryptedStream _transport;
     private readonly FramebufferSnapshotFactory _snapshotFactory;
     private readonly ISafeDiagnosticSink? _diagnosticSink;
+    private readonly RemoteInputDiagnosticTracker _inputDiagnostics;
     private readonly bool _requireArdAuthentication;
     private RfbHandshakeResult? _handshake;
     private RfbServerInit? _serverInit;
@@ -48,6 +50,7 @@ internal sealed class RfbClient : IRfbClient
         _transport = new ArdEncryptedStream(stream, ProtocolLimits.Default);
         _snapshotFactory = snapshotFactory ?? new FramebufferSnapshotFactory();
         _diagnosticSink = diagnosticSink;
+        _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _authenticationResult = authenticationResult;
         _requireArdAuthentication = requireArdAuthentication;
     }
@@ -290,12 +293,21 @@ internal sealed class RfbClient : IRfbClient
             await _sessionEncryption.WaitUntilEncryptedAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        var encrypted = _transport.IsEncrypted;
+        _inputDiagnostics.Record(
+            RemoteInputKind.Pointer,
+            RemoteInputBoundary.ProtocolWriteStarted,
+            encrypted);
         await new PointerEventWriter(new RfbWriter(_transport)).WriteAsync(
                 buttons,
                 x,
                 y,
                 cancellationToken)
             .ConfigureAwait(false);
+        _inputDiagnostics.Record(
+            RemoteInputKind.Pointer,
+            RemoteInputBoundary.ProtocolWriteCompleted,
+            encrypted);
     }
 
     public async ValueTask SendKeyAsync(
@@ -309,11 +321,20 @@ internal sealed class RfbClient : IRfbClient
             await _sessionEncryption.WaitUntilEncryptedAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        var encrypted = _transport.IsEncrypted;
+        _inputDiagnostics.Record(
+            RemoteInputKind.Keyboard,
+            RemoteInputBoundary.ProtocolWriteStarted,
+            encrypted);
         await new KeyEventWriter(new RfbWriter(_transport)).WriteAsync(
                 down,
                 keysym,
                 cancellationToken)
             .ConfigureAwait(false);
+        _inputDiagnostics.Record(
+            RemoteInputKind.Keyboard,
+            RemoteInputBoundary.ProtocolWriteCompleted,
+            encrypted);
     }
 
     public async ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken)
