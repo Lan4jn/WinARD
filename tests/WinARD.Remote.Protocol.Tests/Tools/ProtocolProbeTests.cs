@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using WinARD.ProtocolProbe;
+using WinARD.ProtocolProbe.RdmCapture;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Encodings;
@@ -148,6 +149,176 @@ public sealed class ProtocolProbeTests
     public void Probe_command_line_rejects_null_arguments()
     {
         Assert.Throws<ArgumentNullException>(() => ProbeCommandLine.TryParse(null!, out _));
+    }
+
+    [Fact]
+    public void Rdm_output_formatters_emit_only_safe_expected_fields()
+    {
+        Assert.Equal(
+            "RDM capture listening on 127.0.0.1:5901 for profile adaptive-default.",
+            ProbeOutput.FormatRdmListening(5901, "adaptive-default"));
+        Assert.Equal(
+            @"RDM capture saved: artifacts\protocol-research\rdm\adaptive-default.json",
+            ProbeOutput.FormatRdmSaved(@"artifacts\protocol-research\rdm\adaptive-default.json"));
+
+        var comparison = ProbeOutput.FormatRdmComparisonCandidate(-309);
+        Assert.Equal("RDM comparison candidate signed encoding ID: -309.", comparison);
+        Assert.DoesNotContain("MVS", comparison, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("payload", comparison, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private-workstation", comparison, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null, true, 5901)]
+    [InlineData("", true, 5901)]
+    [InlineData("5902", true, 5902)]
+    [InlineData("not-a-port", false, 0)]
+    [InlineData("0", false, 0)]
+    [InlineData("65536", false, 0)]
+    public void Rdm_listener_port_uses_safe_default_and_rejects_invalid_values(
+        string? value,
+        bool expectedSuccess,
+        int expectedPort)
+    {
+        var success = global::Program.TryParseRdmListenPort(value, out var port);
+
+        Assert.Equal(expectedSuccess, success);
+        Assert.Equal(expectedPort, port);
+    }
+
+    [Fact]
+    public void Usage_covers_all_research_commands_with_powershell_call_operator()
+    {
+        var usage = global::Program.UsageText;
+
+        Assert.Contains(
+            @"& '.\WinARD.ProtocolProbe.exe' --listen-rdm adaptive-default '.\artifacts\protocol-research\rdm\adaptive-default.json'",
+            usage,
+            StringComparison.Ordinal);
+        Assert.Contains("--compare-rdm-captures", usage, StringComparison.Ordinal);
+        Assert.Contains("--capture-differential-prefix", usage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Invalid_rdm_listener_port_returns_usage_error_before_remote_credentials_are_read()
+    {
+        var requestedVariables = new List<string>();
+        using var output = new StringWriter(CultureInfo.InvariantCulture);
+        using var error = new StringWriter(CultureInfo.InvariantCulture);
+
+        var exitCode = await global::Program.RunAsync(
+            ["--listen-rdm", "adaptive-default", "capture.json"],
+            name =>
+            {
+                requestedVariables.Add(name);
+                return name == "WINARD_LISTEN_PORT"
+                    ? "invalid"
+                    : throw new InvalidOperationException($"Remote variable {name} must not be read.");
+            },
+            output,
+            error,
+            CancellationToken.None);
+
+        Assert.Equal(2, exitCode);
+        Assert.Equal(["WINARD_LISTEN_PORT"], requestedVariables);
+        Assert.Equal(string.Empty, output.ToString());
+        Assert.Contains("--listen-rdm", error.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Rdm_listener_dispatches_capture_and_file_write_before_remote_credentials_are_read()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-probe-rdm-{Guid.NewGuid():N}");
+        var path = Path.Combine(directory, "adaptive-default.json");
+        var requestedVariables = new List<string>();
+        var capturedArguments = new List<(int Port, string Profile)>();
+        using var output = new StringWriter(CultureInfo.InvariantCulture);
+        using var error = new StringWriter(CultureInfo.InvariantCulture);
+        try
+        {
+            var exitCode = await global::Program.RunAsync(
+                ["--listen-rdm", "adaptive-default", path],
+                name =>
+                {
+                    requestedVariables.Add(name);
+                    return name == "WINARD_LISTEN_PORT"
+                        ? "5902"
+                        : throw new InvalidOperationException($"Remote variable {name} must not be read.");
+                },
+                output,
+                error,
+                CancellationToken.None,
+                (port, profile, _) =>
+                {
+                    capturedArguments.Add((port, profile));
+                    return Task.FromResult(CreateRdmReport("adaptive-default", [0, -223, -309]));
+                });
+
+            Assert.Equal(0, exitCode);
+            Assert.Equal(["WINARD_LISTEN_PORT"], requestedVariables);
+            Assert.Equal([(5902, "adaptive-default")], capturedArguments);
+            Assert.Equal(
+                ProbeOutput.FormatRdmListening(5902, "adaptive-default")
+                    + Environment.NewLine
+                    + ProbeOutput.FormatRdmSaved(path)
+                    + Environment.NewLine,
+                output.ToString());
+            Assert.Equal(string.Empty, error.ToString());
+            var restored = await RdmCaptureFile.ReadAsync(path, CancellationToken.None);
+            Assert.Equal("adaptive-default", restored.Profile);
+            Assert.Equal([0, -223, -309], restored.Encodings);
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Rdm_comparison_reads_files_and_outputs_only_candidate_before_remote_credentials_are_read()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-probe-rdm-{Guid.NewGuid():N}");
+        var baselinePath = Path.Combine(directory, "baseline.json");
+        var adaptivePath = Path.Combine(directory, "adaptive.json");
+        using var output = new StringWriter(CultureInfo.InvariantCulture);
+        using var error = new StringWriter(CultureInfo.InvariantCulture);
+        try
+        {
+            await RdmCaptureFile.WriteAsync(
+                baselinePath,
+                CreateRdmReport("full", [0, -223]),
+                CancellationToken.None);
+            await RdmCaptureFile.WriteAsync(
+                adaptivePath,
+                CreateRdmReport("adaptive-default", [0, -223, -309]),
+                CancellationToken.None);
+
+            var exitCode = await global::Program.RunAsync(
+                ["--compare-rdm-captures", baselinePath, adaptivePath],
+                name => throw new InvalidOperationException($"Environment variable {name} must not be read."),
+                output,
+                error,
+                CancellationToken.None);
+
+            Assert.Equal(0, exitCode);
+            Assert.Equal(
+                ProbeOutput.FormatRdmComparisonCandidate(-309) + Environment.NewLine,
+                output.ToString());
+            Assert.Equal(string.Empty, error.ToString());
+            Assert.DoesNotContain("MVS", output.ToString(), StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(baselinePath, output.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain(adaptivePath, output.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
     }
 
     [Fact]
@@ -850,6 +1021,18 @@ public sealed class ProtocolProbeTests
         Assert.Contains("[REDACTED]", output, StringComparison.Ordinal);
         await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
+
+    private static RdmCaptureReport CreateRdmReport(string profile, IReadOnlyList<int> encodings) =>
+        new(
+            1,
+            profile,
+            "RFB 003.889",
+            0xC1,
+            new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
+            encodings,
+            [new CapturedClientMessage(3, "FramebufferUpdateRequest", 10, "000000000007800438", null)],
+            true,
+            null);
 
     private static async Task RunScriptedServerAsync(
         TcpListener listener,

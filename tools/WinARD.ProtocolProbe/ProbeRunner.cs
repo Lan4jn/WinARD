@@ -231,7 +231,7 @@ public sealed class ProbeRunner
 
         if (request.Mode is ProbeMode.Authentication or ProbeMode.PointerSmoke)
         {
-            if (request.CaptureFirstFramePath is not null)
+            if (request.OutputPath is not null)
             {
                 throw new ArgumentException(
                     $"{request.Mode} mode must not specify a capture path.",

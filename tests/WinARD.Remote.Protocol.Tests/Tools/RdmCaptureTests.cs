@@ -1,11 +1,17 @@
+using System.Buffers.Binary;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using WinARD.ProtocolProbe.RdmCapture;
+using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
+using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
+using WinARD.Remote.Protocol.Initialization;
+using WinARD.Remote.Protocol.IO;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -14,6 +20,346 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 
 public sealed class RdmCaptureTests
 {
+    [Fact]
+    public async Task Declaration_reader_captures_known_messages_through_first_framebuffer_request_without_retaining_viewer_info()
+    {
+        const string privateViewerInfo = "private-workstation";
+        var viewerInfo = new byte[66];
+        viewerInfo[0] = 0x21;
+        Encoding.UTF8.GetBytes(privateViewerInfo).CopyTo(viewerInfo, 1);
+        byte[] setMode = [0x0A, 0x00, 0x00, 0x01];
+        byte[] setDisplay = [0x0D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        byte[] setPixelFormat = [0x00, 0x00, 0x00, 0x00, .. PixelFormat.WinArdBgra32.ToWireBytes()];
+        byte[] setEncodings =
+        [
+            0x02, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x30, 0x39,
+            0x00, 0x00, 0x00, 0x10,
+            0x00, 0x00, 0x00, 0x00,
+            0xFF, 0xFF, 0xFF, 0x21,
+        ];
+        byte[] framebufferRequest = [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x80, 0x04, 0x38];
+        await using var stream = new MemoryStream(
+            [.. viewerInfo, .. setMode, .. setDisplay, .. setPixelFormat, .. setEncodings, .. framebufferRequest]);
+
+        var result = await RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None);
+
+        var expectedPixelFormat = PixelFormat.WinArdBgra32;
+        Assert.Equal(
+            new CapturedPixelFormat(
+                expectedPixelFormat.BitsPerPixel,
+                expectedPixelFormat.Depth,
+                expectedPixelFormat.BigEndian,
+                expectedPixelFormat.TrueColor,
+                expectedPixelFormat.RedMax,
+                expectedPixelFormat.GreenMax,
+                expectedPixelFormat.BlueMax,
+                expectedPixelFormat.RedShift,
+                expectedPixelFormat.GreenShift,
+                expectedPixelFormat.BlueShift),
+            result.PixelFormat);
+        Assert.Equal([12345, 16, 0, -223], result.Encodings);
+        Assert.True(result.ReachedFramebufferRequest);
+        Assert.Null(result.StoppedAtUnknownMessageType);
+        Assert.Equal(6, result.Messages.Count);
+        Assert.Equal(
+            new CapturedClientMessage(
+                0x21,
+                "ViewerInfo",
+                66,
+                null,
+                Convert.ToHexString(SHA256.HashData(viewerInfo))),
+            result.Messages[0]);
+        Assert.Equal("000000000007800438", result.Messages[^1].NumericPayloadHex);
+
+        var report = new RdmCaptureReport(
+            1,
+            "adaptive-default",
+            "RFB 003.889",
+            0xC1,
+            result.PixelFormat,
+            result.Encodings,
+            result.Messages,
+            result.ReachedFramebufferRequest,
+            result.StoppedAtUnknownMessageType);
+        var json = JsonSerializer.Serialize(report);
+        Assert.DoesNotContain(privateViewerInfo, json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Declaration_reader_captures_auto_update_and_both_known_set_encryption_opcodes()
+    {
+        byte[] autoFramebufferUpdate =
+            [0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x80, 0x04, 0x38];
+        byte[] encryptionRequest =
+            [0x12, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01];
+        byte[] encryptionAcknowledgement = [0x12, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00];
+        byte[] framebufferRequest = [0x03, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04];
+        await using var stream = new MemoryStream(
+            [.. autoFramebufferUpdate, .. encryptionRequest, .. encryptionAcknowledgement, .. framebufferRequest]);
+
+        var result = await RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None);
+
+        Assert.Collection(
+            result.Messages,
+            message => Assert.Equal(
+                new CapturedClientMessage(
+                    0x09,
+                    "AutoFramebufferUpdate",
+                    16,
+                    "000001000000000000000007800438",
+                    null),
+                message),
+            message => Assert.Equal(
+                new CapturedClientMessage(
+                    0x12,
+                    "SetEncryption",
+                    12,
+                    "0000010001000100000001",
+                    null),
+                message),
+            message => Assert.Equal(
+                new CapturedClientMessage(0x12, "SetEncryption", 8, "00000200010000", null),
+                message),
+            message => Assert.Equal(
+                new CapturedClientMessage(
+                    0x03,
+                    "FramebufferUpdateRequest",
+                    10,
+                    "010001000200030004",
+                    null),
+                message));
+    }
+
+    [Theory]
+    [InlineData(0x04)]
+    [InlineData(0x05)]
+    [InlineData(0x06)]
+    [InlineData(0x7F)]
+    public async Task Declaration_reader_stops_at_unknown_message_type_without_consuming_payload(byte type)
+    {
+        await using var stream = new MemoryStream([type, 0xA5, 0xB6]);
+
+        var result = await RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None);
+
+        Assert.False(result.ReachedFramebufferRequest);
+        Assert.Equal(type, result.StoppedAtUnknownMessageType);
+        Assert.Empty(result.Messages);
+        Assert.Equal(1, stream.Position);
+    }
+
+    [Fact]
+    public async Task Declaration_reader_rejects_set_encodings_count_above_4096_before_reading_ids()
+    {
+        await using var stream = new MemoryStream([0x02, 0xA5, 0x10, 0x01, 0xB6]);
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None));
+
+        Assert.Equal("The RFB SetEncodings count exceeds 4096.", exception.Message);
+        Assert.Equal(4, stream.Position);
+        Assert.DoesNotContain("A5", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("B6", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Declaration_reader_rejects_more_than_64_messages()
+    {
+        byte[] setMode = [0x0A, 0x00, 0x00, 0x01];
+        await using var stream = new MemoryStream(
+            Enumerable.Range(0, 65).SelectMany(_ => setMode).ToArray());
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None));
+
+        Assert.Equal("The RFB client declaration exceeds 64 messages.", exception.Message);
+    }
+
+    [Fact]
+    public async Task Declaration_reader_rejects_more_than_64_kibibytes()
+    {
+        var maximumSetEncodings = new byte[4 + (4096 * sizeof(int))];
+        maximumSetEncodings[0] = 0x02;
+        BinaryPrimitives.WriteUInt16BigEndian(maximumSetEncodings.AsSpan(2), 4096);
+        await using var stream = new MemoryStream(
+            Enumerable.Range(0, 4).SelectMany(_ => maximumSetEncodings).ToArray());
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None));
+
+        Assert.Equal("The RFB client declaration exceeds 65536 bytes.", exception.Message);
+    }
+
+    [Fact]
+    public async Task Declaration_reader_rejects_unknown_set_encryption_opcode_without_guessing_its_length()
+    {
+        await using var stream = new MemoryStream([0x12, 0x00, 0xA5, 0xB6, 0xC7]);
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None));
+
+        Assert.Equal("The RFB SetEncryption opcode is unsupported.", exception.Message);
+        Assert.Equal(4, stream.Position);
+        Assert.DoesNotContain("A5", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("B6", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("C7", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Declaration_reader_reports_truncation_without_echoing_payload()
+    {
+        var privatePayload = Encoding.UTF8.GetBytes("private-truncated-viewer-info");
+        await using var stream = new MemoryStream([0x21, .. privatePayload]);
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None));
+
+        Assert.Equal("The RFB client declaration was truncated.", exception.Message);
+        Assert.DoesNotContain("private", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Declaration_reader_honors_pre_cancelled_token()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await using var stream = new MemoryStream([0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            RfbClientDeclarationReader.ReadAsync(stream, cancellation.Token));
+
+        Assert.Equal("The RFB client declaration was cancelled.", exception.Message);
+    }
+
+    [Fact]
+    public async Task Capture_server_sends_synthetic_server_init_and_round_trips_captured_declarations()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var port = ReserveLoopbackPort();
+        var serverTask = new RdmCaptureServer().CaptureOnceAsync(
+            port,
+            "adaptive-default",
+            cancellation.Token);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
+        await using var stream = client.GetStream();
+        using var username = SecretMaterial.FromUtf8("synthetic-user");
+        using var password = SecretMaterial.FromUtf8("synthetic-password");
+        var handshake = await RfbHandshake.NegotiateAsync(stream, cancellation.Token);
+        using var authentication = await new ArdAuthenticator().AuthenticateAsync(
+            stream,
+            handshake.Version,
+            username,
+            password,
+            cancellation.Token);
+
+        var serverInit = await RfbSessionInitializer.InitializeAsync(
+            stream,
+            handshake,
+            ProtocolLimits.Default,
+            cancellation.Token);
+        Assert.Equal(1920, serverInit.Width);
+        Assert.Equal(1080, serverInit.Height);
+        Assert.Equal(PixelFormat.WinArdBgra32, serverInit.PixelFormat);
+        Assert.Equal("WinARD Synthetic Probe", serverInit.Name);
+        Assert.NotNull(serverInit.ArdCapabilities);
+        Assert.True(serverInit.ArdCapabilities.MayControl);
+        Assert.False(serverInit.ArdCapabilities.RequiresSessionSelection);
+
+        await RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
+            stream,
+            incremental: false,
+            0,
+            0,
+            1920,
+            1080,
+            cancellation.Token);
+        var report = await serverTask.WaitAsync(cancellation.Token);
+        Assert.Equal(1, report.SchemaVersion);
+        Assert.Equal("adaptive-default", report.Profile);
+        Assert.Equal("RFB 003.889", report.ClientVersion);
+        Assert.Equal(0xC1, report.ClientInit);
+        Assert.True(report.ReachedFramebufferRequest);
+        Assert.Null(report.StoppedAtUnknownMessageType);
+        Assert.Equal(
+            new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
+            report.PixelFormat);
+        Assert.NotEmpty(report.Encodings);
+
+        var directory = CreateTemporaryDirectory();
+        var path = Path.Combine(directory, "adaptive-default.json");
+        try
+        {
+            await RdmCaptureFile.WriteAsync(path, report, cancellation.Token);
+            var restored = await RdmCaptureFile.ReadAsync(path, cancellation.Token);
+            Assert.Equal(report.SchemaVersion, restored.SchemaVersion);
+            Assert.Equal(report.Profile, restored.Profile);
+            Assert.Equal(report.ClientVersion, restored.ClientVersion);
+            Assert.Equal(report.ClientInit, restored.ClientInit);
+            Assert.Equal(report.PixelFormat, restored.PixelFormat);
+            Assert.Equal(report.Encodings, restored.Encodings);
+            Assert.Equal(report.Messages, restored.Messages);
+            Assert.Equal(report.ReachedFramebufferRequest, restored.ReachedFramebufferRequest);
+            Assert.Equal(report.StoppedAtUnknownMessageType, restored.StoppedAtUnknownMessageType);
+            Assert.Equal([Path.GetFullPath(path)], Directory.EnumerateFiles(directory).Select(Path.GetFullPath));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_server_binds_only_127_0_0_1_and_stops_accepting_after_first_connection()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var port = ReserveLoopbackPort();
+        var serverTask = new RdmCaptureServer().CaptureOnceAsync(port, "adaptive-default", cancellation.Token);
+        using var alternateLoopbackClient = new TcpClient();
+        await Assert.ThrowsAnyAsync<SocketException>(async () =>
+            await alternateLoopbackClient.ConnectAsync(
+                IPAddress.Parse("127.0.0.2"),
+                port,
+                cancellation.Token));
+
+        using var firstClient = new TcpClient();
+        await firstClient.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
+        await using var firstStream = firstClient.GetStream();
+        Assert.Equal(
+            "RFB 003.889\n",
+            Encoding.ASCII.GetString(await ReadExactlyAsync(firstStream, 12, cancellation.Token)));
+        using var secondClient = new TcpClient();
+        await Assert.ThrowsAnyAsync<SocketException>(async () =>
+            await secondClient.ConnectAsync(IPAddress.Loopback, port, cancellation.Token));
+
+        await firstStream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.007\n"), cancellation.Token);
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await serverTask.WaitAsync(cancellation.Token));
+    }
+
+    [Fact]
+    public async Task Capture_server_uses_ten_second_no_progress_timeout_without_echoing_input()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(10), RdmCaptureServer.DefaultInactivityTimeout);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var port = ReserveLoopbackPort();
+        var serverTask = new RdmCaptureServer(TimeSpan.FromMilliseconds(100)).CaptureOnceAsync(
+            port,
+            "adaptive-default",
+            cancellation.Token);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
+        await using var stream = client.GetStream();
+        var serverBanner = await ReadExactlyAsync(stream, 12, cancellation.Token);
+        Assert.Equal("RFB 003.889\n", Encoding.ASCII.GetString(serverBanner));
+
+        var exception = await Assert.ThrowsAsync<TimeoutException>(async () =>
+            await serverTask.WaitAsync(cancellation.Token));
+
+        Assert.Equal("RDM capture made no progress for 10 seconds.", exception.Message);
+        Assert.DoesNotContain("RFB", exception.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task Ard_server_handshake_accepts_real_889_client_without_retaining_authentication_response()
     {
@@ -602,6 +948,13 @@ public sealed class RdmCaptureTests
     }
 
     private static int GetPort(TcpListener listener) => ((IPEndPoint)listener.LocalEndpoint).Port;
+
+    private static int ReserveLoopbackPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return GetPort(listener);
+    }
 
     private static void AssertZeroed(ReadOnlyMemory<byte> memory)
     {

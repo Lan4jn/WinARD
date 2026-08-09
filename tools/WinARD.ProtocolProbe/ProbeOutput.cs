@@ -26,6 +26,21 @@ public static class ProbeOutput
         return $"Pointer smoke: sent buttonless move to ({pointerSmoke.X},{pointerSmoke.Y}) within {pointerSmoke.Width}x{pointerSmoke.Height}. RFB does not confirm server execution.";
     }
 
+    public static string FormatRdmListening(int port, string profile)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        return $"RDM capture listening on 127.0.0.1:{port} for profile {profile}.";
+    }
+
+    public static string FormatRdmSaved(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return $"RDM capture saved: {path}";
+    }
+
+    public static string FormatRdmComparisonCandidate(int encodingId) =>
+        $"RDM comparison candidate signed encoding ID: {encodingId}.";
+
     public static string FormatFailure(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
