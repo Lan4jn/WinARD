@@ -1,5 +1,8 @@
 using Microsoft.Data.Sqlite;
+using WinARD.Domain.Connections;
 using WinARD.Infrastructure.Database;
+using WinARD.Infrastructure.Database.Migrations;
+using WinARD.Infrastructure.Devices;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -8,6 +11,19 @@ namespace WinARD.Infrastructure.Tests;
 
 public sealed class WinArdDatabaseTests
 {
+    [Fact]
+    public async Task Existing_device_migrates_to_automatic_refresh()
+    {
+        await using var fixture = await DatabaseFixture.CreateAtVersionOneAsync();
+        await fixture.Database.InitializeAsync(CancellationToken.None);
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+
+        var profile = Assert.Single(await repository.GetAllAsync(CancellationToken.None));
+
+        Assert.Equal(FrameRefreshPolicy.Automatic, profile.FrameRefreshPolicy);
+        Assert.Equal(2, await fixture.ReadSchemaVersionAsync());
+    }
+
     [Fact]
     public async Task Failed_migration_rolls_back_schema_and_version()
     {
@@ -57,8 +73,8 @@ public sealed class WinArdDatabaseTests
             await using var reader = await command.ExecuteReaderAsync();
             Assert.True(await reader.ReadAsync());
             Assert.Equal(1L, reader.GetInt64(0));
-            Assert.Equal(1L, reader.GetInt64(1));
-            Assert.Equal(1L, reader.GetInt64(2));
+            Assert.Equal(2L, reader.GetInt64(1));
+            Assert.Equal(2L, reader.GetInt64(2));
         }
         finally
         {
@@ -242,5 +258,61 @@ public sealed class WinArdDatabaseTests
         public string Path { get; }
 
         public void Dispose() => System.IO.Directory.Delete(_directory, recursive: true);
+    }
+
+    private sealed class DatabaseFixture : IAsyncDisposable
+    {
+        private DatabaseFixture(string directory, WinArdDatabase database)
+        {
+            Directory = directory;
+            Database = database;
+        }
+
+        public string Directory { get; }
+
+        public WinArdDatabase Database { get; }
+
+        public static async Task<DatabaseFixture> CreateAtVersionOneAsync()
+        {
+            var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "WinARD.Tests", Guid.NewGuid().ToString("N"));
+            var path = System.IO.Path.Combine(directory, "winard.db");
+            var database = new WinArdDatabase(path);
+            await database.InitializeAsync([new Migration001Initial()], CancellationToken.None);
+            await using (var connection = database.CreateConnection())
+            {
+                await connection.OpenAsync();
+                var command = connection.CreateCommand();
+                command.CommandText = """
+                    INSERT INTO devices (
+                        id, display_name, host, port, mac_username, transport_mode,
+                        credential_store, credential_key, created_utc, updated_utc)
+                    VALUES (
+                        $id, 'Existing Mac', 'existing.local', 5900, 'alex', 0,
+                        NULL, NULL, '2026-08-02T00:00:00.0000000+00:00', '2026-08-02T00:00:00.0000000+00:00');
+                    """;
+                command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("D"));
+                await command.ExecuteNonQueryAsync();
+            }
+
+            return new DatabaseFixture(directory, database);
+        }
+
+        public async Task<int> ReadSchemaVersionAsync()
+        {
+            await using var connection = Database.CreateConnection();
+            await connection.OpenAsync();
+            var command = connection.CreateCommand();
+            command.CommandText = "SELECT version FROM schema_version;";
+            return Convert.ToInt32(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await Database.DisposeAsync();
+            if (System.IO.Directory.Exists(Directory))
+            {
+                System.IO.Directory.Delete(Directory, recursive: true);
+            }
+        }
     }
 }

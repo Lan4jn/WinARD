@@ -24,6 +24,55 @@ namespace WinARD.Desktop.Tests;
 public sealed class FramePresentationTests
 {
     [Fact]
+    public void Remote_message_contracts_preserve_pre_statistics_constructor_signatures()
+    {
+        Assert.NotNull(typeof(RemoteCursorMessage).GetConstructor([typeof(RemoteCursorUpdate)]));
+        Assert.NotNull(typeof(RemoteFramebufferMessage).GetConstructor(
+        [
+            typeof(RemoteFramebufferSize),
+            typeof(byte[]),
+            typeof(int),
+            typeof(IReadOnlyList<RemoteRectangle>),
+            typeof(RemoteCursorUpdate),
+        ]));
+        Assert.NotNull(typeof(RemoteFramebufferMessage).GetConstructor(
+        [
+            typeof(RemoteFramebufferSize),
+            typeof(System.Buffers.IMemoryOwner<byte>),
+            typeof(int),
+            typeof(int),
+            typeof(IReadOnlyList<RemoteRectangle>),
+            typeof(RemoteCursorUpdate),
+        ]));
+    }
+
+    [Fact]
+    public void Remote_update_statistics_and_messages_publish_safe_snapshots()
+    {
+        var counts = new Dictionary<int, int> { [(int)RfbEncodingType.Raw] = 1 };
+        var statistics = new RemoteUpdateStatistics(42, counts);
+        counts[(int)RfbEncodingType.Raw] = 99;
+
+        using var cursorMessage = new RemoteCursorMessage(
+            new RemoteCursorUpdate(0, 0, 0, 0, []),
+            statistics);
+        using var framebufferMessage = new RemoteFramebufferMessage(
+            new RemoteFramebufferSize(1, 1),
+            new byte[4],
+            4,
+            [],
+            cursor: null,
+            statistics: statistics);
+
+        Assert.Equal(42, cursorMessage.Statistics.ReceivedSessionBytes);
+        Assert.Equal(1, cursorMessage.Statistics.EncodingCounts[(int)RfbEncodingType.Raw]);
+        Assert.Equal(42, framebufferMessage.Statistics.ReceivedSessionBytes);
+        Assert.Equal(1, framebufferMessage.Statistics.EncodingCounts[(int)RfbEncodingType.Raw]);
+        using var legacyMessage = new RemoteCursorMessage(new RemoteCursorUpdate(0, 0, 0, 0, []));
+        Assert.Empty(legacyMessage.Statistics.EncodingCounts);
+    }
+
+    [Fact]
     public void Fit_maps_viewport_center_through_letterbox()
     {
         var transform = ViewportTransform.Create(
@@ -471,6 +520,69 @@ public sealed class FramePresentationTests
 
         Assert.Equal(0, snapshotCopies);
         Assert.Equal([1, 2, 3, 255], cursor.Bgra32.ToArray());
+        Assert.Equal(21, message.Statistics.ReceivedSessionBytes);
+        Assert.Equal(1, message.Statistics.EncodingCounts[(int)RfbEncodingType.Cursor]);
+    }
+
+    [Fact]
+    public async Task Rfb_client_counts_one_encrypted_transport_read_once_across_consecutive_updates()
+    {
+        var authenticationKey = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
+        var sessionKey = Enumerable.Range(32, 16).Select(value => (byte)value).ToArray();
+        var sessionIv = Enumerable.Range(64, 16).Select(value => (byte)value).ToArray();
+        var encryptedUpdates = ArdEncryptedPacketCodec.Encrypt(
+            sessionKey,
+            sessionIv,
+            0,
+            [.. CursorOnlyUpdate(), .. CursorOnlyUpdate()]);
+        await using var stream = new ScriptedDuplexStream(
+        [
+            .. Handshake("RFB 003.889\n"),
+            .. ArdServerInit(2, 1),
+            .. ArdSessionEncryptionUpdate(authenticationKey, sessionKey, sessionIv),
+            .. encryptedUpdates,
+        ]);
+        await using var client = new RfbClient(
+            stream,
+            authenticationResult: new ArdAuthenticationResult(authenticationKey));
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        using var activation = Assert.IsType<RemoteFramebufferMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        using var first = Assert.IsType<RemoteCursorMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        using var second = Assert.IsType<RemoteCursorMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+
+        Assert.True(first.Statistics.ReceivedSessionBytes >= 0);
+        Assert.True(second.Statistics.ReceivedSessionBytes >= 0);
+        Assert.Equal(
+            encryptedUpdates.Length,
+            first.Statistics.ReceivedSessionBytes + second.Statistics.ReceivedSessionBytes);
+        Assert.Equal(encryptedUpdates.Length, first.Statistics.ReceivedSessionBytes);
+        Assert.Equal(0, second.Statistics.ReceivedSessionBytes);
+        Assert.Equal(1, first.Statistics.EncodingCounts[(int)RfbEncodingType.Cursor]);
+        Assert.Equal(1, second.Statistics.EncodingCounts[(int)RfbEncodingType.Cursor]);
+    }
+
+    [Fact]
+    public async Task Rfb_client_carries_bell_and_clipboard_bytes_into_the_next_frame_once()
+    {
+        byte[] clipboard = [3, 0, 0, 0, 0, 0, 0, 0];
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1), 2, .. clipboard, .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+
+        Assert.IsType<RemoteBellMessage>(await client.ReceiveAsync(CancellationToken.None));
+        Assert.IsType<RemoteClipboardMessage>(await client.ReceiveAsync(CancellationToken.None));
+        using var frame = Assert.IsType<RemoteCursorMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+
+        Assert.Equal(1 + clipboard.Length + CursorOnlyUpdate().Length,
+            frame.Statistics.ReceivedSessionBytes);
     }
 
     [Fact]
@@ -513,6 +625,40 @@ public sealed class FramePresentationTests
             client.InitializeAsync(CancellationToken.None));
 
         Assert.Equal(RfbProtocolFailureKind.ArdEncryptionNegotiation, exception.Failure?.Kind);
+    }
+
+    [Fact]
+    public async Task Initialize_does_not_publish_runtime_resources_after_shutdown_starts()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        var client = new RfbClient(stream);
+        await client.NegotiateAsync(CancellationToken.None);
+        var blockedRead = stream.BlockReadAfter(4);
+        var initialize = client.InitializeAsync(CancellationToken.None);
+        await blockedRead.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        client.BeginShutdown();
+        Exception? initializeFailure;
+        try
+        {
+            blockedRead.Release.TrySetResult();
+            initializeFailure = await Record.ExceptionAsync(
+                () => initialize.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+        finally
+        {
+            blockedRead.Release.TrySetResult();
+            await client.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.IsType<ObjectDisposedException>(initializeFailure);
+        Assert.Throws<ObjectDisposedException>(() =>
+        {
+            _ = client.RequestFramebufferUpdateAsync(
+                incremental: true,
+                CancellationToken.None).AsTask();
+        });
     }
 
     [Fact]
@@ -626,6 +772,48 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Pending_encryption_does_not_block_framebuffer_request_that_delivers_1103()
+    {
+        var authenticationKey = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
+        var sessionKey = Enumerable.Range(32, 16).Select(value => (byte)value).ToArray();
+        var sessionIv = Enumerable.Range(64, 16).Select(value => (byte)value).ToArray();
+        await using var stream = new InteractiveDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(
+            stream,
+            authenticationResult: new ArdAuthenticationResult(authenticationKey));
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        stream.DeliverAfterFramebufferRequest(
+            ArdSessionEncryptionUpdate(authenticationKey, sessionKey, sessionIv));
+
+        var input = client.SendPointerAsync(0, 1, 1, CancellationToken.None).AsTask();
+        var receive = client.ReceiveAsync(CancellationToken.None).AsTask();
+        var request = client.RequestFramebufferUpdateAsync(
+            incremental: true,
+            CancellationToken.None).AsTask();
+        var requestObserved = false;
+        try
+        {
+            await stream.FramebufferRequestObserved.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            requestObserved = true;
+        }
+        finally
+        {
+            if (!requestObserved)
+            {
+                stream.DeliverWithoutFramebufferRequest();
+            }
+        }
+
+        using var activation = Assert.IsType<RemoteFramebufferMessage>(
+            await receive.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Task.WhenAll(input, request).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(requestObserved);
+    }
+
+    [Fact]
     public async Task Rfb_client_records_successful_889_control_negotiation_without_remote_identity()
     {
         var redactor = new SecretRedactor();
@@ -701,6 +889,7 @@ public sealed class FramePresentationTests
         using var cursor = message.TakeCursorOwnership();
 
         Assert.Equal([1, 2, 3, 255], cursor.Bgra32.ToArray());
+        Assert.Equal(1 + CursorOnlyUpdate().Length, message.Statistics.ReceivedSessionBytes);
     }
 
     [Fact]
@@ -739,6 +928,9 @@ public sealed class FramePresentationTests
         using var cursor = message.TakeCursorOwnership();
 
         Assert.Equal([1, 2, 3, 255], cursor.Bgra32.ToArray());
+        Assert.Equal(
+            ArdStateChange(flags: 0x1234, status: 4, extra: [0xAA]).Length + CursorOnlyUpdate().Length,
+            message.Statistics.ReceivedSessionBytes);
         Assert.Equal(
             [0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1],
             stream.WrittenBytes[outputOffset..]);
@@ -979,6 +1171,129 @@ public sealed class FramePresentationTests
         Assert.Equal(
             [3, 0, 0, 0, 0, 0, 0, 2, 0, 1, 3, 1, 0, 0, 0, 0, 0, 2, 0, 1],
             stream.WrittenBytes[^20..]);
+    }
+
+    [Fact]
+    public async Task Rfb_client_prioritizes_input_over_queued_framebuffer_requests()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        var outputOffset = stream.WrittenBytes.Length;
+        var blockedWrite = stream.BlockNextWrite();
+
+        var activeBackground = client.RequestFramebufferUpdateAsync(
+            incremental: false,
+            CancellationToken.None).AsTask();
+        await blockedWrite.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var queuedBackground = client.RequestFramebufferUpdateAsync(
+            incremental: true,
+            CancellationToken.None).AsTask();
+        var input = client.SendPointerAsync(1, 1, 1, CancellationToken.None).AsTask();
+
+        blockedWrite.Release.TrySetResult();
+        await Task.WhenAll(activeBackground, input, queuedBackground)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(
+            [
+                3, 0, 0, 0, 0, 0, 0, 2, 0, 1,
+                5, 1, 0, 1, 0, 1,
+                3, 1, 0, 0, 0, 0, 0, 2, 0, 1,
+            ],
+            stream.WrittenBytes[outputOffset..]);
+    }
+
+    [Fact]
+    public async Task Rfb_client_serves_background_after_thirty_two_input_writes()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        var outputOffset = stream.WrittenBytes.Length;
+        var blockedWrite = stream.BlockNextWrite();
+        var activeBackground = client.RequestFramebufferUpdateAsync(
+            incremental: false,
+            CancellationToken.None).AsTask();
+        await blockedWrite.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var inputs = Enumerable.Range(0, 40)
+            .Select(value => client.SendPointerAsync(
+                0,
+                value,
+                value,
+                CancellationToken.None).AsTask())
+            .ToArray();
+        var queuedBackground = client.RequestFramebufferUpdateAsync(
+            incremental: true,
+            CancellationToken.None).AsTask();
+
+        blockedWrite.Release.TrySetResult();
+        await Task.WhenAll(inputs.Append(activeBackground).Append(queuedBackground))
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        var types = ParseClientMessageTypes(stream.WrittenBytes[outputOffset..]);
+        Assert.Equal(33, types.LastIndexOf(3));
+    }
+
+    [Fact]
+    public async Task Rfb_client_queues_ARD_tickle_reply_behind_active_runtime_write()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.889\n"),
+                .. ArdServerInit(2, 1),
+                .. ArdStateChange(flags: 0, status: 4),
+                .. CursorOnlyUpdate(),
+            ]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        var blockedWrite = stream.BlockNextWrite();
+        var pointer = client.SendPointerAsync(0, 1, 1, CancellationToken.None).AsTask();
+        await blockedWrite.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var receive = client.ReceiveAsync(CancellationToken.None).AsTask();
+        var earlyCompletion = await Task.WhenAny(receive, Task.Delay(100));
+
+        blockedWrite.Release.TrySetResult();
+        using var message = Assert.IsType<RemoteCursorMessage>(
+            await receive.WaitAsync(TimeSpan.FromSeconds(5)));
+        await pointer.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.NotSame(receive, earlyCompletion);
+    }
+
+    [Fact]
+    public async Task Rfb_client_dispose_cancels_active_scheduler_write_before_releasing_resources()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        var client = new RfbClient(stream);
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        var blockedWrite = stream.BlockNextWrite();
+        var pointer = client.SendPointerAsync(0, 1, 1, CancellationToken.None).AsTask();
+        await blockedWrite.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var disposal = Task.Run(async () => await client.DisposeAsync());
+        try
+        {
+            await disposal.WaitAsync(TimeSpan.FromSeconds(5));
+            await blockedWrite.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pointer);
+        }
+        finally
+        {
+            blockedWrite.Release.TrySetResult();
+            _ = await Record.ExceptionAsync(() => pointer);
+            await disposal.WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     [Theory]
@@ -1307,9 +1622,27 @@ public sealed class FramePresentationTests
         return -1;
     }
 
+    private static List<byte> ParseClientMessageTypes(byte[] messages)
+    {
+        var types = new List<byte>();
+        for (var offset = 0; offset < messages.Length;)
+        {
+            var type = messages[offset];
+            types.Add(type);
+            offset += type switch
+            {
+                3 => 10,
+                5 => 6,
+                _ => throw new InvalidDataException($"Unexpected client message type {type}."),
+            };
+        }
+
+        return types;
+    }
+
     private static byte[] CursorOnlyUpdate()
     {
-        var bytes = new byte[22];
+        var bytes = new byte[21];
         bytes[0] = 0;
         BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2), 1);
         BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(8), 1);
@@ -1378,6 +1711,9 @@ public sealed class FramePresentationTests
         private readonly MemoryStream _input = new(input, writable: false);
         private readonly MemoryStream _output = new();
         private IOException? _nextWriteFailure;
+        private BlockedWrite? _nextBlockedWrite;
+        private BlockedRead? _blockedRead;
+        private int _readsUntilBlock;
 
         public byte[] WrittenBytes => _output.ToArray();
 
@@ -1388,6 +1724,30 @@ public sealed class FramePresentationTests
             {
                 throw new InvalidOperationException("A write failure is already pending.");
             }
+        }
+
+        public BlockedWrite BlockNextWrite()
+        {
+            var blockedWrite = new BlockedWrite();
+            if (Interlocked.CompareExchange(ref _nextBlockedWrite, blockedWrite, null) is not null)
+            {
+                throw new InvalidOperationException("A blocked write is already pending.");
+            }
+
+            return blockedWrite;
+        }
+
+        public BlockedRead BlockReadAfter(int readCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(readCount);
+            var blockedRead = new BlockedRead();
+            if (Interlocked.CompareExchange(ref _blockedRead, blockedRead, null) is not null)
+            {
+                throw new InvalidOperationException("A blocked read is already pending.");
+            }
+
+            Volatile.Write(ref _readsUntilBlock, readCount);
+            return blockedRead;
         }
 
         public override bool CanRead => true;
@@ -1402,6 +1762,17 @@ public sealed class FramePresentationTests
             Memory<byte> buffer,
             CancellationToken cancellationToken = default)
         {
+            var readsUntilBlock = Volatile.Read(ref _readsUntilBlock);
+            if (readsUntilBlock > 0 && Interlocked.Decrement(ref _readsUntilBlock) == 0)
+            {
+                var blockedRead = Interlocked.Exchange(ref _blockedRead, null);
+                if (blockedRead is not null)
+                {
+                    blockedRead.Started.TrySetResult();
+                    await blockedRead.Release.Task.WaitAsync(cancellationToken);
+                }
+            }
+
             if (_input.Position == _input.Length && exceptionAfterInput is not null)
             {
                 throw exceptionAfterInput;
@@ -1416,12 +1787,32 @@ public sealed class FramePresentationTests
             return read;
         }
         public override void Write(byte[] buffer, int offset, int count) => _output.Write(buffer, offset, count);
-        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
         {
             var failure = Interlocked.Exchange(ref _nextWriteFailure, null);
-            return failure is null
-                ? _output.WriteAsync(buffer, cancellationToken)
-                : ValueTask.FromException(failure);
+            if (failure is not null)
+            {
+                throw failure;
+            }
+
+            var blockedWrite = Interlocked.Exchange(ref _nextBlockedWrite, null);
+            if (blockedWrite is not null)
+            {
+                blockedWrite.Started.TrySetResult();
+                try
+                {
+                    await blockedWrite.Release.Task.WaitAsync(cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    blockedWrite.CancellationObserved.TrySetResult();
+                    throw;
+                }
+            }
+
+            await _output.WriteAsync(buffer, cancellationToken);
         }
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
@@ -1436,5 +1827,173 @@ public sealed class FramePresentationTests
 
             base.Dispose(disposing);
         }
+
+        public sealed class BlockedWrite
+        {
+            public TaskCompletionSource Started { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public TaskCompletionSource Release { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public TaskCompletionSource CancellationObserved { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        public sealed class BlockedRead
+        {
+            public TaskCompletionSource Started { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public TaskCompletionSource Release { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+    }
+
+    private sealed class InteractiveDuplexStream : Stream
+    {
+        private readonly object _sync = new();
+        private readonly Queue<byte> _input = new();
+        private readonly MemoryStream _output = new();
+        private TaskCompletionSource _inputAvailable = NewSignal();
+        private byte[]? _delivery;
+        private bool _deliveryCompleted;
+
+        public InteractiveDuplexStream(byte[] input) => AppendInput(input);
+
+        public TaskCompletionSource FramebufferRequestObserved { get; } =
+            NewSignal();
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public void DeliverAfterFramebufferRequest(byte[] delivery)
+        {
+            ArgumentNullException.ThrowIfNull(delivery);
+            lock (_sync)
+            {
+                _delivery = delivery.ToArray();
+            }
+        }
+
+        public void DeliverWithoutFramebufferRequest()
+        {
+            byte[]? delivery;
+            lock (_sync)
+            {
+                if (_deliveryCompleted)
+                {
+                    return;
+                }
+
+                _deliveryCompleted = true;
+                delivery = _delivery;
+            }
+
+            if (delivery is not null)
+            {
+                AppendInput(delivery);
+            }
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override Task FlushAsync(CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            while (true)
+            {
+                Task wait;
+                lock (_sync)
+                {
+                    if (_input.Count > 0)
+                    {
+                        var count = Math.Min(buffer.Length, _input.Count);
+                        for (var index = 0; index < count; index++)
+                        {
+                            buffer.Span[index] = _input.Dequeue();
+                        }
+
+                        return count;
+                    }
+
+                    wait = _inputAvailable.Task;
+                }
+
+                await wait.WaitAsync(cancellationToken);
+            }
+        }
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            byte[]? delivery = null;
+            lock (_sync)
+            {
+                _output.Write(buffer.Span);
+                if (!_deliveryCompleted &&
+                    _delivery is not null &&
+                    buffer.Length == 10 &&
+                    buffer.Span[0] == 3)
+                {
+                    _deliveryCompleted = true;
+                    delivery = _delivery;
+                    FramebufferRequestObserved.TrySetResult();
+                }
+            }
+
+            if (delivery is not null)
+            {
+                AppendInput(delivery);
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) =>
+            throw new NotSupportedException();
+
+        public override void SetLength(long value) =>
+            throw new NotSupportedException();
+
+        private void AppendInput(byte[] input)
+        {
+            TaskCompletionSource signal;
+            lock (_sync)
+            {
+                foreach (var value in input)
+                {
+                    _input.Enqueue(value);
+                }
+
+                signal = _inputAvailable;
+                _inputAvailable = NewSignal();
+            }
+
+            signal.TrySetResult();
+        }
+
+        private static TaskCompletionSource NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }

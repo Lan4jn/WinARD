@@ -5,6 +5,7 @@ using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
+using WinARD.Domain.Connections;
 using WinARD.Infrastructure.Diagnostics;
 using WinARD.Remote.Protocol.Errors;
 using Xunit;
@@ -15,6 +16,608 @@ namespace WinARD.Desktop.Tests.ViewModels;
 
 public sealed class RemoteSessionViewModelTests
 {
+    [Fact]
+    public async Task Session_frame_mailbox_does_not_merge_a_frame_already_taken_for_presentation()
+    {
+        await using var mailbox = new SessionFrameMailbox();
+        mailbox.Publish(CreateSessionFrame(sequence: 1, receivedBytes: 10, encoding: 0, x: 0));
+
+        using var taken = await mailbox.ReadLatestAsync(CancellationToken.None);
+        mailbox.Publish(CreateSessionFrame(sequence: 2, receivedBytes: 20, encoding: 16, x: 1));
+        using var next = await mailbox.ReadLatestAsync(CancellationToken.None);
+
+        Assert.Equal(10, taken.Performance.Update.ReceivedSessionBytes);
+        Assert.Equal(20, next.Performance.Update.ReceivedSessionBytes);
+        Assert.Equal(new Dictionary<int, int> { [0] = 1 }, taken.Performance.Update.EncodingCounts);
+        Assert.Equal(new Dictionary<int, int> { [16] = 1 }, next.Performance.Update.EncodingCounts);
+    }
+
+    [Fact]
+    public async Task Session_frame_mailbox_merges_replaced_frame_statistics_encodings_and_dirty_area()
+    {
+        await using var mailbox = new SessionFrameMailbox();
+        mailbox.Publish(CreateSessionFrame(sequence: 1, receivedBytes: 10, encoding: 0, x: 0));
+        mailbox.Publish(CreateSessionFrame(sequence: 2, receivedBytes: 20, encoding: 16, x: 1));
+
+        using var latest = await mailbox.ReadLatestAsync(CancellationToken.None);
+
+        Assert.Equal(30, latest.Performance.Update.ReceivedSessionBytes);
+        Assert.Equal(
+            new Dictionary<int, int> { [0] = 1, [16] = 1 },
+            latest.Performance.Update.EncodingCounts);
+        Assert.Equal(
+            [new RemoteRectangle(0, 0, 1, 1), new RemoteRectangle(1, 0, 1, 1)],
+            latest.Performance.Dirty.OrderBy(rectangle => rectangle.X));
+    }
+
+    [Fact]
+    public async Task Session_frame_mailbox_dispose_is_idempotent_and_releases_pending_take()
+    {
+        var mailbox = new SessionFrameMailbox();
+        var take = mailbox.ReadLatestAsync(CancellationToken.None).AsTask();
+
+        await Task.WhenAll(mailbox.DisposeAsync().AsTask(), mailbox.DisposeAsync().AsTask());
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => take);
+        Assert.True(mailbox.ResourcesDisposed);
+    }
+
+    [Fact]
+    public async Task Session_frame_mailbox_dispose_waits_for_taken_reader_to_exit_after_cancel()
+    {
+        var coordinator = new SessionFrameMailboxTestCoordinator(
+            SessionFrameMailboxTestPause.AfterTake);
+        var mailbox = new SessionFrameMailbox(coordinator);
+        mailbox.Publish(CreateSessionFrame(1, 10, 0, 0));
+        var read = Task.Run(async () => await mailbox.ReadLatestAsync(CancellationToken.None));
+        await coordinator.Paused.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var dispose = Task.Run(async () => await mailbox.DisposeAsync());
+        await coordinator.DisposeCancellationIssued.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(dispose.IsCompleted);
+        coordinator.Release();
+        using var frame = await read;
+        await dispose;
+        Assert.True(mailbox.ResourcesDisposed);
+    }
+
+    [Fact]
+    public async Task Session_frame_mailbox_dispose_cannot_release_resources_before_publish_signals()
+    {
+        var coordinator = new SessionFrameMailboxTestCoordinator(
+            SessionFrameMailboxTestPause.BeforeSignal);
+        var mailbox = new SessionFrameMailbox(coordinator);
+        var publish = Task.Run(() => mailbox.Publish(CreateSessionFrame(1, 10, 0, 0)));
+        await coordinator.Paused.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var dispose = Task.Run(async () => await mailbox.DisposeAsync());
+        await coordinator.DisposeStarted.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(dispose.IsCompleted);
+        coordinator.Release();
+        await publish;
+        await dispose;
+        Assert.True(mailbox.ResourcesDisposed);
+    }
+
+    private static SessionFrameEnvelope CreateSessionFrame(
+        long sequence,
+        long receivedBytes,
+        int encoding,
+        int x)
+    {
+        var dirty = new RemoteRectangle(x, 0, 1, 1);
+        return new SessionFrameEnvelope(
+            new FramePacket(
+                sequence,
+                width: 2,
+                height: 1,
+                stride: 8,
+                length: 8,
+                [dirty],
+                new TrackingMemoryOwner(new byte[8])),
+            new SessionFramePerformance(
+                new RemoteUpdateStatistics(
+                    receivedBytes,
+                    new Dictionary<int, int> { [encoding] = 1 }),
+                [dirty],
+                new RemoteFramebufferSize(2, 1),
+                TimeSpan.Zero));
+    }
+
+    [Fact]
+    public async Task Fixed_30_waits_for_pacer_before_requesting_the_next_frame()
+    {
+        var runtime = new RefreshPolicyRuntime(frameCount: 1);
+        var delayEntered = new TaskCompletionSource<TimeSpan>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseDelay = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var time = new ManualTimestampProvider();
+        var pacer = new FramebufferRequestPacer(
+            time,
+            (delay, _) =>
+            {
+                delayEntered.TrySetResult(delay);
+                return releaseDelay.Task;
+            });
+        await using var viewModel = CreateRefreshViewModel(
+            runtime,
+            FrameRefreshPolicy.Fixed(30),
+            time,
+            pacer);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        var requestedDelay = await delayEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.InRange(requestedDelay.TotalMilliseconds, 33.2, 33.4);
+        Assert.Equal(1, runtime.RequestCount);
+
+        releaseDelay.TrySetResult();
+        await runtime.SecondRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(2, runtime.RequestCount);
+    }
+
+    [Fact]
+    public async Task Unlimited_requests_the_next_frame_without_pacer_delay()
+    {
+        var runtime = new RefreshPolicyRuntime(frameCount: 1);
+        var delayCount = 0;
+        var time = new ManualTimestampProvider();
+        var pacer = new FramebufferRequestPacer(
+            time,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref delayCount);
+                return Task.CompletedTask;
+            });
+        await using var viewModel = CreateRefreshViewModel(
+            runtime,
+            FrameRefreshPolicy.Unlimited,
+            time,
+            pacer);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.SecondRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(0, delayCount);
+        Assert.Null(viewModel.TargetFramesPerSecond);
+    }
+
+    [Theory]
+    [InlineData(30, 33.3)]
+    [InlineData(60, 16.6)]
+    public async Task Fixed_rate_spaces_actual_writes_after_background_queue_delay(
+        int framesPerSecond,
+        double minimumSpacingMilliseconds)
+    {
+        var time = new ManualTimestampProvider();
+        var runtime = new QueuedWriteTimingRuntime(time, TimeSpan.FromMilliseconds(100));
+        var pacer = new FramebufferRequestPacer(
+            time,
+            (delay, _) =>
+            {
+                time.Advance(TimeSpan.FromMilliseconds(Math.Ceiling(delay.TotalMilliseconds)));
+                return Task.CompletedTask;
+            });
+        await using var viewModel = CreateRefreshViewModel(
+            runtime,
+            FrameRefreshPolicy.Fixed(framesPerSecond),
+            time,
+            pacer);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.SecondWriteCompleted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(2, runtime.WriteCompletedAt.Count);
+        var spacing = time.GetElapsedTime(
+            runtime.WriteCompletedAt[0],
+            runtime.WriteCompletedAt[1]);
+        Assert.True(spacing.TotalMilliseconds >= minimumSpacingMilliseconds);
+    }
+
+    [Fact]
+    public async Task Automatic_bad_samples_lower_target_and_update_the_pacer()
+    {
+        using var presentationGate = new SemaphoreSlim(0);
+        var runtime = new RefreshPolicyRuntime(
+            frameCount: 3,
+            performance: new RemoteRuntimePerformanceSnapshot(100, 1, 1),
+            presentationGate: presentationGate);
+        var time = new ManualTimestampProvider();
+        var pacer = new FramebufferRequestPacer(time, (_, _) => Task.CompletedTask);
+        await using var viewModel = CreateRefreshViewModel(
+            runtime,
+            FrameRefreshPolicy.Automatic,
+            time,
+            pacer,
+            new SignalingPresenter(presentationGate));
+        var targetChanged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(RemoteSessionViewModel.TargetFramesPerSecond) &&
+                viewModel.TargetFramesPerSecond == 45)
+            {
+                targetChanged.TrySetResult();
+            }
+        };
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await targetChanged.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await runtime.FourthRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(FrameRefreshMode.Automatic, viewModel.Performance.Mode);
+        Assert.Equal(45, viewModel.TargetFramesPerSecond);
+    }
+
+    [Fact]
+    public async Task Set_refresh_policy_updates_target_immediately()
+    {
+        await using var viewModel = CreateRefreshViewModel(
+            new BlockingRuntime(),
+            FrameRefreshPolicy.Automatic,
+            new ManualTimestampProvider(),
+            pacer: null);
+
+        viewModel.SetFrameRefreshPolicy(FrameRefreshPolicy.Fixed(30));
+
+        Assert.Equal(FrameRefreshMode.Fixed, viewModel.Performance.Mode);
+        Assert.Equal(30, viewModel.TargetFramesPerSecond);
+    }
+
+    [Theory]
+    [InlineData(29)]
+    [InlineData(241)]
+    public async Task Invalid_remote_refresh_maximum_is_ignored_with_safe_category(int maximum)
+    {
+        var sink = new RecordingDiagnosticSink();
+        await using var viewModel = new RemoteSessionViewModel(
+            new DisplayCapabilityRuntime(maximum),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: sink,
+            initialRefreshPolicy: FrameRefreshPolicy.Automatic);
+
+        Assert.Equal(60, viewModel.TargetFramesPerSecond);
+        var diagnostic = Assert.Single(
+            sink.Events,
+            item => item.Code == "REMOTE_DISPLAY_CAPABILITIES_INVALID");
+        Assert.Equal("InvalidRefreshRateRange", Assert.Single(diagnostic.Fields!).Value);
+        Assert.DoesNotContain(
+            maximum.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            diagnostic.Fields!.Select(field => field.Value));
+    }
+
+    [Fact]
+    public async Task Fixed_policy_target_is_capped_without_changing_selected_policy()
+    {
+        await using var viewModel = new RemoteSessionViewModel(
+            new DisplayCapabilityRuntime(60),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Fixed(120));
+
+        Assert.Equal(FrameRefreshMode.Fixed, viewModel.Performance.Mode);
+        Assert.Equal(60, viewModel.TargetFramesPerSecond);
+
+        viewModel.SetFrameRefreshPolicy(FrameRefreshPolicy.Fixed(105));
+        Assert.Equal(60, viewModel.TargetFramesPerSecond);
+
+        viewModel.SetFrameRefreshPolicy(FrameRefreshPolicy.Unlimited);
+        Assert.Null(viewModel.TargetFramesPerSecond);
+    }
+
+    [Fact]
+    public async Task Unknown_remote_maximum_keeps_every_refresh_option_enabled()
+    {
+        await using var viewModel = CreateRefreshViewModel(
+            new BlockingRuntime(),
+            FrameRefreshPolicy.Automatic,
+            new ManualTimestampProvider(),
+            pacer: null);
+
+        Assert.Equal(9, viewModel.FrameRefreshOptions.Count);
+        Assert.All(viewModel.FrameRefreshOptions, option => Assert.True(option.IsEnabled));
+        Assert.Equal(FrameRefreshPolicy.Automatic, viewModel.SelectedFrameRefreshOption.Policy);
+    }
+
+    [Fact]
+    public async Task Reliable_remote_maximum_disables_only_higher_fixed_options()
+    {
+        await using var viewModel = new RemoteSessionViewModel(
+            new DisplayCapabilityRuntime(59),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Fixed(45));
+
+        Assert.True(FindOption(viewModel, FrameRefreshPolicy.Automatic).IsEnabled);
+        Assert.True(FindOption(viewModel, FrameRefreshPolicy.Fixed(45)).IsEnabled);
+        Assert.False(FindOption(viewModel, FrameRefreshPolicy.Fixed(60)).IsEnabled);
+        Assert.False(FindOption(viewModel, FrameRefreshPolicy.Fixed(120)).IsEnabled);
+        Assert.True(FindOption(viewModel, FrameRefreshPolicy.Unlimited).IsEnabled);
+    }
+
+    [Fact]
+    public async Task Saved_fixed_policy_above_remote_maximum_remains_selected_with_effective_constraint()
+    {
+        await using var viewModel = new RemoteSessionViewModel(
+            new DisplayCapabilityRuntime(59),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Fixed(120));
+
+        Assert.Equal(FrameRefreshPolicy.Fixed(120), viewModel.SelectedFrameRefreshOption.Policy);
+        Assert.False(viewModel.SelectedFrameRefreshOption.IsEnabled);
+        Assert.Equal("当前上限 59，有效 59", viewModel.SelectedFrameRefreshOption.ConstraintText);
+    }
+
+    [Fact]
+    public void Performance_text_formats_mode_measurements_rate_encoding_and_response()
+    {
+        var snapshot = new SessionPerformanceSnapshot(
+            FrameRefreshMode.Automatic,
+            45,
+            38,
+            13_002_342,
+            16,
+            86,
+            0,
+            0,
+            0,
+            1);
+
+        Assert.Equal(
+            "自动 45 FPS · 实际 38 FPS · 12.4 MiB/s · ZRLE · 86 ms",
+            RemoteSessionViewModel.FormatSessionPerformance(snapshot));
+    }
+
+    [Fact]
+    public void Fixed_performance_text_includes_the_mode_name()
+    {
+        var snapshot = new SessionPerformanceSnapshot(
+            FrameRefreshMode.Fixed,
+            60,
+            38,
+            13_002_342,
+            16,
+            86,
+            0,
+            0,
+            0,
+            1);
+
+        Assert.Equal(
+            "固定 60 FPS · 实际 38 FPS · 12.4 MiB/s · ZRLE · 86 ms",
+            RemoteSessionViewModel.FormatSessionPerformance(snapshot));
+    }
+
+    [Fact]
+    public void Performance_text_uses_dashes_for_unmeasured_values_and_stable_signed_encoding_ids()
+    {
+        var unknown = new SessionPerformanceSnapshot(
+            FrameRefreshMode.Unlimited, null, 0, 0, null, 0, 0, 0, 0, 0);
+        var signedEncoding = unknown with
+        {
+            Mode = FrameRefreshMode.Fixed,
+            TargetFramesPerSecond = 60,
+            ActualFramesPerSecond = 1,
+            ReceiveBytesPerSecond = 1,
+            PrimaryFramebufferEncoding = -314,
+            ResponseMilliseconds = 1,
+            SampleSequence = 1,
+        };
+
+        Assert.Equal("无限 · 实际 — · — · — · —", RemoteSessionViewModel.FormatSessionPerformance(unknown));
+        Assert.Contains("编码 -314", RemoteSessionViewModel.FormatSessionPerformance(signedEncoding));
+    }
+
+    [Fact]
+    public async Task Performance_publication_is_bounded_and_publishes_latest_snapshot_after_one_second()
+    {
+        var time = new ManualTimestampProvider();
+        var dispatcher = new CountingDispatcher();
+        await using var viewModel = new RemoteSessionViewModel(
+            new BlockingRuntime(),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            dispatcher,
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Automatic,
+            timeProvider: time);
+        var notifications = 0;
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(RemoteSessionViewModel.SessionPerformance))
+            {
+                notifications++;
+            }
+        };
+
+        for (var sequence = 1; sequence <= 20; sequence++)
+        {
+            await viewModel.PublishSessionPerformanceAsync(
+                CreatePerformanceSnapshot(sequence),
+                force: false,
+                CancellationToken.None);
+        }
+
+        Assert.Equal(1, dispatcher.InvocationCount);
+        Assert.Equal(1, notifications);
+        time.Advance(TimeSpan.FromSeconds(1));
+        await viewModel.PublishSessionPerformanceAsync(
+            CreatePerformanceSnapshot(21),
+            force: false,
+            CancellationToken.None);
+        Assert.Equal(2, dispatcher.InvocationCount);
+        Assert.Equal(2, notifications);
+        Assert.Equal(21, viewModel.Performance.SampleSequence);
+    }
+
+    [Fact]
+    public async Task Performance_policy_change_publishes_immediately_without_delayed_work_after_close()
+    {
+        var time = new ManualTimestampProvider();
+        var dispatcher = new CountingDispatcher();
+        var viewModel = new RemoteSessionViewModel(
+            new BlockingRuntime(),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            dispatcher,
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Automatic,
+            timeProvider: time);
+        var publications = Enumerable.Range(1, 20)
+            .Select(sequence => viewModel.PublishSessionPerformanceAsync(
+                CreatePerformanceSnapshot(sequence),
+                force: false,
+                CancellationToken.None).AsTask())
+            .ToArray();
+
+        viewModel.SetFrameRefreshPolicy(FrameRefreshPolicy.Fixed(60));
+
+        Assert.StartsWith("固定 60 FPS", viewModel.SessionPerformance, StringComparison.Ordinal);
+        Assert.All(publications, publication => Assert.True(publication.IsCompletedSuccessfully));
+        await viewModel.DisposeAsync();
+        Assert.False(viewModel.HasPendingPerformancePublication);
+    }
+
+    [Fact]
+    public async Task Queued_automatic_snapshot_cannot_overwrite_immediate_fixed_policy()
+    {
+        var dispatcher = new QueuedDispatcher();
+        await using var viewModel = new RemoteSessionViewModel(
+            new BlockingRuntime(),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            dispatcher,
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Automatic,
+            timeProvider: new ManualTimestampProvider());
+        var oldAutomatic = viewModel.PublishSessionPerformanceAsync(
+            CreatePerformanceSnapshot(1),
+            force: true,
+            CancellationToken.None).AsTask();
+
+        await dispatcher.InvocationQueued;
+        viewModel.SetFrameRefreshPolicy(FrameRefreshPolicy.Fixed(60));
+        Assert.StartsWith("固定 60 FPS", viewModel.SessionPerformance, StringComparison.Ordinal);
+        dispatcher.ReleaseAll();
+        await oldAutomatic;
+
+        Assert.Equal(FrameRefreshMode.Fixed, viewModel.Performance.Mode);
+        Assert.StartsWith("固定 60 FPS", viewModel.SessionPerformance, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Multiple_old_publications_are_dropped_and_new_generation_is_not_lost()
+    {
+        var dispatcher = new QueuedDispatcher();
+        await using var viewModel = new RemoteSessionViewModel(
+            new BlockingRuntime(),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            dispatcher,
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Automatic,
+            timeProvider: new ManualTimestampProvider());
+        var first = viewModel.PublishSessionPerformanceAsync(
+            CreatePerformanceSnapshot(1), force: true, CancellationToken.None).AsTask();
+        var second = viewModel.PublishSessionPerformanceAsync(
+            CreatePerformanceSnapshot(2), force: true, CancellationToken.None).AsTask();
+        await dispatcher.InvocationQueued;
+
+        viewModel.SetFrameRefreshPolicy(FrameRefreshPolicy.Unlimited);
+        dispatcher.ReleaseAll();
+        await Task.WhenAll(first, second);
+        await viewModel.PublishSessionPerformanceAsync(
+            CreatePerformanceSnapshot(3) with
+            {
+                Mode = FrameRefreshMode.Unlimited,
+                TargetFramesPerSecond = null,
+            },
+            force: true,
+            CancellationToken.None);
+
+        Assert.Equal(FrameRefreshMode.Unlimited, viewModel.Performance.Mode);
+        Assert.Equal(3, viewModel.Performance.SampleSequence);
+    }
+
+    [Fact]
+    public async Task Dispose_invalidates_queued_performance_publication()
+    {
+        var dispatcher = new QueuedDispatcher();
+        var viewModel = new RemoteSessionViewModel(
+            new BlockingRuntime(),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            dispatcher,
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Automatic,
+            timeProvider: new ManualTimestampProvider());
+        var publication = viewModel.PublishSessionPerformanceAsync(
+            CreatePerformanceSnapshot(99),
+            force: true,
+            CancellationToken.None).AsTask();
+        await dispatcher.InvocationQueued;
+
+        var disposal = viewModel.DisposeAsync().AsTask();
+        dispatcher.ReleaseAll();
+        await Task.WhenAll(publication, disposal);
+
+        Assert.Equal(0, viewModel.Performance.SampleSequence);
+        Assert.False(viewModel.HasPendingPerformancePublication);
+    }
+
+    private static SessionPerformanceSnapshot CreatePerformanceSnapshot(long sequence) =>
+        new(
+            FrameRefreshMode.Automatic,
+            60,
+            (int)sequence,
+            sequence * 1024,
+            16,
+            (int)sequence,
+            0,
+            0,
+            0,
+            sequence);
+
+    private static FrameRefreshOption FindOption(
+        RemoteSessionViewModel viewModel,
+        FrameRefreshPolicy policy) =>
+        Assert.Single(viewModel.FrameRefreshOptions, option => option.Policy == policy);
+
+    private static RemoteSessionViewModel CreateRefreshViewModel(
+        IRemoteSessionRuntime runtime,
+        FrameRefreshPolicy policy,
+        TimeProvider time,
+        FramebufferRequestPacer? pacer,
+        IFramePresenter? presenter = null) =>
+        new(
+            runtime,
+            new TrackingLifetime(),
+            presenter ?? new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: policy,
+            timeProvider: time,
+            pacer: pacer);
+
     [Fact]
     public async Task Dispose_before_start_reports_disconnected_quality()
     {
@@ -128,6 +731,74 @@ public sealed class RemoteSessionViewModelTests
 
         Assert.Equal(80, viewModel.ConnectionQuality.ResponseMilliseconds);
         Assert.Equal("良好 · 80 ms", viewModel.ConnectionQuality.DisplayText);
+    }
+
+    [Fact]
+    public async Task Framebuffer_response_excludes_request_queue_wait_before_protocol_write_completion()
+    {
+        var time = new ManualTimestampProvider();
+        var runtime = new TimedFrameRuntime(
+            time,
+            responseTime: TimeSpan.FromMilliseconds(80),
+            requestQueueTime: TimeSpan.FromMilliseconds(300));
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            timeProvider: time);
+        var qualityUpdated = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(RemoteSessionViewModel.ConnectionQuality) &&
+                viewModel.ConnectionQuality.ResponseMilliseconds is not null)
+            {
+                qualityUpdated.TrySetResult();
+            }
+        };
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await qualityUpdated.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(80, viewModel.ConnectionQuality.ResponseMilliseconds);
+    }
+
+    [Fact]
+    public async Task Failed_framebuffer_request_does_not_mark_pacer_baseline()
+    {
+        var time = new ManualTimestampProvider();
+        var pacer = new FramebufferRequestPacer(time);
+        await using var viewModel = CreateRefreshViewModel(
+            new FailedRequestRuntime(),
+            FrameRefreshPolicy.Fixed(60),
+            time,
+            pacer);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(pacer.HasRequestBaseline);
+    }
+
+    [Fact]
+    public async Task Canceled_framebuffer_request_does_not_mark_pacer_baseline()
+    {
+        var time = new ManualTimestampProvider();
+        var pacer = new FramebufferRequestPacer(time);
+        var runtime = new BlockingRequestRuntime();
+        var viewModel = CreateRefreshViewModel(
+            runtime,
+            FrameRefreshPolicy.Fixed(60),
+            time,
+            pacer);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.RequestStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await viewModel.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(pacer.HasRequestBaseline);
     }
 
     [Fact]
@@ -693,13 +1364,46 @@ public sealed class RemoteSessionViewModelTests
             new TrackingLifetime(),
             new TrackingPresenter(),
             new InlineDispatcher(),
-            clipboardBridge: null);
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Unlimited);
 
         await viewModel.StartAsync(CancellationToken.None);
         await runtime.MessagesConsumed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await runtime.SecondRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await viewModel.DisposeAsync();
 
         Assert.Equal([(false, 0), (true, 2)], runtime.UpdateRequests);
+    }
+
+    [Fact]
+    public async Task Next_pull_request_waits_until_frame_presentation_completes()
+    {
+        var runtime = new ScriptedRuntime(
+            new RemoteFramebufferMessage(
+                new RemoteFramebufferSize(1, 1),
+                [0, 0, 0, 255],
+                4,
+                [new RemoteRectangle(0, 0, 1, 1)]));
+        var dispatcher = new QueuedDispatcher();
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            dispatcher,
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Unlimited);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await dispatcher.InvocationQueued.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var requestsWhilePresentationBlocked = runtime.UpdateRequests.ToArray();
+        dispatcher.ReleaseAll();
+        await runtime.SecondRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal([(false, 0)], requestsWhilePresentationBlocked);
+        Assert.Equal([(false, 0), (true, 1)], runtime.UpdateRequests);
     }
 
     [Fact]
@@ -743,10 +1447,13 @@ public sealed class RemoteSessionViewModelTests
             new TrackingLifetime(),
             new TrackingPresenter(),
             new InlineDispatcher(),
-            clipboardBridge: null);
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Unlimited);
 
         await viewModel.StartAsync(CancellationToken.None);
         await runtime.MessagesConsumed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await runtime.ThirdRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await viewModel.DisposeAsync();
 
         Assert.Equal([(false, 0), (false, 1), (true, 2)], runtime.UpdateRequests);
@@ -763,7 +1470,9 @@ public sealed class RemoteSessionViewModelTests
             new TrackingLifetime(),
             new TrackingPresenter(),
             new InlineDispatcher(),
-            clipboardBridge: null);
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Unlimited);
 
         await viewModel.StartAsync(CancellationToken.None);
         await runtime.MessagesConsumed.Task.WaitAsync(TimeSpan.FromSeconds(2));
@@ -772,6 +1481,37 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal([1, 2, 3, 4], viewModel.RemoteCursor.Bgra32.ToArray());
         Assert.False(owner.IsDisposed);
         Assert.Equal([(false, 0), (true, 1)], runtime.UpdateRequests);
+    }
+
+    [Fact]
+    public async Task Cursor_only_update_contributes_bytes_without_counting_a_frame_or_primary_encoding()
+    {
+        var time = new ManualTimestampProvider();
+        var runtime = new CursorStatisticsRuntime(time);
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Unlimited,
+            timeProvider: time);
+        var published = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(RemoteSessionViewModel.Performance) &&
+                viewModel.Performance.ReceiveBytesPerSecond == 1024)
+            {
+                published.TrySetResult();
+            }
+        };
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await published.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(0, viewModel.Performance.ActualFramesPerSecond);
+        Assert.Null(viewModel.Performance.PrimaryFramebufferEncoding);
     }
 
     [Fact]
@@ -830,7 +1570,9 @@ public sealed class RemoteSessionViewModelTests
             lifetime,
             presenter,
             new InlineDispatcher(),
-            clipboardBridge: null);
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Unlimited);
 
         await viewModel.StartAsync(CancellationToken.None);
         await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
@@ -838,8 +1580,8 @@ public sealed class RemoteSessionViewModelTests
         Assert.True(viewModel.Completion.IsCompletedSuccessfully);
         Assert.Equal("画面呈现失败，会话正在关闭。", viewModel.StatusMessage);
         Assert.Equal(1, presenter.PresentCount);
-        Assert.Equal(2, runtime.ReceiveCount);
-        Assert.True(runtime.ReceiveCancelled);
+        Assert.Equal(1, runtime.ReceiveCount);
+        Assert.False(runtime.ReceiveCancelled);
         Assert.Equal(1, lifetime.DisposeCount);
         Assert.True(frameOwner.IsDisposed);
         Assert.Equal(1, frameOwner.DisposeCount);
@@ -927,13 +1669,15 @@ public sealed class RemoteSessionViewModelTests
             lifetime,
             presenter,
             dispatcher,
-            clipboardBridge: null);
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Unlimited);
 
         await viewModel.StartAsync(CancellationToken.None);
         await viewModel.Completion.WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.True(viewModel.Completion.IsCompletedSuccessfully);
-        Assert.True(runtime.ReceiveCancelled);
+        Assert.False(runtime.ReceiveCancelled);
         Assert.Equal(1, lifetime.DisposeCount);
         Assert.Equal(1, presenter.PresentCount);
         Assert.True(frameOwner.IsDisposed);
@@ -1223,6 +1967,213 @@ public sealed class RemoteSessionViewModelTests
         public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
     }
 
+    private sealed class FailedRequestRuntime : IRemoteSessionRuntime
+    {
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+            ValueTask.FromException(new IOException("request write failed"));
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromException<RemoteServerMessage>(new InvalidOperationException());
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class BlockingRequestRuntime : IRemoteSessionRuntime
+    {
+        public TaskCompletionSource RequestStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public async ValueTask RequestFramebufferUpdateAsync(
+            bool incremental,
+            CancellationToken cancellationToken)
+        {
+            RequestStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromException<RemoteServerMessage>(new InvalidOperationException());
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class RefreshPolicyRuntime(
+        int frameCount,
+        RemoteRuntimePerformanceSnapshot? performance = null,
+        SemaphoreSlim? presentationGate = null) : IRemoteSessionRuntime
+    {
+        private int _received;
+        private int _requests;
+
+        public TaskCompletionSource SecondRequest { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FourthRequest { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int RequestCount => Volatile.Read(ref _requests);
+
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+
+        public RemoteRuntimePerformanceSnapshot PerformanceSnapshot =>
+            performance ?? RemoteRuntimePerformanceSnapshot.Empty;
+
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
+        {
+            var requestCount = Interlocked.Increment(ref _requests);
+            if (requestCount == 2)
+            {
+                SecondRequest.TrySetResult();
+            }
+            else if (requestCount == 4)
+            {
+                FourthRequest.TrySetResult();
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            var received = Interlocked.Increment(ref _received);
+            if (received <= frameCount)
+            {
+                if (received > 1 && presentationGate is not null)
+                {
+                    await presentationGate.WaitAsync(cancellationToken);
+                }
+
+                return new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1),
+                    [0, 0, 0, 255],
+                    4,
+                    [new RemoteRectangle(0, 0, 1, 1)],
+                    cursor: null,
+                    new RemoteUpdateStatistics(1024, new Dictionary<int, int> { [0] = 1 }));
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException();
+        }
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class QueuedWriteTimingRuntime(
+        ManualTimestampProvider timeProvider,
+        TimeSpan firstQueueDelay) : IRemoteSessionRuntime
+    {
+        private int _requests;
+        private int _receives;
+
+        public List<long> WriteCompletedAt { get; } = [];
+        public TaskCompletionSource SecondWriteCompleted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Interlocked.Increment(ref _requests) == 1)
+            {
+                timeProvider.Advance(firstQueueDelay);
+            }
+
+            WriteCompletedAt.Add(timeProvider.GetTimestamp());
+            if (WriteCompletedAt.Count == 2)
+            {
+                SecondWriteCompleted.TrySetResult();
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _receives) == 1)
+            {
+                return new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1),
+                    [0, 0, 0, 255],
+                    4,
+                    [new RemoteRectangle(0, 0, 1, 1)]);
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException();
+        }
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class SignalingPresenter(SemaphoreSlim presented) : IFramePresenter
+    {
+        public void Resize(int width, int height) { }
+
+        public void Present(
+            ReadOnlySpan<byte> bgra32,
+            int stride,
+            IReadOnlyList<RemoteRectangle> dirtyRectangles) => presented.Release();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class DisplayCapabilityRuntime(int maximum) : IRemoteSessionRuntime
+    {
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public RemoteDisplayCapabilities DisplayCapabilities { get; } = new(maximum);
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) => ValueTask.FromResult<RemoteServerMessage>(new RemoteBellMessage());
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class CursorStatisticsRuntime(ManualTimestampProvider time) : IRemoteSessionRuntime
+    {
+        private int _receiveCount;
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _receiveCount) == 1)
+            {
+                time.Advance(TimeSpan.FromSeconds(1));
+                return new RemoteCursorMessage(
+                    new RemoteCursorUpdate(0, 0, 0, 0, []),
+                    new RemoteUpdateStatistics(
+                        1024,
+                        new Dictionary<int, int> { [(int)WinARD.Remote.Protocol.Encodings.RfbEncodingType.Cursor] = 1 }));
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException();
+        }
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
     private sealed class FailingRuntime : IRemoteSessionRuntime
     {
         public RemoteFramebufferSize FramebufferSize => new(1, 1);
@@ -1277,12 +2228,24 @@ public sealed class RemoteSessionViewModelTests
         private int _receiveCount;
         public TaskCompletionSource MessagesConsumed { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource SecondRequest { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ThirdRequest { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         public List<(bool Incremental, int ReceiveCount)> UpdateRequests { get; } = [];
         public RemoteFramebufferSize FramebufferSize => new(1, 1);
 
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
         {
             UpdateRequests.Add((incremental, _receiveCount));
+            if (UpdateRequests.Count == 2)
+            {
+                SecondRequest.TrySetResult();
+            }
+            else if (UpdateRequests.Count == 3)
+            {
+                ThirdRequest.TrySetResult();
+            }
             return ValueTask.CompletedTask;
         }
 
@@ -1351,14 +2314,19 @@ public sealed class RemoteSessionViewModelTests
 
     private sealed class TimedFrameRuntime(
         ManualTimestampProvider timeProvider,
-        TimeSpan responseTime) : IRemoteSessionRuntime
+        TimeSpan responseTime,
+        TimeSpan? requestQueueTime = null) : IRemoteSessionRuntime
     {
         private int _receiveCount;
         public RemoteFramebufferSize FramebufferSize => new(1, 1);
 
         public ValueTask RequestFramebufferUpdateAsync(
             bool incremental,
-            CancellationToken cancellationToken) => ValueTask.CompletedTask;
+            CancellationToken cancellationToken)
+        {
+            timeProvider.Advance(requestQueueTime ?? TimeSpan.Zero);
+            return ValueTask.CompletedTask;
+        }
 
         public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
         {
@@ -1524,6 +2492,66 @@ public sealed class RemoteSessionViewModelTests
             }
 
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class CountingDispatcher : IUiDispatcher
+    {
+        public int InvocationCount { get; private set; }
+
+        public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            InvocationCount++;
+            action();
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class QueuedDispatcher : IUiDispatcher
+    {
+        private readonly object _sync = new();
+        private readonly List<(Action Action, TaskCompletionSource Completion)> _queued = [];
+        private readonly TaskCompletionSource _invocationQueued = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private bool _releaseImmediately;
+
+        public Task InvocationQueued => _invocationQueued.Task;
+
+        public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (_sync)
+            {
+                if (_releaseImmediately)
+                {
+                    action();
+                    return Task.CompletedTask;
+                }
+
+                var completion = new TaskCompletionSource(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                _queued.Add((action, completion));
+                _invocationQueued.TrySetResult();
+                return completion.Task;
+            }
+        }
+
+        public void ReleaseAll()
+        {
+            (Action Action, TaskCompletionSource Completion)[] queued;
+            lock (_sync)
+            {
+                _releaseImmediately = true;
+                queued = [.. _queued];
+                _queued.Clear();
+            }
+
+            foreach (var invocation in queued)
+            {
+                invocation.Action();
+                invocation.Completion.TrySetResult();
+            }
         }
     }
 

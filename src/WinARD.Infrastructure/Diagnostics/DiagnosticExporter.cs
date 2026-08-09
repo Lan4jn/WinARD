@@ -1,4 +1,6 @@
+using System.Globalization;
 using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
@@ -55,6 +57,113 @@ public sealed record DiagnosticExportLimits(
 public sealed class DiagnosticExporter : IDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly string[] ForbiddenFieldNameTokens =
+    [
+        "coordinate",
+        "pointerx",
+        "pointery",
+        "keysym",
+        "pixel",
+        "ciphertext",
+        "sequence",
+        "keycontent",
+        "clipboardcontent",
+    ];
+    private static readonly HashSet<string> AllowedPerformanceCounterKeys = new(StringComparer.Ordinal)
+    {
+        "Session.RefreshMode", "Session.TargetFps", "Session.ActualFps",
+        "Session.ReceiveBytesPerSecond", "Session.ResponseMilliseconds",
+        "Session.PresentationMilliseconds", "Session.InputWriteMilliseconds",
+        "Session.InputQueueDepth", "Session.PointerMovesCoalesced",
+        "Session.ReceiveRateInsideSshTunnel", "Session.AutomaticTargetChanges",
+    };
+    private static readonly HashSet<string> AllowedEncodingStatisticKeys = new(StringComparer.Ordinal)
+    {
+        "Raw", "CopyRect", "ZRLE", "DesktopSize", "Cursor",
+        "ARD.DisplayInfo", "ARD.SessionEncryption", "ARD.DisplayInfo2", "Encoding.Other",
+    };
+    private static readonly HashSet<string> AllowedProfileProtocolVersions = new(StringComparer.Ordinal)
+    {
+        "RFB 3.x", "3.3", "3.7", "3.8", "003.003", "003.007", "003.008",
+    };
+    private static readonly HashSet<string> AllowedProfileSecurityTypes = new(StringComparer.Ordinal)
+    {
+        "ARD-30", "30", "AppleRemoteDesktop",
+    };
+    private static readonly HashSet<string> AllowedDiagnosticCategories = new(StringComparer.Ordinal)
+    {
+        "InvalidRefreshRateRange",
+    };
+    private static readonly HashSet<string> AllowedConnectionStages = new(StringComparer.Ordinal)
+    {
+        "Resolving", "Connecting", "Negotiating", "Authenticating", "Initializing", "Connected",
+        "Reconnecting", "Disconnecting",
+    };
+    private static readonly HashSet<string> AllowedDiagnosticActions = new(StringComparer.Ordinal)
+    {
+        "Retry", "ReenterCredentials", "UnlockVault", "OpenHelp", "CopyCorrelationId",
+        "ExportDiagnostics", "Cancel", "Disconnect", "ReplaceHostKey", "RemoteSessionClosed",
+        "AutoFBUpdateFailed", "AutoFBUpdateSent", "Consumed", "UnknownConsumed",
+    };
+    private static readonly HashSet<string> AllowedInputKinds = new(StringComparer.Ordinal)
+    {
+        "Keyboard", "Pointer",
+    };
+    private static readonly HashSet<string> AllowedInputBoundaries = new(StringComparer.Ordinal)
+    {
+        "UiCaptured", "UiDropped", "ProtocolWriteStarted", "ProtocolWriteCompleted",
+    };
+    private static readonly HashSet<string> AllowedInputDropReasons = new(StringComparer.Ordinal)
+    {
+        "SessionClosing", "InvalidTransform",
+    };
+    private static readonly HashSet<string> AllowedProtocolFailureKinds = new(StringComparer.Ordinal)
+    {
+        "UnexpectedServerMessage", "UnsupportedEncoding", "TruncatedRead", "MalformedFramebufferUpdate",
+        "MalformedClipboard", "DecoderFailure", "MalformedArdStateChange", "RemoteSessionClosed",
+        "ArdEncryptionNegotiation", "ArdEncryptionPacket", "ArdEncryptionIntegrity", "MalformedHandshake",
+    };
+    private static readonly HashSet<string> AllowedRfbHandshakeStages = new(StringComparer.Ordinal)
+    {
+        "VersionBanner", "VersionParse", "SecurityType33", "SecurityTypeCount", "SecurityTypes",
+    };
+    private static readonly HashSet<string> AllowedPresentationStages = new(StringComparer.Ordinal)
+    {
+        "CreateDevice", "CreateTexture2D", "CreateSwapChainForComposition", "SetSwapChain", "GetBuffer",
+        "UpdateSubresource", "CopySubresourceRegion", "Present1", "RecoveryDetachSwapChain",
+        "RecoveryCreateSwapChain", "RecoverySetSwapChain", "RecoveryGetBuffer", "RecoveryPresent",
+    };
+    private static readonly HashSet<string> AllowedProtocolReadStages = new(StringComparer.Ordinal)
+    {
+        "ServerMessageType", "FramebufferHeader", "FramebufferRectangleHeader",
+        "FramebufferRectanglePayload", "ClipboardHeader", "ClipboardPayload", "ArdStateChangeHeader",
+        "ArdStateChangePayload",
+    };
+    private static readonly HashSet<string> AllowedArdEncryptionStages = new(StringComparer.Ordinal)
+    {
+        "OuterLength", "TruncatedCiphertext", "CbcDecrypt", "PlaintextTooShort", "PayloadLength",
+        "Padding", "Integrity", "StateCommit",
+    };
+    private static readonly HashSet<string> AllowedExceptionTypes = new(StringComparer.Ordinal)
+    {
+        "Exception", "InvalidOperationException", "IOException", "TimeoutException",
+        "OperationCanceledException", "TaskCanceledException", "UnauthorizedAccessException",
+        "ArgumentException", "ArgumentOutOfRangeException", "FormatException", "SocketException",
+        "TransportTimeoutException", "SessionAlreadyActiveException", "OpenSshTunnelException",
+        "OpenSshTunnelCleanupTimeoutException", "OpenSshAuthenticationUnsupportedException",
+        "SshHostKeyUnknownException", "SshHostKeyChangedException", "OpenSshSystemDirectoryException",
+        "OpenSshPlatformNotSupportedException", "OpenSshExecutableNotFoundException",
+        "OpenSshExecutableConfigurationException", "OpenSshAskPassException", "OpenSshKeyScanException",
+        "OpenSshOutputLimitExceededException", "OpenSshKeyScanProcessException",
+        "OpenSshProcessCleanupTimeoutException", "VaultConcurrencyException", "VaultFormatException",
+        "VaultLockedException", "MigrationSourceDeleteUncertainException",
+        "MigrationTargetWriteUncertainException", "ArdAuthenticationRejectedException",
+        "ArdExtendedInitializationRequiredException", "ArdControlNotAllowedException",
+        "ArdSessionCommandUnavailableException", "ArdSessionDeniedException", "ArdSessionMalformedException",
+        "RfbConnectionRejectedException", "RfbProtocolException", "UnsupportedRfbVersionException",
+        "UnsupportedSecurityTypeException", "UnsupportedSchemaVersionException",
+        "DeviceEndpointConflictException", "ConnectionFailedException", "D3DPresentationException",
+    };
     private readonly ISafeDiagnosticSink _sink;
     private readonly SecretRedactor _redactor;
     private readonly DiagnosticExportLimits _limits;
@@ -164,37 +273,35 @@ public sealed class DiagnosticExporter : IDisposable
             .ToArray();
         var profiles = context.Profiles.Take(_limits.MaxProfiles).Select(profile => new
         {
-            displayName = Safe(profile.DisplayName, privacy),
-            host = ExportHost(profile.Host, context.IncludeHosts, privacy),
+            displayName = "Remote session",
+            host = OmitProfileHost(privacy),
             profile.Port,
-            username = Safe(profile.Username, privacy),
-            protocolVersion = Safe(profile.ProtocolVersion, privacy),
-            securityType = Safe(profile.SecurityType, privacy),
+            username = (string?)null,
+            protocolVersion = ExportProfileProtocolVersion(profile.ProtocolVersion),
+            securityType = ExportProfileSecurityType(profile.SecurityType),
             encodingStatistics = profile.EncodingStatistics is null
                 ? null
-                : SafeDictionary(
+                : ExportEncodingStatistics(
                     profile.EncodingStatistics,
-                    _limits.MaxEncodingStatisticsPerProfile,
-                    privacy),
-            errorCode = Safe(profile.ErrorCode, privacy),
-            correlationId = Safe(profile.CorrelationId, privacy),
+                    _limits.MaxEncodingStatisticsPerProfile),
+            errorCode = profile.ErrorCode is null ? null : ExportEventCode(profile.ErrorCode),
+            correlationId = profile.CorrelationId is null ? null : ExportCorrelationId(profile.CorrelationId),
         }).ToArray();
         var diagnostics = new
         {
             generatedUtc = DateTimeOffset.UtcNow,
             application = new
             {
-                name = Safe(context.Application.Application, privacy),
-                version = Safe(context.Application.ApplicationVersion, privacy),
-                operatingSystem = Safe(context.Application.OperatingSystem, privacy),
-                dotNet = Safe(context.Application.DotNetVersion, privacy),
-                windowsAppSdk = Safe(context.Application.WindowsAppSdkVersion, privacy),
+                name = "WinARD",
+                version = ExportVersion(context.Application.ApplicationVersion),
+                operatingSystem = Safe(RuntimeInformation.OSDescription, privacy),
+                dotNet = Safe(RuntimeInformation.FrameworkDescription, privacy),
+                windowsAppSdk = ExportVersion(context.Application.WindowsAppSdkVersion),
             },
             profiles,
-            performanceCounters = SafeDictionary(
+            performanceCounters = ExportPerformanceCounters(
                 context.PerformanceCounters,
-                _limits.MaxPerformanceCounters,
-                privacy),
+                _limits.MaxPerformanceCounters),
             events,
         };
         var manifest = new
@@ -258,16 +365,16 @@ public sealed class DiagnosticExporter : IDisposable
         ExportPrivacyCounters privacy) => new
         {
             item.Timestamp,
-            code = Safe(item.Code, privacy),
-            correlationId = Safe(item.CorrelationId, privacy),
-            message = Safe(item.Message, privacy),
+            code = ExportEventCode(item.Code),
+            correlationId = ExportCorrelationId(item.CorrelationId),
+            message = Safe("Diagnostic event.", privacy),
             fields = ExportFields(item.Fields, includeHosts, privacy),
             exception = item.Exception is null
                 ? null
                 : new
                 {
-                    type = Safe(item.Exception.Type, privacy),
-                    hResult = Safe(item.Exception.HResult, privacy),
+                    type = ExportExceptionType(item.Exception.Type),
+                    hResult = ExportHResult(item.Exception.HResult),
                 },
         };
 
@@ -309,16 +416,16 @@ public sealed class DiagnosticExporter : IDisposable
         return consumedChars == value.Length ? value : value[..consumedChars];
     }
 
-    private Dictionary<string, TValue> SafeDictionary<TValue>(
-        IReadOnlyDictionary<string, TValue> values,
-        int maxCount,
-        ExportPrivacyCounters privacy)
+    private static Dictionary<string, long> ExportPerformanceCounters(
+        IReadOnlyDictionary<string, long> values,
+        int maxCount)
     {
-        var safe = new Dictionary<string, TValue>(StringComparer.Ordinal);
-        foreach (var pair in values.Take(maxCount))
+        var safe = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var pair in values
+                     .Where(pair => AllowedPerformanceCounterKeys.Contains(pair.Key))
+                     .Take(maxCount))
         {
-            var key = Safe(pair.Key, privacy) ?? string.Empty;
-            safe[key] = pair.Value;
+            safe[pair.Key] = pair.Value;
         }
 
         return safe;
@@ -330,30 +437,243 @@ public sealed class DiagnosticExporter : IDisposable
         ExportPrivacyCounters privacy)
     {
         var safe = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var field in values.Take(_limits.MaxFieldsPerEvent))
+        foreach (var entry in values
+                     .Select(field => MapToFinalExportEntry(field, includeHosts, privacy))
+                     .Where(static entry => entry is not null)
+                     .Take(_limits.MaxFieldsPerEvent))
         {
-            if (field.Category == DiagnosticFieldCategory.Path)
-            {
-                privacy.PathFieldsOmitted++;
-                continue;
-            }
-
-            if (field.Category == DiagnosticFieldCategory.Host)
-            {
-                var host = ExportHost(field.Value, includeHosts, privacy);
-                if (host is not null)
-                {
-                    safe[Safe(field.Name, privacy) ?? string.Empty] = host;
-                }
-
-                continue;
-            }
-
-            var key = Safe(field.Name, privacy) ?? string.Empty;
-            safe[key] = Safe(field.Value, privacy) ?? string.Empty;
+            var finalEntry = entry!.Value;
+            safe[finalEntry.Key] = finalEntry.Value;
         }
 
         return safe;
+    }
+
+    private static Dictionary<string, long> ExportEncodingStatistics(
+        IReadOnlyDictionary<string, long> values,
+        int maxCount)
+    {
+        var safe = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var pair in values.Where(pair => IsAllowedEncodingStatisticKey(pair.Key)).Take(maxCount))
+        {
+            safe[pair.Key] = pair.Value;
+        }
+
+        return safe;
+    }
+
+    private KeyValuePair<string, string>? MapToFinalExportEntry(
+        SafeDiagnosticField field,
+        bool includeHosts,
+        ExportPrivacyCounters privacy)
+    {
+        if (field.Category == DiagnosticFieldCategory.Path)
+        {
+            privacy.PathFieldsOmitted++;
+            return null;
+        }
+
+        if (field.Category is
+            DiagnosticFieldCategory.ClipboardContent or
+            DiagnosticFieldCategory.Password or
+            DiagnosticFieldCategory.Secret or
+            DiagnosticFieldCategory.PrivateKey or
+            DiagnosticFieldCategory.Credential or
+            DiagnosticFieldCategory.VaultMaster)
+        {
+            return null;
+        }
+
+        var key = field.Name switch
+        {
+            "stage" => "Stage",
+            "action" => "Action",
+            "Kind" or "Boundary" or "Count" or "Reason" or "Encrypted" or "Sampled" or
+            "Category" or "ProtocolVersion" or "ClientInit" or "ServerFlags" or "MayControl" or
+            "SessionSelectRequired" or "SessionSelectCompleted" or "RequestedMode" or "FinalState" or
+            "Status" or "Flags" or "Action" or "ProtocolFailureKind" or "RfbHandshakeStage" or
+            "ExpectedByteCount" or "ActualByteCount" or "PresentationStage" or "ProtocolReadStage" or
+            "ServerMessageType" or "EncodingId" or "RectangleIndex" or "ArdEncryptionStage" or
+            "ArdEncryptionDirection" or "securityType" or "endpoint" or "fingerprint" or
+            "oldFingerprint" or "newFingerprint" => field.Name,
+            "ArdCiphertextLength" => "ArdEncryptedPacketLength",
+            _ => null,
+        };
+        if (key is null || ContainsForbiddenToken(key))
+        {
+            return null;
+        }
+
+        if (field.Category == DiagnosticFieldCategory.Host)
+        {
+            if (key != "endpoint")
+            {
+                privacy.InvalidHostsOmitted++;
+                return null;
+            }
+
+            var host = ExportHost(field.Value, includeHosts, privacy);
+            return host is null ? null : new KeyValuePair<string, string>(key, host);
+        }
+
+        if (key == "endpoint")
+        {
+            return null;
+        }
+
+        var value = ExportFieldValue(key, field.Value);
+        return value is null ? null : new KeyValuePair<string, string>(key, value);
+    }
+
+    private static string? ExportFieldValue(string key, string value) => key switch
+    {
+        "Stage" => ExportAllowedValue(value, AllowedConnectionStages),
+        "Action" => ExportAllowedValue(value, AllowedDiagnosticActions),
+        "Kind" => ExportAllowedValue(value, AllowedInputKinds),
+        "Boundary" => ExportAllowedValue(value, AllowedInputBoundaries),
+        "Count" => ExportNonNegativeInt64(value),
+        "Reason" => ExportAllowedValue(value, AllowedInputDropReasons),
+        "Encrypted" or "Sampled" or "SessionSelectRequired" or "SessionSelectCompleted" =>
+            ExportBoolean(value),
+        "Category" => ExportAllowedValue(value, AllowedDiagnosticCategories),
+        "ProtocolVersion" => ExportProtocolVersion(value),
+        "ClientInit" => value is "0xC1" or "0x01" ? value : null,
+        "ServerFlags" => value == "NotApplicable" ? value : ExportFixedHex(value, 8),
+        "MayControl" => value == "NotApplicable" ? value : ExportBoolean(value),
+        "RequestedMode" => value is "Shared" or "StandardShared" ? value : null,
+        "FinalState" => value is "SharedControlNegotiated" or "Initialized" ? value : null,
+        "Status" => ExportNonNegativeUInt16(value),
+        "Flags" => ExportFixedHex(value, 4),
+        "ProtocolFailureKind" => ExportAllowedValue(value, AllowedProtocolFailureKinds),
+        "RfbHandshakeStage" => ExportAllowedValue(value, AllowedRfbHandshakeStages),
+        "ExpectedByteCount" or "ActualByteCount" or "RectangleIndex" or "ArdEncryptedPacketLength" =>
+            ExportNonNegativeInt32(value),
+        "PresentationStage" => ExportAllowedValue(value, AllowedPresentationStages),
+        "ProtocolReadStage" => ExportAllowedValue(value, AllowedProtocolReadStages),
+        "ServerMessageType" => ExportFixedHex(value, 2),
+        "EncodingId" => ExportInt32(value),
+        "ArdEncryptionStage" => ExportAllowedValue(value, AllowedArdEncryptionStages),
+        "ArdEncryptionDirection" => value is "Send" or "Receive" ? value : null,
+        "securityType" => value == "30" ? value : null,
+        "fingerprint" or "oldFingerprint" or "newFingerprint" => ExportFingerprint(value),
+        _ => null,
+    };
+
+    private static string? ExportAllowedValue(string value, HashSet<string> allowed) =>
+        allowed.Contains(value) ? value : null;
+
+    private static string? ExportBoolean(string value) =>
+        value is "True" or "False" ? value : null;
+
+    private static string? ExportNonNegativeInt64(string value) =>
+        long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed.ToString(CultureInfo.InvariantCulture)
+            : null;
+
+    private static string? ExportNonNegativeInt32(string value) =>
+        int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed.ToString(CultureInfo.InvariantCulture)
+            : null;
+
+    private static string? ExportNonNegativeUInt16(string value) =>
+        ushort.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed.ToString(CultureInfo.InvariantCulture)
+            : null;
+
+    private static string? ExportInt32(string value) =>
+        int.TryParse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed.ToString(CultureInfo.InvariantCulture)
+            : null;
+
+    private static string? ExportFixedHex(string value, int digits)
+    {
+        if (value.Length != digits + 2 || !value.StartsWith("0x", StringComparison.Ordinal) ||
+            !value.Skip(2).All(Uri.IsHexDigit))
+        {
+            return null;
+        }
+
+        return $"0x{value[2..].ToUpperInvariant()}";
+    }
+
+    private static string? ExportProtocolVersion(string value)
+    {
+        var components = value.Split('.');
+        return components.Length is >= 2 and <= 4 &&
+               components.All(component => component.Length is > 0 and <= 4 && component.All(char.IsAsciiDigit)) &&
+               Version.TryParse(value, out _)
+            ? value
+            : null;
+    }
+
+    private static string? ExportFingerprint(string value)
+    {
+        const string prefix = "SHA256:";
+        const int encodedLength = 43;
+        if (!value.StartsWith(prefix, StringComparison.Ordinal) ||
+            value.Length != prefix.Length + encodedLength)
+        {
+            return null;
+        }
+
+        foreach (var character in value.AsSpan(prefix.Length))
+        {
+            if (!char.IsAsciiLetterOrDigit(character) && character is not ('+' or '/'))
+            {
+                return null;
+            }
+        }
+
+        return value;
+    }
+
+    private static bool IsAllowedEncodingStatisticKey(string key) =>
+        AllowedEncodingStatisticKeys.Contains(key) ||
+        key.StartsWith("Encoding.", StringComparison.Ordinal) &&
+        int.TryParse(key.AsSpan("Encoding.".Length), out _);
+
+    private static string ExportEventCode(string code) =>
+        code.Length is > 0 and <= 64 &&
+        code.All(character => character is >= 'A' and <= 'Z' or >= '0' and <= '9' or '_') &&
+        !ContainsForbiddenToken(code)
+            ? code
+            : "DIAGNOSTIC_EVENT_OMITTED";
+
+    private static string? ExportCorrelationId(string correlationId) =>
+        Guid.TryParse(correlationId, out var parsed) ? parsed.ToString("N") : null;
+
+    private static string? ExportExceptionType(string type) =>
+        AllowedExceptionTypes.Contains(type) ? type : null;
+
+    private static string? ExportHResult(string value) =>
+        value.Length == 10 &&
+        value.StartsWith("0x", StringComparison.Ordinal) &&
+        value.Skip(2).All(Uri.IsHexDigit)
+            ? value.ToUpperInvariant().Replace("0X", "0x", StringComparison.Ordinal)
+            : null;
+
+    private static string ExportVersion(string value) =>
+        Version.TryParse(value, out var version) ? version.ToString() : "unknown";
+
+    private static string ExportProfileProtocolVersion(string value) =>
+        AllowedProfileProtocolVersions.Contains(value) ? value : "Unknown";
+
+    private static string ExportProfileSecurityType(string value) =>
+        AllowedProfileSecurityTypes.Contains(value) ? value : "Unknown";
+
+    private static string? OmitProfileHost(ExportPrivacyCounters privacy)
+    {
+        privacy.HostFieldsOmitted++;
+        return null;
+    }
+
+    private static bool ContainsForbiddenToken(string value)
+    {
+        var normalized = new string(value
+            .Where(char.IsLetterOrDigit)
+            .Select(char.ToLowerInvariant)
+            .ToArray());
+        return ForbiddenFieldNameTokens.Any(normalized.Contains);
     }
 
     private string? ExportHost(

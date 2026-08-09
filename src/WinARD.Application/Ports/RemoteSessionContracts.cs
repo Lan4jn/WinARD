@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.ObjectModel;
 
 namespace WinARD.Application.Ports;
 
@@ -11,6 +12,19 @@ public readonly record struct RemotePoint(int X, int Y);
 
 public readonly record struct RemoteRectangle(int X, int Y, int Width, int Height);
 
+public sealed record RemoteDisplayCapabilities(int? MaximumRefreshRate)
+{
+    public static RemoteDisplayCapabilities Unknown { get; } = new((int?)null);
+}
+
+public sealed record RemoteRuntimePerformanceSnapshot(
+    int InputWriteMilliseconds,
+    int InputQueueDepth,
+    long SampleSequence)
+{
+    public static RemoteRuntimePerformanceSnapshot Empty { get; } = new(0, 0, 0);
+}
+
 [Flags]
 public enum RemotePointerButtons
 {
@@ -21,6 +35,35 @@ public enum RemotePointerButtons
 }
 
 public abstract record RemoteServerMessage;
+
+public sealed record RemoteUpdateStatistics(
+    long ReceivedSessionBytes,
+    IReadOnlyDictionary<int, int> EncodingCounts)
+{
+    public static RemoteUpdateStatistics Empty { get; } = new(0, new Dictionary<int, int>());
+
+    /// <summary>
+    /// Gets bytes newly read from the underlying session stream since the previous statistics snapshot was emitted.
+    /// Non-frame server messages are carried forward to the next framebuffer statistics snapshot. Buffering and ARD
+    /// packet boundaries can shift attribution, so this is not a strict logical RFB-message wire length; totals across
+    /// consecutive snapshots remain accurate without counting bytes twice.
+    /// </summary>
+    public long ReceivedSessionBytes { get; } = ValidateReceivedSessionBytes(ReceivedSessionBytes);
+    public IReadOnlyDictionary<int, int> EncodingCounts { get; } = SnapshotEncodingCounts(EncodingCounts);
+
+    private static long ValidateReceivedSessionBytes(long receivedSessionBytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(receivedSessionBytes);
+        return receivedSessionBytes;
+    }
+
+    private static ReadOnlyDictionary<int, int> SnapshotEncodingCounts(
+        IReadOnlyDictionary<int, int> encodingCounts)
+    {
+        ArgumentNullException.ThrowIfNull(encodingCounts);
+        return new ReadOnlyDictionary<int, int>(new Dictionary<int, int>(encodingCounts));
+    }
+}
 
 public sealed class RemoteCursorUpdate : IDisposable
 {
@@ -105,11 +148,22 @@ public sealed record RemoteCursorMessage : RemoteServerMessage, IDisposable
 {
     private RemoteCursorUpdate? _cursor;
 
-    public RemoteCursorMessage(RemoteCursorUpdate cursor) =>
+    public RemoteCursorMessage(RemoteCursorUpdate cursor)
+        : this(cursor, statistics: null)
+    {
+    }
+
+    public RemoteCursorMessage(
+        RemoteCursorUpdate cursor,
+        RemoteUpdateStatistics? statistics)
+    {
         _cursor = cursor ?? throw new ArgumentNullException(nameof(cursor));
+        Statistics = statistics ?? RemoteUpdateStatistics.Empty;
+    }
 
     public RemoteCursorUpdate Cursor =>
         _cursor ?? throw new ObjectDisposedException(nameof(RemoteCursorMessage));
+    public RemoteUpdateStatistics Statistics { get; }
 
     public RemoteCursorUpdate TakeCursorOwnership() =>
         Interlocked.Exchange(ref _cursor, null) ??
@@ -129,13 +183,25 @@ public sealed record RemoteFramebufferMessage : RemoteServerMessage, IDisposable
         int stride,
         IReadOnlyList<RemoteRectangle> dirtyRectangles,
         RemoteCursorUpdate? cursor = null)
+        : this(size, bgra32, stride, dirtyRectangles, cursor, statistics: null)
+    {
+    }
+
+    public RemoteFramebufferMessage(
+        RemoteFramebufferSize size,
+        byte[] bgra32,
+        int stride,
+        IReadOnlyList<RemoteRectangle> dirtyRectangles,
+        RemoteCursorUpdate? cursor,
+        RemoteUpdateStatistics? statistics)
         : this(
             size,
             new ByteArrayMemoryOwner(bgra32 ?? throw new ArgumentNullException(nameof(bgra32))),
             bgra32.Length,
             stride,
             dirtyRectangles,
-            cursor)
+            cursor,
+            statistics)
     {
     }
 
@@ -146,6 +212,18 @@ public sealed record RemoteFramebufferMessage : RemoteServerMessage, IDisposable
         int stride,
         IReadOnlyList<RemoteRectangle> dirtyRectangles,
         RemoteCursorUpdate? cursor = null)
+        : this(size, pixels, length, stride, dirtyRectangles, cursor, statistics: null)
+    {
+    }
+
+    public RemoteFramebufferMessage(
+        RemoteFramebufferSize size,
+        IMemoryOwner<byte> pixels,
+        int length,
+        int stride,
+        IReadOnlyList<RemoteRectangle> dirtyRectangles,
+        RemoteCursorUpdate? cursor,
+        RemoteUpdateStatistics? statistics)
     {
         ArgumentNullException.ThrowIfNull(pixels);
         ArgumentNullException.ThrowIfNull(dirtyRectangles);
@@ -167,12 +245,14 @@ public sealed record RemoteFramebufferMessage : RemoteServerMessage, IDisposable
         Stride = stride;
         DirtyRectangles = dirtyRectangles;
         _cursor = cursor;
+        Statistics = statistics ?? RemoteUpdateStatistics.Empty;
     }
 
     public RemoteFramebufferSize Size { get; }
     public int Length { get; }
     public int Stride { get; }
     public IReadOnlyList<RemoteRectangle> DirtyRectangles { get; }
+    public RemoteUpdateStatistics Statistics { get; }
     public ReadOnlyMemory<byte> Bgra32 => PixelOwner.Memory[..Length];
 
     public IMemoryOwner<byte> TakePixelOwnership() =>
@@ -210,6 +290,15 @@ public interface IRemoteSessionRuntime
 {
     RemoteFramebufferSize FramebufferSize { get; }
 
+    RemoteDisplayCapabilities DisplayCapabilities => RemoteDisplayCapabilities.Unknown;
+
+    RemoteRuntimePerformanceSnapshot PerformanceSnapshot =>
+        RemoteRuntimePerformanceSnapshot.Empty;
+
+    /// <summary>
+    /// Completes only after the framebuffer update request has been written to the protocol transport.
+    /// Scheduling or client-message queue time occurs before completion.
+    /// </summary>
     ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken);
 
     ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken);

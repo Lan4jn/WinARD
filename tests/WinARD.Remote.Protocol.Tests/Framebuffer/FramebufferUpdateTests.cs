@@ -14,6 +14,68 @@ namespace WinARD.Remote.Protocol.Tests.Framebuffer;
 public sealed class FramebufferUpdateTests
 {
     [Fact]
+    public async Task Update_reports_each_rectangle_encoding_count()
+    {
+        using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);
+        var message = Update(
+            Raw(0, 0, 1, 1, [1, 2, 3, 0]),
+            CopyRect(1, 0, 1, 1, 0, 0),
+            Cursor(0, 0, 1, 1, [4, 5, 6, 0], [0x80]));
+
+        var result = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(message),
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            CancellationToken.None);
+
+        Assert.Equal(1, result.EncodingCounts[(int)RfbEncodingType.Raw]);
+        Assert.Equal(1, result.EncodingCounts[(int)RfbEncodingType.CopyRect]);
+        Assert.Equal(1, result.EncodingCounts[(int)RfbEncodingType.Cursor]);
+    }
+
+    [Fact]
+    public async Task Update_aggregates_repeated_rectangle_encodings()
+    {
+        using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);
+
+        var result = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(Update(
+                Raw(0, 0, 1, 1, [1, 2, 3, 0]),
+                Raw(1, 0, 1, 1, [4, 5, 6, 0]))),
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            CancellationToken.None);
+
+        Assert.Equal(2, result.EncodingCounts[(int)RfbEncodingType.Raw]);
+        Assert.Single(result.EncodingCounts);
+    }
+
+    [Fact]
+    public void Update_result_defensively_copies_encoding_counts()
+    {
+        var counts = new Dictionary<int, int> { [(int)RfbEncodingType.Raw] = 1 };
+        var result = new FramebufferUpdateResult([], [], null, false, counts);
+
+        counts[(int)RfbEncodingType.Raw] = 99;
+
+        Assert.Equal(1, result.EncodingCounts[(int)RfbEncodingType.Raw]);
+        var mutableView = Assert.IsAssignableFrom<IDictionary<int, int>>(result.EncodingCounts);
+        Assert.True(mutableView.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => mutableView.Add((int)RfbEncodingType.CopyRect, 1));
+    }
+
+    [Fact]
+    public void Legacy_update_result_constructor_has_immutable_empty_encoding_counts()
+    {
+        var result = new FramebufferUpdateResult([], [], null, false);
+
+        Assert.Empty(result.EncodingCounts);
+        var mutableView = Assert.IsAssignableFrom<IDictionary<int, int>>(result.EncodingCounts);
+        Assert.True(mutableView.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => mutableView.Add((int)RfbEncodingType.Raw, 1));
+    }
+
+    [Fact]
     public async Task Public_encoding_decoder_contract_decodes_canonical_raw_rectangle()
     {
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);

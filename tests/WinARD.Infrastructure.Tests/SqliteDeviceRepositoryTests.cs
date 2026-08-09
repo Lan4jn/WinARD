@@ -12,6 +12,44 @@ namespace WinARD.Infrastructure.Tests;
 
 public sealed class SqliteDeviceRepositoryTests
 {
+    public static TheoryData<FrameRefreshPolicy> RefreshPolicies =>
+    [
+        FrameRefreshPolicy.Automatic,
+        FrameRefreshPolicy.Fixed(30),
+        FrameRefreshPolicy.Fixed(120),
+        FrameRefreshPolicy.Unlimited,
+    ];
+
+    [Theory]
+    [MemberData(nameof(RefreshPolicies))]
+    public async Task Repository_round_trips_refresh_policy(FrameRefreshPolicy policy)
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user")
+            .WithFrameRefreshPolicy(policy);
+
+        await repository.SaveAsync(profile, CancellationToken.None);
+
+        Assert.Equal(policy, (await repository.GetAsync(profile.Id, CancellationToken.None))!.FrameRefreshPolicy);
+    }
+
+    [Fact]
+    public async Task Save_updates_existing_refresh_policy()
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user");
+        await repository.SaveAsync(original, CancellationToken.None);
+        var updated = original.WithFrameRefreshPolicy(FrameRefreshPolicy.Fixed(90));
+
+        await repository.SaveAsync(updated, CancellationToken.None);
+
+        Assert.Equal(
+            FrameRefreshPolicy.Fixed(90),
+            (await repository.GetAsync(original.Id, CancellationToken.None))!.FrameRefreshPolicy);
+    }
+
     [Fact]
     public async Task Saved_profile_round_trips_all_non_secret_fields_without_secret_material()
     {
@@ -89,6 +127,30 @@ public sealed class SqliteDeviceRepositoryTests
         await fixture.ExecuteAsync($"PRAGMA ignore_check_constraints=ON; UPDATE devices SET transport_mode=99 WHERE id='{profile.Id:D}';");
 
         await Assert.ThrowsAsync<InvalidDataException>(() => repository.GetAsync(profile.Id, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(99, null)]
+    [InlineData((int)FrameRefreshMode.Automatic, 30)]
+    [InlineData((int)FrameRefreshMode.Unlimited, 30)]
+    [InlineData((int)FrameRefreshMode.Fixed, null)]
+    [InlineData((int)FrameRefreshMode.Fixed, 31)]
+    public async Task Invalid_persisted_refresh_policy_is_rejected_on_read(int mode, int? framesPerSecond)
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database, new FixedTimeProvider());
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex");
+        await repository.SaveAsync(profile, CancellationToken.None);
+        var persistedFramesPerSecond = framesPerSecond?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "NULL";
+        await fixture.ExecuteAsync(
+            $"PRAGMA ignore_check_constraints=ON; UPDATE devices SET refresh_mode={mode}, refresh_fps={persistedFramesPerSecond} WHERE id='{profile.Id:D}';");
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(
+            () => repository.GetAsync(profile.Id, CancellationToken.None));
+        if (mode == (int)FrameRefreshMode.Fixed && framesPerSecond == 31)
+        {
+            Assert.IsType<ArgumentOutOfRangeException>(exception.InnerException);
+        }
     }
 
     [Fact]

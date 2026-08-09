@@ -87,4 +87,136 @@ public sealed class ConnectionProfileTests
         Assert.Null(direct.SshProfile);
     }
 
+    [Fact]
+    public void New_profile_defaults_to_automatic_refresh()
+    {
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user");
+
+        Assert.Equal(FrameRefreshPolicy.Automatic, profile.FrameRefreshPolicy);
+    }
+
+    [Theory]
+    [InlineData(30)]
+    [InlineData(45)]
+    [InlineData(60)]
+    [InlineData(75)]
+    [InlineData(90)]
+    [InlineData(105)]
+    [InlineData(120)]
+    public void Fixed_refresh_accepts_only_supported_steps(int fps)
+    {
+        Assert.Equal(fps, FrameRefreshPolicy.Fixed(fps).FixedFramesPerSecond);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(15)]
+    [InlineData(31)]
+    [InlineData(121)]
+    public void Fixed_refresh_rejects_unsupported_values(int fps) =>
+        Assert.Throws<ArgumentOutOfRangeException>(() => FrameRefreshPolicy.Fixed(fps));
+
+    [Fact]
+    public void Supported_fixed_refresh_values_are_not_exposed_as_a_mutable_array()
+    {
+        var supportedValues = FrameRefreshPolicy.SupportedFixedFramesPerSecond;
+
+        Assert.IsNotType<int[]>(supportedValues);
+        var list = Assert.IsAssignableFrom<IList<int>>(supportedValues);
+        Assert.Throws<NotSupportedException>(() => list[0] = 15);
+    }
+
+    [Fact]
+    public void Refresh_policy_modes_expose_expected_fixed_value_semantics()
+    {
+        Assert.Equal(FrameRefreshMode.Automatic, FrameRefreshPolicy.Automatic.Mode);
+        Assert.Null(FrameRefreshPolicy.Automatic.FixedFramesPerSecond);
+        Assert.Equal(FrameRefreshMode.Unlimited, FrameRefreshPolicy.Unlimited.Mode);
+        Assert.Null(FrameRefreshPolicy.Unlimited.FixedFramesPerSecond);
+
+        var fixedPolicy = FrameRefreshPolicy.Fixed(60);
+
+        Assert.Equal(FrameRefreshMode.Fixed, fixedPolicy.Mode);
+        Assert.Equal(60, fixedPolicy.FixedFramesPerSecond);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(90)]
+    public void Automatic_refresh_uses_remote_maximum(int? remoteMaximum)
+    {
+        Assert.Equal(remoteMaximum, FrameRefreshPolicy.Automatic.EffectiveMaximum(remoteMaximum));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(90)]
+    public void Unlimited_refresh_has_no_effective_maximum(int? remoteMaximum)
+    {
+        Assert.Null(FrameRefreshPolicy.Unlimited.EffectiveMaximum(remoteMaximum));
+    }
+
+    [Fact]
+    public void Fixed_refresh_without_remote_maximum_uses_fixed_value()
+    {
+        Assert.Equal(60, FrameRefreshPolicy.Fixed(60).EffectiveMaximum(null));
+    }
+
+    [Theory]
+    [InlineData(45, 45)]
+    [InlineData(90, 60)]
+    public void Fixed_refresh_with_remote_maximum_uses_lower_value(int remoteMaximum, int expectedMaximum)
+    {
+        Assert.Equal(expectedMaximum, FrameRefreshPolicy.Fixed(60).EffectiveMaximum(remoteMaximum));
+    }
+
+    [Fact]
+    public void Updating_refresh_preserves_connection_and_credentials()
+    {
+        var credential = CredentialReference.Create("windows", "mac-device-1");
+        var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user")
+            .WithCredential(credential);
+
+        var updated = original.WithFrameRefreshPolicy(FrameRefreshPolicy.Unlimited);
+
+        Assert.Equal(FrameRefreshPolicy.Unlimited, updated.FrameRefreshPolicy);
+        Assert.Equal(original.CredentialReference, updated.CredentialReference);
+        Assert.Equal(original.Host, updated.Host);
+    }
+
+    [Fact]
+    public void Updating_credential_preserves_refresh_policy()
+    {
+        var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user")
+            .WithFrameRefreshPolicy(FrameRefreshPolicy.Fixed(75));
+
+        var updated = original.WithCredential(CredentialReference.Create("windows", "mac-device-1"));
+
+        Assert.Equal(original.FrameRefreshPolicy, updated.FrameRefreshPolicy);
+    }
+
+    [Fact]
+    public void Enabling_ssh_preserves_refresh_policy()
+    {
+        var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user")
+            .WithFrameRefreshPolicy(FrameRefreshPolicy.Unlimited);
+        var ssh = SshProfile.Create("bastion", 22, "jump", null, "mac", 5900, null, null, null);
+
+        var updated = original.WithSsh(ssh);
+
+        Assert.Equal(original.FrameRefreshPolicy, updated.FrameRefreshPolicy);
+    }
+
+    [Fact]
+    public void Disabling_ssh_preserves_refresh_policy()
+    {
+        var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user")
+            .WithSsh(SshProfile.Create("bastion", 22, "jump", null, "mac", 5900, null, null, null))
+            .WithFrameRefreshPolicy(FrameRefreshPolicy.Fixed(105));
+
+        var updated = original.WithoutSsh();
+
+        Assert.Equal(original.FrameRefreshPolicy, updated.FrameRefreshPolicy);
+    }
+
 }

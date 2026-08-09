@@ -106,10 +106,10 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         command.CommandText = """
             INSERT INTO devices (
                 id, display_name, host, port, mac_username, transport_mode,
-                credential_store, credential_key, created_utc, updated_utc)
+                credential_store, credential_key, refresh_mode, refresh_fps, created_utc, updated_utc)
             VALUES (
                 $id, $display_name, $host, $port, $mac_username, $transport_mode,
-                $credential_store, $credential_key, $now, $now)
+                $credential_store, $credential_key, $refresh_mode, $refresh_fps, $now, $now)
             ON CONFLICT(id) DO UPDATE SET
                 display_name = excluded.display_name,
                 host = excluded.host,
@@ -118,6 +118,8 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
                 transport_mode = excluded.transport_mode,
                 credential_store = excluded.credential_store,
                 credential_key = excluded.credential_key,
+                refresh_mode = excluded.refresh_mode,
+                refresh_fps = excluded.refresh_fps,
                 updated_utc = excluded.updated_utc;
             """;
         command.Parameters.AddWithValue("$id", profile.Id.ToString("D"));
@@ -127,6 +129,10 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         command.Parameters.AddWithValue("$mac_username", profile.MacUsername);
         command.Parameters.AddWithValue("$transport_mode", (int)profile.TransportMode);
         AddCredentialParameters(command, "$credential_store", "$credential_key", profile.CredentialReference);
+        command.Parameters.AddWithValue("$refresh_mode", (int)profile.FrameRefreshPolicy.Mode);
+        command.Parameters.AddWithValue(
+            "$refresh_fps",
+            profile.FrameRefreshPolicy.FixedFramesPerSecond is { } framesPerSecond ? framesPerSecond : DBNull.Value);
         command.Parameters.AddWithValue("$now", now);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -192,7 +198,7 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         command.CommandText = """
             SELECT
                 d.id, d.display_name, d.host, d.port, d.mac_username, d.transport_mode,
-                d.credential_store, d.credential_key,
+                d.credential_store, d.credential_key, d.refresh_mode, d.refresh_fps,
                 s.ssh_host, s.ssh_port, s.ssh_username, s.private_key_path, s.target_host, s.target_port,
                 s.password_credential_store, s.password_credential_key,
                 s.passphrase_credential_store, s.passphrase_credential_key,
@@ -214,7 +220,7 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
             (int)TransportMode.Ssh => TransportMode.Ssh,
             _ => throw new InvalidDataException($"Unsupported persisted transport mode {transportModeValue}."),
         };
-        var hasSshProfile = !reader.IsDBNull(8);
+        var hasSshProfile = !reader.IsDBNull(10);
         if ((transportMode == TransportMode.Ssh) != hasSshProfile)
         {
             throw new InvalidDataException("Persisted transport mode does not match the SSH profile row.");
@@ -225,7 +231,8 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
             reader.GetString(1),
             reader.GetString(2),
             reader.GetInt32(3),
-            reader.GetString(4));
+            reader.GetString(4))
+            .WithFrameRefreshPolicy(ReadRefreshPolicy(reader, 8, 9));
         var macCredential = ReadCredential(reader, 6, 7);
         if (macCredential is not null)
         {
@@ -235,23 +242,23 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         if (hasSshProfile)
         {
             var ssh = SshProfile.Create(
-                    reader.GetString(8),
-                    reader.GetInt32(9),
                     reader.GetString(10),
-                    ReadNullableString(reader, 11),
+                    reader.GetInt32(11),
                     reader.GetString(12),
-                    reader.GetInt32(13),
+                    ReadNullableString(reader, 13),
+                    reader.GetString(14),
+                    reader.GetInt32(15),
                     null,
-                    ReadNullableString(reader, 18),
-                    ReadNullableString(reader, 19))
-                .WithAuthenticationCredentials(ReadCredential(reader, 14, 15), ReadCredential(reader, 16, 17));
-            if (!reader.IsDBNull(20))
+                    ReadNullableString(reader, 20),
+                    ReadNullableString(reader, 21))
+                .WithAuthenticationCredentials(ReadCredential(reader, 16, 17), ReadCredential(reader, 18, 19));
+            if (!reader.IsDBNull(22))
             {
                 ssh = ssh.WithHostKeyPin(new SshHostKeyPin(
-                    new SshHostKeyEndpoint(reader.GetString(20), reader.GetInt32(21)),
-                    reader.GetString(22),
-                    reader.GetString(23),
-                    reader.GetString(24)));
+                    new SshHostKeyEndpoint(reader.GetString(22), reader.GetInt32(23)),
+                    reader.GetString(24),
+                    reader.GetString(25),
+                    reader.GetString(26)));
             }
 
             profile = profile.WithSsh(ssh);
@@ -290,6 +297,30 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         reader.IsDBNull(storeOrdinal)
             ? null
             : CredentialReference.Create(reader.GetString(storeOrdinal), reader.GetString(keyOrdinal));
+
+    private static FrameRefreshPolicy ReadRefreshPolicy(SqliteDataReader reader, int modeOrdinal, int fpsOrdinal)
+    {
+        var mode = (FrameRefreshMode)reader.GetInt32(modeOrdinal);
+        if (mode == FrameRefreshMode.Fixed && !reader.IsDBNull(fpsOrdinal))
+        {
+            var framesPerSecond = reader.GetInt32(fpsOrdinal);
+            try
+            {
+                return FrameRefreshPolicy.Fixed(framesPerSecond);
+            }
+            catch (ArgumentOutOfRangeException exception)
+            {
+                throw new InvalidDataException("Persisted frame refresh policy is invalid.", exception);
+            }
+        }
+
+        return mode switch
+        {
+            FrameRefreshMode.Automatic when reader.IsDBNull(fpsOrdinal) => FrameRefreshPolicy.Automatic,
+            FrameRefreshMode.Unlimited when reader.IsDBNull(fpsOrdinal) => FrameRefreshPolicy.Unlimited,
+            _ => throw new InvalidDataException("Persisted frame refresh policy is invalid."),
+        };
+    }
 
     private static string? ReadNullableString(SqliteDataReader reader, int ordinal) =>
         reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);

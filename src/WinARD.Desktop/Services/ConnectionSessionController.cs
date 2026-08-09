@@ -51,6 +51,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
+        var profilesToPublish = new List<ConnectionProfile>();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -89,7 +90,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
                     async (updated, token) =>
                     {
                         await _repository.SaveAsync(updated, token).ConfigureAwait(false);
-                        ProfileUpdated?.Invoke(updated);
+                        profilesToPublish.Add(updated);
                     },
                     hostKeyPrompt,
                     cancellationToken).ConfigureAwait(false);
@@ -124,6 +125,10 @@ public sealed class ConnectionSessionController : IAsyncDisposable
         finally
         {
             _gate.Release();
+            foreach (var updated in profilesToPublish)
+            {
+                PublishProfileUpdated(updated);
+            }
         }
     }
 
@@ -156,6 +161,38 @@ public sealed class ConnectionSessionController : IAsyncDisposable
         {
             _gate.Release();
         }
+    }
+
+    public async Task<ConnectionProfile> UpdateConnectedFrameRefreshPolicyAsync(
+        FrameRefreshPolicy policy,
+        CancellationToken cancellationToken)
+    {
+        ConnectionProfile updated;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var ownership = _ownership ??
+                throw new InvalidOperationException("There is no transferred connected session to update.");
+            await ownership.EnterProfileUpdateAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                updated = ownership.Profile.WithFrameRefreshPolicy(policy);
+                await _repository.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+                ownership.UpdateProfile(updated);
+            }
+            finally
+            {
+                ownership.ExitProfileUpdate();
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        PublishProfileUpdated(updated);
+        return updated;
     }
 
     public async Task DisconnectAsync(CancellationToken cancellationToken)
@@ -215,14 +252,38 @@ public sealed class ConnectionSessionController : IAsyncDisposable
         _ = Interlocked.CompareExchange(ref _ownership, null, ownership);
         StatusMessage = "已断开。";
     }
+
+    private void PublishProfileUpdated(ConnectionProfile profile)
+    {
+        var subscribers = ProfileUpdated;
+        if (subscribers is null)
+        {
+            return;
+        }
+
+        foreach (Action<ConnectionProfile> subscriber in subscribers.GetInvocationList())
+        {
+            try
+            {
+                subscriber(profile);
+            }
+            catch (Exception)
+            {
+                // Persistence already committed; subscriber failures are isolated.
+            }
+        }
+    }
 }
 
 public sealed class ConnectedSessionOwnership : IAsyncDisposable
 {
     private readonly object _sync = new();
+    private readonly SemaphoreSlim _profileOperationGate = new(1, 1);
     private readonly RemoteSession _session;
     private readonly ActiveSessionCoordinator.ActiveSessionLease _lease;
     private readonly Action<ConnectedSessionOwnership> _disposedCallback;
+    private ConnectionProfile _profile;
+    private OwnershipState _state;
     private Task? _disposeTask;
 
     internal ConnectedSessionOwnership(
@@ -231,7 +292,7 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
         ActiveSessionCoordinator.ActiveSessionLease lease,
         Action<ConnectedSessionOwnership> disposedCallback)
     {
-        Profile = profile ?? throw new ArgumentNullException(nameof(profile));
+        _profile = profile ?? throw new ArgumentNullException(nameof(profile));
         _session = session;
         _lease = lease;
         _disposedCallback = disposedCallback;
@@ -239,7 +300,40 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
 
     public RemoteSession Session => _session;
 
-    public ConnectionProfile Profile { get; }
+    public ConnectionProfile Profile
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _profile;
+            }
+        }
+    }
+
+    internal void UpdateProfile(ConnectionProfile profile)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        lock (_sync)
+        {
+            _profile = profile;
+        }
+    }
+
+    internal async Task EnterProfileUpdateAsync(CancellationToken cancellationToken)
+    {
+        await _profileOperationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        lock (_sync)
+        {
+            if (_state != OwnershipState.Active)
+            {
+                _profileOperationGate.Release();
+                throw new ObjectDisposedException(nameof(ConnectedSessionOwnership));
+            }
+        }
+    }
+
+    internal void ExitProfileUpdate() => _profileOperationGate.Release();
 
     public ValueTask DisposeAsync()
     {
@@ -252,6 +346,19 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
+        await _profileOperationGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (_sync)
+            {
+                _state = OwnershipState.Disposing;
+            }
+        }
+        finally
+        {
+            _profileOperationGate.Release();
+        }
+
         Exception? sessionFailure = null;
         try
         {
@@ -272,6 +379,11 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
         }
         finally
         {
+            lock (_sync)
+            {
+                _state = OwnershipState.Disposed;
+            }
+
             _disposedCallback(this);
         }
 
@@ -279,6 +391,13 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
         {
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(sessionFailure).Throw();
         }
+    }
+
+    private enum OwnershipState
+    {
+        Active,
+        Disposing,
+        Disposed,
     }
 }
 

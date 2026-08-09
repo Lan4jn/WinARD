@@ -92,6 +92,257 @@ public sealed class ConnectionSessionControllerTests
     }
 
     [Fact]
+    public async Task Connected_refresh_policy_update_persists_and_updates_transferred_ownership()
+    {
+        var repository = new RecordingRepository();
+        await using var sut = Controller(
+            new TrackingTransport(),
+            new Prompt(SshHostKeyPromptDecision.Cancel),
+            repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+        ConnectionProfile? published = null;
+        sut.ProfileUpdated += profile => published = profile;
+
+        var updated = await sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(90),
+            CancellationToken.None);
+
+        Assert.Same(updated, ownership.Profile);
+        Assert.Same(updated, published);
+        Assert.Equal(FrameRefreshPolicy.Fixed(90), updated.FrameRefreshPolicy);
+        Assert.Equal([updated], repository.Saved);
+    }
+
+    [Fact]
+    public async Task Failed_connected_refresh_policy_persistence_keeps_transferred_ownership_profile()
+    {
+        var repository = new ThrowingRepository();
+        await using var sut = Controller(
+            new TrackingTransport(),
+            new Prompt(SshHostKeyPromptDecision.Cancel),
+            repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+        var previous = ownership.Profile;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            sut.UpdateConnectedFrameRefreshPolicyAsync(
+                FrameRefreshPolicy.Fixed(90),
+                CancellationToken.None));
+
+        Assert.Same(previous, ownership.Profile);
+        Assert.Equal(FrameRefreshPolicy.Automatic, ownership.Profile.FrameRefreshPolicy);
+        Assert.Equal(FrameRefreshPolicy.Fixed(90), repository.Attempted!.FrameRefreshPolicy);
+    }
+
+    [Fact]
+    public async Task Refresh_policy_update_ignores_throwing_subscriber_and_notifies_later_subscribers()
+    {
+        var repository = new RecordingRepository();
+        await using var sut = Controller(
+            new TrackingTransport(),
+            new Prompt(SshHostKeyPromptDecision.Cancel),
+            repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+        var published = new List<ConnectionProfile>();
+        sut.ProfileUpdated += _ => throw new InvalidOperationException("subscriber failure");
+        sut.ProfileUpdated += published.Add;
+
+        var updated = await sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(90),
+            CancellationToken.None);
+
+        Assert.Same(updated, ownership.Profile);
+        Assert.Equal([updated], published);
+    }
+
+    [Fact]
+    public async Task Refresh_policy_update_allows_profile_updated_subscriber_to_reenter_controller()
+    {
+        var repository = new RecordingRepository();
+        await using var sut = Controller(
+            new TrackingTransport(),
+            new Prompt(SshHostKeyPromptDecision.Cancel),
+            repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+        var reentered = false;
+        Task<ConnectionProfile>? nestedUpdate = null;
+        sut.ProfileUpdated += _ =>
+        {
+            if (reentered)
+            {
+                return;
+            }
+
+            reentered = true;
+            nestedUpdate = sut.UpdateConnectedFrameRefreshPolicyAsync(
+                FrameRefreshPolicy.Fixed(105),
+                CancellationToken.None);
+            Assert.True(nestedUpdate.IsCompletedSuccessfully);
+        };
+
+        await sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(90),
+            CancellationToken.None);
+        await nestedUpdate!.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(FrameRefreshPolicy.Fixed(105), ownership.Profile.FrameRefreshPolicy);
+        Assert.Equal(
+            [FrameRefreshPolicy.Fixed(90), FrameRefreshPolicy.Fixed(105)],
+            repository.Saved.Select(profile => profile.FrameRefreshPolicy));
+    }
+
+    [Fact]
+    public async Task Refresh_policy_update_that_enters_save_before_dispose_commits_before_disposal()
+    {
+        var repository = new BlockingFirstSaveRepository();
+        var client = new TrackingClient();
+        await using var sut = Controller(client, new ActiveSessionCoordinator(), repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        var ownership = sut.TransferConnectedSession();
+        var published = new List<ConnectionProfile>();
+        sut.ProfileUpdated += published.Add;
+
+        var update = sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(90),
+            CancellationToken.None);
+        await repository.SaveStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var dispose = ownership.DisposeAsync().AsTask();
+        var disposeCompletedBeforeCommit = dispose.IsCompleted;
+
+        repository.AllowFirstSave.TrySetResult();
+        var updated = await update.WaitAsync(TimeSpan.FromSeconds(1));
+        await dispose.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.False(disposeCompletedBeforeCommit);
+        Assert.Same(updated, ownership.Profile);
+        Assert.Equal([updated], repository.Saved);
+        Assert.Equal([updated], published);
+        Assert.Equal(1, client.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Closing_cancellation_unblocks_infinite_save_before_ownership_disposal()
+    {
+        var repository = new InfiniteCancelableSaveRepository();
+        var client = new TrackingClient();
+        await using var sut = Controller(client, new ActiveSessionCoordinator(), repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        var ownership = sut.TransferConnectedSession();
+        var published = new List<ConnectionProfile>();
+        sut.ProfileUpdated += published.Add;
+        using var saveLifetime = new CancellationTokenSource();
+
+        var update = sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(90),
+            saveLifetime.Token);
+        await repository.SaveStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        saveLifetime.Cancel();
+        var dispose = ownership.DisposeAsync().AsTask();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => update);
+        await dispose.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.True(repository.SaveCanceled.Task.IsCompletedSuccessfully);
+        Assert.Equal(1, repository.SaveCalls);
+        Assert.Empty(published);
+        Assert.Equal(1, client.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Dispose_that_starts_before_refresh_policy_update_rejects_without_saving_or_publishing()
+    {
+        var repository = new RecordingRepository();
+        var client = new BlockingDisposeClient();
+        await using var sut = Controller(client, new ActiveSessionCoordinator(), repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        var ownership = sut.TransferConnectedSession();
+        var published = new List<ConnectionProfile>();
+        sut.ProfileUpdated += published.Add;
+
+        var dispose = ownership.DisposeAsync().AsTask();
+        await client.DisposeStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Exception? updateFailure = null;
+        try
+        {
+            _ = await sut.UpdateConnectedFrameRefreshPolicyAsync(
+                FrameRefreshPolicy.Fixed(90),
+                CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            updateFailure = exception;
+        }
+
+        client.AllowDispose.TrySetResult();
+        await dispose.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.IsType<ObjectDisposedException>(updateFailure);
+        Assert.Empty(repository.Saved);
+        Assert.Empty(published);
+    }
+
+    [Fact]
+    public async Task Concurrent_refresh_policy_updates_commit_in_gate_order()
+    {
+        var repository = new BlockingFirstSaveRepository();
+        await using var sut = Controller(
+            new TrackingTransport(),
+            new Prompt(SshHostKeyPromptDecision.Cancel),
+            repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+
+        var first = sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(30),
+            CancellationToken.None);
+        await repository.SaveStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var second = sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(90),
+            CancellationToken.None);
+
+        repository.AllowFirstSave.TrySetResult();
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(
+            [FrameRefreshPolicy.Fixed(30), FrameRefreshPolicy.Fixed(90)],
+            repository.Saved.Select(profile => profile.FrameRefreshPolicy));
+        Assert.Equal(FrameRefreshPolicy.Fixed(90), ownership.Profile.FrameRefreshPolicy);
+    }
+
+    [Fact]
+    public async Task Canceled_refresh_policy_update_waiting_for_gate_does_not_save()
+    {
+        var repository = new BlockingFirstSaveRepository();
+        await using var sut = Controller(
+            new TrackingTransport(),
+            new Prompt(SshHostKeyPromptDecision.Cancel),
+            repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+
+        var first = sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(30),
+            CancellationToken.None);
+        await repository.SaveStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        using var cancellation = new CancellationTokenSource();
+        var canceled = sut.UpdateConnectedFrameRefreshPolicyAsync(
+            FrameRefreshPolicy.Fixed(90),
+            cancellation.Token);
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceled);
+        repository.AllowFirstSave.TrySetResult();
+        await first.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Single(repository.Saved);
+        Assert.Equal(FrameRefreshPolicy.Fixed(30), ownership.Profile.FrameRefreshPolicy);
+    }
+
+    [Fact]
     public async Task Controller_and_window_concurrent_close_dispose_session_once()
     {
         var client = new TrackingClient();
@@ -165,6 +416,34 @@ public sealed class ConnectionSessionControllerTests
 
         await using var ownership = sut.TransferConnectedSession();
         Assert.Equal(candidate.ToPin(), ownership.Profile.SshProfile!.HostKeyPin);
+    }
+
+    [Fact]
+    public async Task Accepted_host_key_profile_publication_is_reentrant_and_isolates_subscriber_failures()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
+        var repository = new RecordingRepository();
+        await using var sut = Controller(
+            new HostKeyUntilPinnedTransport(candidate),
+            new Prompt(SshHostKeyPromptDecision.Trust),
+            repository);
+        Task? reentrantDisconnect = null;
+        var published = new List<ConnectionProfile>();
+        sut.ProfileUpdated += _ =>
+        {
+            reentrantDisconnect = sut.DisconnectAsync(CancellationToken.None);
+            Assert.True(reentrantDisconnect.IsCompletedSuccessfully);
+        };
+        sut.ProfileUpdated += _ => throw new InvalidOperationException("subscriber failure");
+        sut.ProfileUpdated += published.Add;
+
+        await sut.ConnectAsync(SshProfileFor(endpoint), CancellationToken.None);
+        await reentrantDisconnect!.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.False(sut.IsConnected);
+        Assert.Single(repository.Saved);
+        Assert.Equal(repository.Saved, published);
     }
 
     [Theory]
@@ -429,6 +708,12 @@ public sealed class ConnectionSessionControllerTests
     private static ConnectionSessionController Controller(
         IRfbClient client,
         ActiveSessionCoordinator coordinator) =>
+        Controller(client, coordinator, new Repository());
+
+    private static ConnectionSessionController Controller(
+        IRfbClient client,
+        ActiveSessionCoordinator coordinator,
+        IDeviceRepository repository) =>
         new(
             new ConnectionAttemptWorkflow(
                 new ConnectDeviceHandler(
@@ -438,7 +723,7 @@ public sealed class ConnectionSessionControllerTests
                     new ErrorMapper()),
                 new Prompt(SshHostKeyPromptDecision.Cancel)),
             coordinator,
-            new Repository());
+            repository);
 
     private static ConnectionSessionController Controller(
         IRemoteTransportFactory transport,
@@ -557,6 +842,95 @@ public sealed class ConnectionSessionControllerTests
 
         public Task<IReadOnlyList<ConnectionProfile>> GetAllAsync(CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<ConnectionProfile>>(Saved is null ? [] : [Saved]);
+
+        public Task DeleteAsync(Guid id, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class RecordingRepository : IDeviceRepository
+    {
+        public List<ConnectionProfile> Saved { get; } = [];
+
+        public Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Saved.Add(profile);
+            return Task.CompletedTask;
+        }
+
+        public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
+            Task.FromResult(Saved.LastOrDefault(profile => profile.Id == id));
+
+        public Task<IReadOnlyList<ConnectionProfile>> GetAllAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<ConnectionProfile>>(Saved);
+
+        public Task DeleteAsync(Guid id, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class BlockingFirstSaveRepository : IDeviceRepository
+    {
+        public TaskCompletionSource SaveStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource AllowFirstSave { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<ConnectionProfile> Saved { get; } = [];
+
+        public async Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken)
+        {
+            Saved.Add(profile);
+            if (Saved.Count == 1)
+            {
+                SaveStarted.TrySetResult();
+                await AllowFirstSave.Task.WaitAsync(cancellationToken);
+            }
+        }
+
+        public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
+            Task.FromResult(Saved.LastOrDefault(profile => profile.Id == id));
+
+        public Task<IReadOnlyList<ConnectionProfile>> GetAllAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<ConnectionProfile>>(Saved);
+
+        public Task DeleteAsync(Guid id, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class InfiniteCancelableSaveRepository : IDeviceRepository
+    {
+        private int _saveCalls;
+
+        public TaskCompletionSource SaveStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource SaveCanceled { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int SaveCalls => Volatile.Read(ref _saveCalls);
+
+        public async Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken)
+        {
+            _ = Interlocked.Increment(ref _saveCalls);
+            SaveStarted.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                SaveCanceled.TrySetResult();
+                throw;
+            }
+        }
+
+        public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
+            Task.FromResult<ConnectionProfile?>(null);
+
+        public Task<IReadOnlyList<ConnectionProfile>> GetAllAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<ConnectionProfile>>([]);
 
         public Task DeleteAsync(Guid id, CancellationToken cancellationToken) => Task.CompletedTask;
 
