@@ -238,29 +238,54 @@ public static class RfbSessionInitializer
         await writer.WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task WriteSetEncodingsAsync(RfbWriter writer, CancellationToken cancellationToken)
+    public static ValueTask WriteSetEncodingsAsync(
+        Stream stream,
+        IReadOnlyList<int> encodings,
+        CancellationToken cancellationToken)
     {
-        await WriteSetEncodingsAsync(writer, RequestedEncodings, cancellationToken).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(encodings);
+        cancellationToken.ThrowIfCancellationRequested();
+        return new RfbWriter(stream).WriteMessageAsync(
+            BuildSetEncodingsMessage(encodings),
+            cancellationToken);
     }
+
+    private static Task WriteSetEncodingsAsync(RfbWriter writer, CancellationToken cancellationToken) =>
+        WriteSetEncodingsAsync(writer, RequestedEncodings, cancellationToken);
 
     private static async Task WriteSetEncodingsAsync(
         RfbWriter writer,
-        int[] encodings,
+        IReadOnlyList<int> encodings,
         CancellationToken cancellationToken)
     {
-        var message = new byte[4 + (encodings.Length * sizeof(int))];
+        await writer.WriteMessageAsync(BuildSetEncodingsMessage(encodings), cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static byte[] BuildSetEncodingsMessage(IReadOnlyList<int> encodings)
+    {
+        ArgumentNullException.ThrowIfNull(encodings);
+        if (encodings.Count > ushort.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(encodings),
+                "An RFB SetEncodings message cannot contain more than 65535 entries.");
+        }
+
+        var message = new byte[checked(4 + (encodings.Count * sizeof(int)))];
         message[0] = 2;
         BinaryPrimitives.WriteUInt16BigEndian(
             message.AsSpan(2),
-            checked((ushort)encodings.Length));
-        for (var index = 0; index < encodings.Length; index++)
+            checked((ushort)encodings.Count));
+        for (var index = 0; index < encodings.Count; index++)
         {
             BinaryPrimitives.WriteInt32BigEndian(
                 message.AsSpan(4 + (index * sizeof(int))),
                 encodings[index]);
         }
 
-        await writer.WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
+        return message;
     }
 
     private static (string Name, bool IsTruncated) CreateDisplayName(ReadOnlySpan<byte> bytes)

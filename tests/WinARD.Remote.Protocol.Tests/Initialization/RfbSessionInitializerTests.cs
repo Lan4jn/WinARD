@@ -468,6 +468,81 @@ public sealed class RfbSessionInitializerTests
     }
 
     [Fact]
+    public async Task Set_encodings_writer_preserves_signed_ids_and_order()
+    {
+        await using var stream = new MemoryStream();
+
+        await RfbSessionInitializer.WriteSetEncodingsAsync(
+            stream,
+            [16, -223, 1103, int.MinValue],
+            CancellationToken.None);
+
+        Assert.Equal(
+            Convert.FromHexString("0200000400000010FFFFFF210000044F80000000"),
+            stream.ToArray());
+    }
+
+    [Fact]
+    public async Task Set_encodings_writer_allows_empty_declaration()
+    {
+        await using var stream = new MemoryStream();
+
+        await RfbSessionInitializer.WriteSetEncodingsAsync(
+            stream,
+            Array.Empty<int>(),
+            CancellationToken.None);
+
+        Assert.Equal(new byte[] { 2, 0, 0, 0 }, stream.ToArray());
+    }
+
+    [Fact]
+    public async Task Set_encodings_writer_rejects_too_many_entries_before_writing()
+    {
+        await using var stream = new MemoryStream();
+
+        var exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            RfbSessionInitializer.WriteSetEncodingsAsync(
+                stream,
+                new int[ushort.MaxValue + 1],
+                CancellationToken.None).AsTask());
+
+        Assert.Equal("encodings", exception.ParamName);
+        Assert.Empty(stream.ToArray());
+    }
+
+    [Fact]
+    public async Task Set_encodings_writer_rejects_null_entries_before_writing()
+    {
+        await using var stream = new MemoryStream();
+
+        var exception = await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            RfbSessionInitializer.WriteSetEncodingsAsync(
+                stream,
+                null!,
+                CancellationToken.None).AsTask());
+
+        Assert.Equal("encodings", exception.ParamName);
+        Assert.Empty(stream.ToArray());
+    }
+
+    [Fact]
+    public async Task Set_encodings_writer_honors_pre_cancellation_before_writing()
+    {
+        await using var stream = new MemoryStream();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            RfbSessionInitializer.WriteSetEncodingsAsync(
+                stream,
+                [16],
+                cancellation.Token).AsTask());
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.Empty(stream.ToArray());
+    }
+
+    [Fact]
     public async Task Update_request_uses_exact_big_endian_wire_format()
     {
         await using var stream = new ScriptedDuplexStream([]);
