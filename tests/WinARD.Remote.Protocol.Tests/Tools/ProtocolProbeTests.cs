@@ -47,6 +47,76 @@ public sealed class ProtocolProbeTests
         Assert.Equal(new ProbeRequest(ProbeMode.CaptureFirstFrame, path), request);
     }
 
+    [Fact]
+    public void Probe_command_line_parses_rdm_listener()
+    {
+        Assert.True(ProbeCommandLine.TryParse(
+            ["--listen-rdm", "adaptive-default", "capture.json"],
+            out var request));
+
+        Assert.Equal(ProbeMode.ListenRdm, request.Mode);
+        Assert.Equal("adaptive-default", request.ProfileName);
+        Assert.Equal("capture.json", request.OutputPath);
+        Assert.Null(request.BaselineCapturePath);
+        Assert.Null(request.AdaptiveCapturePath);
+        Assert.False(request.SyntheticScreenConfirmed);
+    }
+
+    [Fact]
+    public void Probe_command_line_parses_rdm_capture_comparison()
+    {
+        Assert.True(ProbeCommandLine.TryParse(
+            ["--compare-rdm-captures", "full.json", "adaptive.json"],
+            out var request));
+
+        Assert.Equal(ProbeMode.CompareRdmCaptures, request.Mode);
+        Assert.Equal("full.json", request.BaselineCapturePath);
+        Assert.Equal("adaptive.json", request.AdaptiveCapturePath);
+        Assert.Null(request.OutputPath);
+        Assert.Null(request.ProfileName);
+    }
+
+    [Fact]
+    public void Probe_command_line_parses_confirmed_differential_prefix_capture()
+    {
+        Assert.True(ProbeCommandLine.TryParse(
+            [
+                "--capture-differential-prefix",
+                "full.json",
+                "adaptive.json",
+                "capture-directory",
+                "--confirm-synthetic-screen",
+            ],
+            out var request));
+
+        Assert.Equal(ProbeMode.CaptureDifferentialEncodingPrefix, request.Mode);
+        Assert.Equal("full.json", request.BaselineCapturePath);
+        Assert.Equal("adaptive.json", request.AdaptiveCapturePath);
+        Assert.Equal("capture-directory", request.OutputPath);
+        Assert.True(request.SyntheticScreenConfirmed);
+    }
+
+    [Fact]
+    public void Probe_command_line_requires_synthetic_screen_confirmation()
+    {
+        Assert.False(ProbeCommandLine.TryParse(
+            ["--capture-differential-prefix", "full.json", "adaptive.json", "capture-directory"],
+            out _));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("UPPER")]
+    [InlineData("contains space")]
+    [InlineData("contains_underscore")]
+    [InlineData("123456789012345678901234567890123")]
+    public void Probe_command_line_rejects_invalid_rdm_profile(string profile)
+    {
+        Assert.False(ProbeCommandLine.TryParse(
+            ["--listen-rdm", profile, "capture.json"],
+            out _));
+    }
+
     [Theory]
     [InlineData("--unknown")]
     [InlineData("--pointer-smoke", "extra")]
@@ -54,6 +124,12 @@ public sealed class ProtocolProbeTests
     [InlineData("--capture-first-frame", "frame.bgra", "extra")]
     [InlineData("--pointer-smoke", "--capture-first-frame", "frame.bgra")]
     [InlineData("--capture-first-frame", "frame.bgra", "--pointer-smoke")]
+    [InlineData("--listen-rdm", "adaptive-default")]
+    [InlineData("--listen-rdm", "adaptive-default", "capture.json", "extra")]
+    [InlineData("--compare-rdm-captures", "full.json")]
+    [InlineData("--compare-rdm-captures", "full.json", "adaptive.json", "extra")]
+    [InlineData("--capture-differential-prefix", "full.json", "adaptive.json", "out", "--wrong")]
+    [InlineData("--capture-differential-prefix", "full.json", "adaptive.json", "out", "--confirm-synthetic-screen", "--confirm-synthetic-screen")]
     public void Probe_command_line_rejects_invalid_arguments(params string[] args)
     {
         Assert.False(ProbeCommandLine.TryParse(args, out _));
