@@ -116,6 +116,13 @@ public static async ValueTask WriteSetEncodingsAsync(
     ArgumentNullException.ThrowIfNull(stream);
     ArgumentNullException.ThrowIfNull(encodings);
     cancellationToken.ThrowIfCancellationRequested();
+    var message = BuildSetEncodingsMessage(encodings);
+    await new RfbWriter(stream).WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
+}
+
+private static byte[] BuildSetEncodingsMessage(IReadOnlyList<int> encodings)
+{
+    ArgumentNullException.ThrowIfNull(encodings);
     if (encodings.Count > ushort.MaxValue)
     {
         throw new ArgumentOutOfRangeException(
@@ -133,11 +140,11 @@ public static async ValueTask WriteSetEncodingsAsync(
             encodings[index]);
     }
 
-    await new RfbWriter(stream).WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
+    return message;
 }
 ```
 
-删除私有方法中的重复序列化循环，现有数组通过这个入口写入。
+现有私有 `WriteSetEncodingsAsync(RfbWriter, int[], ...)` 继续负责写入既有 writer，但改为调用同一个 `BuildSetEncodingsMessage`；不得复制第二份序列化循环。
 
 - [ ] **步骤 4：增加 null、65536 项和预取消测试**
 
