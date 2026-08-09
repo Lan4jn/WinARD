@@ -1,6 +1,11 @@
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json;
 using WinARD.ProtocolProbe.RdmCapture;
+using WinARD.Remote.Protocol.Authentication;
+using WinARD.Remote.Protocol.Handshake;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -9,6 +14,145 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 
 public sealed class RdmCaptureTests
 {
+    [Fact]
+    public async Task Ard_server_handshake_accepts_real_889_client_without_retaining_authentication_response()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await using var stream = client.GetStream();
+        using var username = SecretMaterial.FromUtf8("synthetic-user");
+        using var password = SecretMaterial.FromUtf8("synthetic-password");
+
+        var negotiated = await RfbHandshake.NegotiateAsync(stream, CancellationToken.None);
+        using var authentication = await new ArdAuthenticator().AuthenticateAsync(
+            stream,
+            negotiated.Version,
+            username,
+            password,
+            CancellationToken.None);
+        await stream.WriteAsync(new byte[] { 0xC1 });
+
+        var result = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(RfbVersion.V3_889, result.Version);
+        Assert.Equal(0xC1, result.ClientInit);
+        Assert.Equal(192, result.DiscardedAuthenticationResponseBytes);
+        var propertyNames = string.Join(',', result.GetType().GetProperties().Select(property => property.Name));
+        Assert.DoesNotContain("credential", propertyNames, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("host", propertyNames, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("rawresponse", propertyNames, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(result.GetType().GetProperties(), property => property.PropertyType == typeof(byte[]));
+    }
+
+    [Fact]
+    public async Task Ard_server_handshake_rejects_unsupported_client_banner()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await using var stream = client.GetStream();
+
+        Assert.Equal("RFB 003.889\n", Encoding.ASCII.GetString(await ReadExactlyAsync(stream, 12)));
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.007\n"));
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("The RFB client version banner is not supported.", exception.Message);
+    }
+
+    [Fact]
+    public async Task Ard_server_handshake_rejects_security_selection_other_than_ard()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await using var stream = client.GetStream();
+
+        _ = await ReadExactlyAsync(stream, 12);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+        Assert.Equal(new byte[] { 1, 30 }, await ReadExactlyAsync(stream, 2));
+        await stream.WriteAsync(new byte[] { 1 });
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("The RFB client did not select Apple Remote Desktop security.", exception.Message);
+    }
+
+    [Fact]
+    public async Task Ard_server_handshake_rejects_truncated_authentication_response_without_echoing_it()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await using var stream = client.GetStream();
+
+        _ = await ReadExactlyAsync(stream, 12);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.889\n"));
+        _ = await ReadExactlyAsync(stream, 2);
+        await stream.WriteAsync(new byte[] { 30 });
+        _ = await ReadExactlyAsync(stream, 132);
+        var partialResponse = Enumerable.Repeat((byte)0xA7, 191).ToArray();
+        await stream.WriteAsync(partialResponse);
+        client.Client.Shutdown(SocketShutdown.Send);
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("The ARD authentication response was truncated.", exception.Message);
+        Assert.DoesNotContain("A7", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Ard_server_handshake_rejects_invalid_client_init()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await using var stream = client.GetStream();
+        using var username = SecretMaterial.FromUtf8("synthetic-user");
+        using var password = SecretMaterial.FromUtf8("synthetic-password");
+
+        var negotiated = await RfbHandshake.NegotiateAsync(stream, CancellationToken.None);
+        using var authentication = await new ArdAuthenticator().AuthenticateAsync(
+            stream,
+            negotiated.Version,
+            username,
+            password,
+            CancellationToken.None);
+        await stream.WriteAsync(new byte[] { 0x00 });
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("The RFB ClientInit value is not supported.", exception.Message);
+    }
+
+    [Fact]
+    public async Task Ard_server_handshake_honors_cancellation_while_reading_client_banner()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var cancellation = new CancellationTokenSource();
+        var serverTask = AcceptHandshakeAsync(listener, cancellation.Token);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await using var stream = client.GetStream();
+        _ = await ReadExactlyAsync(stream, 12);
+
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
     [Fact]
     public async Task Capture_file_round_trips_camel_case_json_without_sensitive_fields()
     {
@@ -399,4 +543,21 @@ public sealed class RdmCaptureTests
         Directory.CreateDirectory(directory);
         return directory;
     }
+
+    private static async Task<ArdProbeServerHandshakeResult> AcceptHandshakeAsync(
+        TcpListener listener,
+        CancellationToken cancellationToken)
+    {
+        using var client = await listener.AcceptTcpClientAsync(cancellationToken);
+        return await ArdProbeServerHandshake.AcceptAsync(client.GetStream(), cancellationToken);
+    }
+
+    private static async Task<byte[]> ReadExactlyAsync(Stream stream, int length)
+    {
+        var bytes = new byte[length];
+        await stream.ReadExactlyAsync(bytes);
+        return bytes;
+    }
+
+    private static int GetPort(TcpListener listener) => ((IPEndPoint)listener.LocalEndpoint).Port;
 }
