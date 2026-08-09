@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using WinARD.ProtocolProbe.RdmCapture;
 using Xunit;
@@ -122,6 +123,146 @@ public sealed class RdmCaptureTests
     }
 
     [Fact]
+    public async Task Read_rejects_files_larger_than_four_mibibytes_before_deserialization()
+    {
+        const int maximumFileLength = 4 * 1024 * 1024;
+        var directory = CreateTemporaryDirectory();
+        var path = Path.Combine(directory, "oversized.json");
+        try
+        {
+            await File.WriteAllTextAsync(path, new string(' ', maximumFileLength + 1));
+
+            var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+                RdmCaptureFile.ReadAsync(path, CancellationToken.None));
+
+            Assert.Contains(
+                maximumFileLength.ToString(CultureInfo.InvariantCulture),
+                exception.Message,
+                StringComparison.Ordinal);
+            Assert.Null(exception.InnerException);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Read_rejects_oversized_client_version()
+    {
+        await AssertInvalidCaptureAsync(CreateJson(clientVersion: new string('v', 33)));
+    }
+
+    [Fact]
+    public async Task Read_rejects_oversized_message_name()
+    {
+        var messages = $"[{{\"type\":0,\"name\":{JsonSerializer.Serialize(new string('n', 65))},\"wireLength\":1}}]";
+
+        await AssertInvalidCaptureAsync(CreateJson(messages: messages));
+    }
+
+    [Fact]
+    public async Task Read_rejects_numeric_payload_hex_larger_than_4096_characters()
+    {
+        var messages = $"[{{\"type\":0,\"name\":\"Message\",\"wireLength\":1,\"numericPayloadHex\":{JsonSerializer.Serialize(new string('A', 4098))}}}]";
+
+        await AssertInvalidCaptureAsync(CreateJson(messages: messages));
+    }
+
+    [Fact]
+    public async Task Read_rejects_non_null_sha256_that_is_not_64_uppercase_hex_characters()
+    {
+        var invalidHashes = new[]
+        {
+            string.Empty,
+            new string('A', 63),
+            new string('a', 64),
+            new string('G', 64),
+        };
+
+        foreach (var hash in invalidHashes)
+        {
+            var messages = $"[{{\"type\":0,\"name\":\"Message\",\"wireLength\":1,\"payloadSha256\":{JsonSerializer.Serialize(hash)}}}]";
+            await AssertInvalidCaptureAsync(CreateJson(messages: messages));
+        }
+    }
+
+    [Fact]
+    public void Capture_report_snapshots_source_collections()
+    {
+        var encodings = new List<int> { 0 };
+        var messages = new List<CapturedClientMessage>
+        {
+            new(3, "FramebufferUpdateRequest", 10, "0000000004000300", null),
+        };
+        var report = CreateReport(encodings: encodings, messages: messages);
+
+        encodings.Add(-309);
+        messages.Add(new CapturedClientMessage(0, "SetPixelFormat", 20, "0020", null));
+
+        Assert.Equal([0], report.Encodings);
+        Assert.Single(report.Messages);
+        Assert.IsNotType<List<int>>(report.Encodings);
+        Assert.IsNotType<List<CapturedClientMessage>>(report.Messages);
+    }
+
+    [Fact]
+    public async Task Write_serializes_the_capture_snapshot_not_mutated_source_collections()
+    {
+        var directory = CreateTemporaryDirectory();
+        var path = Path.Combine(directory, "snapshot.json");
+        var encodings = new List<int> { 0 };
+        var messages = new List<CapturedClientMessage>
+        {
+            new(3, "FramebufferUpdateRequest", 10, "0000000004000300", null),
+        };
+        var report = CreateReport(encodings: encodings, messages: messages);
+        encodings.Add(-309);
+        messages.Clear();
+
+        try
+        {
+            await RdmCaptureFile.WriteAsync(path, report, CancellationToken.None);
+
+            var restored = await RdmCaptureFile.ReadAsync(path, CancellationToken.None);
+            Assert.Equal([0], restored.Encodings);
+            Assert.Single(restored.Messages);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Write_uses_short_random_temporary_name_and_removes_it()
+    {
+        var directory = CreateTemporaryDirectory();
+        var path = Path.Combine(directory, "capture-with-a-descriptive-target-name.json");
+        var temporaryName = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var watcher = new FileSystemWatcher(directory, "*.tmp")
+        {
+            EnableRaisingEvents = true,
+        };
+        watcher.Created += (_, args) => temporaryName.TrySetResult(args.Name ?? string.Empty);
+
+        try
+        {
+            await RdmCaptureFile.WriteAsync(path, CreateReport(), CancellationToken.None);
+
+            var observedName = await temporaryName.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Matches("^\\.winard-rdm-[0-9a-f]{32}\\.tmp$", observedName);
+            Assert.DoesNotContain(Path.GetFileName(path), observedName, StringComparison.Ordinal);
+            Assert.DoesNotContain(Directory.EnumerateFiles(directory), candidate =>
+                string.Equals(Path.GetExtension(candidate), ".tmp", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Comparer_returns_the_only_distinct_signed_adaptive_encoding_in_adaptive_order()
     {
         var baseline = CreateReport(encodings: [0, -223, 16]);
@@ -202,12 +343,13 @@ public sealed class RdmCaptureTests
     private static RdmCaptureReport CreateReport(
         int schemaVersion = 1,
         string profile = "adaptive-default",
+        string clientVersion = "RFB 003.008",
         IReadOnlyList<int>? encodings = null,
         IReadOnlyList<CapturedClientMessage>? messages = null) =>
         new(
             schemaVersion,
             profile,
-            "RFB 003.008",
+            clientVersion,
             1,
             new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
             encodings ?? [0],
@@ -234,13 +376,14 @@ public sealed class RdmCaptureTests
 
     private static string CreateJson(
         string profile = "valid-profile",
+        string clientVersion = "RFB 003.008",
         string encodings = "[]",
         string messages = "[]") =>
         $$"""
         {
           "schemaVersion": 1,
           "profile": {{JsonSerializer.Serialize(profile)}},
-          "clientVersion": "RFB 003.008",
+          "clientVersion": {{JsonSerializer.Serialize(clientVersion)}},
           "clientInit": 1,
           "pixelFormat": null,
           "encodings": {{encodings}},

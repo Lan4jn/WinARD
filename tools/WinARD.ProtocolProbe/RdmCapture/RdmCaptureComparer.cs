@@ -11,6 +11,9 @@ public static class RdmCaptureComparer
         ArgumentNullException.ThrowIfNull(baseline);
         ArgumentNullException.ThrowIfNull(adaptive);
 
+        baseline = Snapshot(baseline);
+        adaptive = Snapshot(adaptive);
+
         if (baseline.SchemaVersion != adaptive.SchemaVersion)
         {
             throw new InvalidDataException(
@@ -47,4 +50,16 @@ public static class RdmCaptureComparer
 
         return adaptiveOnly[0];
     }
+
+    private static RdmCaptureReport Snapshot(RdmCaptureReport report) =>
+        new(
+            report.SchemaVersion,
+            report.Profile,
+            report.ClientVersion,
+            report.ClientInit,
+            report.PixelFormat,
+            report.Encodings,
+            report.Messages,
+            report.ReachedFramebufferRequest,
+            report.StoppedAtUnknownMessageType);
 }
