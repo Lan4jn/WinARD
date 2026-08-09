@@ -162,7 +162,8 @@ public sealed class RdmCaptureTests
 
         cancellation.Cancel();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => serverTask);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
     [Fact]
