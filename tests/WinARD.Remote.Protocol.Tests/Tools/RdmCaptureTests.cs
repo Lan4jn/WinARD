@@ -17,25 +17,27 @@ public sealed class RdmCaptureTests
     [Fact]
     public async Task Ard_server_handshake_accepts_real_889_client_without_retaining_authentication_response()
     {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cancellationToken = cancellation.Token;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        var serverTask = AcceptHandshakeAsync(listener, cancellationToken);
         using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener), cancellationToken);
         await using var stream = client.GetStream();
         using var username = SecretMaterial.FromUtf8("synthetic-user");
         using var password = SecretMaterial.FromUtf8("synthetic-password");
 
-        var negotiated = await RfbHandshake.NegotiateAsync(stream, CancellationToken.None);
+        var negotiated = await RfbHandshake.NegotiateAsync(stream, cancellationToken);
         using var authentication = await new ArdAuthenticator().AuthenticateAsync(
             stream,
             negotiated.Version,
             username,
             password,
-            CancellationToken.None);
-        await stream.WriteAsync(new byte[] { 0xC1 });
+            cancellationToken);
+        await stream.WriteAsync(new byte[] { 0xC1 }, cancellationToken);
 
-        var result = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        var result = await serverTask.WaitAsync(cancellationToken);
         Assert.Equal(RfbVersion.V3_889, result.Version);
         Assert.Equal(0xC1, result.ClientInit);
         Assert.Equal(192, result.DiscardedAuthenticationResponseBytes);
@@ -49,62 +51,70 @@ public sealed class RdmCaptureTests
     [Fact]
     public async Task Ard_server_handshake_rejects_unsupported_client_banner()
     {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cancellationToken = cancellation.Token;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        var serverTask = AcceptHandshakeAsync(listener, cancellationToken);
         using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener), cancellationToken);
         await using var stream = client.GetStream();
 
-        Assert.Equal("RFB 003.889\n", Encoding.ASCII.GetString(await ReadExactlyAsync(stream, 12)));
-        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.007\n"));
+        Assert.Equal(
+            "RFB 003.889\n",
+            Encoding.ASCII.GetString(await ReadExactlyAsync(stream, 12, cancellationToken)));
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.007\n"), cancellationToken);
 
         var exception = await Assert.ThrowsAsync<InvalidDataException>(async () =>
-            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            await serverTask.WaitAsync(cancellationToken));
         Assert.Equal("The RFB client version banner is not supported.", exception.Message);
     }
 
     [Fact]
     public async Task Ard_server_handshake_rejects_security_selection_other_than_ard()
     {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cancellationToken = cancellation.Token;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        var serverTask = AcceptHandshakeAsync(listener, cancellationToken);
         using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener), cancellationToken);
         await using var stream = client.GetStream();
 
-        _ = await ReadExactlyAsync(stream, 12);
-        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"));
-        Assert.Equal(new byte[] { 1, 30 }, await ReadExactlyAsync(stream, 2));
-        await stream.WriteAsync(new byte[] { 1 });
+        _ = await ReadExactlyAsync(stream, 12, cancellationToken);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.008\n"), cancellationToken);
+        Assert.Equal(new byte[] { 1, 30 }, await ReadExactlyAsync(stream, 2, cancellationToken));
+        await stream.WriteAsync(new byte[] { 1 }, cancellationToken);
 
         var exception = await Assert.ThrowsAsync<InvalidDataException>(async () =>
-            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            await serverTask.WaitAsync(cancellationToken));
         Assert.Equal("The RFB client did not select Apple Remote Desktop security.", exception.Message);
     }
 
     [Fact]
     public async Task Ard_server_handshake_rejects_truncated_authentication_response_without_echoing_it()
     {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cancellationToken = cancellation.Token;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        var serverTask = AcceptHandshakeAsync(listener, cancellationToken);
         using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener), cancellationToken);
         await using var stream = client.GetStream();
 
-        _ = await ReadExactlyAsync(stream, 12);
-        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.889\n"));
-        _ = await ReadExactlyAsync(stream, 2);
-        await stream.WriteAsync(new byte[] { 30 });
-        _ = await ReadExactlyAsync(stream, 132);
+        _ = await ReadExactlyAsync(stream, 12, cancellationToken);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("RFB 003.889\n"), cancellationToken);
+        _ = await ReadExactlyAsync(stream, 2, cancellationToken);
+        await stream.WriteAsync(new byte[] { 30 }, cancellationToken);
+        _ = await ReadExactlyAsync(stream, 132, cancellationToken);
         var partialResponse = Enumerable.Repeat((byte)0xA7, 191).ToArray();
-        await stream.WriteAsync(partialResponse);
+        await stream.WriteAsync(partialResponse, cancellationToken);
         client.Client.Shutdown(SocketShutdown.Send);
 
         var exception = await Assert.ThrowsAsync<InvalidDataException>(async () =>
-            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            await serverTask.WaitAsync(cancellationToken));
         Assert.Equal("The ARD authentication response was truncated.", exception.Message);
         Assert.DoesNotContain("A7", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -112,45 +122,73 @@ public sealed class RdmCaptureTests
     [Fact]
     public async Task Ard_server_handshake_rejects_invalid_client_init()
     {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cancellationToken = cancellation.Token;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var serverTask = AcceptHandshakeAsync(listener, CancellationToken.None);
+        var serverTask = AcceptHandshakeAsync(listener, cancellationToken);
         using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener), cancellationToken);
         await using var stream = client.GetStream();
         using var username = SecretMaterial.FromUtf8("synthetic-user");
         using var password = SecretMaterial.FromUtf8("synthetic-password");
 
-        var negotiated = await RfbHandshake.NegotiateAsync(stream, CancellationToken.None);
+        var negotiated = await RfbHandshake.NegotiateAsync(stream, cancellationToken);
         using var authentication = await new ArdAuthenticator().AuthenticateAsync(
             stream,
             negotiated.Version,
             username,
             password,
-            CancellationToken.None);
-        await stream.WriteAsync(new byte[] { 0x00 });
+            cancellationToken);
+        await stream.WriteAsync(new byte[] { 0x00 }, cancellationToken);
 
         var exception = await Assert.ThrowsAsync<InvalidDataException>(async () =>
-            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            await serverTask.WaitAsync(cancellationToken));
         Assert.Equal("The RFB ClientInit value is not supported.", exception.Message);
     }
 
     [Fact]
     public async Task Ard_server_handshake_honors_cancellation_while_reading_client_banner()
     {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cancellationToken = cancellation.Token;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        using var cancellation = new CancellationTokenSource();
-        var serverTask = AcceptHandshakeAsync(listener, cancellation.Token);
+        var serverTask = AcceptHandshakeAsync(listener, cancellationToken);
         using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener));
+        await client.ConnectAsync(IPAddress.Loopback, GetPort(listener), cancellationToken);
         await using var stream = client.GetStream();
-        _ = await ReadExactlyAsync(stream, 12);
+        _ = await ReadExactlyAsync(stream, 12, cancellationToken);
 
         cancellation.Cancel();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
-            await serverTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => serverTask);
+    }
+
+    [Fact]
+    public async Task Ard_server_handshake_zeroes_discarded_authentication_response_after_success()
+    {
+        var clientBytes = CreateScriptedHandshakeClientBytes(192, 0xC1);
+        await using var stream = new AuthenticationReadCaptureStream(clientBytes);
+
+        var result = await ArdProbeServerHandshake.AcceptAsync(stream, CancellationToken.None);
+
+        Assert.Equal(192, result.DiscardedAuthenticationResponseBytes);
+        Assert.True(stream.CapturedAuthenticationResponse);
+        AssertZeroed(stream.AuthenticationResponseTarget);
+    }
+
+    [Fact]
+    public async Task Ard_server_handshake_zeroes_partial_authentication_response_after_truncation()
+    {
+        var clientBytes = CreateScriptedHandshakeClientBytes(191, clientInit: null);
+        await using var stream = new AuthenticationReadCaptureStream(clientBytes);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            ArdProbeServerHandshake.AcceptAsync(stream, CancellationToken.None));
+
+        Assert.True(stream.CapturedAuthenticationResponse);
+        AssertZeroed(stream.AuthenticationResponseTarget);
     }
 
     [Fact]
@@ -552,12 +590,100 @@ public sealed class RdmCaptureTests
         return await ArdProbeServerHandshake.AcceptAsync(client.GetStream(), cancellationToken);
     }
 
-    private static async Task<byte[]> ReadExactlyAsync(Stream stream, int length)
+    private static async Task<byte[]> ReadExactlyAsync(
+        Stream stream,
+        int length,
+        CancellationToken cancellationToken)
     {
         var bytes = new byte[length];
-        await stream.ReadExactlyAsync(bytes);
+        await stream.ReadExactlyAsync(bytes, cancellationToken);
         return bytes;
     }
 
     private static int GetPort(TcpListener listener) => ((IPEndPoint)listener.LocalEndpoint).Port;
+
+    private static void AssertZeroed(ReadOnlyMemory<byte> memory)
+    {
+        Assert.Equal(192, memory.Length);
+        Assert.DoesNotContain(memory.ToArray(), value => value != 0);
+    }
+
+    private static byte[] CreateScriptedHandshakeClientBytes(int responseLength, byte? clientInit)
+    {
+        var bytes = new List<byte>(13 + responseLength + (clientInit.HasValue ? 1 : 0));
+        bytes.AddRange(Encoding.ASCII.GetBytes("RFB 003.889\n"));
+        bytes.Add(30);
+        bytes.AddRange(Enumerable.Repeat((byte)0xA7, responseLength));
+        if (clientInit.HasValue)
+        {
+            bytes.Add(clientInit.Value);
+        }
+
+        return bytes.ToArray();
+    }
+
+    private sealed class AuthenticationReadCaptureStream(byte[] clientBytes) : Stream
+    {
+        private const int AuthenticationResponseOffset = 13;
+
+        private int _position;
+
+        public bool CapturedAuthenticationResponse { get; private set; }
+
+        public Memory<byte> AuthenticationResponseTarget { get; private set; }
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => true;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() => throw new InvalidOperationException("The handshake must not flush the stream.");
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_position == AuthenticationResponseOffset && !CapturedAuthenticationResponse)
+            {
+                CapturedAuthenticationResponse = true;
+                AuthenticationResponseTarget = buffer;
+            }
+
+            var count = Math.Min(buffer.Length, clientBytes.Length - _position);
+            if (count == 0)
+            {
+                return ValueTask.FromResult(0);
+            }
+
+            clientBytes.AsMemory(_position, count).CopyTo(buffer);
+            _position += count;
+            return ValueTask.FromResult(count);
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return ValueTask.CompletedTask;
+        }
+    }
 }
