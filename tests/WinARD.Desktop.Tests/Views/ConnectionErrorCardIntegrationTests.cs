@@ -71,6 +71,104 @@ public sealed class ConnectionErrorCardIntegrationTests
     }
 
     [Fact]
+    public void RemoteSessionToolbarExposesCurrentSessionDiagnosticExport()
+    {
+        var xaml = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml"));
+        var window = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
+
+        Assert.Contains("RemoteExportDiagnosticsButton", xaml, StringComparison.Ordinal);
+        Assert.Contains("Click=\"OnExportDiagnosticsClicked\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("ExportDiagnosticsButton.IsEnabled", window, StringComparison.Ordinal);
+        Assert.Contains("ExportDiagnosticsAsync", window, StringComparison.Ordinal);
+        Assert.Contains(
+            "handlers[ConnectionErrorActionKind.ExportDiagnostics] = RunDiagnosticExportAsync;",
+            window,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "handlers[ConnectionErrorActionKind.ExportDiagnostics] = ExportDiagnosticsAsync;",
+            window,
+            StringComparison.Ordinal);
+        Assert.Contains("await RunDiagnosticExportAsync(_lifetime.Token);", window, StringComparison.Ordinal);
+        Assert.Contains("_diagnosticExportState.IsEnabled", window, StringComparison.Ordinal);
+        Assert.Contains(
+            "_diagnosticExportState.TryBeginExport(cancellationToken, out var exportToken)",
+            window,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "if (!_diagnosticExportState.IsClosing)\n            {\n                RefreshDiagnosticActionState();",
+            window,
+            StringComparison.Ordinal);
+        Assert.Contains("BeginClosingDiagnostics);", window, StringComparison.Ordinal);
+        Assert.Contains("_diagnosticExportState.BeginClosing()", window, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RemoteSessionStatusExposesAccessibleConnectionQualityIndicator()
+    {
+        var xaml = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml"));
+        var window = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Contains("RemoteConnectionQualityIndicator", xaml, StringComparison.Ordinal);
+        Assert.Contains("<Ellipse", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"QualityIndicator\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"QualityText\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("UpdateConnectionQualityVisual", window, StringComparison.Ordinal);
+        Assert.Contains(
+            "nameof(RemoteSessionViewModel.ConnectionQuality)",
+            window,
+            StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.SetName", window, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RemoteSessionToolbarSourceContractExposesRefreshPerformanceAndIndependentStatus()
+    {
+        // This is a source/XAML contract test. The test host does not instantiate a WinUI window.
+        var xaml = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml"));
+        var window = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+        var option = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "ViewModels", "FrameRefreshOption.cs"));
+
+        Assert.Contains("<CommandBar.Content>", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"FrameRateComboBox\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:DataType=\"viewModels:FrameRefreshOption\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.AutomationId=\"RemoteFrameRateComboBox\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"PerformanceText\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"FrameRateSaveStatusText\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.LiveSetting=\"Polite\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("SelectionChanged=\"OnFrameRateSelectionChanged\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("OnFrameRateSelectionChanged", window, StringComparison.Ordinal);
+        Assert.Contains("FrameRateSaveStatusText", window, StringComparison.Ordinal);
+        Assert.Contains("StatusText.SetBinding", window, StringComparison.Ordinal);
+        Assert.Contains(
+            "nameof(RemoteSessionViewModel.StatusMessage)",
+            window,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "message => StatusText.Text = message",
+            window,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "StatusText.Text = \"刷新设置",
+            window,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "nameof(RemoteSessionViewModel.SessionPerformance)",
+            window,
+            StringComparison.Ordinal);
+        Assert.Contains("\"自动\"", option, StringComparison.Ordinal);
+        Assert.Contains("\"120\"", option, StringComparison.Ordinal);
+        Assert.Contains("\"无限\"", option, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ErrorPresentationDoesNotReadRawExceptionMessage()
     {
         var files = new[]
@@ -144,11 +242,11 @@ public sealed class ConnectionErrorCardIntegrationTests
             StringComparison.Ordinal);
         Assert.Contains("retryToken => _uiOperation.RunAsync", main, StringComparison.Ordinal);
         Assert.Contains("cancellationToken: retryToken", main, StringComparison.Ordinal);
-        Assert.Contains("var effectiveProfile = ownership.Profile", main, StringComparison.Ordinal);
         Assert.Contains(
-            "ConnectProfileWithHandlingAsync(\n                            effectiveProfile,",
+            "ConnectProfileWithHandlingAsync(\n                            ownership.Profile,",
             main,
             StringComparison.Ordinal);
+        Assert.Contains("profile: ownership.Profile", main, StringComparison.Ordinal);
         Assert.DoesNotContain(
             "ConnectProfileWithHandlingAsync(\n                            profile,",
             main,

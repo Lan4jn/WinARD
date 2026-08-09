@@ -22,12 +22,25 @@ public sealed class ArdEncryptedPacketCodecTests
 
         Assert.Equal(
             Convert.FromHexString(
-                "0020E00344A9F8724BAF1ECB0759905C5B71D8CDF4E4876C6BEBC5DA7BDACCA93ADE"),
+                "0020FE2E2CACB8418991A8CDB1A23857886887970E159D647B0D7435DDE53A20E920"),
             packet);
     }
 
     [Fact]
-    public void Decrypt_accepts_digest_before_zero_padding_for_32768_byte_payload()
+    public void Decrypt_accepts_zero_padding_before_digest_for_128_byte_packet()
+    {
+        var payload = Enumerable.Range(0, 100).Select(value => (byte)value).ToArray();
+        var plaintext = BuildProtocolPlaintext(Sequence, payload);
+        var ciphertext = EncryptFixturePlaintext(plaintext);
+
+        using var decoded = ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, Sequence, ciphertext);
+
+        Assert.Equal(128, ciphertext.Length);
+        Assert.Equal(payload, decoded.Payload);
+    }
+
+    [Fact]
+    public void Decrypt_accepts_zero_padding_before_digest_for_32768_byte_payload()
     {
         var payload = Enumerable.Range(0, 32_768).Select(value => (byte)value).ToArray();
         var plaintext = BuildProtocolPlaintext(Sequence, payload);
@@ -54,7 +67,7 @@ public sealed class ArdEncryptedPacketCodecTests
     public void Decrypt_rejects_sha1_mismatch()
     {
         var plaintext = BuildProtocolPlaintext(Sequence, PointerPayload);
-        plaintext[sizeof(ushort) + PointerPayload.Length] ^= 0x01;
+        plaintext[^1] ^= 0x01;
         var ciphertext = EncryptFixturePlaintext(plaintext);
 
         var exception = Assert.Throws<RfbProtocolException>(() =>
@@ -116,11 +129,26 @@ public sealed class ArdEncryptedPacketCodecTests
             ciphertext.Length);
     }
 
+    [Theory]
+    [InlineData(32_768, 32_800)]
+    [InlineData(1_664, 1_696)]
+    public void Decrypt_accepts_authenticated_non_zero_padding(int payloadLength, int ciphertextLength)
+    {
+        var payload = Enumerable.Range(0, payloadLength).Select(value => (byte)value).ToArray();
+        var plaintext = BuildProtocolPlaintext(Sequence, payload, paddingByte: 0xA5);
+        var ciphertext = EncryptFixturePlaintext(plaintext);
+
+        using var decoded = ArdEncryptedPacketCodec.Decrypt(Key, InitialIv, Sequence, ciphertext);
+
+        Assert.Equal(ciphertextLength, ciphertext.Length);
+        Assert.Equal(payload, decoded.Payload);
+    }
+
     [Fact]
-    public void Decrypt_rejects_non_zero_trailing_padding()
+    public void Decrypt_rejects_padding_modified_after_digest_was_computed()
     {
         var plaintext = BuildProtocolPlaintext(Sequence, PointerPayload);
-        plaintext[^1] = 0x01;
+        plaintext[sizeof(ushort) + PointerPayload.Length] ^= 0x01;
         var ciphertext = EncryptFixturePlaintext(plaintext);
 
         var exception = Assert.Throws<RfbProtocolException>(() =>
@@ -128,26 +156,31 @@ public sealed class ArdEncryptedPacketCodecTests
 
         AssertFailure(
             exception,
-            RfbProtocolFailureKind.ArdEncryptionPacket,
-            ArdEncryptedPacketFailureStage.Padding,
+            RfbProtocolFailureKind.ArdEncryptionIntegrity,
+            ArdEncryptedPacketFailureStage.Integrity,
             ciphertext.Length);
     }
 
-    private static byte[] BuildProtocolPlaintext(uint sequence, ReadOnlySpan<byte> payload)
+    private static byte[] BuildProtocolPlaintext(
+        uint sequence,
+        ReadOnlySpan<byte> payload,
+        byte paddingByte = 0)
     {
         const int digestLength = 20;
         const int blockLength = 16;
-        var authenticatedLength = sizeof(ushort) + payload.Length;
-        var plaintextLength = ((authenticatedLength + digestLength + blockLength - 1) / blockLength) * blockLength;
+        var payloadEnd = sizeof(ushort) + payload.Length;
+        var plaintextLength = ((payloadEnd + digestLength + blockLength - 1) / blockLength) * blockLength;
+        var digestOffset = plaintextLength - digestLength;
         var plaintext = new byte[plaintextLength];
         BinaryPrimitives.WriteUInt16BigEndian(plaintext, checked((ushort)payload.Length));
         payload.CopyTo(plaintext.AsSpan(sizeof(ushort)));
+        plaintext.AsSpan(payloadEnd, digestOffset - payloadEnd).Fill(paddingByte);
 
-        var hashInput = new byte[sizeof(uint) + authenticatedLength];
+        var hashInput = new byte[sizeof(uint) + digestOffset];
         BinaryPrimitives.WriteUInt32BigEndian(hashInput, sequence);
-        plaintext.AsSpan(0, authenticatedLength).CopyTo(hashInput.AsSpan(sizeof(uint)));
+        plaintext.AsSpan(0, digestOffset).CopyTo(hashInput.AsSpan(sizeof(uint)));
 #pragma warning disable CA5350 // SHA-1 is required by the Apple Remote Desktop encrypted packet format.
-        _ = SHA1.HashData(hashInput, plaintext.AsSpan(authenticatedLength, digestLength));
+        _ = SHA1.HashData(hashInput, plaintext.AsSpan(digestOffset, digestLength));
 #pragma warning restore CA5350
         return plaintext;
     }

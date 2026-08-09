@@ -8,6 +8,7 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
     private readonly Func<Task> _stopSession;
     private readonly Func<Task> _closeWindow;
     private readonly Func<CancellationToken, Task>? _retryRequested;
+    private readonly Action? _closingStarted;
     private readonly CancellationTokenSource _retryCancellation = new();
     private Task? _stopTask;
     private Task? _closeWindowTask;
@@ -15,6 +16,7 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
     private Task? _disconnectTask;
     private bool _retryStarted;
     private bool _disconnectStarted;
+    private bool _closingNotified;
     private bool _disposed;
 
     public RemoteSessionWindowLifecycle(
@@ -22,7 +24,8 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
         Func<bool> hasTerminalError,
         Func<Task> stopSession,
         Func<Task> closeWindow,
-        Func<CancellationToken, Task>? retryRequested)
+        Func<CancellationToken, Task>? retryRequested,
+        Action? closingStarted = null)
     {
         _sessionCompletion = sessionCompletion ??
             throw new ArgumentNullException(nameof(sessionCompletion));
@@ -33,6 +36,7 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
         _closeWindow = closeWindow ??
             throw new ArgumentNullException(nameof(closeWindow));
         _retryRequested = retryRequested;
+        _closingStarted = closingStarted;
     }
 
     public bool IsSessionStopped
@@ -102,6 +106,7 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
         TaskCompletionSource completion;
+        var notifyClosing = false;
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -122,11 +127,13 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
             }
 
             _retryStarted = true;
+            notifyClosing = MarkClosingStartedNoLock();
             completion = new TaskCompletionSource(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             _retryTask = completion.Task;
         }
 
+        NotifyClosingStarted(notifyClosing);
         _ = CompleteRetryAsync(completion);
         return completion.Task;
     }
@@ -134,6 +141,7 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
     public Task DisconnectAsync()
     {
         TaskCompletionSource completion;
+        var notifyClosing = false;
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -143,14 +151,44 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
             }
 
             _disconnectStarted = true;
+            notifyClosing = MarkClosingStartedNoLock();
             completion = new TaskCompletionSource(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             _disconnectTask = completion.Task;
         }
 
+        NotifyClosingStarted(notifyClosing);
         _retryCancellation.Cancel();
         _ = CompleteDisconnectAsync(completion);
         return completion.Task;
+    }
+
+    private bool MarkClosingStartedNoLock()
+    {
+        if (_closingNotified)
+        {
+            return false;
+        }
+
+        _closingNotified = true;
+        return true;
+    }
+
+    private void NotifyClosingStarted(bool notify)
+    {
+        if (!notify || _closingStarted is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _closingStarted();
+        }
+        catch (Exception)
+        {
+            // A window-state notification must not prevent terminal cleanup.
+        }
     }
 
     public void Dispose()

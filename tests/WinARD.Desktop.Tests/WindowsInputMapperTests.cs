@@ -10,6 +10,32 @@ namespace WinARD.Desktop.Tests;
 public sealed class WindowsInputMapperTests
 {
     [Fact]
+    public async Task Enter_sends_x11_return_down_and_up()
+    {
+        var events = new List<(uint Keysym, bool Down)>();
+        var mapper = new WindowsInputMapper((keysym, down, _) =>
+        {
+            events.Add((keysym, down));
+            return ValueTask.CompletedTask;
+        });
+
+        await mapper.KeyDownAsync(
+            VirtualKey.Enter,
+            scanCode: 0x1c,
+            isExtended: false,
+            text: null,
+            CancellationToken.None);
+        await mapper.KeyUpAsync(
+            VirtualKey.Enter,
+            scanCode: 0x1c,
+            isExtended: false,
+            text: null,
+            CancellationToken.None);
+
+        Assert.Equal([(0xff0du, true), (0xff0du, false)], events);
+    }
+
+    [Fact]
     public async Task Control_down_then_release_all_sends_left_control_up()
     {
         var events = new List<(uint Keysym, bool Down)>();

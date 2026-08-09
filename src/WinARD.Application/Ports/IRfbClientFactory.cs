@@ -9,6 +9,20 @@ public interface IRfbClient : IAsyncDisposable
 {
     RemoteFramebufferSize FramebufferSize => default;
 
+    RemoteDisplayCapabilities DisplayCapabilities => RemoteDisplayCapabilities.Unknown;
+
+    RemoteRuntimePerformanceSnapshot PerformanceSnapshot =>
+        RemoteRuntimePerformanceSnapshot.Empty;
+
+    /// <summary>
+    /// Idempotently stops accepting new runtime writes and aborts any active scheduled write.
+    /// Implementations without background or scheduled writes may keep the default no-op behavior.
+    /// This method must not dispose protocol decoders or the underlying transport.
+    /// </summary>
+    void BeginShutdown()
+    {
+    }
+
     Task NegotiateAsync(CancellationToken cancellationToken);
 
     Task AuthenticateAsync(

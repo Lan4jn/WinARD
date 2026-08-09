@@ -16,6 +16,8 @@ public sealed class RemoteSessionRuntimeTests
         var client = new RuntimeClient
         {
             NextMessage = new RemoteClipboardMessage("remote text"),
+            DisplayCapabilities = new RemoteDisplayCapabilities(120),
+            PerformanceSnapshot = new RemoteRuntimePerformanceSnapshot(7, 2, 11),
         };
         await using var session = await ConnectAsync(client);
 
@@ -26,6 +28,8 @@ public sealed class RemoteSessionRuntimeTests
         await session.SendClipboardTextAsync("local text", CancellationToken.None);
 
         Assert.Equal(new RemoteFramebufferSize(640, 480), session.FramebufferSize);
+        Assert.Equal(120, session.DisplayCapabilities.MaximumRefreshRate);
+        Assert.Equal(new RemoteRuntimePerformanceSnapshot(7, 2, 11), session.PerformanceSnapshot);
         Assert.IsType<RemoteClipboardMessage>(message);
         Assert.True(client.LastIncremental);
         Assert.Equal((3, 12, 34), client.LastPointer);
@@ -74,6 +78,25 @@ public sealed class RemoteSessionRuntimeTests
         Assert.Equal(1, client.DisposeCount);
     }
 
+    [Fact]
+    public async Task Disconnect_stops_runtime_writes_before_transport_and_client_disposal()
+    {
+        var events = new List<string>();
+        var client = new RuntimeClient
+        {
+            BeginShutdownAction = () => events.Add("client-begin"),
+            DisposeAction = () => events.Add("client-dispose"),
+        };
+        var stream = new OrderingDisposeStream(() => events.Add("transport-dispose"));
+        var session = await ConnectAsync(client, stream);
+
+        await session.DisconnectAsync();
+
+        Assert.Equal(
+            ["client-begin", "transport-dispose", "client-dispose"],
+            events);
+    }
+
     private static async Task<RemoteSession> ConnectAsync(RuntimeClient client)
         => await ConnectAsync(client, new MemoryStream());
 
@@ -93,6 +116,10 @@ public sealed class RemoteSessionRuntimeTests
     private sealed class RuntimeClient : IRfbClient
     {
         public RemoteFramebufferSize FramebufferSize => new(640, 480);
+        public RemoteDisplayCapabilities DisplayCapabilities { get; init; } =
+            RemoteDisplayCapabilities.Unknown;
+        public RemoteRuntimePerformanceSnapshot PerformanceSnapshot { get; init; } =
+            RemoteRuntimePerformanceSnapshot.Empty;
         public RemoteServerMessage NextMessage { get; init; } =
             new RemoteFramebufferMessage(
                 new RemoteFramebufferSize(1, 1),
@@ -104,6 +131,8 @@ public sealed class RemoteSessionRuntimeTests
         public (uint Keysym, bool Down) LastKey { get; private set; }
         public string? LastClipboard { get; private set; }
         public int DisposeCount { get; private set; }
+        public Action? BeginShutdownAction { get; init; }
+        public Action? DisposeAction { get; init; }
 
         public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
@@ -130,9 +159,11 @@ public sealed class RemoteSessionRuntimeTests
             LastClipboard = text;
             return ValueTask.CompletedTask;
         }
+        public void BeginShutdown() => BeginShutdownAction?.Invoke();
         public ValueTask DisposeAsync()
         {
             DisposeCount++;
+            DisposeAction?.Invoke();
             return ValueTask.CompletedTask;
         }
     }
@@ -208,6 +239,15 @@ public sealed class RemoteSessionRuntimeTests
             }
 
             base.Dispose(disposing);
+        }
+    }
+
+    private sealed class OrderingDisposeStream(Action onDispose) : MemoryStream
+    {
+        public override ValueTask DisposeAsync()
+        {
+            onDispose();
+            return base.DisposeAsync();
         }
     }
 

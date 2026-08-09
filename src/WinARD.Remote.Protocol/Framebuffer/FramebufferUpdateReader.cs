@@ -131,6 +131,7 @@ public static class FramebufferUpdateReader
 
         var dirtyRects = new List<FramebufferRect>(rectangleCount);
         var pixelContentRects = new List<FramebufferRect>(rectangleCount);
+        var encodingCounts = new Dictionary<int, int>();
         RemoteCursor? cursor = null;
         var desktopResized = false;
         for (var index = 0; index < rectangleCount; index++)
@@ -156,6 +157,9 @@ public static class FramebufferUpdateReader
                     0,
                     RectangleIndex: index));
             }
+
+            encodingCounts.TryGetValue(encodingId, out var encodingCount);
+            encodingCounts[encodingId] = checked(encodingCount + 1);
 
             var encoding = (RfbEncodingType)encodingId;
             if (!decoders.TryGetValue(encodingId, out var decoder))
@@ -231,7 +235,12 @@ public static class FramebufferUpdateReader
             desktopResized |= previousWidth != framebuffer.Width || previousHeight != framebuffer.Height;
         }
 
-        return new FramebufferUpdateResult(dirtyRects, pixelContentRects, cursor, desktopResized);
+        return new FramebufferUpdateResult(
+            dirtyRects,
+            pixelContentRects,
+            cursor,
+            desktopResized,
+            encodingCounts);
     }
 
     private static Dictionary<int, IRfbEncodingDecoder> CreateDecoders(PixelFormat pixelFormat) =>

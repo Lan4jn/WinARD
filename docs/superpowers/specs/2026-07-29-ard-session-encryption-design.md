@@ -84,15 +84,15 @@ u16be(ciphertextLength) || AES-128-CBC(ciphertext)
 Before encryption, the packet plaintext is built as:
 
 ```text
-u16be(payloadLength) || payload || sha1[20] || zeroPadding
+u16be(payloadLength) || payload || padding || sha1[20]
 ```
 
-The digest immediately follows the declared payload. Zero padding follows the digest and extends the plaintext to the smallest multiple of 16. Payload and ciphertext lengths are bounded by protocol limits and the two-byte wire length.
+The digest occupies the final 20 bytes of the packet plaintext. Padding separates the declared payload from that final digest and extends the plaintext to the smallest multiple of 16. WinARD emits zero-filled padding, but receivers treat padding as authenticated opaque bytes because macOS does not guarantee that the bytes are zero. Payload and ciphertext lengths are bounded by protocol limits and the two-byte wire length.
 
 The digest is SHA-1 over:
 
 ```text
-u32be(directionSequence) || u16be(payloadLength) || payload
+u32be(directionSequence) || u16be(payloadLength) || payload || padding
 ```
 
 Send and receive directions maintain independent sequence counters and chaining IVs. After each packet, the next IV is the last ciphertext block from that direction. Counters begin at zero when encryption activates and increment exactly once per successfully processed packet.

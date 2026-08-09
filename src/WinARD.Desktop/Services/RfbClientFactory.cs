@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Globalization;
 using System.Runtime.ExceptionServices;
 using WinARD.Application.Ports;
+using WinARD.Desktop.Input;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Clipboard;
@@ -25,16 +26,23 @@ public sealed class RfbClientFactory(ISafeDiagnosticSink? diagnosticSink = null)
 
 internal sealed class RfbClient : IRfbClient
 {
+    private readonly object _lifecycleSync = new();
+    private readonly SessionTrafficCountingStream _traffic;
     private readonly ArdEncryptedStream _transport;
     private readonly FramebufferSnapshotFactory _snapshotFactory;
     private readonly ISafeDiagnosticSink? _diagnosticSink;
+    private readonly RemoteInputDiagnosticTracker _inputDiagnostics;
     private readonly bool _requireArdAuthentication;
+    private readonly ClientMessageScheduler _messageScheduler;
     private RfbHandshakeResult? _handshake;
     private RfbServerInit? _serverInit;
     private Framebuffer? _framebuffer;
     private FramebufferUpdateSession? _framebufferUpdates;
     private ArdAuthenticationResult? _authenticationResult;
     private ArdSessionEncryption? _sessionEncryption;
+    private Task? _disposeTask;
+    private long _lastFramebufferStatisticsBytes;
+    private bool _shutdownStarted;
     private bool _disposed;
 
     public RfbClient(
@@ -45,11 +53,14 @@ internal sealed class RfbClient : IRfbClient
         bool requireArdAuthentication = false)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        _transport = new ArdEncryptedStream(stream, ProtocolLimits.Default);
+        _traffic = new SessionTrafficCountingStream(stream, leaveOpen: true);
+        _transport = new ArdEncryptedStream(_traffic, ProtocolLimits.Default);
         _snapshotFactory = snapshotFactory ?? new FramebufferSnapshotFactory();
         _diagnosticSink = diagnosticSink;
+        _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _authenticationResult = authenticationResult;
         _requireArdAuthentication = requireArdAuthentication;
+        _messageScheduler = new ClientMessageScheduler();
     }
 
     public RemoteFramebufferSize FramebufferSize
@@ -101,11 +112,12 @@ internal sealed class RfbClient : IRfbClient
                 new RfbProtocolFailureInfo(RfbProtocolFailureKind.ArdEncryptionNegotiation));
         }
 
+        RfbServerInit serverInit;
         if (handshake.Version == RfbVersion.V3_889 && _authenticationResult is not null)
         {
             _sessionEncryption = new ArdSessionEncryption(_transport, _authenticationResult);
             _authenticationResult = null;
-            _serverInit = await RfbSessionInitializer.InitializeAsync(
+            serverInit = await RfbSessionInitializer.InitializeAsync(
                 _transport,
                 handshake,
                 ProtocolLimits.Default,
@@ -114,38 +126,70 @@ internal sealed class RfbClient : IRfbClient
         }
         else
         {
-            _serverInit = await RfbSessionInitializer.InitializeAsync(
+            serverInit = await RfbSessionInitializer.InitializeAsync(
                 _transport,
                 handshake,
                 ProtocolLimits.Default,
                 cancellationToken).ConfigureAwait(false);
         }
 
-        _framebuffer = new Framebuffer(
-            _serverInit.Width,
-            _serverInit.Height,
+        var framebuffer = new Framebuffer(
+            serverInit.Width,
+            serverInit.Height,
             ProtocolLimits.Default);
-        _framebufferUpdates = _sessionEncryption is null
-            ? FramebufferUpdateReader.CreateSession(_framebuffer, PixelFormat.WinArdBgra32)
-            : FramebufferUpdateReader.CreateSession(
-                _framebuffer,
-                PixelFormat.WinArdBgra32,
-                _sessionEncryption.CreateDecoder());
-        WriteNegotiationDiagnostic(handshake, _serverInit);
+        FramebufferUpdateSession framebufferUpdates;
+        try
+        {
+            framebufferUpdates = _sessionEncryption is null
+                ? FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32)
+                : FramebufferUpdateReader.CreateSession(
+                    framebuffer,
+                    PixelFormat.WinArdBgra32,
+                    _sessionEncryption.CreateDecoder());
+        }
+        catch
+        {
+            framebuffer.Dispose();
+            throw;
+        }
+
+        var published = false;
+        lock (_lifecycleSync)
+        {
+            if (!_shutdownStarted)
+            {
+                _serverInit = serverInit;
+                _framebuffer = framebuffer;
+                _framebufferUpdates = framebufferUpdates;
+                published = true;
+            }
+        }
+
+        if (!published)
+        {
+            await framebufferUpdates.DisposeAsync().ConfigureAwait(false);
+            framebuffer.Dispose();
+            throw new ObjectDisposedException(nameof(RfbClient));
+        }
+
+        _lastFramebufferStatisticsBytes = _traffic.BytesRead;
+        WriteNegotiationDiagnostic(handshake, serverInit);
     }
 
     public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
         var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
-        return new ValueTask(RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
-            _transport,
-            incremental,
-            0,
-            0,
-            checked((ushort)framebuffer.Width),
-            checked((ushort)framebuffer.Height),
-            cancellationToken));
+        return _messageScheduler.EnqueueBackgroundAsync(
+            token => new ValueTask(RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
+                _transport,
+                incremental,
+                0,
+                0,
+                checked((ushort)framebuffer.Width),
+                checked((ushort)framebuffer.Height),
+                token)),
+            cancellationToken);
     }
 
     public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
@@ -184,7 +228,10 @@ internal sealed class RfbClient : IRfbClient
                                 .ConfigureAwait(false);
                         }
 
-                        return _snapshotFactory.CreateServerMessage(framebuffer, update);
+                        var statistics = new RemoteUpdateStatistics(
+                            SessionBytesSinceLastFramebufferStatistics(),
+                            update.EncodingCounts);
+                        return _snapshotFactory.CreateServerMessage(framebuffer, update, statistics);
                     }
                     catch (RfbProtocolException exception)
                     {
@@ -229,10 +276,12 @@ internal sealed class RfbClient : IRfbClient
                     {
                         try
                         {
-                            await new ArdClientMessageWriter(new RfbWriter(_transport))
-                                .WriteAutoFramebufferUpdateAsync(
-                                    checked((ushort)framebuffer.Width),
-                                    checked((ushort)framebuffer.Height),
+                            await _messageScheduler.EnqueueBackgroundAsync(
+                                    token => new ArdClientMessageWriter(new RfbWriter(_transport))
+                                        .WriteAutoFramebufferUpdateAsync(
+                                            checked((ushort)framebuffer.Width),
+                                            checked((ushort)framebuffer.Height),
+                                            token),
                                     cancellationToken)
                                 .ConfigureAwait(false);
                         }
@@ -290,12 +339,24 @@ internal sealed class RfbClient : IRfbClient
             await _sessionEncryption.WaitUntilEncryptedAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await new PointerEventWriter(new RfbWriter(_transport)).WriteAsync(
-                buttons,
-                x,
-                y,
-                cancellationToken)
-            .ConfigureAwait(false);
+        await EnqueueInputAsync(async token =>
+        {
+            var encrypted = _transport.IsEncrypted;
+            _inputDiagnostics.Record(
+                RemoteInputKind.Pointer,
+                RemoteInputBoundary.ProtocolWriteStarted,
+                encrypted);
+            await new PointerEventWriter(new RfbWriter(_transport)).WriteAsync(
+                    buttons,
+                    x,
+                    y,
+                    token)
+                .ConfigureAwait(false);
+            _inputDiagnostics.Record(
+                RemoteInputKind.Pointer,
+                RemoteInputBoundary.ProtocolWriteCompleted,
+                encrypted);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask SendKeyAsync(
@@ -309,11 +370,23 @@ internal sealed class RfbClient : IRfbClient
             await _sessionEncryption.WaitUntilEncryptedAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await new KeyEventWriter(new RfbWriter(_transport)).WriteAsync(
-                down,
-                keysym,
-                cancellationToken)
-            .ConfigureAwait(false);
+        await EnqueueInputAsync(async token =>
+        {
+            var encrypted = _transport.IsEncrypted;
+            _inputDiagnostics.Record(
+                RemoteInputKind.Keyboard,
+                RemoteInputBoundary.ProtocolWriteStarted,
+                encrypted);
+            await new KeyEventWriter(new RfbWriter(_transport)).WriteAsync(
+                    down,
+                    keysym,
+                    token)
+                .ConfigureAwait(false);
+            _inputDiagnostics.Record(
+                RemoteInputKind.Keyboard,
+                RemoteInputBoundary.ProtocolWriteCompleted,
+                encrypted);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken)
@@ -324,21 +397,57 @@ internal sealed class RfbClient : IRfbClient
             await _sessionEncryption.WaitUntilEncryptedAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await new ClipboardProtocol(new RfbWriter(_transport)).WriteClientCutTextAsync(
-                text,
-                cancellationToken)
-            .ConfigureAwait(false);
+        await EnqueueBackgroundAsync(async token =>
+        {
+            await new ClipboardProtocol(new RfbWriter(_transport)).WriteClientCutTextAsync(
+                    text,
+                    token)
+                .ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
-    public async ValueTask DisposeAsync()
+    public void BeginShutdown()
     {
-        if (_disposed)
+        lock (_lifecycleSync)
         {
-            return;
+            if (_shutdownStarted)
+            {
+                return;
+            }
+
+            _shutdownStarted = true;
         }
 
-        _disposed = true;
+        _messageScheduler.AbortActiveWrites();
+    }
+
+    public RemoteDisplayCapabilities DisplayCapabilities => RemoteDisplayCapabilities.Unknown;
+
+    public RemoteRuntimePerformanceSnapshot PerformanceSnapshot =>
+        _messageScheduler.PerformanceSnapshot;
+
+    public ValueTask DisposeAsync()
+    {
+        BeginShutdown();
+        lock (_lifecycleSync)
+        {
+            _disposeTask ??= DisposeCoreAsync();
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         Exception? failure = null;
+        try
+        {
+            await _messageScheduler.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
         try
         {
             if (_framebufferUpdates is not null)
@@ -370,14 +479,52 @@ internal sealed class RfbClient : IRfbClient
         _authenticationResult?.Dispose();
         _authenticationResult = null;
         _framebuffer?.Dispose();
-        await _transport.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            await _transport.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            await _traffic.DisposeAsync().ConfigureAwait(false);
+        }
+
+        lock (_lifecycleSync)
+        {
+            _disposed = true;
+        }
+
         if (failure is not null)
         {
             ExceptionDispatchInfo.Capture(failure).Throw();
         }
     }
 
-    private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+    private void ThrowIfDisposed()
+    {
+        lock (_lifecycleSync)
+        {
+            ObjectDisposedException.ThrowIf(_shutdownStarted || _disposed, this);
+        }
+    }
+
+    private ValueTask EnqueueInputAsync(
+        Func<CancellationToken, ValueTask> write,
+        CancellationToken cancellationToken) =>
+        _messageScheduler.EnqueueInputAsync(write, cancellationToken);
+
+    private ValueTask EnqueueBackgroundAsync(
+        Func<CancellationToken, ValueTask> write,
+        CancellationToken cancellationToken) =>
+        _messageScheduler.EnqueueBackgroundAsync(write, cancellationToken);
+
+    private long SessionBytesSinceLastFramebufferStatistics()
+    {
+        var currentBytes = _traffic.BytesRead;
+        var previousBytes = Interlocked.Exchange(
+            ref _lastFramebufferStatisticsBytes,
+            currentBytes);
+        return currentBytes >= previousBytes ? currentBytes - previousBytes : 0;
+    }
 
     private void WriteNegotiationDiagnostic(RfbHandshakeResult handshake, RfbServerInit serverInit)
     {
@@ -448,7 +595,8 @@ internal sealed class FramebufferSnapshotFactory
 
     public RemoteFramebufferMessage Create(
         Framebuffer framebuffer,
-        FramebufferUpdateResult update)
+        FramebufferUpdateResult update,
+        RemoteUpdateStatistics? statistics = null)
     {
         ArgumentNullException.ThrowIfNull(framebuffer);
         ArgumentNullException.ThrowIfNull(update);
@@ -476,7 +624,8 @@ internal sealed class FramebufferSnapshotFactory
                         rectangle.Width,
                         rectangle.Height))
                     .ToArray(),
-                cursor);
+                cursor,
+                statistics);
         }
         catch
         {
@@ -488,16 +637,17 @@ internal sealed class FramebufferSnapshotFactory
 
     public RemoteServerMessage CreateServerMessage(
         Framebuffer framebuffer,
-        FramebufferUpdateResult update)
+        FramebufferUpdateResult update,
+        RemoteUpdateStatistics? statistics = null)
     {
         ArgumentNullException.ThrowIfNull(framebuffer);
         ArgumentNullException.ThrowIfNull(update);
         if (update.Cursor is not null && update.DirtyRects.Count == 0 && !update.DesktopResized)
         {
-            return new RemoteCursorMessage(CreateCursorUpdate(update.Cursor)!);
+            return new RemoteCursorMessage(CreateCursorUpdate(update.Cursor)!, statistics);
         }
 
-        return Create(framebuffer, update);
+        return Create(framebuffer, update, statistics);
     }
 
     private static RemoteCursorUpdate? CreateCursorUpdate(RemoteCursor? cursor) =>

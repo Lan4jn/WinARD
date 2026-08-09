@@ -43,6 +43,24 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
         }
     }
 
+    public RemoteDisplayCapabilities DisplayCapabilities
+    {
+        get
+        {
+            EnsureConnected();
+            return _client.DisplayCapabilities;
+        }
+    }
+
+    public RemoteRuntimePerformanceSnapshot PerformanceSnapshot
+    {
+        get
+        {
+            EnsureConnected();
+            return _client.PerformanceSnapshot;
+        }
+    }
+
     public ValueTask RequestFramebufferUpdateAsync(
         bool incremental,
         CancellationToken cancellationToken)
@@ -149,6 +167,15 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
     private async Task DisposeCoreAsync()
     {
         List<Exception>? failures = null;
+        try
+        {
+            _client.BeginShutdown();
+        }
+        catch (Exception exception)
+        {
+            AddFailure(ref failures, exception);
+        }
+
         try
         {
             await _transport.DisposeAsync().ConfigureAwait(false);

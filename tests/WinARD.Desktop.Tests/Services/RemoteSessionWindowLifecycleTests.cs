@@ -6,6 +6,8 @@ using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using Xunit;
 
+#pragma warning disable CA1707
+
 namespace WinARD.Desktop.Tests.Services;
 
 public sealed class RemoteSessionWindowLifecycleTests
@@ -48,7 +50,8 @@ public sealed class RemoteSessionWindowLifecycleTests
                 sequence.Add("open");
                 openCalls++;
                 return Task.CompletedTask;
-            });
+            },
+            () => sequence.Add("closing"));
 
         var observation = lifecycle.ObserveCompletionAsync(CancellationToken.None);
         await viewModel.StartAsync(CancellationToken.None);
@@ -65,13 +68,44 @@ public sealed class RemoteSessionWindowLifecycleTests
             lifecycle.RetryAsync(CancellationToken.None));
 
         Assert.Equal(
-            ["stop-start", "stop-complete", "close-window", "connect", "open"],
+            ["stop-start", "stop-complete", "closing", "close-window", "connect", "open"],
             sequence);
         Assert.Equal(1, stopCalls);
         Assert.Equal(1, windowCloseCalls);
         Assert.Equal(1, ownership.DisposeCount);
         Assert.Equal(1, connectCalls);
         Assert.Equal(1, openCalls);
+    }
+
+    [Fact]
+    public async Task Disconnect_notifies_closing_before_stopping_session()
+    {
+        var closing = false;
+        var stopEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStop = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var lifecycle = new RemoteSessionWindowLifecycle(
+            Task.CompletedTask,
+            () => false,
+            async () =>
+            {
+                Assert.True(closing);
+                stopEntered.TrySetResult();
+                await releaseStop.Task;
+            },
+            () => Task.CompletedTask,
+            retryRequested: null,
+            closingStarted: () => closing = true);
+
+        var disconnect = lifecycle.DisconnectAsync();
+        await stopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(closing);
+        Assert.False(disconnect.IsCompleted);
+
+        releaseStop.TrySetResult();
+        await disconnect;
     }
 
     [Fact]

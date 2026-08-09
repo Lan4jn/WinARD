@@ -26,10 +26,11 @@ internal static class ArdEncryptedPacketCodec
                 $"ARD encrypted packet payloads must not exceed {MaximumPayloadLength} bytes.");
         }
 
-        var authenticatedLength = HeaderLength + payload.Length;
-        var ciphertextLength = AlignToBlock(authenticatedLength + DigestLength);
+        var payloadEnd = HeaderLength + payload.Length;
+        var ciphertextLength = AlignToBlock(payloadEnd + DigestLength);
+        var digestOffset = ciphertextLength - DigestLength;
         var plaintext = new byte[ciphertextLength];
-        var hashInput = new byte[SequenceLength + authenticatedLength];
+        var hashInput = new byte[SequenceLength + digestOffset];
         var wire = new byte[HeaderLength + ciphertextLength];
         var keyBytes = key.ToArray();
         try
@@ -37,9 +38,9 @@ internal static class ArdEncryptedPacketCodec
             BinaryPrimitives.WriteUInt16BigEndian(plaintext, checked((ushort)payload.Length));
             payload.CopyTo(plaintext.AsSpan(HeaderLength));
             BinaryPrimitives.WriteUInt32BigEndian(hashInput, sequence);
-            plaintext.AsSpan(0, authenticatedLength).CopyTo(hashInput.AsSpan(SequenceLength));
+            plaintext.AsSpan(0, digestOffset).CopyTo(hashInput.AsSpan(SequenceLength));
 #pragma warning disable CA5350 // SHA-1 is required by the Apple Remote Desktop encrypted packet format.
-            _ = SHA1.HashData(hashInput, plaintext.AsSpan(authenticatedLength, DigestLength));
+            _ = SHA1.HashData(hashInput, plaintext.AsSpan(digestOffset, DigestLength));
 #pragma warning restore CA5350
 
             BinaryPrimitives.WriteUInt16BigEndian(wire, checked((ushort)ciphertextLength));
@@ -107,9 +108,9 @@ internal static class ArdEncryptedPacketCodec
             }
 
             var payloadLength = BinaryPrimitives.ReadUInt16BigEndian(plaintext);
+            var digestOffset = plaintext.Length - DigestLength;
             var payloadEnd = HeaderLength + payloadLength;
-            var digestEnd = payloadEnd + DigestLength;
-            if (digestEnd > plaintext.Length)
+            if (payloadEnd > digestOffset)
             {
                 throw PacketFailure(
                     "ARD encrypted packet payload length exceeds the decrypted packet.",
@@ -119,26 +120,16 @@ internal static class ArdEncryptedPacketCodec
                     ciphertext.Length);
             }
 
-            if (plaintext.AsSpan(digestEnd).ContainsAnyExcept((byte)0))
-            {
-                throw PacketFailure(
-                    "ARD encrypted packet padding is invalid.",
-                    RfbProtocolFailureKind.ArdEncryptionPacket,
-                    ArdEncryptedPacketFailureStage.Padding,
-                    sequence,
-                    ciphertext.Length);
-            }
-
-            hashInput = new byte[SequenceLength + payloadEnd];
+            hashInput = new byte[SequenceLength + digestOffset];
             BinaryPrimitives.WriteUInt32BigEndian(hashInput, sequence);
-            plaintext.AsSpan(0, payloadEnd).CopyTo(hashInput.AsSpan(SequenceLength));
+            plaintext.AsSpan(0, digestOffset).CopyTo(hashInput.AsSpan(SequenceLength));
             Span<byte> expectedDigest = stackalloc byte[DigestLength];
 #pragma warning disable CA5350 // SHA-1 is required by the Apple Remote Desktop encrypted packet format.
             _ = SHA1.HashData(hashInput, expectedDigest);
 #pragma warning restore CA5350
             if (!CryptographicOperations.FixedTimeEquals(
                     expectedDigest,
-                    plaintext.AsSpan(payloadEnd, DigestLength)))
+                    plaintext.AsSpan(digestOffset, DigestLength)))
             {
                 throw PacketFailure(
                     "ARD encrypted packet integrity validation failed.",

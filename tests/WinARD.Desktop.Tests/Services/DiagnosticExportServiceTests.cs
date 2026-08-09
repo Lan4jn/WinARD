@@ -95,6 +95,24 @@ public sealed class DiagnosticExportServiceTests : IDisposable
             service.ExportForTestAsync(DiagnosticExportContext.Empty, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task CancellationWhilePickerIsOpenEndsTheExportPromptlyAndReleasesTheGate()
+    {
+        var picker = new CancellationAwarePicker();
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
+        using var service = new DiagnosticExportService(exporter, picker);
+        using var cancellation = new CancellationTokenSource();
+
+        var export = service.ExportForTestAsync(DiagnosticExportContext.Empty, cancellation.Token);
+        await picker.Entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await export.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Null(await service.ExportForTestAsync(DiagnosticExportContext.Empty, CancellationToken.None));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directory))
@@ -127,6 +145,25 @@ public sealed class DiagnosticExportServiceTests : IDisposable
             Calls++;
             Entered.TrySetResult();
             return Release.Task;
+        }
+    }
+
+    private sealed class CancellationAwarePicker : IDiagnosticSavePicker
+    {
+        private int _calls;
+        public TaskCompletionSource Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<string?> PickPathAsync(Window? owner, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _calls) > 1)
+            {
+                return null;
+            }
+
+            Entered.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return null;
         }
     }
 }
