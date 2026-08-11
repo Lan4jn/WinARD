@@ -35,7 +35,13 @@ public static class EncodingPrefixCaptureFile
 
         ArgumentException.ThrowIfNullOrWhiteSpace(outputDirectory);
         ArgumentNullException.ThrowIfNull(capture);
-        var snapshot = capture with { PayloadPrefix = capture.PayloadPrefix?.ToArray()! };
+        var snapshot = new EncodingPrefixCapture(
+            capture.SchemaVersion,
+            capture.EncodingId,
+            capture.Rectangle,
+            capture.PrefixLength,
+            capture.PayloadSha256,
+            capture.PayloadPrefix);
         Validate(snapshot);
         cancellationToken.ThrowIfCancellationRequested();
         EnsureDestinationAvailable(outputDirectory);

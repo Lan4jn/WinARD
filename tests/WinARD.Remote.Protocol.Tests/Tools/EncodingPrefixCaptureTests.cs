@@ -1,13 +1,19 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
+using System.Numerics;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using WinARD.ProtocolProbe;
 using WinARD.ProtocolProbe.EncodingResearch;
 using WinARD.ProtocolProbe.RdmCapture;
+using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
+using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
+using WinARD.Remote.Protocol.Framebuffer;
+using WinARD.Remote.Protocol.Handshake;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -17,6 +23,34 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 public sealed class EncodingPrefixCaptureTests
 {
     private const int CandidateEncoding = 12345;
+
+    [Fact]
+    public void Capture_snapshots_the_constructor_payload()
+    {
+        var source = new byte[] { 1, 2, 3, 4 };
+        var capture = CreateCapture(source);
+
+        source[0] = 99;
+
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, capture.PayloadPrefix);
+        Assert.Equal(
+            Convert.ToHexString(SHA256.HashData(new byte[] { 1, 2, 3, 4 })),
+            capture.PayloadSha256);
+    }
+
+    [Fact]
+    public void Capture_payload_getter_does_not_expose_internal_storage()
+    {
+        var capture = CreateCapture([1, 2, 3, 4]);
+        var exposed = capture.PayloadPrefix;
+
+        exposed[0] = 99;
+
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, capture.PayloadPrefix);
+        Assert.Equal(
+            Convert.ToHexString(SHA256.HashData(capture.PayloadPrefix)),
+            capture.PayloadSha256);
+    }
 
     [Fact]
     public async Task Reader_captures_candidate_rectangle_length_and_payload_prefix()
@@ -334,6 +368,74 @@ public sealed class EncodingPrefixCaptureTests
         }
     }
 
+    [Fact]
+    public async Task Runner_completes_encrypted_loopback_capture_in_protocol_order()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-success-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var baselinePath = Path.Combine(directory, "baseline.json");
+        var adaptivePath = Path.Combine(directory, "adaptive.json");
+        var outputDirectory = Path.Combine(directory, "output");
+        var expectedPrefix = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray();
+        await RdmCaptureFile.WriteAsync(baselinePath, CreateRdmReport([0]), CancellationToken.None);
+        await RdmCaptureFile.WriteAsync(
+            adaptivePath,
+            CreateRdmReport([0, CandidateEncoding]),
+            CancellationToken.None);
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var hardTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        var serverTask = RunEncryptedCaptureServerAsync(
+            listener,
+            CandidateEncoding,
+            expectedPrefix,
+            hardTimeout.Token);
+        using var username = SecretMaterial.FromUtf8("synthetic-user");
+        using var password = SecretMaterial.FromUtf8("synthetic-password");
+        try
+        {
+            var runTask = new EncodingPrefixCaptureRunner(TimeSpan.FromSeconds(5)).RunAsync(
+                IPAddress.Loopback.ToString(),
+                ((IPEndPoint)listener.LocalEndpoint).Port,
+                username,
+                password,
+                baselinePath,
+                adaptivePath,
+                outputDirectory,
+                syntheticScreenConfirmed: true,
+                hardTimeout.Token);
+
+            await Task.WhenAll(serverTask, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            var capture = await runTask;
+
+            Assert.Equal(1, await serverTask);
+            Assert.Equal(CandidateEncoding, capture.EncodingId);
+            Assert.Equal(new CapturedRectangle(0, 0, 4, 2), capture.Rectangle);
+            Assert.Equal(expectedPrefix, capture.PayloadPrefix);
+            Assert.Equal(Convert.ToHexString(SHA256.HashData(expectedPrefix)), capture.PayloadSha256);
+            Assert.Equal(
+                ["manifest.json", "payload-prefix.bin"],
+                Directory.GetFiles(outputDirectory)
+                    .Select(path => Path.GetFileName(path)!)
+                    .Order()
+                    .ToArray());
+            Assert.Equal(
+                expectedPrefix,
+                await File.ReadAllBytesAsync(
+                    Path.Combine(outputDirectory, "payload-prefix.bin"),
+                    hardTimeout.Token));
+            var manifest = await File.ReadAllTextAsync(
+                Path.Combine(outputDirectory, "manifest.json"),
+                hardTimeout.Token);
+            Assert.Contains(capture.PayloadSha256, manifest, StringComparison.Ordinal);
+        }
+        finally
+        {
+            listener.Stop();
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static EncodingPrefixCapture CreateCapture(byte[] payload) =>
         new(
             1,
@@ -355,12 +457,17 @@ public sealed class EncodingPrefixCaptureTests
             true,
             null);
 
-    private static byte[] CreateUpdate(int encodingId, byte[] payload, bool includeLength = true)
+    private static byte[] CreateUpdate(
+        int encodingId,
+        byte[] payload,
+        bool includeLength = true,
+        ushort width = 1920,
+        ushort height = 1080)
     {
         var bytes = new byte[checked(4 + 12 + (includeLength ? 4 : 0) + payload.Length)];
         bytes[3] = 1;
-        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(8), 1920);
-        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(10), 1080);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(8), width);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(10), height);
         BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(12), encodingId);
         var offset = 16;
         if (includeLength)
@@ -371,6 +478,204 @@ public sealed class EncodingPrefixCaptureTests
 
         payload.CopyTo(bytes, offset);
         return bytes;
+    }
+
+    private static async Task<int> RunEncryptedCaptureServerAsync(
+        TcpListener listener,
+        int candidateEncodingId,
+        byte[] payloadPrefix,
+        CancellationToken cancellationToken)
+    {
+        using var client = await listener.AcceptTcpClientAsync(cancellationToken);
+        await using var stream = client.GetStream();
+        var banner = Encoding.ASCII.GetBytes("RFB 003.889\n");
+        await stream.WriteAsync(banner, cancellationToken);
+        Assert.Equal(banner, await ReadExactlyAsync(stream, banner.Length, cancellationToken));
+        await stream.WriteAsync(
+            new byte[] { 1, (byte)RfbSecurityType.AppleRemoteDesktop },
+            cancellationToken);
+        Assert.Equal(
+            new byte[] { (byte)RfbSecurityType.AppleRemoteDesktop },
+            await ReadExactlyAsync(stream, 1, cancellationToken));
+
+        var modulus = Convert.FromHexString(
+            "D2652EF10104A3DDC1219700EDFBD1E19F7678B4A4F6D5952634BD8BF1D60326322B5D32366DC25CB4E8E73AF4312A70D2DCAF2747EB89D7E88553EECD6A283D");
+        var prime = new BigInteger(modulus, isUnsigned: true, isBigEndian: true);
+        var serverPublic = ToFixedWidth(
+            BigInteger.ModPow(new BigInteger(5), new BigInteger(3), prime),
+            modulus.Length);
+        var challenge = new byte[4 + (2 * modulus.Length)];
+        BinaryPrimitives.WriteUInt16BigEndian(challenge, 5);
+        BinaryPrimitives.WriteUInt16BigEndian(challenge.AsSpan(2), checked((ushort)modulus.Length));
+        modulus.CopyTo(challenge, 4);
+        serverPublic.CopyTo(challenge, 4 + modulus.Length);
+        await stream.WriteAsync(challenge, cancellationToken);
+        var response = await ReadExactlyAsync(stream, 128 + modulus.Length, cancellationToken);
+        var clientPublic = new BigInteger(response.AsSpan(128), isUnsigned: true, isBigEndian: true);
+        var sharedSecret = ToFixedWidth(
+            BigInteger.ModPow(clientPublic, new BigInteger(3), prime),
+            modulus.Length);
+        byte[] authenticationKey;
+#pragma warning disable CA5351 // MD5 is mandated by ARD security type 30 compatibility.
+        authenticationKey = MD5.HashData(sharedSecret);
+#pragma warning restore CA5351
+        await stream.WriteAsync(new byte[4], cancellationToken);
+
+        Assert.Equal(new byte[] { 0xC1 }, await ReadExactlyAsync(stream, 1, cancellationToken));
+        await stream.WriteAsync(CreateExtendedServerInit(4, 2), cancellationToken);
+        Assert.Equal(0x21, (await ReadExactlyAsync(stream, 66, cancellationToken))[0]);
+        Assert.Equal(
+            new byte[] { 0x0A, 0, 0, 1 },
+            await ReadExactlyAsync(stream, 4, cancellationToken));
+        Assert.Equal(
+            new byte[] { 0x0D, 1, 0, 0, 0, 0, 0, 0 },
+            await ReadExactlyAsync(stream, 8, cancellationToken));
+        Assert.Equal(0, (await ReadExactlyAsync(stream, 20, cancellationToken))[0]);
+        var initialEncodingHeader = await ReadExactlyAsync(stream, 4, cancellationToken);
+        Assert.Equal(2, initialEncodingHeader[0]);
+        var initialEncodingCount = BinaryPrimitives.ReadUInt16BigEndian(initialEncodingHeader.AsSpan(2));
+        var initialEncodings = await ReadExactlyAsync(
+            stream,
+            initialEncodingCount * sizeof(int),
+            cancellationToken);
+        Assert.Contains(
+            (int)RfbEncodingType.ArdSessionEncryption,
+            Enumerable.Range(0, initialEncodingCount).Select(index =>
+                BinaryPrimitives.ReadInt32BigEndian(initialEncodings.AsSpan(index * sizeof(int)))));
+        Assert.Equal(
+            new byte[] { 0x12, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1 },
+            await ReadExactlyAsync(stream, 12, cancellationToken));
+
+        var activationRequests = 0;
+        var activationRequest = await ReadExactlyAsync(stream, 10, cancellationToken);
+        activationRequests++;
+        Assert.Equal(CreateFullRequest(4, 2), activationRequest);
+        var sessionKey = Enumerable.Range(32, 16).Select(value => (byte)value).ToArray();
+        var sessionIv = Enumerable.Range(64, 16).Select(value => (byte)value).ToArray();
+        await stream.WriteAsync(
+            CreateEncryptionActivationUpdate(authenticationKey, sessionKey, sessionIv),
+            cancellationToken);
+        Assert.Equal(
+            new byte[] { 0x12, 0, 0, 2, 0, 1, 0, 0 },
+            await ReadExactlyAsync(stream, 8, cancellationToken));
+
+        var firstClientPacket = await ReadEncryptedPacketAsync(
+            stream,
+            sessionKey,
+            sessionIv,
+            sequence: 0,
+            cancellationToken);
+        var expectedSetEncodings = new byte[12];
+        expectedSetEncodings[0] = 2;
+        BinaryPrimitives.WriteUInt16BigEndian(expectedSetEncodings.AsSpan(2), 2);
+        BinaryPrimitives.WriteInt32BigEndian(expectedSetEncodings.AsSpan(4), candidateEncodingId);
+        BinaryPrimitives.WriteInt32BigEndian(
+            expectedSetEncodings.AsSpan(8),
+            (int)RfbEncodingType.Raw);
+        Assert.Equal(expectedSetEncodings, firstClientPacket.Payload);
+
+        var secondClientPacket = await ReadEncryptedPacketAsync(
+            stream,
+            sessionKey,
+            firstClientPacket.NextIv,
+            sequence: 1,
+            cancellationToken);
+        Assert.Equal(CreateFullRequest(4, 2), secondClientPacket.Payload);
+
+        var update = CreateUpdate(candidateEncodingId, payloadPrefix, width: 4, height: 2);
+        var serverPacket = ArdEncryptedPacketCodec.Encrypt(sessionKey, sessionIv, 0, update);
+        await stream.WriteAsync(serverPacket, cancellationToken);
+        Assert.Equal(0, await stream.ReadAsync(new byte[1], cancellationToken));
+        Assert.InRange(activationRequests, 1, 8);
+        return activationRequests;
+    }
+
+    private static byte[] CreateExtendedServerInit(ushort width, ushort height)
+    {
+        var extendedName = new byte[26];
+        BinaryPrimitives.WriteUInt32BigEndian(extendedName.AsSpan(2), (uint)ArdServerFlags.MayControl);
+        Encoding.UTF8.GetBytes("Mac").CopyTo(extendedName, 23);
+        var bytes = new byte[24 + extendedName.Length];
+        BinaryPrimitives.WriteUInt16BigEndian(bytes, width);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2), height);
+        PixelFormat.WinArdBgra32.ToWireBytes().CopyTo(bytes, 4);
+        BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(20), checked((uint)extendedName.Length));
+        extendedName.CopyTo(bytes, 24);
+        return bytes;
+    }
+
+    private static byte[] CreateFullRequest(ushort width, ushort height)
+    {
+        var request = new byte[10];
+        request[0] = 3;
+        BinaryPrimitives.WriteUInt16BigEndian(request.AsSpan(6), width);
+        BinaryPrimitives.WriteUInt16BigEndian(request.AsSpan(8), height);
+        return request;
+    }
+
+    private static byte[] CreateEncryptionActivationUpdate(
+        byte[] authenticationKey,
+        byte[] sessionKey,
+        byte[] sessionIv)
+    {
+        var update = new byte[4 + 12 + 36];
+        BinaryPrimitives.WriteUInt16BigEndian(update.AsSpan(2), 1);
+        BinaryPrimitives.WriteInt32BigEndian(
+            update.AsSpan(12),
+            (int)RfbEncodingType.ArdSessionEncryption);
+        BinaryPrimitives.WriteUInt32BigEndian(update.AsSpan(16), 1);
+#pragma warning disable CA5358 // AES-ECB is required to construct an ARD session fixture.
+        using var aes = Aes.Create();
+        aes.Key = authenticationKey;
+        aes.EncryptEcb(sessionKey, PaddingMode.None).CopyTo(update, 20);
+        aes.EncryptEcb(sessionIv, PaddingMode.None).CopyTo(update, 36);
+#pragma warning restore CA5358
+        return update;
+    }
+
+    private static async Task<(byte[] Payload, byte[] NextIv)> ReadEncryptedPacketAsync(
+        Stream stream,
+        byte[] key,
+        byte[] iv,
+        uint sequence,
+        CancellationToken cancellationToken)
+    {
+        var header = await ReadExactlyAsync(stream, 2, cancellationToken);
+        var ciphertext = await ReadExactlyAsync(
+            stream,
+            BinaryPrimitives.ReadUInt16BigEndian(header),
+            cancellationToken);
+        using var decoded = ArdEncryptedPacketCodec.Decrypt(key, iv, sequence, ciphertext);
+        return (decoded.Payload.ToArray(), decoded.NextIv.ToArray());
+    }
+
+    private static async Task<byte[]> ReadExactlyAsync(
+        Stream stream,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        var bytes = new byte[count];
+        var offset = 0;
+        while (offset < bytes.Length)
+        {
+            var read = await stream.ReadAsync(bytes.AsMemory(offset), cancellationToken);
+            if (read == 0)
+            {
+                throw new EndOfStreamException("The loopback client closed before the scripted exchange completed.");
+            }
+
+            offset += read;
+        }
+
+        return bytes;
+    }
+
+    private static byte[] ToFixedWidth(BigInteger value, int width)
+    {
+        var source = value.ToByteArray(isUnsigned: true, isBigEndian: true);
+        var result = new byte[width];
+        source.CopyTo(result, width - source.Length);
+        return result;
     }
 
     private sealed class PayloadReadTrackingStream(byte[] bytes, int partialPayloadCount) : MemoryStream(bytes)
