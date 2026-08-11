@@ -1,5 +1,6 @@
 using System.Runtime.ExceptionServices;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Domain.Sessions;
 
 namespace WinARD.Application.Sessions;
@@ -67,6 +68,15 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
     {
         EnsureConnected();
         return _client.RequestFramebufferUpdateAsync(incremental, cancellationToken);
+    }
+
+    public ArdDisplayCapabilities QualityCapabilities
+    {
+        get
+        {
+            EnsureConnected();
+            return _client.QualityCapabilities;
+        }
     }
 
     public ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(

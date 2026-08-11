@@ -157,7 +157,9 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _remoteMaximum = ValidateRemoteMaximum(session.DisplayCapabilities.MaximumRefreshRate);
         _qualityProfile = qualityProfile ?? throw new ArgumentNullException(nameof(qualityProfile));
         _refreshPolicy = qualityProfile.Refresh;
-        _adaptiveQualityCapabilities = adaptiveQualityCapabilities ?? ConservativeCapabilities(_remoteMaximum);
+        _adaptiveQualityCapabilities = adaptiveQualityCapabilities ?? WithMaximumRefreshRate(
+            session.QualityCapabilities,
+            _remoteMaximum);
         _qualityDecoderGates = qualityDecoderGates ?? new QualityDecoderGates();
         _adaptiveQualityController = adaptiveQualityController ?? new AdaptiveQualityController(
             _qualityProfile,
@@ -1087,15 +1089,17 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private static int InitialAdaptiveTarget(AdaptiveQualityController controller) =>
         AdaptiveQualityController.QualityTable[(int)controller.CurrentLevel].FramesPerSecond;
 
-    private static ArdDisplayCapabilities ConservativeCapabilities(int? maximumRefreshRate) => new(
-        CapabilitySupport.Unknown,
-        CapabilitySupport.Unknown,
-        CapabilitySupport.Unknown,
-        CapabilitySupport.Unknown,
-        CapabilitySupport.Unknown,
-        SafeOnlinePixelFormatSwitch: false,
-        SafeOnlineScaleSwitch: false,
-        maximumRefreshRate);
+    private static ArdDisplayCapabilities WithMaximumRefreshRate(
+        ArdDisplayCapabilities capabilities,
+        int? fallbackMaximumRefreshRate) => new(
+        capabilities.Zlib,
+        capabilities.Rgb565,
+        capabilities.ServerScaling,
+        capabilities.AppleColor1002,
+        capabilities.AppleGrayscale1001,
+        capabilities.SafeOnlinePixelFormatSwitch,
+        capabilities.SafeOnlineScaleSwitch,
+        capabilities.MaximumRefreshRate ?? fallbackMaximumRefreshRate);
 
     private int? ValidateRemoteMaximum(int? maximum)
     {

@@ -46,6 +46,16 @@ public sealed record ArdDisplayCapabilities(
     bool SafeOnlineScaleSwitch,
     int? MaximumRefreshRate)
 {
+    public static ArdDisplayCapabilities Unknown { get; } = new(
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        false,
+        false,
+        null);
+
     public CapabilitySupport Zlib { get; } = CapabilitySupportExtensions.Validate(Zlib);
     public CapabilitySupport Rgb565 { get; } = CapabilitySupportExtensions.Validate(Rgb565);
     public CapabilitySupport ServerScaling { get; } = CapabilitySupportExtensions.Validate(ServerScaling);

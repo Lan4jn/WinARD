@@ -1,5 +1,6 @@
 using WinARD.Application.Errors;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Application.Sessions;
 using WinARD.Domain.Connections;
 using Xunit;
@@ -18,6 +19,15 @@ public sealed class RemoteSessionRuntimeTests
             NextMessage = new RemoteClipboardMessage("remote text"),
             DisplayCapabilities = new RemoteDisplayCapabilities(120),
             PerformanceSnapshot = new RemoteRuntimePerformanceSnapshot(7, 2, 11),
+            QualityCapabilities = new ArdDisplayCapabilities(
+                CapabilitySupport.Observed,
+                CapabilitySupport.Observed,
+                CapabilitySupport.Unknown,
+                CapabilitySupport.Unknown,
+                CapabilitySupport.Unknown,
+                true,
+                false,
+                120),
         };
         await using var session = await ConnectAsync(client);
 
@@ -32,6 +42,7 @@ public sealed class RemoteSessionRuntimeTests
         Assert.Equal(new RemoteFramebufferSize(640, 480), session.FramebufferSize);
         Assert.Equal(120, session.DisplayCapabilities.MaximumRefreshRate);
         Assert.Equal(new RemoteRuntimePerformanceSnapshot(7, 2, 11), session.PerformanceSnapshot);
+        Assert.Same(client.QualityCapabilities, session.QualityCapabilities);
         Assert.IsType<RemoteClipboardMessage>(message);
         Assert.True(client.LastIncremental);
         Assert.Same(quality, client.LastQualitySettings);
@@ -124,6 +135,8 @@ public sealed class RemoteSessionRuntimeTests
             RemoteDisplayCapabilities.Unknown;
         public RemoteRuntimePerformanceSnapshot PerformanceSnapshot { get; init; } =
             RemoteRuntimePerformanceSnapshot.Empty;
+        public ArdDisplayCapabilities QualityCapabilities { get; init; } =
+            ArdDisplayCapabilities.Unknown;
         public RemoteServerMessage NextMessage { get; init; } =
             new RemoteFramebufferMessage(
                 new RemoteFramebufferSize(1, 1),

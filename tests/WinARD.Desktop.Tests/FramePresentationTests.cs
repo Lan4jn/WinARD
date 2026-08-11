@@ -1,4 +1,5 @@
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
 using WinARD.Remote.Protocol.Ard;
@@ -24,6 +25,25 @@ namespace WinARD.Desktop.Tests;
 
 public sealed class FramePresentationTests
 {
+    [Fact]
+    public async Task Production_client_exposes_only_confirmed_standard_quality_capabilities_after_initialization()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+
+        var capabilities = client.QualityCapabilities;
+
+        Assert.Equal(CapabilitySupport.Observed, capabilities.Zlib);
+        Assert.Equal(CapabilitySupport.Observed, capabilities.Rgb565);
+        Assert.True(capabilities.SafeOnlinePixelFormatSwitch);
+        Assert.Equal(CapabilitySupport.Unknown, capabilities.ServerScaling);
+        Assert.Equal(CapabilitySupport.Unknown, capabilities.AppleColor1002);
+        Assert.Equal(CapabilitySupport.Unknown, capabilities.AppleGrayscale1001);
+        Assert.False(capabilities.SafeOnlineScaleSwitch);
+    }
     [Fact]
     public void Remote_message_contracts_preserve_pre_statistics_constructor_signatures()
     {

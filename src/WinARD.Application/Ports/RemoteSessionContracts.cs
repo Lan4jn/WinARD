@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.ObjectModel;
+using WinARD.Application.Quality;
 
 namespace WinARD.Application.Ports;
 
@@ -339,6 +340,8 @@ public interface IRemoteSessionRuntime
     RemoteFramebufferSize FramebufferSize { get; }
 
     RemoteDisplayCapabilities DisplayCapabilities => RemoteDisplayCapabilities.Unknown;
+
+    ArdDisplayCapabilities QualityCapabilities => ArdDisplayCapabilities.Unknown;
 
     RemoteRuntimePerformanceSnapshot PerformanceSnapshot =>
         RemoteRuntimePerformanceSnapshot.Empty;

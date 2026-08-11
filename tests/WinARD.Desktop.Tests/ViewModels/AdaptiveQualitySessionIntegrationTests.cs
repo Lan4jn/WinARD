@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using WinARD.Application.Ports;
 using WinARD.Application.Quality;
 using WinARD.Desktop.Rendering;
+using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
@@ -51,6 +52,40 @@ public sealed class AdaptiveQualitySessionIntegrationTests
             ["Request:False", "Receive:1", "Present", "ApplyTransition", "Request:False", "Receive:2", "Present", "Request:True"],
             events);
         Assert.Equal(1, runtime.NonIncrementalRepairCount);
+    }
+
+    [Fact]
+    public async Task Production_standard_capabilities_enable_a_q1_transition_without_test_injection()
+    {
+        var events = new ConcurrentQueue<string>();
+        var runtime = new TransitionRuntime(
+            events,
+            frameCount: 1,
+            qualityCapabilities: RfbClient.ConfirmedStandardQualityCapabilities);
+        var profile = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Color16,
+            QualityScale.Native,
+            FrameRefreshPolicy.Automatic,
+            allowAutomaticGrayscale: false,
+            colorLocked: true,
+            scaleLocked: true);
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new AsyncLifetime(),
+            new EventPresenter(events),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            profile);
+
+        await viewModel.StartAsync(default);
+        await runtime.SecondRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(RemotePixelFormatKind.Rgb565, runtime.LastAppliedSettings?.PixelFormat);
+        Assert.Equal(CapabilitySupport.Unknown, runtime.QualityCapabilities.ServerScaling);
+        Assert.Equal(CapabilitySupport.Unknown, runtime.QualityCapabilities.AppleColor1002);
+        Assert.Equal(CapabilitySupport.Unknown, runtime.QualityCapabilities.AppleGrayscale1001);
     }
 
     [Fact]
@@ -468,12 +503,16 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     private sealed class TransitionRuntime(
         ConcurrentQueue<string> events,
         int frameCount,
-        QualityTransitionStatus transitionStatus = QualityTransitionStatus.Applied)
+        QualityTransitionStatus transitionStatus = QualityTransitionStatus.Applied,
+        ArdDisplayCapabilities? qualityCapabilities = null)
         : IRemoteSessionRuntime
     {
         private int _receiveCount;
         private int _requestCount;
         public int NonIncrementalRepairCount { get; private set; }
+        public RemoteQualitySettings? LastAppliedSettings { get; private set; }
+        public ArdDisplayCapabilities QualityCapabilities { get; } =
+            qualityCapabilities ?? ConservativeCapabilities();
         public TaskCompletionSource ThirdRequest { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource SecondRequest { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public RemoteFramebufferSize FramebufferSize => new(1, 1);
@@ -498,6 +537,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
             CancellationToken cancellationToken)
         {
             events.Enqueue("ApplyTransition");
+            LastAppliedSettings = settings;
             if (transitionStatus == QualityTransitionStatus.Applied)
             {
                 NonIncrementalRepairCount++;
@@ -527,6 +567,16 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+
+        private static ArdDisplayCapabilities ConservativeCapabilities() => new(
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            false,
+            false,
+            null);
     }
 
     private sealed class BlockingRuntime : IRemoteSessionRuntime

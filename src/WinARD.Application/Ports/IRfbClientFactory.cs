@@ -1,5 +1,7 @@
 namespace WinARD.Application.Ports;
 
+using WinARD.Application.Quality;
+
 public interface IRfbClientFactory
 {
     IRfbClient Create(Stream stream);
@@ -10,6 +12,8 @@ public interface IRfbClient : IAsyncDisposable
     RemoteFramebufferSize FramebufferSize => default;
 
     RemoteDisplayCapabilities DisplayCapabilities => RemoteDisplayCapabilities.Unknown;
+
+    ArdDisplayCapabilities QualityCapabilities => ArdDisplayCapabilities.Unknown;
 
     RemoteRuntimePerformanceSnapshot PerformanceSnapshot =>
         RemoteRuntimePerformanceSnapshot.Empty;

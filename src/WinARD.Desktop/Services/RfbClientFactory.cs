@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Globalization;
 using System.Runtime.ExceptionServices;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Desktop.Input;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Ard;
@@ -27,6 +28,16 @@ public sealed class RfbClientFactory(ISafeDiagnosticSink? diagnosticSink = null)
 
 internal sealed class RfbClient : IRfbClient
 {
+    internal static ArdDisplayCapabilities ConfirmedStandardQualityCapabilities { get; } = new(
+        CapabilitySupport.Observed,
+        CapabilitySupport.Observed,
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        SafeOnlinePixelFormatSwitch: true,
+        SafeOnlineScaleSwitch: false,
+        MaximumRefreshRate: null);
+
     private readonly object _lifecycleSync = new();
     private readonly SessionTrafficCountingStream _traffic;
     private readonly ArdEncryptedStream _transport;
@@ -661,6 +672,20 @@ internal sealed class RfbClient : IRfbClient
     }
 
     public RemoteDisplayCapabilities DisplayCapabilities => RemoteDisplayCapabilities.Unknown;
+
+    public ArdDisplayCapabilities QualityCapabilities
+    {
+        get
+        {
+            ThrowIfDisposed();
+            if (_qualitySettings is null)
+            {
+                throw new InvalidOperationException("RFB initialization has not completed.");
+            }
+
+            return ConfirmedStandardQualityCapabilities;
+        }
+    }
 
     public RemoteRuntimePerformanceSnapshot PerformanceSnapshot =>
         _messageScheduler.PerformanceSnapshot;
