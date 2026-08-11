@@ -81,8 +81,8 @@ public sealed class EncodingPrefixCaptureRunner
 
         try
         {
-            var captures = new List<EncodingPrefixCapture>(EncodingPrefixCaptureFile.RequiredSampleNames.Count);
-            foreach (var sampleName in EncodingPrefixCaptureFile.RequiredSampleNames)
+            var captures = new List<EncodingPrefixCapture>(EncodingPrefixCaptureFile.RequiredCaptureVariantNames.Count);
+            foreach (var sampleName in EncodingPrefixCaptureFile.RequiredCaptureVariantNames)
             {
                 await _confirmSample(sampleName, cancellationToken).ConfigureAwait(false);
                 var capture = await CaptureOneWithTimeoutAsync(

@@ -13,6 +13,15 @@ public static class EncodingPrefixCaptureFile
     };
     public static IReadOnlyList<string> RequiredSampleNames { get; } =
         ["solid-color", "gradient", "text", "multiple-rectangle-sizes"];
+    public static IReadOnlyList<string> RequiredCaptureVariantNames { get; } =
+    [
+        "solid-color",
+        "gradient",
+        "text",
+        "multiple-rectangle-sizes/small",
+        "multiple-rectangle-sizes/medium",
+        "multiple-rectangle-sizes/large",
+    ];
 
     public static void EnsureDestinationAvailable(string outputDirectory)
     {
@@ -130,7 +139,7 @@ public static class EncodingPrefixCaptureFile
             throw new ArgumentOutOfRangeException(nameof(candidateEncodingId));
         }
 
-        if (!RequiredSampleNames.Contains(sampleName, StringComparer.Ordinal))
+        if (!RequiredCaptureVariantNames.Contains(sampleName, StringComparer.Ordinal))
         {
             throw new ArgumentOutOfRangeException(nameof(sampleName));
         }
@@ -159,19 +168,35 @@ public static class EncodingPrefixCaptureFile
         ArgumentException.ThrowIfNullOrWhiteSpace(stagingDirectory);
         ArgumentNullException.ThrowIfNull(captures);
         if (candidateEncodingId is not (1002 or 1001)
-            || captures.Count != RequiredSampleNames.Count
+            || captures.Count != RequiredCaptureVariantNames.Count
             || captures.Any(capture => capture.EncodingId != candidateEncodingId))
         {
             throw new InvalidDataException("The encoding prefix capture set is incomplete or invalid.");
+        }
+
+        var distinctMultipleRectangleSizes = RequiredCaptureVariantNames
+            .Select((name, index) => (name, index))
+            .Where(item => item.name.StartsWith("multiple-rectangle-sizes/", StringComparison.Ordinal))
+            .Select(item => captures[item.index].Rectangle)
+            .Select(rectangle => (rectangle.Width, rectangle.Height))
+            .Distinct()
+            .Count();
+        if (distinctMultipleRectangleSizes < 2)
+        {
+            throw new InvalidDataException(
+                "The multiple-rectangle-sizes sample requires at least two distinct wire rectangle sizes.");
         }
 
         var manifest = new CaptureSetManifest(
             SchemaVersion: 1,
             candidateEncodingId,
             Status: "complete",
-            RequiredSampleNames.Zip(
+            RequiredCaptureVariantNames.Zip(
                 captures,
-                (name, capture) => new CaptureSetSample(name, capture.PayloadSha256)).ToArray());
+                (name, capture) => new CaptureSetSample(
+                    name,
+                    capture.Rectangle,
+                    capture.PayloadSha256)).ToArray());
         var path = Path.Combine(Path.GetFullPath(stagingDirectory), "capture-set.json");
         await using var destination = new FileStream(
             path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, useAsync: true);
@@ -314,5 +339,8 @@ public static class EncodingPrefixCaptureFile
         string Status,
         IReadOnlyList<CaptureSetSample> Samples);
 
-    private sealed record CaptureSetSample(string Name, string PayloadSha256);
+    private sealed record CaptureSetSample(
+        string Name,
+        CapturedRectangle Rectangle,
+        string PayloadSha256);
 }

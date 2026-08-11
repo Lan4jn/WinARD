@@ -305,7 +305,7 @@ public sealed class EncodingPrefixCaptureTests
         var directory = Path.Combine(Path.GetTempPath(), $"winard-prefix-set-{Guid.NewGuid():N}");
         try
         {
-            foreach (var sample in EncodingPrefixCaptureFile.RequiredSampleNames)
+            foreach (var sample in EncodingPrefixCaptureFile.RequiredCaptureVariantNames)
             {
                 await EncodingPrefixCaptureFile.WriteSampleAsync(
                     directory,
@@ -333,6 +333,72 @@ public sealed class EncodingPrefixCaptureTests
         finally
         {
             if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_set_rejects_multiple_rectangle_variants_with_only_one_wire_size()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-same-size-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var captures = EncodingPrefixCaptureFile.RequiredCaptureVariantNames
+            .Select(_ => CreateCapture([1], new CapturedRectangle(0, 0, 4, 2)))
+            .ToArray();
+        try
+        {
+            await Assert.ThrowsAsync<InvalidDataException>(() =>
+                EncodingPrefixCaptureFile.WriteSetManifestAsync(
+                    directory, CandidateEncoding, captures, CancellationToken.None));
+            Assert.False(File.Exists(Path.Combine(directory, "capture-set.json")));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_set_indexes_distinct_wire_sizes_for_multiple_rectangle_variants()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-distinct-size-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var rectangles = new[]
+        {
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 2, 1),
+            new CapturedRectangle(0, 0, 3, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+        };
+        var captures = rectangles.Select(rectangle => CreateCapture([1], rectangle)).ToArray();
+        try
+        {
+            await EncodingPrefixCaptureFile.WriteSetManifestAsync(
+                directory, CandidateEncoding, captures, CancellationToken.None);
+
+            var manifest = await File.ReadAllTextAsync(Path.Combine(directory, "capture-set.json"));
+            using var document = JsonDocument.Parse(manifest);
+            var samples = document.RootElement.GetProperty("samples").EnumerateArray().ToArray();
+            Assert.Equal(EncodingPrefixCaptureFile.RequiredCaptureVariantNames.Count, samples.Length);
+            for (var index = 0; index < samples.Length; index++)
+            {
+                var rectangle = samples[index].GetProperty("rectangle");
+                Assert.Equal(
+                    EncodingPrefixCaptureFile.RequiredCaptureVariantNames[index],
+                    samples[index].GetProperty("name").GetString());
+                Assert.Equal(rectangles[index].X, rectangle.GetProperty("x").GetUInt16());
+                Assert.Equal(rectangles[index].Y, rectangle.GetProperty("y").GetUInt16());
+                Assert.Equal(rectangles[index].Width, rectangle.GetProperty("width").GetUInt16());
+                Assert.Equal(rectangles[index].Height, rectangle.GetProperty("height").GetUInt16());
+                Assert.Equal(
+                    captures[index].PayloadSha256,
+                    samples[index].GetProperty("payloadSha256").GetString());
+            }
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
         }
     }
 
@@ -601,8 +667,8 @@ public sealed class EncodingPrefixCaptureTests
             var captures = await runTask;
             var capture = Assert.Single(captures.DistinctBy(item => item.PayloadSha256));
 
-            Assert.Equal(EncodingPrefixCaptureFile.RequiredSampleNames.Count, await serverTask);
-            Assert.Equal(EncodingPrefixCaptureFile.RequiredSampleNames, confirmedSamples);
+            Assert.Equal(EncodingPrefixCaptureFile.RequiredCaptureVariantNames.Count, await serverTask);
+            Assert.Equal(EncodingPrefixCaptureFile.RequiredCaptureVariantNames, confirmedSamples);
             Assert.Equal(CandidateEncoding, capture.EncodingId);
             Assert.Equal(new CapturedRectangle(0, 0, 4, 2), capture.Rectangle);
             Assert.Equal(expectedPrefix, capture.PayloadPrefix);
@@ -637,11 +703,59 @@ public sealed class EncodingPrefixCaptureTests
         }
     }
 
+    [Fact]
+    public async Task Runner_does_not_publish_when_wire_sizes_are_not_distinct()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-same-wire-size-{Guid.NewGuid():N}");
+        var outputDirectory = Path.Combine(directory, "output");
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var hardTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        var serverTask = RunEncryptedCaptureServerAsync(
+            listener,
+            CandidateEncoding,
+            [1, 2, 3, 4],
+            hardTimeout.Token,
+            distinctMultipleRectangleSizes: false);
+        using var username = SecretMaterial.FromUtf8("synthetic-user");
+        using var password = SecretMaterial.FromUtf8("synthetic-password");
+        try
+        {
+            var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+                new EncodingPrefixCaptureRunner(
+                    TimeSpan.FromSeconds(5),
+                    (_, _) => Task.CompletedTask).RunAsync(
+                    IPAddress.Loopback.ToString(),
+                    ((IPEndPoint)listener.LocalEndpoint).Port,
+                    username,
+                    password,
+                    CandidateEncoding,
+                    outputDirectory,
+                    syntheticScreenConfirmed: true,
+                    hardTimeout.Token));
+
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Contains("distinct wire rectangle sizes", exception.Message, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(outputDirectory));
+            Assert.Empty(Directory.GetDirectories(directory, "output.staging-*"));
+        }
+        finally
+        {
+            listener.Stop();
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static EncodingPrefixCapture CreateCapture(byte[] payload) =>
+        CreateCapture(payload, new CapturedRectangle(0, 0, 1920, 1080));
+
+    private static EncodingPrefixCapture CreateCapture(
+        byte[] payload,
+        CapturedRectangle rectangle) =>
         new(
             1,
             CandidateEncoding,
-            new CapturedRectangle(0, 0, 1920, 1080),
+            rectangle,
             payload.Length,
             Convert.ToHexString(SHA256.HashData(payload)),
             payload);
@@ -673,15 +787,33 @@ public sealed class EncodingPrefixCaptureTests
         TcpListener listener,
         int candidateEncodingId,
         byte[] payloadPrefix,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool distinctMultipleRectangleSizes = true)
     {
         var activationRequests = 0;
-        foreach (var _ in EncodingPrefixCaptureFile.RequiredSampleNames)
+        var rectangles = new[]
+        {
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 2, 1),
+            new CapturedRectangle(0, 0, 3, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+        };
+        if (!distinctMultipleRectangleSizes)
+        {
+            rectangles = Enumerable.Repeat(
+                new CapturedRectangle(0, 0, 4, 2),
+                EncodingPrefixCaptureFile.RequiredCaptureVariantNames.Count).ToArray();
+        }
+        foreach (var rectangle in rectangles)
         {
             activationRequests += await RunEncryptedCaptureSessionAsync(
                 listener,
                 candidateEncodingId,
                 payloadPrefix,
+                rectangle.Width,
+                rectangle.Height,
                 cancellationToken);
         }
 
@@ -692,6 +824,8 @@ public sealed class EncodingPrefixCaptureTests
         TcpListener listener,
         int candidateEncodingId,
         byte[] payloadPrefix,
+        ushort rectangleWidth,
+        ushort rectangleHeight,
         CancellationToken cancellationToken)
     {
         using var client = await listener.AcceptTcpClientAsync(cancellationToken);
@@ -788,7 +922,11 @@ public sealed class EncodingPrefixCaptureTests
             (int)RfbEncodingType.Raw);
         Assert.Equal(expectedSetEncodings, firstClientPacket.Payload);
 
-        var update = CreateUpdate(candidateEncodingId, payloadPrefix, width: 4, height: 2);
+        var update = CreateUpdate(
+            candidateEncodingId,
+            payloadPrefix,
+            width: rectangleWidth,
+            height: rectangleHeight);
         var requestPacket = await ReadEncryptedPacketAsync(
             stream,
             sessionKey,
