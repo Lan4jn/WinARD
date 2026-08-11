@@ -1,5 +1,6 @@
 using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
+using System.Runtime.ExceptionServices;
 
 namespace WinARD.Remote.Protocol.Framebuffer;
 
@@ -124,33 +125,42 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
     private async Task DisposeCoreAsync()
     {
         await _gate.WaitAsync().ConfigureAwait(false);
+        List<Exception>? failures = null;
         try
         {
-            foreach (var decoder in _decoders.Values)
+            foreach (var decoder in _decoders.Values.Distinct(ReferenceEqualityComparer.Instance))
             {
-                if (decoder is IAsyncDisposable asyncDisposable)
+                try
                 {
-                    await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+                    if (decoder is IAsyncDisposable asyncDisposable)
+                    {
+                        await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+                    }
+                    else if (decoder is IDisposable disposable)
+                    {
+                        disposable.Dispose();
+                    }
                 }
-                else if (decoder is IDisposable disposable)
+                catch (Exception exception)
                 {
-                    disposable.Dispose();
+                    (failures ??= []).Add(exception);
                 }
             }
 
             lock (_stateLock)
             {
-                _state = SessionState.Disposed;
-            }
-        }
-        catch
-        {
-            lock (_stateLock)
-            {
-                _state = SessionState.Faulted;
+                _state = failures is null ? SessionState.Disposed : SessionState.Faulted;
             }
 
-            throw;
+            if (failures is { Count: 1 })
+            {
+                ExceptionDispatchInfo.Capture(failures[0]).Throw();
+            }
+
+            if (failures is not null)
+            {
+                throw new AggregateException(failures);
+            }
         }
         finally
         {

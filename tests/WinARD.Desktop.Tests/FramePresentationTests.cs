@@ -1157,7 +1157,7 @@ public sealed class FramePresentationTests
     public async Task Rfb_client_uses_resized_dimensions_and_requested_incremental_flag()
     {
         await using var stream = new ScriptedDuplexStream(
-            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(1, 1), .. DesktopSizeUpdate(2, 1)]);
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(1, 1), .. DesktopSizeUpdate(2, 1), .. CursorOnlyUpdate()]);
         await using var client = new RfbClient(stream);
 
         await client.NegotiateAsync(CancellationToken.None);
@@ -1165,12 +1165,274 @@ public sealed class FramePresentationTests
         using var frame = Assert.IsType<RemoteFramebufferMessage>(
             await client.ReceiveAsync(CancellationToken.None));
         await client.RequestFramebufferUpdateAsync(incremental: false, CancellationToken.None);
+        using var repair = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(CancellationToken.None));
         await client.RequestFramebufferUpdateAsync(incremental: true, CancellationToken.None);
 
         Assert.Equal(new RemoteFramebufferSize(2, 1), frame.Size);
         Assert.Equal(
             [3, 0, 0, 0, 0, 0, 0, 2, 0, 1, 3, 1, 0, 0, 0, 0, 0, 2, 0, 1],
             stream.WrittenBytes[^20..]);
+    }
+
+    [Fact]
+    public async Task Rfb_client_rejects_duplicate_request_until_a_frame_response_completes()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1), 2, .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+
+        await client.RequestFramebufferUpdateAsync(incremental: true, default);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.RequestFramebufferUpdateAsync(incremental: true, default).AsTask());
+        Assert.IsType<RemoteBellMessage>(await client.ReceiveAsync(default));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.RequestFramebufferUpdateAsync(incremental: true, default).AsTask());
+        using var frame = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(default));
+
+        await client.RequestFramebufferUpdateAsync(incremental: true, default);
+    }
+
+    [Fact]
+    public async Task Rfb_client_rejects_concurrent_receive()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var blocked = stream.BlockReadAfter(1);
+        using var cancellation = new CancellationTokenSource();
+        var receive = client.ReceiveAsync(cancellation.Token).AsTask();
+        await blocked.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => client.ReceiveAsync(default).AsTask());
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => receive);
+    }
+
+    [Fact]
+    public async Task Rfb_client_quality_transition_writes_configuration_then_one_full_repair()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+
+        var result = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0, 1, -239, -223], 1),
+            default);
+
+        Assert.Equal(QualityTransitionStatus.Applied, result);
+        var writes = stream.WrittenBytes[offset..];
+        Assert.Equal(0, writes[0]);
+        Assert.Equal(2, writes[20]);
+        Assert.Equal(3, writes[44]);
+        Assert.Equal(54, writes.Length);
+        Assert.Equal(0, writes[45]);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.RequestFramebufferUpdateAsync(incremental: false, default).AsTask());
+    }
+
+    [Fact]
+    public async Task Rfb_client_no_change_and_scale_preflight_write_nothing()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+        var current = new RemoteQualitySettings(
+            RemotePixelFormatKind.Bgra32, [6, 16, 0, 1, -239, -223], 1);
+
+        Assert.Equal(QualityTransitionStatus.NoChange,
+            await client.ApplyQualityTransitionAsync(current, default));
+        Assert.Equal(QualityTransitionStatus.ReconnectRequired,
+            await client.ApplyQualityTransitionAsync(
+                new RemoteQualitySettings(RemotePixelFormatKind.Bgra32, current.Encodings, 0.75), default));
+        Assert.Equal(offset, stream.WrittenBytes.Length);
+    }
+
+    [Fact]
+    public async Task Rfb_client_configuration_write_failure_faults_connection()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        stream.FailNextWrite(new IOException("injected transition failure"));
+
+        var result = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1), default);
+
+        Assert.Equal(QualityTransitionStatus.Faulted, result);
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            client.RequestFramebufferUpdateAsync(incremental: true, default).AsTask());
+        await Assert.ThrowsAnyAsync<Exception>(() => client.ReceiveAsync(default).AsTask());
+    }
+
+    [Fact]
+    public async Task Quality_transition_is_one_background_item_and_input_runs_before_later_background()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+        var blocked = stream.BlockNextWrite();
+        var transition = client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0, 1, -239, -223], 1),
+            default).AsTask();
+        await blocked.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var background = client.SendClipboardTextAsync("x", default).AsTask();
+        var input = client.SendPointerAsync(0, 1, 1, default).AsTask();
+
+        blocked.Release.TrySetResult();
+        await Task.WhenAll(transition, input, background).WaitAsync(TimeSpan.FromSeconds(5));
+
+        var writes = stream.WrittenBytes[offset..];
+        Assert.Equal(0, writes[0]);
+        Assert.Equal(2, writes[20]);
+        Assert.Equal(3, writes[44]);
+        Assert.Equal(5, writes[54]);
+        Assert.Equal(6, writes[60]);
+    }
+
+    [Fact]
+    public async Task Cancellation_after_first_transition_write_faults_scheduler_before_queued_input()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+        using var cancellation = new CancellationTokenSource();
+        var blocked = stream.BlockNextWrite();
+        stream.CancelAfterNextWrite(cancellation);
+        var transition = client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1),
+            cancellation.Token).AsTask();
+        await blocked.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var input = client.SendPointerAsync(0, 1, 1, default).AsTask();
+
+        blocked.Release.TrySetResult();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => transition);
+        await Assert.ThrowsAnyAsync<Exception>(() => input);
+        Assert.Equal(20, stream.WrittenBytes.Length - offset);
+        await Assert.ThrowsAnyAsync<Exception>(() => client.ReceiveAsync(default).AsTask());
+    }
+
+    [Fact]
+    public async Task New_decoder_creation_failure_is_zero_wire_and_old_decoder_remains_usable()
+    {
+        var createCount = 0;
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1), .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(
+            stream,
+            framebufferSessionFactory: (framebuffer, pixelFormat) =>
+            {
+                if (Interlocked.Increment(ref createCount) == 2)
+                {
+                    throw new InvalidOperationException("injected decoder creation failure");
+                }
+
+                return FramebufferUpdateReader.CreateSession(
+                    framebuffer,
+                    pixelFormat == RemotePixelFormatKind.Bgra32
+                        ? PixelFormat.WinArdBgra32
+                        : PixelFormat.WinArdRgb565);
+            });
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+
+        var result = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1), default);
+
+        Assert.Equal(QualityTransitionStatus.CapabilityUnavailable, result);
+        Assert.Equal(offset, stream.WrittenBytes.Length);
+        using var frame = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(default));
+    }
+
+    [Fact]
+    public async Task Old_decoder_dispose_failure_faults_after_configuration_without_repair()
+    {
+        var createCount = 0;
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(
+            stream,
+            framebufferSessionFactory: (framebuffer, pixelFormat) =>
+                Interlocked.Increment(ref createCount) == 1
+                    ? new FramebufferUpdateSession(
+                        framebuffer,
+                        new Dictionary<int, IRfbEncodingDecoder>
+                        {
+                            [700] = new ThrowingDisposeDecoder(),
+                        })
+                    : FramebufferUpdateReader.CreateSession(
+                        framebuffer,
+                        pixelFormat == RemotePixelFormatKind.Bgra32
+                            ? PixelFormat.WinArdBgra32
+                            : PixelFormat.WinArdRgb565));
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+
+        var result = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0, 1, -239, -223], 1), default);
+
+        Assert.Equal(QualityTransitionStatus.Faulted, result);
+        Assert.Equal(44, stream.WrittenBytes.Length - offset);
+        await Assert.ThrowsAnyAsync<Exception>(() => client.ReceiveAsync(default).AsTask());
+    }
+
+    [Fact]
+    public async Task Repair_write_failure_faults_after_configuration_and_emits_no_request()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+        stream.FailAfterSuccessfulWrites(2, new IOException("injected repair failure"));
+
+        var result = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0, 1, -239, -223], 1), default);
+
+        Assert.Equal(QualityTransitionStatus.Faulted, result);
+        Assert.Equal(44, stream.WrittenBytes.Length - offset);
+        await Assert.ThrowsAnyAsync<Exception>(() => client.ReceiveAsync(default).AsTask());
+    }
+
+    [Fact]
+    public async Task Partial_configuration_message_faults_connection_after_prefix_reaches_wire()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+        stream.FailNextWriteAfterPrefix(5, new IOException("injected partial write failure"));
+
+        var result = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1), default);
+
+        Assert.Equal(QualityTransitionStatus.Faulted, result);
+        Assert.Equal(5, stream.WrittenBytes.Length - offset);
+        await Assert.ThrowsAnyAsync<Exception>(() => client.ReceiveAsync(default).AsTask());
     }
 
     [Fact]
@@ -1189,9 +1451,7 @@ public sealed class FramePresentationTests
             incremental: false,
             CancellationToken.None).AsTask();
         await blockedWrite.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var queuedBackground = client.RequestFramebufferUpdateAsync(
-            incremental: true,
-            CancellationToken.None).AsTask();
+        var queuedBackground = client.SendClipboardTextAsync("x", CancellationToken.None).AsTask();
         var input = client.SendPointerAsync(1, 1, 1, CancellationToken.None).AsTask();
 
         blockedWrite.Release.TrySetResult();
@@ -1202,7 +1462,7 @@ public sealed class FramePresentationTests
             [
                 3, 0, 0, 0, 0, 0, 0, 2, 0, 1,
                 5, 1, 0, 1, 0, 1,
-                3, 1, 0, 0, 0, 0, 0, 2, 0, 1,
+                6, 0, 0, 0, 0, 0, 0, 1, (byte)'x',
             ],
             stream.WrittenBytes[outputOffset..]);
     }
@@ -1229,16 +1489,14 @@ public sealed class FramePresentationTests
                 value,
                 CancellationToken.None).AsTask())
             .ToArray();
-        var queuedBackground = client.RequestFramebufferUpdateAsync(
-            incremental: true,
-            CancellationToken.None).AsTask();
+        var queuedBackground = client.SendClipboardTextAsync("x", CancellationToken.None).AsTask();
 
         blockedWrite.Release.TrySetResult();
         await Task.WhenAll(inputs.Append(activeBackground).Append(queuedBackground))
             .WaitAsync(TimeSpan.FromSeconds(5));
 
         var types = ParseClientMessageTypes(stream.WrittenBytes[outputOffset..]);
-        Assert.Equal(33, types.LastIndexOf(3));
+        Assert.Equal(33, types.LastIndexOf(6));
     }
 
     [Fact]
@@ -1633,6 +1891,7 @@ public sealed class FramePresentationTests
             {
                 3 => 10,
                 5 => 6,
+                6 => checked(8 + BinaryPrimitives.ReadInt32BigEndian(messages.AsSpan(offset + 4))),
                 _ => throw new InvalidDataException($"Unexpected client message type {type}."),
             };
         }
@@ -1703,6 +1962,20 @@ public sealed class FramePresentationTests
         public void Dispose() => _buffer = null;
     }
 
+    private sealed class ThrowingDisposeDecoder : IRfbEncodingDecoder, IDisposable
+    {
+        public int EncodingId => 700;
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            WinARD.Remote.Protocol.Framebuffer.Framebuffer framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(EncodingDecodeResult.Empty);
+
+        public void Dispose() => throw new InvalidOperationException("injected old decoder disposal failure");
+    }
+
     private sealed class ScriptedDuplexStream(
         byte[] input,
         CancellationTokenSource? cancelAfterInput = null,
@@ -1711,6 +1984,11 @@ public sealed class FramePresentationTests
         private readonly MemoryStream _input = new(input, writable: false);
         private readonly MemoryStream _output = new();
         private IOException? _nextWriteFailure;
+        private IOException? _deferredWriteFailure;
+        private IOException? _partialWriteFailure;
+        private int _partialWriteBytes;
+        private int _successfulWritesBeforeFailure = -1;
+        private CancellationTokenSource? _cancelAfterNextWrite;
         private BlockedWrite? _nextBlockedWrite;
         private BlockedRead? _blockedRead;
         private int _readsUntilBlock;
@@ -1723,6 +2001,39 @@ public sealed class FramePresentationTests
             if (Interlocked.CompareExchange(ref _nextWriteFailure, exception, null) is not null)
             {
                 throw new InvalidOperationException("A write failure is already pending.");
+            }
+        }
+
+        public void FailAfterSuccessfulWrites(int successfulWrites, IOException exception)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(successfulWrites);
+            ArgumentNullException.ThrowIfNull(exception);
+            if (Interlocked.CompareExchange(ref _deferredWriteFailure, exception, null) is not null)
+            {
+                throw new InvalidOperationException("A deferred write failure is already pending.");
+            }
+
+            Volatile.Write(ref _successfulWritesBeforeFailure, successfulWrites);
+        }
+
+        public void FailNextWriteAfterPrefix(int prefixBytes, IOException exception)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(prefixBytes);
+            ArgumentNullException.ThrowIfNull(exception);
+            if (Interlocked.CompareExchange(ref _partialWriteFailure, exception, null) is not null)
+            {
+                throw new InvalidOperationException("A partial write failure is already pending.");
+            }
+
+            Volatile.Write(ref _partialWriteBytes, prefixBytes);
+        }
+
+        public void CancelAfterNextWrite(CancellationTokenSource cancellation)
+        {
+            ArgumentNullException.ThrowIfNull(cancellation);
+            if (Interlocked.CompareExchange(ref _cancelAfterNextWrite, cancellation, null) is not null)
+            {
+                throw new InvalidOperationException("A post-write cancellation is already pending.");
             }
         }
 
@@ -1791,10 +2102,30 @@ public sealed class FramePresentationTests
             ReadOnlyMemory<byte> buffer,
             CancellationToken cancellationToken = default)
         {
+            var writesBeforeFailure = Volatile.Read(ref _successfulWritesBeforeFailure);
+            if (writesBeforeFailure == 0)
+            {
+                Volatile.Write(ref _successfulWritesBeforeFailure, -1);
+                throw Interlocked.Exchange(ref _deferredWriteFailure, null)!;
+            }
+
+            if (writesBeforeFailure > 0)
+            {
+                _ = Interlocked.Decrement(ref _successfulWritesBeforeFailure);
+            }
+
             var failure = Interlocked.Exchange(ref _nextWriteFailure, null);
             if (failure is not null)
             {
                 throw failure;
+            }
+
+            var partialFailure = Interlocked.Exchange(ref _partialWriteFailure, null);
+            if (partialFailure is not null)
+            {
+                var prefixBytes = Math.Min(Volatile.Read(ref _partialWriteBytes), buffer.Length);
+                await _output.WriteAsync(buffer[..prefixBytes], CancellationToken.None);
+                throw partialFailure;
             }
 
             var blockedWrite = Interlocked.Exchange(ref _nextBlockedWrite, null);
@@ -1813,6 +2144,7 @@ public sealed class FramePresentationTests
             }
 
             await _output.WriteAsync(buffer, cancellationToken);
+            Interlocked.Exchange(ref _cancelAfterNextWrite, null)?.Cancel();
         }
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();

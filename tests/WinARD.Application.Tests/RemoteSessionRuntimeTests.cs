@@ -22,6 +22,8 @@ public sealed class RemoteSessionRuntimeTests
         await using var session = await ConnectAsync(client);
 
         await session.RequestFramebufferUpdateAsync(incremental: true, CancellationToken.None);
+        var quality = new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1);
+        var transition = await session.ApplyQualityTransitionAsync(quality, CancellationToken.None);
         var message = await session.ReceiveAsync(CancellationToken.None);
         await session.SendPointerAsync(3, 12, 34, CancellationToken.None);
         await session.SendKeyAsync(0xffe3, true, CancellationToken.None);
@@ -32,6 +34,8 @@ public sealed class RemoteSessionRuntimeTests
         Assert.Equal(new RemoteRuntimePerformanceSnapshot(7, 2, 11), session.PerformanceSnapshot);
         Assert.IsType<RemoteClipboardMessage>(message);
         Assert.True(client.LastIncremental);
+        Assert.Same(quality, client.LastQualitySettings);
+        Assert.Equal(QualityTransitionStatus.Applied, transition);
         Assert.Equal((3, 12, 34), client.LastPointer);
         Assert.Equal((0xffe3u, true), client.LastKey);
         Assert.Equal("local text", client.LastClipboard);
@@ -127,6 +131,7 @@ public sealed class RemoteSessionRuntimeTests
                 4,
                 [new RemoteRectangle(0, 0, 1, 1)]);
         public bool LastIncremental { get; private set; }
+        public RemoteQualitySettings? LastQualitySettings { get; private set; }
         public (byte Buttons, int X, int Y) LastPointer { get; private set; }
         public (uint Keysym, bool Down) LastKey { get; private set; }
         public string? LastClipboard { get; private set; }
@@ -141,6 +146,13 @@ public sealed class RemoteSessionRuntimeTests
         {
             LastIncremental = incremental;
             return ValueTask.CompletedTask;
+        }
+        public ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(
+            RemoteQualitySettings settings,
+            CancellationToken cancellationToken)
+        {
+            LastQualitySettings = settings;
+            return ValueTask.FromResult(QualityTransitionStatus.Applied);
         }
         public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
             ValueTask.FromResult(NextMessage);

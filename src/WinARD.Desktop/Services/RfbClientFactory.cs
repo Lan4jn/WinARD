@@ -6,6 +6,7 @@ using WinARD.Desktop.Input;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Clipboard;
+using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
 using WinARD.Remote.Protocol.Framebuffer;
 using WinARD.Remote.Protocol.Handshake;
@@ -34,6 +35,7 @@ internal sealed class RfbClient : IRfbClient
     private readonly RemoteInputDiagnosticTracker _inputDiagnostics;
     private readonly bool _requireArdAuthentication;
     private readonly ClientMessageScheduler _messageScheduler;
+    private readonly Func<Framebuffer, RemotePixelFormatKind, FramebufferUpdateSession>? _framebufferSessionFactory;
     private RfbHandshakeResult? _handshake;
     private RfbServerInit? _serverInit;
     private Framebuffer? _framebuffer;
@@ -42,6 +44,11 @@ internal sealed class RfbClient : IRfbClient
     private ArdSessionEncryption? _sessionEncryption;
     private Task? _disposeTask;
     private long _lastFramebufferStatisticsBytes;
+    private RemoteQualitySettings? _qualitySettings;
+    private bool _framebufferRequestOutstanding;
+    private bool _receiveActive;
+    private bool _qualityTransitionActive;
+    private bool _faulted;
     private bool _shutdownStarted;
     private bool _disposed;
 
@@ -50,7 +57,8 @@ internal sealed class RfbClient : IRfbClient
         FramebufferSnapshotFactory? snapshotFactory = null,
         ISafeDiagnosticSink? diagnosticSink = null,
         ArdAuthenticationResult? authenticationResult = null,
-        bool requireArdAuthentication = false)
+        bool requireArdAuthentication = false,
+        Func<Framebuffer, RemotePixelFormatKind, FramebufferUpdateSession>? framebufferSessionFactory = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
         _traffic = new SessionTrafficCountingStream(stream, leaveOpen: true);
@@ -60,6 +68,7 @@ internal sealed class RfbClient : IRfbClient
         _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _authenticationResult = authenticationResult;
         _requireArdAuthentication = requireArdAuthentication;
+        _framebufferSessionFactory = framebufferSessionFactory;
         _messageScheduler = new ClientMessageScheduler();
     }
 
@@ -140,12 +149,9 @@ internal sealed class RfbClient : IRfbClient
         FramebufferUpdateSession framebufferUpdates;
         try
         {
-            framebufferUpdates = _sessionEncryption is null
-                ? FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32)
-                : FramebufferUpdateReader.CreateSession(
-                    framebuffer,
-                    PixelFormat.WinArdBgra32,
-                    _sessionEncryption.CreateDecoder());
+            framebufferUpdates = CreateFramebufferUpdateSession(
+                framebuffer,
+                RemotePixelFormatKind.Bgra32);
         }
         catch
         {
@@ -161,6 +167,10 @@ internal sealed class RfbClient : IRfbClient
                 _serverInit = serverInit;
                 _framebuffer = framebuffer;
                 _framebufferUpdates = framebufferUpdates;
+                _qualitySettings = NormalizeSettings(new RemoteQualitySettings(
+                    RemotePixelFormatKind.Bgra32,
+                    [6, 16, 0, 1, -239, -223],
+                    1));
                 published = true;
             }
         }
@@ -180,149 +190,374 @@ internal sealed class RfbClient : IRfbClient
     {
         ThrowIfDisposed();
         var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
-        return _messageScheduler.EnqueueBackgroundAsync(
-            token => new ValueTask(RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
-                _transport,
-                incremental,
-                0,
-                0,
-                checked((ushort)framebuffer.Width),
-                checked((ushort)framebuffer.Height),
-                token)),
-            cancellationToken);
+        lock (_lifecycleSync)
+        {
+            ThrowIfProtocolUnavailableNoLock();
+            if (_qualityTransitionActive)
+            {
+                throw new InvalidOperationException("A quality transition is active.");
+            }
+
+            if (_framebufferRequestOutstanding)
+            {
+                throw new InvalidOperationException("A framebuffer update request is already outstanding.");
+            }
+
+            _framebufferRequestOutstanding = true;
+        }
+
+        return RequestFramebufferUpdateCoreAsync(framebuffer, incremental, cancellationToken);
+    }
+
+    private async ValueTask RequestFramebufferUpdateCoreAsync(
+        Framebuffer framebuffer,
+        bool incremental,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _messageScheduler.EnqueueBackgroundAsync(
+                token => new ValueTask(RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
+                    _transport,
+                    incremental,
+                    0,
+                    0,
+                    checked((ushort)framebuffer.Width),
+                    checked((ushort)framebuffer.Height),
+                    token)),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            lock (_lifecycleSync)
+            {
+                _framebufferRequestOutstanding = false;
+            }
+
+            throw;
+        }
+    }
+
+    public async ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(
+        RemoteQualitySettings settings,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(settings);
+        var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
+        var normalized = NormalizeSettings(settings);
+        FramebufferUpdateSession oldSession;
+        lock (_lifecycleSync)
+        {
+            ThrowIfProtocolUnavailableNoLock();
+            if (_framebufferRequestOutstanding || _receiveActive || _qualityTransitionActive)
+            {
+                return QualityTransitionStatus.CapabilityUnavailable;
+            }
+
+            var current = _qualitySettings ?? throw new InvalidOperationException("RFB initialization has not completed.");
+            if (SettingsEqual(current, normalized))
+            {
+                return QualityTransitionStatus.NoChange;
+            }
+
+            if (!current.ScaleFactor.Equals(normalized.ScaleFactor))
+            {
+                // Online server resize timing has not been proven for this connection.
+                return QualityTransitionStatus.ReconnectRequired;
+            }
+
+            if (normalized.Encodings.Any(encoding => encoding is 1001 or 1002))
+            {
+                return QualityTransitionStatus.CapabilityUnavailable;
+            }
+
+            oldSession = _framebufferUpdates ?? throw new InvalidOperationException("RFB initialization has not completed.");
+            _qualityTransitionActive = true;
+        }
+
+        FramebufferUpdateSession newSession;
+        try
+        {
+            newSession = CreateFramebufferUpdateSession(framebuffer, normalized.PixelFormat);
+        }
+        catch
+        {
+            lock (_lifecycleSync)
+            {
+                _qualityTransitionActive = false;
+            }
+
+            return QualityTransitionStatus.CapabilityUnavailable;
+        }
+
+        var swapped = false;
+        var wireAttempted = false;
+        try
+        {
+            await _messageScheduler.EnqueueBackgroundAsync(async token =>
+            {
+                try
+                {
+                    var current = _qualitySettings!;
+                    var pixelChanged = current.PixelFormat != normalized.PixelFormat;
+                    var encodingsChanged = !current.Encodings.SequenceEqual(normalized.Encodings);
+                    if (pixelChanged)
+                    {
+                        wireAttempted = true;
+                        await RfbSessionInitializer.WriteSetPixelFormatAsync(
+                            _transport,
+                            ToProtocolPixelFormat(normalized.PixelFormat),
+                            token).ConfigureAwait(false);
+                    }
+
+                    if (encodingsChanged)
+                    {
+                        wireAttempted = true;
+                        await RfbSessionInitializer.WriteSetEncodingsAsync(
+                            _transport,
+                            normalized.Encodings,
+                            token).ConfigureAwait(false);
+                    }
+
+                    lock (_lifecycleSync)
+                    {
+                        ThrowIfProtocolUnavailableNoLock();
+                        _framebufferUpdates = newSession;
+                        swapped = true;
+                    }
+
+                    await oldSession.DisposeAsync().ConfigureAwait(false);
+                    wireAttempted = true;
+                    await RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
+                        _transport,
+                        incremental: false,
+                        0,
+                        0,
+                        checked((ushort)framebuffer.Width),
+                        checked((ushort)framebuffer.Height),
+                        token).ConfigureAwait(false);
+                    lock (_lifecycleSync)
+                    {
+                        _qualitySettings = normalized;
+                        _framebufferRequestOutstanding = true;
+                    }
+                }
+                catch (OperationCanceledException exception) when (wireAttempted || swapped)
+                {
+                    // A normal scheduler cancellation would allow the next queued writer to run.
+                    // Convert it to a scheduler fault before returning cancellation to the caller.
+                    throw new QualityTransitionInterruptedException(exception);
+                }
+            }, cancellationToken).ConfigureAwait(false);
+
+            return QualityTransitionStatus.Applied;
+        }
+        catch (QualityTransitionInterruptedException exception)
+        {
+            await FaultAndDisposeDecoderAsync(newSession).ConfigureAwait(false);
+            throw new OperationCanceledException(
+                "The quality transition was canceled after protocol output began.",
+                exception.InnerException,
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            if (wireAttempted || swapped)
+            {
+                await FaultAndDisposeDecoderAsync(newSession).ConfigureAwait(false);
+            }
+            else
+            {
+                await newSession.DisposeAsync().ConfigureAwait(false);
+            }
+
+            throw;
+        }
+        catch
+        {
+            if (wireAttempted || swapped)
+            {
+                await FaultAndDisposeDecoderAsync(newSession).ConfigureAwait(false);
+                return QualityTransitionStatus.Faulted;
+            }
+
+            await newSession.DisposeAsync().ConfigureAwait(false);
+            return QualityTransitionStatus.CapabilityUnavailable;
+        }
+        finally
+        {
+            lock (_lifecycleSync)
+            {
+                _qualityTransitionActive = false;
+            }
+        }
     }
 
     public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
-        var updates = _framebufferUpdates ?? throw new InvalidOperationException("RFB initialization has not completed.");
+        Framebuffer framebuffer;
+        FramebufferUpdateSession updates;
+        lock (_lifecycleSync)
+        {
+            ThrowIfProtocolUnavailableNoLock();
+            if (_receiveActive)
+            {
+                throw new InvalidOperationException("A server-message receive is already active.");
+            }
+
+            if (_qualityTransitionActive)
+            {
+                throw new InvalidOperationException("A quality transition is active.");
+            }
+
+            framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
+            updates = _framebufferUpdates ?? throw new InvalidOperationException("RFB initialization has not completed.");
+            _receiveActive = true;
+        }
         var handshake = _handshake ?? throw new InvalidOperationException("RFB negotiation has not completed.");
         var reader = new RfbReader(_transport, ProtocolLimits.Default);
-        while (true)
+        try
         {
-            byte type;
-            try
+            while (true)
             {
-                type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (RfbProtocolException exception)
-            {
-                throw exception.WithContext(new RfbProtocolFailureInfo(
-                    RfbProtocolFailureKind.UnexpectedServerMessage,
-                    RfbProtocolReadStage.ServerMessageType));
-            }
+                byte type;
+                try
+                {
+                    type = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (RfbProtocolException exception)
+                {
+                    throw exception.WithContext(new RfbProtocolFailureInfo(
+                        RfbProtocolFailureKind.UnexpectedServerMessage,
+                        RfbProtocolReadStage.ServerMessageType));
+                }
 
-            switch (type)
-            {
-                case 0:
-                    try
-                    {
-                        var update = await updates.ApplyBodyAsync(
-                                _transport,
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                        if (_sessionEncryption is not null)
-                        {
-                            await _sessionEncryption.CompleteFramebufferUpdateAsync(cancellationToken)
-                                .ConfigureAwait(false);
-                        }
-
-                        var statistics = new RemoteUpdateStatistics(
-                            SessionBytesSinceLastFramebufferStatistics(),
-                            update.EncodingCounts);
-                        return _snapshotFactory.CreateServerMessage(framebuffer, update, statistics);
-                    }
-                    catch (RfbProtocolException exception)
-                    {
-                        throw exception.WithContext(new RfbProtocolFailureInfo(
-                            RfbProtocolFailureKind.MalformedFramebufferUpdate,
-                            ServerMessageType: 0));
-                    }
-                case 2:
-                    return new RemoteBellMessage();
-                case 3:
-                    try
-                    {
-                        return new RemoteClipboardMessage(
-                            await ClipboardProtocol.ReadServerCutTextBodyAsync(
-                                reader,
-                                cancellationToken).ConfigureAwait(false));
-                    }
-                    catch (RfbProtocolException exception)
-                    {
-                        throw exception.WithContext(new RfbProtocolFailureInfo(
-                            RfbProtocolFailureKind.MalformedClipboard,
-                            ServerMessageType: 3));
-                    }
-                case ArdServerMessage.StateChangeType when handshake.Version == RfbVersion.V3_889:
-                    var stateChange = await ArdStateChangeReader.ReadBodyAsync(
-                            reader,
-                            ProtocolLimits.Default,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    if (stateChange.Status == (ushort)ArdStateChangeStatus.LocalUserClosed)
-                    {
-                        WriteArdStateChangeDiagnostic(stateChange, "RemoteSessionClosed");
-                        throw RfbProtocolException.Create(
-                            "The remote ARD session was closed.",
-                            new RfbProtocolFailureInfo(
-                                RfbProtocolFailureKind.RemoteSessionClosed,
-                                RfbProtocolReadStage.ArdStateChangePayload,
-                                ArdServerMessage.StateChangeType));
-                    }
-
-                    if (stateChange.Status == (ushort)ArdStateChangeStatus.Tickle)
-                    {
+                switch (type)
+                {
+                    case 0:
                         try
                         {
-                            await _messageScheduler.EnqueueBackgroundAsync(
-                                    token => new ArdClientMessageWriter(new RfbWriter(_transport))
-                                        .WriteAutoFramebufferUpdateAsync(
-                                            checked((ushort)framebuffer.Width),
-                                            checked((ushort)framebuffer.Height),
-                                            token),
+                            var update = await updates.ApplyBodyAsync(
+                                    _transport,
                                     cancellationToken)
                                 .ConfigureAwait(false);
+                            if (_sessionEncryption is not null)
+                            {
+                                await _sessionEncryption.CompleteFramebufferUpdateAsync(cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+
+                            var statistics = new RemoteUpdateStatistics(
+                                SessionBytesSinceLastFramebufferStatistics(),
+                                update.EncodingCounts);
+                            var message = _snapshotFactory.CreateServerMessage(framebuffer, update, statistics);
+                            lock (_lifecycleSync)
+                            {
+                                _framebufferRequestOutstanding = false;
+                            }
+
+                            return message;
                         }
-                        catch (OperationCanceledException)
+                        catch (RfbProtocolException exception)
                         {
-                            throw;
+                            throw exception.WithContext(new RfbProtocolFailureInfo(
+                                RfbProtocolFailureKind.MalformedFramebufferUpdate,
+                                ServerMessageType: 0));
                         }
-                        catch (Exception exception)
+                    case 2:
+                        return new RemoteBellMessage();
+                    case 3:
+                        try
                         {
-                            WriteArdStateChangeDiagnostic(stateChange, "AutoFBUpdateFailed", exception);
-                            throw;
+                            return new RemoteClipboardMessage(
+                                await ClipboardProtocol.ReadServerCutTextBodyAsync(
+                                    reader,
+                                    cancellationToken).ConfigureAwait(false));
+                        }
+                        catch (RfbProtocolException exception)
+                        {
+                            throw exception.WithContext(new RfbProtocolFailureInfo(
+                                RfbProtocolFailureKind.MalformedClipboard,
+                                ServerMessageType: 3));
+                        }
+                    case ArdServerMessage.StateChangeType when handshake.Version == RfbVersion.V3_889:
+                        var stateChange = await ArdStateChangeReader.ReadBodyAsync(
+                                reader,
+                                ProtocolLimits.Default,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (stateChange.Status == (ushort)ArdStateChangeStatus.LocalUserClosed)
+                        {
+                            WriteArdStateChangeDiagnostic(stateChange, "RemoteSessionClosed");
+                            throw RfbProtocolException.Create(
+                                "The remote ARD session was closed.",
+                                new RfbProtocolFailureInfo(
+                                    RfbProtocolFailureKind.RemoteSessionClosed,
+                                    RfbProtocolReadStage.ArdStateChangePayload,
+                                    ArdServerMessage.StateChangeType));
                         }
 
-                        WriteArdStateChangeDiagnostic(stateChange, "AutoFBUpdateSent");
-                    }
-                    else
-                    {
-                        var action = stateChange.Status is
-                            (ushort)ArdStateChangeStatus.PasteboardChanged or
-                            (ushort)ArdStateChangeStatus.PasteboardDataNeeded or
-                            (ushort)ArdStateChangeStatus.Sleep or
-                            (ushort)ArdStateChangeStatus.Wake or
-                            (ushort)ArdStateChangeStatus.CursorHidden or
-                            (ushort)ArdStateChangeStatus.CursorVisible
-                                ? "Consumed"
-                                : "UnknownConsumed";
-                        WriteArdStateChangeDiagnostic(stateChange, action);
-                    }
+                        if (stateChange.Status == (ushort)ArdStateChangeStatus.Tickle)
+                        {
+                            try
+                            {
+                                await _messageScheduler.EnqueueBackgroundAsync(
+                                        token => new ArdClientMessageWriter(new RfbWriter(_transport))
+                                            .WriteAutoFramebufferUpdateAsync(
+                                                checked((ushort)framebuffer.Width),
+                                                checked((ushort)framebuffer.Height),
+                                                token),
+                                        cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                throw;
+                            }
+                            catch (Exception exception)
+                            {
+                                WriteArdStateChangeDiagnostic(stateChange, "AutoFBUpdateFailed", exception);
+                                throw;
+                            }
 
-                    continue;
-                case var ardControlMessage
+                            WriteArdStateChangeDiagnostic(stateChange, "AutoFBUpdateSent");
+                        }
+                        else
+                        {
+                            var action = stateChange.Status is
+                                (ushort)ArdStateChangeStatus.PasteboardChanged or
+                                (ushort)ArdStateChangeStatus.PasteboardDataNeeded or
+                                (ushort)ArdStateChangeStatus.Sleep or
+                                (ushort)ArdStateChangeStatus.Wake or
+                                (ushort)ArdStateChangeStatus.CursorHidden or
+                                (ushort)ArdStateChangeStatus.CursorVisible
+                                    ? "Consumed"
+                                    : "UnknownConsumed";
+                            WriteArdStateChangeDiagnostic(stateChange, action);
+                        }
+
+                        continue;
+                    case var ardControlMessage
                     when handshake.Version == RfbVersion.V3_889 &&
                          ArdServerMessage.IsZeroPayloadControl(ardControlMessage):
-                    continue;
-                default:
-                    throw RfbProtocolException.Create(
-                        $"Unsupported RFB server message type {type}.",
-                        new RfbProtocolFailureInfo(
-                            RfbProtocolFailureKind.UnexpectedServerMessage,
-                            RfbProtocolReadStage.ServerMessageType,
-                            type));
+                        continue;
+                    default:
+                        throw RfbProtocolException.Create(
+                            $"Unsupported RFB server message type {type}.",
+                            new RfbProtocolFailureInfo(
+                                RfbProtocolFailureKind.UnexpectedServerMessage,
+                                RfbProtocolReadStage.ServerMessageType,
+                                type));
+                }
+            }
+        }
+        finally
+        {
+            lock (_lifecycleSync)
+            {
+                _receiveActive = false;
             }
         }
     }
@@ -526,6 +761,88 @@ internal sealed class RfbClient : IRfbClient
         return currentBytes >= previousBytes ? currentBytes - previousBytes : 0;
     }
 
+    private FramebufferUpdateSession CreateFramebufferUpdateSession(
+        Framebuffer framebuffer,
+        RemotePixelFormatKind pixelFormat)
+    {
+        if (_framebufferSessionFactory is not null)
+        {
+            return _framebufferSessionFactory(framebuffer, pixelFormat);
+        }
+
+        return _sessionEncryption is null
+            ? FramebufferUpdateReader.CreateSession(framebuffer, ToProtocolPixelFormat(pixelFormat))
+            : FramebufferUpdateReader.CreateSession(
+                framebuffer,
+                ToProtocolPixelFormat(pixelFormat),
+                _sessionEncryption.CreateDecoder());
+    }
+
+    private async ValueTask FaultAndDisposeDecoderAsync(FramebufferUpdateSession session)
+    {
+        lock (_lifecycleSync)
+        {
+            _faulted = true;
+        }
+
+        BeginShutdown();
+        try
+        {
+            await session.DisposeAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+        }
+    }
+
+    private static PixelFormat ToProtocolPixelFormat(RemotePixelFormatKind pixelFormat) =>
+        pixelFormat switch
+        {
+            RemotePixelFormatKind.Bgra32 => PixelFormat.WinArdBgra32,
+            RemotePixelFormatKind.Rgb565 => PixelFormat.WinArdRgb565,
+            _ => throw new ArgumentOutOfRangeException(nameof(pixelFormat)),
+        };
+
+    private RemoteQualitySettings NormalizeSettings(RemoteQualitySettings settings)
+    {
+        var encodings = settings.Encodings.ToList();
+        if (_handshake?.Version == RfbVersion.V3_889)
+        {
+            AddIfMissing(encodings, (int)RfbEncodingType.ArdDisplayInfo);
+            AddIfMissing(encodings, (int)RfbEncodingType.ArdDisplayInfo2);
+            AddIfMissing(encodings, (int)RfbEncodingType.DesktopSize);
+            if (_sessionEncryption is not null)
+            {
+                AddIfMissing(encodings, (int)RfbEncodingType.ArdSessionEncryption);
+            }
+        }
+
+        return new RemoteQualitySettings(settings.PixelFormat, encodings, settings.ScaleFactor);
+    }
+
+    private static void AddIfMissing(List<int> encodings, int encoding)
+    {
+        if (!encodings.Contains(encoding))
+        {
+            encodings.Add(encoding);
+        }
+    }
+
+    private static bool SettingsEqual(RemoteQualitySettings left, RemoteQualitySettings right) =>
+        left.PixelFormat == right.PixelFormat &&
+        left.ScaleFactor.Equals(right.ScaleFactor) &&
+        left.Encodings.SequenceEqual(right.Encodings);
+
+    private void ThrowIfProtocolUnavailableNoLock()
+    {
+        if (_faulted)
+        {
+            throw new RfbProtocolException("The RFB client is faulted; discard it and the connection.");
+        }
+
+        ObjectDisposedException.ThrowIf(_shutdownStarted || _disposed, this);
+    }
+
     private void WriteNegotiationDiagnostic(RfbHandshakeResult handshake, RfbServerInit serverInit)
     {
         var ard = serverInit.ArdCapabilities;
@@ -578,6 +895,9 @@ internal sealed class RfbClient : IRfbClient
 
         private ISecret Secret => _secret ?? throw new ObjectDisposedException(nameof(ApplicationSecretMaterial));
     }
+
+    private sealed class QualityTransitionInterruptedException(OperationCanceledException innerException)
+        : InvalidOperationException("A quality transition was interrupted after protocol output began.", innerException);
 }
 
 internal sealed class FramebufferSnapshotFactory

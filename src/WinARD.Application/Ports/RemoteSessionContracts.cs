@@ -12,6 +12,54 @@ public readonly record struct RemotePoint(int X, int Y);
 
 public readonly record struct RemoteRectangle(int X, int Y, int Width, int Height);
 
+public enum RemotePixelFormatKind
+{
+    Bgra32,
+    Rgb565,
+}
+
+public sealed record RemoteQualitySettings
+{
+    public RemoteQualitySettings(
+        RemotePixelFormatKind pixelFormat,
+        IReadOnlyList<int> encodings,
+        double scaleFactor)
+    {
+        if (!Enum.IsDefined(pixelFormat))
+        {
+            throw new ArgumentOutOfRangeException(nameof(pixelFormat));
+        }
+
+        ArgumentNullException.ThrowIfNull(encodings);
+        if (encodings.Count > ushort.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(encodings));
+        }
+
+        if (!double.IsFinite(scaleFactor) || scaleFactor <= 0 || scaleFactor > 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(scaleFactor));
+        }
+
+        PixelFormat = pixelFormat;
+        Encodings = Array.AsReadOnly(encodings.ToArray());
+        ScaleFactor = scaleFactor;
+    }
+
+    public RemotePixelFormatKind PixelFormat { get; }
+    public IReadOnlyList<int> Encodings { get; }
+    public double ScaleFactor { get; }
+}
+
+public enum QualityTransitionStatus
+{
+    Applied,
+    NoChange,
+    ReconnectRequired,
+    CapabilityUnavailable,
+    Faulted,
+}
+
 public sealed record RemoteDisplayCapabilities(int? MaximumRefreshRate)
 {
     public static RemoteDisplayCapabilities Unknown { get; } = new((int?)null);
@@ -300,6 +348,11 @@ public interface IRemoteSessionRuntime
     /// Scheduling or client-message queue time occurs before completion.
     /// </summary>
     ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken);
+
+    ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(
+        RemoteQualitySettings settings,
+        CancellationToken cancellationToken) =>
+        ValueTask.FromResult(QualityTransitionStatus.CapabilityUnavailable);
 
     ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken);
 

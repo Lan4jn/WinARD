@@ -69,6 +69,15 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
         return _client.RequestFramebufferUpdateAsync(incremental, cancellationToken);
     }
 
+    public ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(
+        RemoteQualitySettings settings,
+        CancellationToken cancellationToken)
+    {
+        EnsureConnected();
+        ArgumentNullException.ThrowIfNull(settings);
+        return _client.ApplyQualityTransitionAsync(settings, cancellationToken);
+    }
+
     public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
     {
         EnsureConnected();

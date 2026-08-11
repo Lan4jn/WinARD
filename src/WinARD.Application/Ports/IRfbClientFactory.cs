@@ -35,6 +35,11 @@ public interface IRfbClient : IAsyncDisposable
     ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
         ValueTask.FromException(new NotSupportedException("Runtime framebuffer updates are not supported."));
 
+    ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(
+        RemoteQualitySettings settings,
+        CancellationToken cancellationToken) =>
+        ValueTask.FromResult(QualityTransitionStatus.CapabilityUnavailable);
+
     ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
         ValueTask.FromException<RemoteServerMessage>(
             new NotSupportedException("Runtime server messages are not supported."));

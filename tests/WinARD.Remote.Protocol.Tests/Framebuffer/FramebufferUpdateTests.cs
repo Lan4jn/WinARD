@@ -1052,6 +1052,26 @@ public sealed class FramebufferUpdateTests
         Assert.Same(firstException, secondException);
     }
 
+    [Fact]
+    public async Task Session_disposal_attempts_every_decoder_and_aggregates_failures()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var disposed = new List<int>();
+        var session = new FramebufferUpdateSession(
+            framebuffer,
+            new Dictionary<int, IRfbEncodingDecoder>
+            {
+                [701] = new RecordingDisposableDecoder(701, disposed, throws: true),
+                [702] = new RecordingDisposableDecoder(702, disposed, throws: false),
+                [703] = new RecordingDisposableDecoder(703, disposed, throws: true),
+            });
+
+        var exception = await Assert.ThrowsAsync<AggregateException>(() => session.DisposeAsync().AsTask());
+
+        Assert.Equal([701, 702, 703], disposed);
+        Assert.Equal(2, exception.InnerExceptions.Count);
+    }
+
     private static byte[] Update(params byte[][] rectangles)
     {
         var bytes = new List<byte> { 0, 0 };
@@ -1084,6 +1104,30 @@ public sealed class FramebufferUpdateTests
         {
             WasCalled = true;
             return ValueTask.FromResult(result);
+        }
+    }
+
+    private sealed class RecordingDisposableDecoder(
+        int encodingId,
+        List<int> disposed,
+        bool throws) : IRfbEncodingDecoder, IDisposable
+    {
+        public int EncodingId { get; } = encodingId;
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            FramebufferModel framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(EncodingDecodeResult.Empty);
+
+        public void Dispose()
+        {
+            disposed.Add(EncodingId);
+            if (throws)
+            {
+                throw new InvalidOperationException($"dispose {EncodingId}");
+            }
         }
     }
 
