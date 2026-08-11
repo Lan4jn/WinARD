@@ -268,6 +268,26 @@ public sealed class ProtocolProbeTests
         Assert.Equal(expectedPort, port);
     }
 
+    [Theory]
+    [InlineData(null, true, 10)]
+    [InlineData("", true, 10)]
+    [InlineData("1", true, 1)]
+    [InlineData("120", true, 120)]
+    [InlineData("600", true, 600)]
+    [InlineData("not-a-timeout", false, 0)]
+    [InlineData("0", false, 0)]
+    [InlineData("601", false, 0)]
+    public void Rdm_listener_idle_timeout_uses_safe_default_and_rejects_invalid_values(
+        string? value,
+        bool expectedSuccess,
+        int expectedSeconds)
+    {
+        var success = global::Program.TryParseRdmIdleTimeout(value, out var timeout);
+
+        Assert.Equal(expectedSuccess, success);
+        Assert.Equal(TimeSpan.FromSeconds(expectedSeconds), timeout);
+    }
+
     [Fact]
     public void Usage_covers_all_research_commands_with_powershell_call_operator()
     {
@@ -308,12 +328,50 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
+    public async Task Invalid_rdm_listener_idle_timeout_returns_usage_error_without_starting_listener()
+    {
+        var requestedVariables = new List<string>();
+        var captureStarted = false;
+        using var output = new StringWriter(CultureInfo.InvariantCulture);
+        using var error = new StringWriter(CultureInfo.InvariantCulture);
+
+        var exitCode = await global::Program.RunAsync(
+            ["--listen-rdm", "adaptive-default", "capture.json"],
+            name =>
+            {
+                requestedVariables.Add(name);
+                return name switch
+                {
+                    "WINARD_LISTEN_PORT" => "5902",
+                    "WINARD_RDM_IDLE_TIMEOUT_SECONDS" => "invalid",
+                    _ => throw new InvalidOperationException($"Remote variable {name} must not be read."),
+                };
+            },
+            output,
+            error,
+            CancellationToken.None,
+            (_, _, _, _) =>
+            {
+                captureStarted = true;
+                throw new InvalidOperationException("Listener must not start.");
+            });
+
+        Assert.Equal(2, exitCode);
+        Assert.Equal(
+            ["WINARD_LISTEN_PORT", "WINARD_RDM_IDLE_TIMEOUT_SECONDS"],
+            requestedVariables);
+        Assert.False(captureStarted);
+        Assert.Equal(string.Empty, output.ToString());
+        Assert.Contains("--listen-rdm", error.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Rdm_listener_dispatches_capture_and_file_write_before_remote_credentials_are_read()
     {
         var directory = Path.Combine(Path.GetTempPath(), $"winard-probe-rdm-{Guid.NewGuid():N}");
         var path = Path.Combine(directory, "adaptive-default.json");
         var requestedVariables = new List<string>();
-        var capturedArguments = new List<(int Port, string Profile)>();
+        var capturedArguments = new List<(TimeSpan Timeout, int Port, string Profile)>();
         using var output = new StringWriter(CultureInfo.InvariantCulture);
         using var error = new StringWriter(CultureInfo.InvariantCulture);
         try
@@ -323,22 +381,27 @@ public sealed class ProtocolProbeTests
                 name =>
                 {
                     requestedVariables.Add(name);
-                    return name == "WINARD_LISTEN_PORT"
-                        ? "5902"
-                        : throw new InvalidOperationException($"Remote variable {name} must not be read.");
+                    return name switch
+                    {
+                        "WINARD_LISTEN_PORT" => "5902",
+                        "WINARD_RDM_IDLE_TIMEOUT_SECONDS" => "120",
+                        _ => throw new InvalidOperationException($"Remote variable {name} must not be read."),
+                    };
                 },
                 output,
                 error,
                 CancellationToken.None,
-                (port, profile, _) =>
+                (timeout, port, profile, _) =>
                 {
-                    capturedArguments.Add((port, profile));
+                    capturedArguments.Add((timeout, port, profile));
                     return Task.FromResult(CreateRdmReport("adaptive-default", [0, -223, -309]));
                 });
 
             Assert.Equal(0, exitCode);
-            Assert.Equal(["WINARD_LISTEN_PORT"], requestedVariables);
-            Assert.Equal([(5902, "adaptive-default")], capturedArguments);
+            Assert.Equal(
+                ["WINARD_LISTEN_PORT", "WINARD_RDM_IDLE_TIMEOUT_SECONDS"],
+                requestedVariables);
+            Assert.Equal([(TimeSpan.FromSeconds(120), 5902, "adaptive-default")], capturedArguments);
             Assert.Equal(
                 ProbeOutput.FormatRdmListening(5902, "adaptive-default")
                     + Environment.NewLine

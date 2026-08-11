@@ -15,6 +15,7 @@ internal static class Program
         + "Research commands:"
         + Environment.NewLine
         + @"  & '.\WinARD.ProtocolProbe.exe' --listen-rdm adaptive-default '.\artifacts\protocol-research\rdm\adaptive-default.json'"
+        + " (optional WINARD_RDM_IDLE_TIMEOUT_SECONDS, 1..600, default 10)"
         + Environment.NewLine
         + @"  & '.\WinARD.ProtocolProbe.exe' --compare-rdm-captures '.\artifacts\protocol-research\rdm\full.json' '.\artifacts\protocol-research\rdm\adaptive-default.json'"
         + Environment.NewLine
@@ -36,6 +37,25 @@ internal static class Program
         }
 
         port = 0;
+        return false;
+    }
+
+    internal static bool TryParseRdmIdleTimeout(string? value, out TimeSpan timeout)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            timeout = RdmCaptureServer.DefaultInactivityTimeout;
+            return true;
+        }
+
+        if (int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var seconds)
+            && seconds is >= 1 and <= 600)
+        {
+            timeout = TimeSpan.FromSeconds(seconds);
+            return true;
+        }
+
+        timeout = TimeSpan.Zero;
         return false;
     }
 
@@ -62,7 +82,7 @@ internal static class Program
         TextWriter output,
         TextWriter error,
         CancellationToken cancellationToken,
-        Func<int, string, CancellationToken, Task<RdmCaptureReport>>? captureRdm = null,
+        Func<TimeSpan, int, string, CancellationToken, Task<RdmCaptureReport>>? captureRdm = null,
         EncodingPrefixCaptureOperation? captureEncodingPrefix = null,
         Func<CancellationToken, ISecretMaterial?>? readPassword = null)
     {
@@ -82,16 +102,21 @@ internal static class Program
             {
                 if (!TryParseRdmListenPort(
                         readEnvironmentVariable("WINARD_LISTEN_PORT"),
-                        out var listenPort))
+                        out var listenPort)
+                    || !TryParseRdmIdleTimeout(
+                        readEnvironmentVariable("WINARD_RDM_IDLE_TIMEOUT_SECONDS"),
+                        out var idleTimeout))
                 {
                     PrintUsage(error);
                     return 2;
                 }
 
-                captureRdm ??= new RdmCaptureServer().CaptureOnceAsync;
+                captureRdm ??= static (timeout, port, profile, token) =>
+                    new RdmCaptureServer(timeout).CaptureOnceAsync(port, profile, token);
                 return await RunRdmListenerAsync(
                     request,
                     listenPort,
+                    idleTimeout,
                     captureRdm,
                     output,
                     cancellationToken).ConfigureAwait(false);
@@ -180,12 +205,13 @@ internal static class Program
     private static async Task<int> RunRdmListenerAsync(
         ProbeRequest request,
         int port,
-        Func<int, string, CancellationToken, Task<RdmCaptureReport>> captureRdm,
+        TimeSpan idleTimeout,
+        Func<TimeSpan, int, string, CancellationToken, Task<RdmCaptureReport>> captureRdm,
         TextWriter output,
         CancellationToken cancellationToken)
     {
         output.WriteLine(ProbeOutput.FormatRdmListening(port, request.ProfileName!));
-        var report = await captureRdm(port, request.ProfileName!, cancellationToken)
+        var report = await captureRdm(idleTimeout, port, request.ProfileName!, cancellationToken)
             .ConfigureAwait(false);
         await RdmCaptureFile.WriteAsync(request.OutputPath!, report, cancellationToken)
             .ConfigureAwait(false);
