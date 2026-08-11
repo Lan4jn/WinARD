@@ -8,7 +8,7 @@ internal enum QualityInputActivityKind
 }
 
 /// <summary>
-/// A content-free input activity snapshot. Active flags remain set until a caller explicitly records them as false.
+/// A content-free input activity snapshot. Pointer drag state is explicit; scroll state expires after inactivity.
 /// </summary>
 internal sealed record QualityActivitySnapshot(
     DateTimeOffset? LastInputTimestamp,

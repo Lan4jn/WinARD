@@ -223,7 +223,8 @@ public sealed class SessionPerformanceTrackerTests
         ObserveFrame(tracker, bytes: 100 * 1024L * 1024L, dirty: [], size: new(100, 100));
         var observation = tracker.CreateQualityObservation();
 
-        Assert.Equal(3 * 1024 * 1024, observation.AverageBytesPerSecond5s);
+        // Advancing the incomplete current interval also ages half of the first completed interval out of the window.
+        Assert.Equal((29d / 9) * 1024 * 1024, observation.AverageBytesPerSecond5s, precision: 6);
         Assert.Equal(5 * 1024 * 1024, observation.PeakBytesPerSecond5s);
         Assert.Equal(1, observation.ActualFramesPerSecond);
         Assert.Equal(time.GetUtcNow(), observation.Timestamp);
@@ -245,6 +246,70 @@ public sealed class SessionPerformanceTrackerTests
 
         Assert.Equal(4 * 1024 * 1024, observation.AverageBytesPerSecond5s);
         Assert.Equal(6 * 1024 * 1024, observation.PeakBytesPerSecond5s);
+    }
+
+    [Fact]
+    public void Quality_observation_weights_completed_intervals_by_real_overlap_duration()
+    {
+        var time = new ManualTimeProvider(frequency: 3_000_000);
+        var tracker = CreateTracker(time);
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveFrame(tracker, 5 * 1024 * 1024, [], new(1, 1));
+        time.Advance(TimeSpan.FromSeconds(4));
+        ObserveFrame(tracker, 4 * 1024 * 1024, [], new(1, 1));
+
+        var observation = tracker.CreateQualityObservation();
+
+        Assert.Equal(1.8 * 1024 * 1024, observation.AverageBytesPerSecond5s, precision: 6);
+        Assert.Equal(5 * 1024 * 1024, observation.PeakBytesPerSecond5s);
+        Assert.Equal(0.4, observation.ActualFramesPerSecond, precision: 6);
+    }
+
+    [Fact]
+    public void Quality_observation_expires_completed_intervals_after_five_silent_seconds()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveFrame(tracker, 5 * 1024 * 1024, [], new(1, 1));
+        time.Advance(TimeSpan.FromSeconds(5));
+
+        var observation = tracker.CreateQualityObservation();
+
+        Assert.Equal(0, observation.AverageBytesPerSecond5s);
+        Assert.Equal(0, observation.PeakBytesPerSecond5s);
+        Assert.Equal(0, observation.ActualFramesPerSecond);
+    }
+
+    [Fact]
+    public void Quality_observation_uses_only_last_five_seconds_of_a_long_completed_interval()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        time.Advance(TimeSpan.FromSeconds(10));
+        ObserveFrame(tracker, 50 * 1024 * 1024, [], new(1, 1));
+
+        var observation = tracker.CreateQualityObservation();
+
+        Assert.Equal(5 * 1024 * 1024, observation.AverageBytesPerSecond5s);
+        Assert.Equal(5 * 1024 * 1024, observation.PeakBytesPerSecond5s);
+        Assert.Equal(0.1, observation.ActualFramesPerSecond, precision: 6);
+    }
+
+    [Fact]
+    public void Timestamp_rollback_discards_old_and_current_performance_windows_before_rebasing()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveFrame(tracker, 100 * 1024 * 1024, [], new(1, 1));
+
+        time.SetTimestamp(-TimeSpan.TicksPerSecond);
+        Assert.Equal(0, tracker.CreateQualityObservation().AverageBytesPerSecond5s);
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveFrame(tracker, 2 * 1024 * 1024, [], new(1, 1));
+
+        Assert.Equal(2 * 1024 * 1024, tracker.CreateQualityObservation().AverageBytesPerSecond5s);
     }
 
     [Fact]
@@ -385,35 +450,35 @@ public sealed class SessionPerformanceTrackerTests
     }
 
     [Fact]
-    public void Input_activity_keeps_only_aggregate_state_and_has_explicit_lifecycle()
+    public void Input_activity_keeps_only_aggregate_state_and_drag_clear_does_not_refresh_input_time()
     {
         var time = new ManualTimeProvider();
         var tracker = CreateTracker(time);
 
-        tracker.RecordInputActivity(
+        tracker.RecordInputOccurred(
             QualityInputActivityKind.Pointer,
             pointerDragActive: true,
-            scrollActive: false,
             pendingInputCount: 3);
         time.Advance(TimeSpan.FromMilliseconds(250));
 
-        var active = tracker.CreateQualityObservation();
-        Assert.Equal(TimeSpan.FromMilliseconds(250), active.SinceLastInput);
-        Assert.True(active.PointerDragActive);
-        Assert.False(active.ScrollActive);
-        Assert.Equal(3, active.PendingInputCount);
-        Assert.Equal(QualityInputActivityKind.Pointer, tracker.CurrentActivity.LastInputKind);
+        tracker.SetInputActiveState(pointerDragActive: false, pendingInputCount: 0);
 
-        tracker.RecordInputActivity(
-            QualityInputActivityKind.Keyboard,
-            pointerDragActive: false,
-            scrollActive: false,
-            pendingInputCount: 0);
-        time.Advance(TimeSpan.FromHours(1));
         var inactive = tracker.CreateQualityObservation();
+        Assert.Equal(TimeSpan.FromMilliseconds(250), inactive.SinceLastInput);
         Assert.False(inactive.PointerDragActive);
         Assert.False(inactive.ScrollActive);
         Assert.Equal(0, inactive.PendingInputCount);
+        Assert.Equal(QualityInputActivityKind.Pointer, tracker.CurrentActivity.LastInputKind);
+
+        tracker.RecordInputOccurred(
+            QualityInputActivityKind.Keyboard,
+            pointerDragActive: false,
+            pendingInputCount: 0);
+        time.Advance(TimeSpan.FromHours(1));
+        var muchLater = tracker.CreateQualityObservation();
+        Assert.False(muchLater.PointerDragActive);
+        Assert.False(muchLater.ScrollActive);
+        Assert.Equal(0, muchLater.PendingInputCount);
         Assert.DoesNotContain(
             tracker.CurrentActivity.GetType().GetProperties(),
             property => property.Name.Contains("Text", StringComparison.OrdinalIgnoreCase) ||
@@ -422,14 +487,33 @@ public sealed class SessionPerformanceTrackerTests
     }
 
     [Fact]
+    public void Scroll_activity_expires_without_a_release_and_preserves_last_real_input_time()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        tracker.RecordInputOccurred(QualityInputActivityKind.Scroll, false, 1);
+        time.Advance(TimeSpan.FromMilliseconds(599));
+        Assert.True(tracker.CreateQualityObservation().ScrollActive);
+
+        time.Advance(TimeSpan.FromMilliseconds(2));
+        var expired = tracker.CreateQualityObservation();
+
+        Assert.False(expired.ScrollActive);
+        Assert.Equal(TimeSpan.FromMilliseconds(601), expired.SinceLastInput);
+        Assert.Equal(QualityInputActivityKind.Scroll, tracker.CurrentActivity.LastInputKind);
+    }
+
+    [Fact]
     public void Input_activity_rejects_negative_pending_count_and_clock_rollback_is_safe()
     {
         var time = new ManualTimeProvider();
         var tracker = CreateTracker(time);
-        tracker.RecordInputActivity(QualityInputActivityKind.Scroll, false, true, 1);
+        tracker.RecordInputOccurred(QualityInputActivityKind.Scroll, false, 1);
 
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            tracker.RecordInputActivity(QualityInputActivityKind.Scroll, false, true, -1));
+            tracker.RecordInputOccurred(QualityInputActivityKind.Scroll, false, -1));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            tracker.SetInputActiveState(false, -1));
         time.SetTimestamp(-TimeSpan.TicksPerSecond);
         Assert.Equal(TimeSpan.Zero, tracker.CreateQualityObservation().SinceLastInput);
     }
