@@ -125,14 +125,38 @@ public sealed class AdaptiveQualityControllerTests
     }
 
     [Fact]
-    public void Dirty_motion_requires_consecutive_samples_and_two_percent_is_not_idle()
+    public void Dirty_motion_requires_sixty_milliseconds_of_continuous_high_coverage()
     {
         var controller = CreateController();
 
         Assert.Equal(QualityContentState.Interactive,
             controller.Decide(Observation(Epoch, dirty: .25)).State);
-        Assert.Equal(QualityContentState.Motion,
+        Assert.Equal(QualityContentState.Interactive,
             controller.Decide(Observation(Epoch.AddMilliseconds(1), dirty: .25)).State);
+        Assert.Equal(QualityContentState.Interactive,
+            controller.Decide(Observation(Epoch.AddMilliseconds(59), dirty: .25)).State);
+        Assert.Equal(QualityContentState.Motion,
+            controller.Decide(Observation(Epoch.AddMilliseconds(60), dirty: .25)).State);
+    }
+
+    [Fact]
+    public void Dirty_motion_timer_resets_when_coverage_drops_below_twenty_five_percent()
+    {
+        var controller = CreateController();
+        controller.Decide(Observation(Epoch, dirty: .25));
+        controller.Decide(Observation(Epoch.AddMilliseconds(30), dirty: .24));
+
+        Assert.Equal(QualityContentState.Interactive,
+            controller.Decide(Observation(Epoch.AddMilliseconds(100), dirty: .25)).State);
+        Assert.Equal(QualityContentState.Interactive,
+            controller.Decide(Observation(Epoch.AddMilliseconds(159), dirty: .25)).State);
+        Assert.Equal(QualityContentState.Motion,
+            controller.Decide(Observation(Epoch.AddMilliseconds(160), dirty: .25)).State);
+    }
+
+    [Fact]
+    public void Two_percent_is_interactive_while_coverage_below_it_is_idle()
+    {
 
         var boundary = CreateController().Decide(Observation(Epoch, dirty: .02));
         var below = CreateController().Decide(Observation(Epoch, dirty: .0199));
@@ -331,8 +355,9 @@ public sealed class AdaptiveQualityControllerTests
         Assert.Throws<ArgumentOutOfRangeException>(() => Observation(Epoch, average: 2, peak: 1));
         Assert.Throws<ArgumentOutOfRangeException>(() => Observation(Epoch, response: TimeSpan.FromTicks(-1)));
         var controller = CreateController();
-        controller.Decide(Observation(Epoch));
-        Assert.Throws<ArgumentOutOfRangeException>(() => controller.Decide(Observation(Epoch.AddTicks(-1))));
+        controller.Decide(Observation(Epoch, dirty: .25));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            controller.Decide(Observation(Epoch.AddTicks(-1), dirty: .25)));
     }
 
     private static QualityLevel DegradeRepeatedly(AdaptiveQualityController controller)

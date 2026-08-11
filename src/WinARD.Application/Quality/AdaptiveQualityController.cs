@@ -9,6 +9,7 @@ namespace WinARD.Application.Quality;
 public sealed class AdaptiveQualityController
 {
     private static readonly TimeSpan InputRecentThreshold = TimeSpan.FromMilliseconds(600);
+    private static readonly TimeSpan SustainedHighDirtyThreshold = TimeSpan.FromMilliseconds(60);
     private static readonly TimeSpan BandwidthWindow = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DegradeCooldown = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan UpgradeCooldown = TimeSpan.FromSeconds(5);
@@ -34,7 +35,7 @@ public sealed class AdaptiveQualityController
     private DateTimeOffset? stableUnderTargetSince;
     private DateTimeOffset? contentStableSince;
     private int consecutiveOverTargetWindows;
-    private int consecutiveHighDirtySamples;
+    private DateTimeOffset? highDirtySince;
     private QualityContentState? state;
     private long generation;
 
@@ -178,15 +179,15 @@ public sealed class AdaptiveQualityController
     {
         if (observation.IsDragging || observation.IsScrolling)
         {
-            consecutiveHighDirtySamples = 0;
+            highDirtySince = null;
             contentStableSince = null;
             return QualityContentState.Motion;
         }
 
         if (observation.DirtyCoverage >= .25)
         {
-            consecutiveHighDirtySamples++;
-            if (consecutiveHighDirtySamples >= 2)
+            highDirtySince ??= observation.Timestamp;
+            if (observation.Timestamp - highDirtySince.Value >= SustainedHighDirtyThreshold)
             {
                 contentStableSince = null;
                 return QualityContentState.Motion;
@@ -194,7 +195,7 @@ public sealed class AdaptiveQualityController
         }
         else
         {
-            consecutiveHighDirtySamples = 0;
+            highDirtySince = null;
         }
 
         if (observation.DirtyCoverage >= .02)
