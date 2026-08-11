@@ -1267,16 +1267,16 @@ public sealed class ProtocolProbeTests
         var declarationHeader = await ReadExactlyAsync(stream, 24);
         Assert.Equal((byte)0, declarationHeader[0]);
         Assert.Equal((byte)2, declarationHeader[20]);
-        Assert.Equal(7, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
+        Assert.Equal(8, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
         Assert.Equal(
             [
+                0, 0, 0, 6,
                 0, 0, 0, 16,
                 0, 0, 0, 0,
                 0, 0, 0, 1,
                 0xFF, 0xFF, 0xFF, 0x11,
-                0xFF, 0xFF, 0xFF, 0x21,
             ],
-            (await ReadExactlyAsync(stream, 28))[..20]);
+            (await ReadExactlyAsync(stream, 32))[..20]);
         Assert.Equal(new byte[] { 5, 0, 0, 2, 0, 1 }, await ReadExactlyAsync(stream, 6));
         await AssertClientClosedWithoutAnotherRequestAsync(stream);
     }
@@ -1341,15 +1341,15 @@ public sealed class ProtocolProbeTests
         var declarationHeader = await ReadExactlyAsync(stream, 24);
         Assert.Equal((byte)0, declarationHeader[0]);
         Assert.Equal((byte)2, declarationHeader[20]);
-        var encodingCount = ard889 ? 7 : 5;
+        var encodingCount = ard889 ? 8 : 6;
         Assert.Equal(encodingCount, BinaryPrimitives.ReadUInt16BigEndian(declarationHeader.AsSpan(22)));
         Assert.Equal(
             [
+                0, 0, 0, 6,
                 0, 0, 0, 16,
                 0, 0, 0, 0,
                 0, 0, 0, 1,
                 0xFF, 0xFF, 0xFF, 0x11,
-                0xFF, 0xFF, 0xFF, 0x21,
             ],
             (await ReadExactlyAsync(stream, encodingCount * 4))[..20]);
         var request = await ReadExactlyAsync(stream, 10);

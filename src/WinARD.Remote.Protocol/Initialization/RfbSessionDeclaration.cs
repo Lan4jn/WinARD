@@ -24,6 +24,7 @@ public sealed record RfbSessionDeclaration
     public static RfbSessionDeclaration Default { get; } = new(
         PixelFormat.WinArdBgra32,
         [
+            (int)RfbEncodingType.Zlib,
             (int)RfbEncodingType.Zrle,
             (int)RfbEncodingType.Raw,
             (int)RfbEncodingType.CopyRect,

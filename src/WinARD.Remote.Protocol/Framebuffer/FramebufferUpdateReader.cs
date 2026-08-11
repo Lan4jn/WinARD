@@ -35,16 +35,37 @@ public static class FramebufferUpdateReader
         ArgumentNullException.ThrowIfNull(framebuffer);
         ArgumentNullException.ThrowIfNull(pixelFormat);
         ArgumentNullException.ThrowIfNull(additionalDecoders);
-        var decoders = CreateDecoders(pixelFormat);
+        var registeredEncodingIds = new HashSet<int>
+        {
+            (int)RfbEncodingType.Raw,
+            (int)RfbEncodingType.CopyRect,
+            (int)RfbEncodingType.Zlib,
+            (int)RfbEncodingType.Zrle,
+            (int)RfbEncodingType.DesktopSize,
+            (int)RfbEncodingType.Cursor,
+            (int)RfbEncodingType.ArdDisplayInfo,
+            (int)RfbEncodingType.ArdDisplayInfo2,
+        };
+        var additionalDecoderSnapshot = new List<(int EncodingId, IRfbEncodingDecoder Decoder)>(
+            additionalDecoders.Length);
         foreach (var decoder in additionalDecoders)
         {
             ArgumentNullException.ThrowIfNull(decoder);
-            if (!decoders.TryAdd(decoder.EncodingId, decoder))
+            var encodingId = decoder.EncodingId;
+            if (!registeredEncodingIds.Add(encodingId))
             {
                 throw new ArgumentException(
-                    $"An RFB decoder for encoding ID {decoder.EncodingId} is already registered.",
+                    $"An RFB decoder for encoding ID {encodingId} is already registered.",
                     nameof(additionalDecoders));
             }
+
+            additionalDecoderSnapshot.Add((encodingId, decoder));
+        }
+
+        var decoders = CreateDecoders(pixelFormat);
+        foreach (var (encodingId, decoder) in additionalDecoderSnapshot)
+        {
+            decoders.Add(encodingId, decoder);
         }
 
         return new FramebufferUpdateSession(framebuffer, decoders);
@@ -248,6 +269,7 @@ public static class FramebufferUpdateReader
         {
             new RawEncoding(pixelFormat),
             new CopyRectEncoding(),
+            new ZlibEncoding(pixelFormat),
             new ZrleEncoding(pixelFormat),
             new DesktopSizeEncoding(),
             new CursorEncoding(pixelFormat),
@@ -260,6 +282,7 @@ public static class FramebufferUpdateReader
         {
             new RawEncoding(pixelFormat),
             new CopyRectEncoding(),
+            new SessionRequiredPersistentEncoding(RfbEncodingType.Zlib, "Zlib"),
             new SessionRequiredZrleEncoding(),
             new DesktopSizeEncoding(),
             new CursorEncoding(pixelFormat),
@@ -279,5 +302,21 @@ public static class FramebufferUpdateReader
             ValueTask.FromException<EncodingDecodeResult>(
                 new RfbProtocolException(
                     "ZRLE requires a persistent per-connection session; use FramebufferUpdateReader.CreateSession."));
+    }
+
+    private sealed class SessionRequiredPersistentEncoding(
+        RfbEncodingType encodingType,
+        string encodingName) : IRfbEncodingDecoder
+    {
+        public int EncodingId => (int)encodingType;
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            Framebuffer framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromException<EncodingDecodeResult>(
+                new RfbProtocolException(
+                    $"{encodingName} requires a persistent per-connection session; use FramebufferUpdateReader.CreateSession."));
     }
 }

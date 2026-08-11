@@ -4,6 +4,7 @@ public enum RfbEncodingType
 {
     Raw = 0,
     CopyRect = 1,
+    Zlib = 6,
     Zrle = 16,
     ArdDisplayInfo = 1101,
     ArdSessionEncryption = 1103,

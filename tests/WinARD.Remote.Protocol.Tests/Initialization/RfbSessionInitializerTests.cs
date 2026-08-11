@@ -86,7 +86,7 @@ public sealed class RfbSessionInitializerTests
     }
 
     [Fact]
-    public void Session_declaration_validates_inputs_and_default_excludes_zlib()
+    public void Session_declaration_validates_inputs_and_default_prefers_zlib()
     {
         Assert.Throws<ArgumentNullException>(() => new RfbSessionDeclaration(null!, []));
         Assert.Throws<ArgumentNullException>(() => new RfbSessionDeclaration(PixelFormat.WinArdBgra32, null!));
@@ -95,7 +95,7 @@ public sealed class RfbSessionInitializerTests
 
         Assert.Equal("encodings", exception.ParamName);
         Assert.Same(PixelFormat.WinArdBgra32, RfbSessionDeclaration.Default.PixelFormat);
-        Assert.DoesNotContain(6, RfbSessionDeclaration.Default.Encodings);
+        Assert.Equal([6, 16, 0, 1, -239, -223], RfbSessionDeclaration.Default.Encodings);
     }
 
     [Fact]
@@ -207,7 +207,7 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal("Studio Mac", server.Name);
         Assert.Equal(PixelFormat.WinArdBgra32, server.PixelFormat);
         Assert.Equal(ExpectedClientInitialization(), stream.WrittenBytes);
-        Assert.Equal([1, 20, 24], stream.WriteLengths);
+        Assert.Equal([1, 20, 28], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
     }
@@ -230,7 +230,7 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal("Studio Mac", server.Name);
         Assert.Null(server.ArdCapabilities);
         Assert.Equal(ExpectedClientInitialization(), stream.WrittenBytes);
-        Assert.Equal([1, 20, 24], stream.WriteLengths);
+        Assert.Equal([1, 20, 28], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
     }
@@ -301,7 +301,7 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal(
             [ClientInitArd(), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), ArdSetEncodingsMessage()],
             stream.Writes);
-        Assert.Equal([1, 66, 4, 8, 20, 32], stream.WriteLengths);
+        Assert.Equal([1, 66, 4, 8, 20, 36], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
     }
@@ -574,7 +574,7 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal(
             [ClientInitArd(), SessionCommand("alice", command: 1), ViewerInfoMessage(), SetModeSharedMessage(), SetDisplayAllMessage(), SetPixelFormatMessage(), BootstrapSetEncodingsMessage(), ArdSetEncodingsMessage()],
             stream.Writes);
-        Assert.Equal([1, 74, 66, 4, 8, 20, 16, 32], stream.WriteLengths);
+        Assert.Equal([1, 74, 66, 4, 8, 20, 16, 36], stream.WriteLengths);
         Assert.All(stream.Writes, message => Assert.NotEqual(3, message[0]));
         Assert.Equal(serverInit.Length + sessionInfo.Length + sessionResult.Length + bootstrap.Length, stream.ReadPosition);
         Assert.Equal(0, stream.FlushCount);
@@ -1052,6 +1052,7 @@ public sealed class RfbSessionInitializerTests
 
     private static byte[] StandardSetEncodingsMessage() =>
         SetEncodingsMessage(
+            (int)RfbEncodingType.Zlib,
             (int)RfbEncodingType.Zrle,
             (int)RfbEncodingType.Raw,
             (int)RfbEncodingType.CopyRect,
@@ -1060,6 +1061,7 @@ public sealed class RfbSessionInitializerTests
 
     private static byte[] ArdSetEncodingsMessage() =>
         SetEncodingsMessage(
+            (int)RfbEncodingType.Zlib,
             (int)RfbEncodingType.Zrle,
             (int)RfbEncodingType.Raw,
             (int)RfbEncodingType.CopyRect,
@@ -1070,6 +1072,7 @@ public sealed class RfbSessionInitializerTests
 
     private static byte[] EncryptedArdSetEncodingsMessage() =>
         SetEncodingsMessage(
+            (int)RfbEncodingType.Zlib,
             (int)RfbEncodingType.Zrle,
             (int)RfbEncodingType.Raw,
             (int)RfbEncodingType.CopyRect,
@@ -1181,7 +1184,8 @@ public sealed class RfbSessionInitializerTests
         1,
         0, 0, 0, 0,
         32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0,
-        2, 0, 0, 5,
+        2, 0, 0, 6,
+        0, 0, 0, 6,
         0, 0, 0, 16,
         0, 0, 0, 0,
         0, 0, 0, 1,

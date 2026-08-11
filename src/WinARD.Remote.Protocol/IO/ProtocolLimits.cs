@@ -53,6 +53,29 @@ public sealed record ProtocolLimits
         int maxCursorBytes,
         int maxZrleCompressedBytes,
         int maxZrleDecompressedBytes)
+        : this(
+            maxMessageBytes,
+            maxFramebufferBytes,
+            maxFramebufferUpdateBytes,
+            maxFramebufferUpdateWorkBytes,
+            maxCursorBytes,
+            maxZrleCompressedBytes,
+            maxZrleDecompressedBytes,
+            maxZrleCompressedBytes,
+            maxZrleDecompressedBytes)
+    {
+    }
+
+    public ProtocolLimits(
+        int maxMessageBytes,
+        int maxFramebufferBytes,
+        int maxFramebufferUpdateBytes,
+        int maxFramebufferUpdateWorkBytes,
+        int maxCursorBytes,
+        int maxZrleCompressedBytes,
+        int maxZrleDecompressedBytes,
+        int maxZlibCompressedBytes,
+        int maxZlibDecompressedBytes)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxMessageBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFramebufferBytes);
@@ -61,6 +84,8 @@ public sealed record ProtocolLimits
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxCursorBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxZrleCompressedBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxZrleDecompressedBytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxZlibCompressedBytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxZlibDecompressedBytes);
         if (maxFramebufferUpdateBytes > maxFramebufferBytes)
         {
             throw new ArgumentOutOfRangeException(
@@ -89,6 +114,20 @@ public sealed record ProtocolLimits
                 "The ZRLE decompressed byte limit cannot exceed the framebuffer update work limit.");
         }
 
+        if (maxZlibCompressedBytes > maxFramebufferUpdateBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxZlibCompressedBytes),
+                "The Zlib compressed byte limit cannot exceed the framebuffer update byte limit.");
+        }
+
+        if (maxZlibDecompressedBytes > maxFramebufferUpdateWorkBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxZlibDecompressedBytes),
+                "The Zlib decompressed byte limit cannot exceed the framebuffer update work limit.");
+        }
+
         MaxMessageBytes = maxMessageBytes;
         MaxFramebufferBytes = maxFramebufferBytes;
         MaxFramebufferUpdateBytes = maxFramebufferUpdateBytes;
@@ -96,6 +135,8 @@ public sealed record ProtocolLimits
         MaxCursorBytes = maxCursorBytes;
         MaxZrleCompressedBytes = maxZrleCompressedBytes;
         MaxZrleDecompressedBytes = maxZrleDecompressedBytes;
+        MaxZlibCompressedBytes = maxZlibCompressedBytes;
+        MaxZlibDecompressedBytes = maxZlibDecompressedBytes;
     }
 
     public static ProtocolLimits Default { get; } = new(
@@ -126,6 +167,12 @@ public sealed record ProtocolLimits
 
     /// <summary>Maximum cumulative decompressed bytes in one ZRLE rectangle.</summary>
     public int MaxZrleDecompressedBytes { get; }
+
+    /// <summary>Maximum compressed bytes in one Zlib rectangle.</summary>
+    public int MaxZlibCompressedBytes { get; }
+
+    /// <summary>Maximum decompressed raw pixel bytes in one Zlib rectangle.</summary>
+    public int MaxZlibDecompressedBytes { get; }
 
     private static int DefaultWorkBytes(int maxFramebufferBytes) =>
         checked((int)Math.Min(int.MaxValue, (long)maxFramebufferBytes * 3));
