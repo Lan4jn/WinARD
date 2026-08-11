@@ -16,6 +16,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Text.Json;
 using System.Security.Cryptography;
+using System.Buffers;
 
 #pragma warning disable CA1707
 
@@ -1239,6 +1240,32 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Quality_settings_preserve_order_deduplicate_and_append_required_encodings_on_wire()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+
+        var result = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0, 6, 16, 0], 1),
+            default);
+
+        Assert.Equal(QualityTransitionStatus.Applied, result);
+        var writes = stream.WrittenBytes[offset..];
+        Assert.Equal(58, writes.Length);
+        Assert.Equal(2, writes[20]);
+        Assert.Equal(6, BinaryPrimitives.ReadUInt16BigEndian(writes.AsSpan(22)));
+        Assert.Equal(
+            [16, 0, 6, 1, -239, -223],
+            Enumerable.Range(0, 6)
+                .Select(index => BinaryPrimitives.ReadInt32BigEndian(writes.AsSpan(24 + (index * 4)))));
+        Assert.Equal(3, writes[48]);
+    }
+
+    [Fact]
     public async Task Rfb_client_no_change_and_scale_preflight_write_nothing()
     {
         await using var stream = new ScriptedDuplexStream(
@@ -1436,6 +1463,52 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Prewire_cancellation_keeps_primary_cancellation_when_new_decoder_cleanup_fails()
+    {
+        const string privateMarker = "PRIVATE-CLEANUP-PATH-MARKER";
+        var createCount = 0;
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(
+            stream,
+            diagnosticSink: sink,
+            framebufferSessionFactory: (framebuffer, pixelFormat) =>
+                Interlocked.Increment(ref createCount) == 1
+                    ? FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32)
+                    : new FramebufferUpdateSession(
+                        framebuffer,
+                        new Dictionary<int, IRfbEncodingDecoder>
+                        {
+                            [700] = new ThrowingDisposeDecoder(privateMarker),
+                        }));
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var blocked = stream.BlockNextWrite();
+        var active = client.SendPointerAsync(0, 1, 1, default).AsTask();
+        await blocked.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        using var cancellation = new CancellationTokenSource();
+        var transition = client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1),
+            cancellation.Token).AsTask();
+
+        cancellation.Cancel();
+        blocked.Release.TrySetResult();
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => transition);
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        await active;
+        var diagnostic = Assert.Single(
+            sink.Snapshot(),
+            item => item.Code == "RFB_QUALITY_TRANSITION_CLEANUP");
+        Assert.Contains(diagnostic.Fields, field =>
+            field.Name == "Stage" && field.Value == "CanceledBeforeWire");
+        Assert.Contains(diagnostic.Fields, field =>
+            field.Name == "FailureKind" && field.Value == "Other");
+        Assert.DoesNotContain(privateMarker, JsonSerializer.Serialize(diagnostic), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Rfb_client_prioritizes_input_over_queued_framebuffer_requests()
     {
         await using var stream = new ScriptedDuplexStream(
@@ -1612,7 +1685,11 @@ public sealed class FramePresentationTests
                 RfbProtocolReadStage.FramebufferRectanglePayload,
                 EncodingId: 1105,
                 RectangleIndex: 2));
-        var snapshotFactory = new FramebufferSnapshotFactory(_ => throw snapshotFailure);
+        var snapshotAttempts = 0;
+        var snapshotFactory = new FramebufferSnapshotFactory(length =>
+            Interlocked.Increment(ref snapshotAttempts) == 1
+                ? throw snapshotFailure
+                : MemoryPool<byte>.Shared.Rent(length));
         await using var stream = new ScriptedDuplexStream(
             [
                 .. Handshake("RFB 003.008\n"),
@@ -1620,20 +1697,54 @@ public sealed class FramePresentationTests
                 0, 0, 0, 1,
                 .. Header(0, 0, 1, 1, (int)RfbEncodingType.Raw),
                 1, 2, 3, 4,
+                0, 0, 0, 1,
+                .. Header(0, 0, 1, 1, (int)RfbEncodingType.Raw),
+                5, 6, 7, 8,
             ]);
         await using var client = new RfbClient(stream, snapshotFactory);
 
         await client.NegotiateAsync(CancellationToken.None);
         await client.InitializeAsync(CancellationToken.None);
+        await client.RequestFramebufferUpdateAsync(incremental: true, CancellationToken.None);
 
         var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             client.ReceiveAsync(CancellationToken.None).AsTask());
+        await client.RequestFramebufferUpdateAsync(incremental: true, CancellationToken.None);
+        using var recovered = Assert.IsType<RemoteFramebufferMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
 
         Assert.Equal(RfbProtocolFailureKind.DecoderFailure, exception.Failure?.Kind);
         Assert.Equal(RfbProtocolReadStage.FramebufferRectanglePayload, exception.Failure?.ReadStage);
         Assert.Equal((byte)0, exception.Failure?.ServerMessageType);
         Assert.Equal(1105, exception.Failure?.EncodingId);
         Assert.Equal(2, exception.Failure?.RectangleIndex);
+        Assert.Equal([5, 6, 7, 255], recovered.Bgra32.ToArray());
+    }
+
+    [Fact]
+    public async Task Wire_decode_failure_keeps_request_outstanding_and_decoder_faulted()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [
+                .. Handshake("RFB 003.008\n"),
+                .. ServerInit(1, 1),
+                0, 0, 0, 1,
+                .. Header(0, 0, 1, 1, 999),
+                .. CursorOnlyUpdate(),
+            ]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        await client.RequestFramebufferUpdateAsync(incremental: true, default);
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() => client.ReceiveAsync(default).AsTask());
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            _ = client.RequestFramebufferUpdateAsync(incremental: true, default).AsTask();
+        });
+        var fault = await Assert.ThrowsAsync<RfbProtocolException>(() => client.ReceiveAsync(default).AsTask());
+
+        Assert.Contains("faulted", fault.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1962,7 +2073,8 @@ public sealed class FramePresentationTests
         public void Dispose() => _buffer = null;
     }
 
-    private sealed class ThrowingDisposeDecoder : IRfbEncodingDecoder, IDisposable
+    private sealed class ThrowingDisposeDecoder(
+        string message = "injected old decoder disposal failure") : IRfbEncodingDecoder, IDisposable
     {
         public int EncodingId => 700;
 
@@ -1973,7 +2085,7 @@ public sealed class FramePresentationTests
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(EncodingDecodeResult.Empty);
 
-        public void Dispose() => throw new InvalidOperationException("injected old decoder disposal failure");
+        public void Dispose() => throw new InvalidOperationException(message);
     }
 
     private sealed class ScriptedDuplexStream(

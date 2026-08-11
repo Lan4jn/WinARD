@@ -369,7 +369,9 @@ internal sealed class RfbClient : IRfbClient
             }
             else
             {
-                await newSession.DisposeAsync().ConfigureAwait(false);
+                await DisposeUnpublishedSessionBestEffortAsync(
+                    newSession,
+                    "CanceledBeforeWire").ConfigureAwait(false);
             }
 
             throw;
@@ -382,7 +384,9 @@ internal sealed class RfbClient : IRfbClient
                 return QualityTransitionStatus.Faulted;
             }
 
-            await newSession.DisposeAsync().ConfigureAwait(false);
+            await DisposeUnpublishedSessionBestEffortAsync(
+                newSession,
+                "FailedBeforeWire").ConfigureAwait(false);
             return QualityTransitionStatus.CapabilityUnavailable;
         }
         finally
@@ -449,15 +453,15 @@ internal sealed class RfbClient : IRfbClient
                                     .ConfigureAwait(false);
                             }
 
-                            var statistics = new RemoteUpdateStatistics(
-                                SessionBytesSinceLastFramebufferStatistics(),
-                                update.EncodingCounts);
-                            var message = _snapshotFactory.CreateServerMessage(framebuffer, update, statistics);
                             lock (_lifecycleSync)
                             {
                                 _framebufferRequestOutstanding = false;
                             }
 
+                            var statistics = new RemoteUpdateStatistics(
+                                SessionBytesSinceLastFramebufferStatistics(),
+                                update.EncodingCounts);
+                            var message = _snapshotFactory.CreateServerMessage(framebuffer, update, statistics);
                             return message;
                         }
                         catch (RfbProtocolException exception)
@@ -790,8 +794,23 @@ internal sealed class RfbClient : IRfbClient
         {
             await session.DisposeAsync().ConfigureAwait(false);
         }
-        catch
+        catch (Exception exception)
         {
+            WriteQualityTransitionCleanupDiagnostic("FaultedConnection", exception);
+        }
+    }
+
+    private async ValueTask DisposeUnpublishedSessionBestEffortAsync(
+        FramebufferUpdateSession session,
+        string stage)
+    {
+        try
+        {
+            await session.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            WriteQualityTransitionCleanupDiagnostic(stage, exception);
         }
     }
 
@@ -805,12 +824,19 @@ internal sealed class RfbClient : IRfbClient
 
     private RemoteQualitySettings NormalizeSettings(RemoteQualitySettings settings)
     {
-        var encodings = settings.Encodings.ToList();
+        var encodings = new List<int>(settings.Encodings.Count + 6);
+        foreach (var encoding in settings.Encodings)
+        {
+            AddIfMissing(encodings, encoding);
+        }
+
+        AddIfMissing(encodings, (int)RfbEncodingType.CopyRect);
+        AddIfMissing(encodings, (int)RfbEncodingType.Cursor);
+        AddIfMissing(encodings, (int)RfbEncodingType.DesktopSize);
         if (_handshake?.Version == RfbVersion.V3_889)
         {
             AddIfMissing(encodings, (int)RfbEncodingType.ArdDisplayInfo);
             AddIfMissing(encodings, (int)RfbEncodingType.ArdDisplayInfo2);
-            AddIfMissing(encodings, (int)RfbEncodingType.DesktopSize);
             if (_sessionEncryption is not null)
             {
                 AddIfMissing(encodings, (int)RfbEncodingType.ArdSessionEncryption);
@@ -818,6 +844,26 @@ internal sealed class RfbClient : IRfbClient
         }
 
         return new RemoteQualitySettings(settings.PixelFormat, encodings, settings.ScaleFactor);
+    }
+
+    private void WriteQualityTransitionCleanupDiagnostic(string stage, Exception exception)
+    {
+        var failureKind = exception switch
+        {
+            OperationCanceledException => "Canceled",
+            IOException => "IO",
+            ObjectDisposedException => "Disposed",
+            AggregateException => "Aggregate",
+            _ => "Other",
+        };
+        _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
+            "RFB_QUALITY_TRANSITION_CLEANUP",
+            Guid.NewGuid().ToString("N"),
+            "Quality transition decoder cleanup failed.",
+            [
+                new("Stage", stage),
+                new("FailureKind", failureKind),
+            ]));
     }
 
     private static void AddIfMissing(List<int> encodings, int encoding)
