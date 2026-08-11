@@ -399,6 +399,37 @@ public sealed class RemoteSessionViewModelTests
     }
 
     [Fact]
+    public async Task Quality_choices_use_real_connection_capabilities_and_preserve_saved_unavailable_values()
+    {
+        var profile = QualityProfile.CreateCustom(
+            2L << 20,
+            QualityColor.Grayscale,
+            QualityScale.Percent50,
+            FrameRefreshPolicy.Automatic);
+        await using var viewModel = new RemoteSessionViewModel(
+            new QualityCapabilityRuntime(60),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            profile);
+
+        var gray = Assert.Single(
+            viewModel.QualityColorOptions,
+            option => option.Value == QualityColor.Grayscale);
+        var scale = Assert.Single(
+            viewModel.QualityScaleOptions,
+            option => option.Value == QualityScale.Percent50);
+
+        Assert.False(gray.IsEnabled);
+        Assert.False(scale.IsEnabled);
+        Assert.Equal("已保存，当前连接不可用", gray.ConstraintText);
+        Assert.Equal("已保存，当前连接不可用", scale.ConstraintText);
+        Assert.False(viewModel.IsAutomaticGrayscaleAvailable);
+    }
+
+    [Fact]
     public void Performance_text_formats_mode_measurements_rate_encoding_and_response()
     {
         var snapshot = new SessionPerformanceSnapshot(

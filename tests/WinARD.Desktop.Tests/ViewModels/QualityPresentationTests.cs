@@ -99,6 +99,98 @@ public sealed class QualityPresentationTests
     }
 
     [Fact]
+    public void Capability_limited_choices_keep_saved_scale_and_grayscale_disabled_and_annotated()
+    {
+        var capabilities = new ArdDisplayCapabilities(
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            true,
+            false,
+            null);
+
+        var colors = QualityPresentation.ColorOptionsFor(
+            QualityColor.Grayscale,
+            capabilities,
+            new QualityDecoderGates());
+        var scales = QualityPresentation.ScaleOptionsFor(QualityScale.Percent50, capabilities);
+
+        var savedGray = Assert.Single(colors, option => option.Value == QualityColor.Grayscale);
+        Assert.False(savedGray.IsEnabled);
+        Assert.Equal("已保存，当前连接不可用", savedGray.ConstraintText);
+        Assert.All(
+            scales.Where(option => option.Value is QualityScale.Percent75 or QualityScale.Percent50),
+            option => Assert.False(option.IsEnabled));
+        var savedScale = Assert.Single(scales, option => option.Value == QualityScale.Percent50);
+        Assert.Equal("已保存，当前连接不可用", savedScale.ConstraintText);
+        Assert.Equal(4, colors.Count);
+        Assert.Equal(4, scales.Count);
+    }
+
+    [Fact]
+    public void Observed_capabilities_and_approved_gate_enable_remote_quality_choices()
+    {
+        var capabilities = new ArdDisplayCapabilities(
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            true,
+            true,
+            null);
+
+        Assert.True(QualityPresentation.ScaleOptionsFor(
+                QualityScale.Native,
+                capabilities,
+                scaleSwitchApproved: true)
+            .Single(option => option.Value == QualityScale.Percent75).IsEnabled);
+        Assert.True(QualityPresentation.ColorOptionsFor(
+                QualityColor.Full32,
+                capabilities,
+                new QualityDecoderGates(AppleColor1002Approved: false, AppleGrayscale1001Approved: true))
+            .Single(option => option.Value == QualityColor.Grayscale).IsEnabled);
+    }
+
+    [Fact]
+    public void Observed_scaling_stays_disabled_until_the_connection_safety_gate_is_approved()
+    {
+        var capabilities = new ArdDisplayCapabilities(
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            true,
+            true,
+            null);
+
+        var scale = QualityPresentation.ScaleOptionsFor(QualityScale.Native, capabilities)
+            .Single(option => option.Value == QualityScale.Percent75);
+
+        Assert.False(scale.IsEnabled);
+        Assert.Equal("当前连接不可用", scale.ConstraintText);
+    }
+
+    [Fact]
+    public void Summary_before_first_decision_labels_saved_values_as_settings_awaiting_confirmation()
+    {
+        var profile = QualityProfile.CreateCustom(
+            2L << 20,
+            QualityColor.Grayscale,
+            QualityScale.Percent50,
+            FrameRefreshPolicy.Automatic);
+
+        var summary = QualityPresentation.FormatPendingSummary(profile, 60, null);
+
+        Assert.Equal("设置：自定义 · 灰度 · 50% · 60 FPS · —（待能力确认）", summary);
+        Assert.DoesNotContain("当前：灰度", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("实际：灰度", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Bandwidth_choices_have_stable_unique_ids_and_explicit_kinds()
     {
         Assert.Equal(

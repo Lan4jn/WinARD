@@ -85,6 +85,83 @@ public sealed class AdaptiveQualityControllerTests
     }
 
     [Fact]
+    public void Entering_recovery_does_not_upgrade_before_fifteen_continuous_stable_seconds()
+    {
+        var controller = CreateController(target: 1_000);
+        controller.Observe(Observation(Epoch, average: 1_500, dirty: .1));
+        controller.Observe(Observation(Epoch.AddMilliseconds(1), average: 700, peak: 900, dirty: .01));
+
+        var recovery = controller.Observe(Observation(
+            Epoch.AddMilliseconds(601),
+            average: 700,
+            peak: 900,
+            dirty: .01));
+
+        Assert.Equal(QualityContentState.Recovery, recovery.ContentState);
+        Assert.Equal(QualityLevel.Q1, recovery.Level);
+        Assert.NotEqual(QualityDecisionReason.StableRecovery, recovery.Reason);
+    }
+
+    [Fact]
+    public void Ninety_percent_average_never_qualifies_for_an_upgrade_even_after_fifteen_seconds()
+    {
+        var controller = CreateController(target: 1_000);
+        controller.Observe(Observation(Epoch, average: 1_500));
+        controller.Observe(Observation(Epoch.AddSeconds(1), average: 900, peak: 900));
+
+        var decision = controller.Observe(Observation(Epoch.AddSeconds(17), average: 900, peak: 900));
+
+        Assert.Equal(QualityLevel.Q1, decision.Level);
+        Assert.NotEqual(QualityDecisionReason.StableRecovery, decision.Reason);
+    }
+
+    [Fact]
+    public void Upgrade_occurs_at_exactly_fifteen_stable_seconds_but_not_one_millisecond_before()
+    {
+        var controller = CreateController(target: 1_000);
+        controller.Observe(Observation(Epoch, average: 1_500));
+        controller.Observe(Observation(Epoch.AddSeconds(1), average: 700, peak: 900));
+
+        var before = controller.Observe(Observation(
+            Epoch.AddMilliseconds(15_999),
+            average: 700,
+            peak: 900));
+        var boundary = controller.Observe(Observation(
+            Epoch.AddSeconds(16),
+            average: 700,
+            peak: 900));
+
+        Assert.Equal(QualityLevel.Q1, before.Level);
+        Assert.Equal(QualityLevel.Q0, boundary.Level);
+        Assert.Equal(QualityDecisionReason.StableRecovery, boundary.Reason);
+    }
+
+    [Theory]
+    [InlineData(50, 0)]
+    [InlineData(0, 1)]
+    public void Unstable_response_or_input_queue_resets_the_fifteen_second_upgrade_window(
+        double responseMilliseconds,
+        int pending)
+    {
+        var controller = CreateController(target: 1_000);
+        controller.Observe(Observation(Epoch, average: 1_500));
+        controller.Observe(Observation(Epoch.AddSeconds(1), average: 700, peak: 900));
+        controller.Observe(Observation(
+            Epoch.AddSeconds(10),
+            average: 700,
+            peak: 900,
+            response: TimeSpan.FromMilliseconds(responseMilliseconds),
+            pending: pending));
+        controller.Observe(Observation(Epoch.AddSeconds(11), average: 700, peak: 900));
+
+        var tooEarly = controller.Observe(Observation(Epoch.AddSeconds(25), average: 700, peak: 900));
+        var recovered = controller.Observe(Observation(Epoch.AddSeconds(26), average: 700, peak: 900));
+
+        Assert.Equal(QualityLevel.Q1, tooEarly.Level);
+        Assert.Equal(QualityLevel.Q0, recovered.Level);
+    }
+
+    [Fact]
     public void Repeated_severe_signals_respect_two_second_degrade_cooldown()
     {
         var controller = CreateController(target: 1_000);
@@ -111,7 +188,7 @@ public sealed class AdaptiveQualityControllerTests
     }
 
     [Fact]
-    public void Since_last_input_contributes_to_the_single_six_hundred_millisecond_recovery_period()
+    public void Low_dirty_content_becomes_idle_when_the_six_hundred_millisecond_input_period_expires()
     {
         var controller = CreateController();
         controller.Observe(Observation(Epoch, dirty: .01, sinceInput: TimeSpan.Zero));
@@ -121,7 +198,8 @@ public sealed class AdaptiveQualityControllerTests
             dirty: .01,
             sinceInput: TimeSpan.FromMilliseconds(600)));
 
-        Assert.Equal(QualityContentState.Recovery, decision.ContentState);
+        Assert.Equal(QualityContentState.Idle, decision.ContentState);
+        Assert.True(decision.TargetFramesPerSecond <= 30);
     }
 
     [Fact]
@@ -299,7 +377,7 @@ public sealed class AdaptiveQualityControllerTests
     }
 
     [Fact]
-    public void Recovery_restores_one_adjacent_level_once_with_unlimited_bandwidth()
+    public void Recovery_waits_for_stability_then_restores_one_adjacent_level_with_unlimited_bandwidth()
     {
         var profile = QualityProfile.CreateCustom(
             null,
@@ -318,13 +396,13 @@ public sealed class AdaptiveQualityControllerTests
         var immediateIdle = controller.Observe(Observation(Epoch.AddMilliseconds(15_602), dirty: .01));
 
         Assert.Equal(QualityContentState.Recovery, recovery.ContentState);
-        Assert.Equal(QualityLevel.Q2, recovery.Level);
-        Assert.Equal(QualityDecisionReason.StableRecovery, recovery.Reason);
+        Assert.Equal(QualityLevel.Q3, recovery.Level);
+        Assert.NotEqual(QualityDecisionReason.StableRecovery, recovery.Reason);
         Assert.Equal(QualityContentState.Idle, idle.ContentState);
-        Assert.Equal(QualityLevel.Q2, idle.Level);
-        Assert.Equal(QualityLevel.Q2, beforeStableIdle.Level);
-        Assert.Equal(QualityLevel.Q1, stableIdle.Level);
-        Assert.Equal(QualityLevel.Q1, immediateIdle.Level);
+        Assert.Equal(QualityLevel.Q3, idle.Level);
+        Assert.Equal(QualityLevel.Q3, beforeStableIdle.Level);
+        Assert.Equal(QualityLevel.Q2, stableIdle.Level);
+        Assert.Equal(QualityLevel.Q2, immediateIdle.Level);
     }
 
     [Theory]

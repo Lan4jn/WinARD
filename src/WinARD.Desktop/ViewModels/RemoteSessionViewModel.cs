@@ -270,6 +270,22 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     internal QualityPresentationSnapshot QualityPresentationSnapshot =>
         Volatile.Read(ref _qualityPresentationSnapshot);
 
+    internal IReadOnlyList<QualityChoice<QualityColor>> QualityColorOptions =>
+        QualityPresentation.ColorOptionsFor(
+            _qualityProfile.Color,
+            _adaptiveQualityCapabilities,
+            _qualityDecoderGates);
+
+    internal IReadOnlyList<QualityChoice<QualityScale>> QualityScaleOptions =>
+        QualityPresentation.ScaleOptionsFor(
+            _qualityProfile.Scale,
+            _adaptiveQualityCapabilities,
+            scaleSwitchApproved: false);
+
+    internal bool IsAutomaticGrayscaleAvailable =>
+        _adaptiveQualityCapabilities.AppleGrayscale1001.IsObserved() &&
+        _qualityDecoderGates.AppleGrayscale1001Approved;
+
     internal RemoteSessionDiagnosticQualitySnapshot CreateDiagnosticQualitySnapshot() =>
         Volatile.Read(ref _diagnosticQualitySnapshot);
 

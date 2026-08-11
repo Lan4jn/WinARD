@@ -84,6 +84,36 @@ public static class QualityPresentation
             new(QualityScale.Percent50, "50%"),
         ]);
 
+    public static IReadOnlyList<QualityChoice<QualityColor>> ColorOptionsFor(
+        QualityColor selected,
+        ArdDisplayCapabilities capabilities,
+        QualityDecoderGates decoderGates)
+    {
+        ArgumentNullException.ThrowIfNull(capabilities);
+        ArgumentNullException.ThrowIfNull(decoderGates);
+        var grayscaleAvailable = capabilities.AppleGrayscale1001.IsObserved() &&
+            decoderGates.AppleGrayscale1001Approved;
+        return ColorOptions
+            .Select(option => option.Value == QualityColor.Grayscale && !grayscaleAvailable
+                ? Unavailable(option, option.Value == selected)
+                : option)
+            .ToArray();
+    }
+
+    public static IReadOnlyList<QualityChoice<QualityScale>> ScaleOptionsFor(
+        QualityScale selected,
+        ArdDisplayCapabilities capabilities,
+        bool scaleSwitchApproved = false)
+    {
+        ArgumentNullException.ThrowIfNull(capabilities);
+        var scalingAvailable = capabilities.ServerScaling.IsObserved() && scaleSwitchApproved;
+        return ScaleOptions
+            .Select(option => option.Value is QualityScale.Percent75 or QualityScale.Percent50 && !scalingAvailable
+                ? Unavailable(option, option.Value == selected)
+                : option)
+            .ToArray();
+    }
+
     public static string FormatSummary(
         QualityPreset preset,
         QualityColor color,
@@ -95,6 +125,16 @@ public static class QualityPresentation
         (bytesPerSecond is >= 0
             ? string.Create(CultureInfo.InvariantCulture, $"{bytesPerSecond / MiB:0.0} MiB/s")
             : "—");
+
+    public static string FormatPendingSummary(
+        QualityProfile profile,
+        int? targetFps,
+        double? bytesPerSecond)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        return $"设置：{FormatSummary(profile.Preset, profile.Color, profile.Scale, targetFps, bytesPerSecond)}" +
+            "（待能力确认）";
+    }
 
     public static string StatusText(QualityPresentationStatus status) => status switch
     {
@@ -295,4 +335,11 @@ public static class QualityPresentation
 
     private static ReadOnlyCollection<QualityChoice<T>> ReadOnly<T>(QualityChoice<T>[] values) =>
         new ReadOnlyCollection<QualityChoice<T>>(values);
+
+    private static QualityChoice<T> Unavailable<T>(QualityChoice<T> option, bool saved) =>
+        option with
+        {
+            IsEnabled = false,
+            ConstraintText = saved ? "已保存，当前连接不可用" : "当前连接不可用",
+        };
 }

@@ -519,6 +519,71 @@ public sealed class SessionPerformanceTrackerTests
     }
 
     [Fact]
+    public void Never_input_uses_session_start_so_low_dirty_content_becomes_idle_at_six_hundred_milliseconds()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        var controller = new AdaptiveQualityController(
+            QualityProfile.Automatic,
+            new ArdDisplayCapabilities(
+                CapabilitySupport.Observed,
+                CapabilitySupport.Observed,
+                CapabilitySupport.Unknown,
+                CapabilitySupport.Unknown,
+                CapabilitySupport.Unknown,
+                true,
+                false,
+                null));
+
+        time.Advance(TimeSpan.FromMilliseconds(599));
+        var interactive = controller.Observe(tracker.CreateQualityObservation());
+        time.Advance(TimeSpan.FromMilliseconds(1));
+        var idle = controller.Observe(tracker.CreateQualityObservation());
+
+        Assert.Equal(QualityContentState.Interactive, interactive.ContentState);
+        Assert.Equal(QualityContentState.Idle, idle.ContentState);
+        Assert.True(idle.TargetFramesPerSecond <= 30);
+        Assert.Null(tracker.CurrentActivity.LastInputKind);
+    }
+
+    [Fact]
+    public void Clock_rollback_restarts_never_input_elapsed_time_without_manufacturing_input_metadata()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        var controller = new AdaptiveQualityController(
+            QualityProfile.Automatic,
+            new ArdDisplayCapabilities(
+                CapabilitySupport.Observed,
+                CapabilitySupport.Observed,
+                CapabilitySupport.Unknown,
+                CapabilitySupport.Unknown,
+                CapabilitySupport.Unknown,
+                true,
+                false,
+                null));
+        time.Advance(TimeSpan.FromSeconds(1));
+        Assert.Equal(
+            QualityContentState.Idle,
+            controller.Observe(tracker.CreateQualityObservation()).ContentState);
+
+        time.SetTimestamp(-TimeSpan.TicksPerSecond);
+        Assert.Equal(
+            QualityContentState.Interactive,
+            controller.Observe(tracker.CreateQualityObservation()).ContentState);
+        time.Advance(TimeSpan.FromMilliseconds(599));
+        Assert.Equal(
+            QualityContentState.Interactive,
+            controller.Observe(tracker.CreateQualityObservation()).ContentState);
+        time.Advance(TimeSpan.FromMilliseconds(1));
+
+        var elapsed = tracker.CreateQualityObservation();
+        Assert.Equal(TimeSpan.FromMilliseconds(600), elapsed.SinceLastInput);
+        Assert.Equal(QualityContentState.Idle, controller.Observe(elapsed).ContentState);
+        Assert.Null(tracker.CurrentActivity.LastInputKind);
+    }
+
+    [Fact]
     public async Task Current_and_quality_observation_are_safe_during_concurrent_updates()
     {
         var time = new ManualTimeProvider();

@@ -68,6 +68,10 @@ internal sealed class SessionPerformanceTracker
     private readonly Dictionary<int, long> _cumulativeEncodingCounts = [];
     private readonly Queue<QualityInterval> _qualityIntervals = new(MaximumQualityIntervalCount);
     private long _windowStarted;
+    private long _inputBaselineTimestamp;
+    private long _observationClockStarted;
+    private DateTimeOffset _observationClockStartedUtc;
+    private DateTimeOffset _latestObservationUtc;
     private long _latestTimestamp;
     private long _windowFrames;
     private long _windowBytes;
@@ -98,6 +102,10 @@ internal sealed class SessionPerformanceTracker
     {
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         _windowStarted = _timeProvider.GetTimestamp();
+        _inputBaselineTimestamp = _windowStarted;
+        _observationClockStarted = _windowStarted;
+        _observationClockStartedUtc = _timeProvider.GetUtcNow();
+        _latestObservationUtc = _observationClockStartedUtc;
         _latestTimestamp = _windowStarted;
         ArgumentOutOfRangeException.ThrowIfNegative(initialWindowFrames);
         _windowFrames = initialWindowFrames;
@@ -242,11 +250,11 @@ internal sealed class SessionPerformanceTracker
             : totalFramesPerSecond / totalOverlapSeconds;
         var sinceLastInput = _lastInputTimestamp is { } lastInput
             ? SafeElapsed(lastInput, now)
-            : TimeSpan.Zero;
+            : SafeElapsed(_inputBaselineTimestamp, now);
         var activity = CreateActivitySnapshotNoLock(now);
 
         return new QualityObservation(
-                _timeProvider.GetUtcNow(),
+                CreateObservationTimestampNoLock(now),
                 ClampFiniteNonNegative(averageBytesPerSecond),
                 ClampFiniteNonNegative(peakBytesPerSecond),
                 ClampFiniteNonNegative(averageFramesPerSecond),
@@ -535,6 +543,9 @@ internal sealed class SessionPerformanceTracker
         {
             _qualityIntervals.Clear();
             _windowStarted = now;
+            _inputBaselineTimestamp = now;
+            _observationClockStarted = now;
+            _observationClockStartedUtc = _latestObservationUtc;
             _windowFrames = 0;
             _windowBytes = 0;
             _windowDirtyCoverage = 0;
@@ -547,6 +558,27 @@ internal sealed class SessionPerformanceTracker
         }
 
         _latestTimestamp = now;
+    }
+
+    private DateTimeOffset CreateObservationTimestampNoLock(long now)
+    {
+        DateTimeOffset candidate;
+        try
+        {
+            candidate = _observationClockStartedUtc.Add(SafeElapsed(_observationClockStarted, now));
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            candidate = DateTimeOffset.MaxValue;
+        }
+
+        if (candidate < _latestObservationUtc)
+        {
+            return _latestObservationUtc;
+        }
+
+        _latestObservationUtc = candidate;
+        return candidate;
     }
 
     private TimeSpan SafeElapsed(long start, long end)

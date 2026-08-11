@@ -87,15 +87,33 @@
                                             x:Name="QualityColorComboBox"
                                             AutomationProperties.AutomationId="RemoteQualityColorComboBox"
                                             AutomationProperties.Name="画质色彩"
-                                            DisplayMemberPath="DisplayName"
-                                            SelectionChanged="OnQualityDetailSelectionChanged" />
+                                            DropDownOpened="OnQualityColorDropDownOpened"
+                                            SelectionChanged="OnQualityDetailSelectionChanged">
+                                            <ComboBox.ItemTemplate>
+                                                <DataTemplate>
+                                                    <StackPanel>
+                                                        <TextBlock Text="{Binding DisplayName}" />
+                                                        <TextBlock FontSize="11" Opacity="0.7" Text="{Binding ConstraintText}" />
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </ComboBox.ItemTemplate>
+                                        </ComboBox>
                                         <TextBlock Text="缩放" />
                                         <ComboBox
                                             x:Name="QualityScaleComboBox"
                                             AutomationProperties.AutomationId="RemoteQualityScaleComboBox"
                                             AutomationProperties.Name="画质缩放"
-                                            DisplayMemberPath="DisplayName"
-                                            SelectionChanged="OnQualityDetailSelectionChanged" />
+                                            DropDownOpened="OnQualityScaleDropDownOpened"
+                                            SelectionChanged="OnQualityDetailSelectionChanged">
+                                            <ComboBox.ItemTemplate>
+                                                <DataTemplate>
+                                                    <StackPanel>
+                                                        <TextBlock Text="{Binding DisplayName}" />
+                                                        <TextBlock FontSize="11" Opacity="0.7" Text="{Binding ConstraintText}" />
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </ComboBox.ItemTemplate>
+                                        </ComboBox>
                                         <TextBlock Text="刷新率" />
                                         <ComboBox
                                             x:Name="QualityRefreshComboBox"

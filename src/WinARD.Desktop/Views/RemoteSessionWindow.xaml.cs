@@ -146,8 +146,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         FrameRateComboBox.ItemsSource = ViewModel.FrameRefreshOptions;
         QualityPresetComboBox.ItemsSource = QualityPresentation.PresetOptions;
         QualityBandwidthComboBox.ItemsSource = QualityPresentation.BandwidthOptions;
-        QualityColorComboBox.ItemsSource = QualityPresentation.ColorOptions;
-        QualityScaleComboBox.ItemsSource = QualityPresentation.ScaleOptions;
+        QualityColorComboBox.ItemsSource = ViewModel.QualityColorOptions;
+        QualityScaleComboBox.ItemsSource = ViewModel.QualityScaleOptions;
         QualityRefreshComboBox.ItemsSource = ViewModel.FrameRefreshOptions;
         RefreshFrameRateSelection();
         UpdatePerformanceVisual();
@@ -604,12 +604,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             profile = QualityPresentation.WithBandwidth(profile, bandwidth.Value);
         }
         else if (ReferenceEquals(sender, QualityColorComboBox) &&
-            QualityColorComboBox.SelectedItem is QualityChoice<QualityColor> color)
+            QualityColorComboBox.SelectedItem is QualityChoice<QualityColor> { IsEnabled: true } color)
         {
             profile = QualityPresentation.WithColor(profile, color.Value);
         }
         else if (ReferenceEquals(sender, QualityScaleComboBox) &&
-            QualityScaleComboBox.SelectedItem is QualityChoice<QualityScale> scale)
+            QualityScaleComboBox.SelectedItem is QualityChoice<QualityScale> { IsEnabled: true } scale)
         {
             profile = QualityPresentation.WithScale(profile, scale.Value);
         }
@@ -675,6 +675,31 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
     }
 
+    private void OnQualityColorDropDownOpened(object sender, object args) =>
+        ApplyQualityChoiceAvailability(QualityColorComboBox, ViewModel.QualityColorOptions);
+
+    private void OnQualityScaleDropDownOpened(object sender, object args) =>
+        ApplyQualityChoiceAvailability(QualityScaleComboBox, ViewModel.QualityScaleOptions);
+
+    private static void ApplyQualityChoiceAvailability<T>(
+        ComboBox comboBox,
+        IReadOnlyList<QualityChoice<T>> options)
+    {
+        for (var index = 0; index < options.Count; index++)
+        {
+            if (comboBox.ContainerFromIndex(index) is ComboBoxItem item)
+            {
+                var option = options[index];
+                item.IsEnabled = option.IsEnabled;
+                AutomationProperties.SetName(
+                    item,
+                    option.ConstraintText is null
+                        ? option.DisplayName
+                        : $"{option.DisplayName}，{option.ConstraintText}");
+            }
+        }
+    }
+
     private async Task ApplyQualityFromUiAsync(QualityProfile profile)
     {
         ClearFrameRateSaveStatus();
@@ -718,6 +743,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         {
             var presentation = ViewModel.QualityPresentationSnapshot;
             var profile = presentation.Profile;
+            var colorOptions = ViewModel.QualityColorOptions;
+            var scaleOptions = ViewModel.QualityScaleOptions;
             QualityPresetComboBox.SelectedItem = QualityPresentation.PresetOptions.Single(
                 option => option.Value == profile.Preset);
             var targetBytesPerSecond = profile.TargetBytesPerSecond;
@@ -734,11 +761,19 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                 QualityCustomBandwidthBox.Value = targetBytesPerSecond.GetValueOrDefault() / (1024d * 1024d);
             }
             QualityBandwidthComboBox.SelectedItem = bandwidthOption;
-            QualityColorComboBox.SelectedItem = QualityPresentation.ColorOptions.Single(option => option.Value == profile.Color);
-            QualityScaleComboBox.SelectedItem = QualityPresentation.ScaleOptions.Single(option => option.Value == profile.Scale);
+            QualityColorComboBox.ItemsSource = colorOptions;
+            QualityScaleComboBox.ItemsSource = scaleOptions;
+            QualityColorComboBox.SelectedItem = colorOptions.Single(option => option.Value == profile.Color);
+            QualityScaleComboBox.SelectedItem = scaleOptions.Single(option => option.Value == profile.Scale);
             QualityRefreshComboBox.ItemsSource = ViewModel.FrameRefreshOptions;
             QualityRefreshComboBox.SelectedItem = ViewModel.SelectedFrameRefreshOption;
             QualityGrayscaleToggle.IsOn = profile.AllowAutomaticGrayscale;
+            QualityGrayscaleToggle.IsEnabled = ViewModel.IsAutomaticGrayscaleAvailable;
+            AutomationProperties.SetName(
+                QualityGrayscaleToggle,
+                ViewModel.IsAutomaticGrayscaleAvailable
+                    ? "允许自动使用灰度"
+                    : "允许自动使用灰度，当前连接不可用");
             QualityBandwidthLock.IsChecked = profile.BandwidthLocked;
             QualityColorLock.IsChecked = profile.ColorLocked;
             QualityScaleLock.IsChecked = profile.ScaleLocked;
@@ -746,12 +781,17 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
             var decision = presentation.Decision;
             var performance = presentation.Performance;
-            var summary = QualityPresentation.FormatSummary(
-                profile.Preset,
-                decision?.Color ?? profile.Color,
-                decision?.Scale ?? profile.Scale,
-                decision?.TargetFramesPerSecond ?? performance.TargetFramesPerSecond,
-                performance.SampleSequence > 0 ? performance.ReceiveBytesPerSecond : null);
+            var summary = decision is null
+                ? QualityPresentation.FormatPendingSummary(
+                    profile,
+                    performance.TargetFramesPerSecond,
+                    performance.SampleSequence > 0 ? performance.ReceiveBytesPerSecond : null)
+                : QualityPresentation.FormatSummary(
+                    profile.Preset,
+                    decision.Color,
+                    decision.Scale,
+                    decision.TargetFramesPerSecond,
+                    performance.SampleSequence > 0 ? performance.ReceiveBytesPerSecond : null);
             var status = decision is null
                 ? QualityPresentationStatus.Unknown
                 : QualityPresentation.StatusFor(

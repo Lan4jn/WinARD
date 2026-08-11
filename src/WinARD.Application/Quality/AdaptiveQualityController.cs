@@ -39,6 +39,7 @@ public sealed class AdaptiveQualityController
     private DateTimeOffset? contentStableSince;
     private int consecutiveOverTargetWindows;
     private DateTimeOffset? highDirtySince;
+    private bool recoveringFromContentActivity;
     private QualityContentState? state;
     private long generation;
 
@@ -132,16 +133,6 @@ public sealed class AdaptiveQualityController
                 }
             }
 
-            var enteringRecovery = nextState == QualityContentState.Recovery &&
-                previousState != QualityContentState.Recovery;
-            if (!levelChangedThisDecision && !severe && !overTarget && enteringRecovery &&
-                CanUpgrade(observation.Timestamp) && MoveOneLevel(down: false))
-            {
-                MarkLevelChange(observation.Timestamp, down: false);
-                reason = QualityDecisionReason.StableRecovery;
-                levelChangedThisDecision = true;
-            }
-
             var contentIsStable = nextState is QualityContentState.Recovery or QualityContentState.Idle;
             if (contentIsStable && IsStableUnderTarget(observation, target))
             {
@@ -208,6 +199,7 @@ public sealed class AdaptiveQualityController
         {
             highDirtySince = null;
             contentStableSince = null;
+            recoveringFromContentActivity = true;
             return QualityContentState.Motion;
         }
 
@@ -217,6 +209,7 @@ public sealed class AdaptiveQualityController
             if (observation.Timestamp - highDirtySince.Value >= SustainedHighDirtyThreshold)
             {
                 contentStableSince = null;
+                recoveringFromContentActivity = true;
                 return QualityContentState.Motion;
             }
         }
@@ -228,6 +221,7 @@ public sealed class AdaptiveQualityController
         if (observation.DirtyCoverage >= .02)
         {
             contentStableSince = null;
+            recoveringFromContentActivity = true;
             return QualityContentState.Interactive;
         }
 
@@ -237,13 +231,18 @@ public sealed class AdaptiveQualityController
             return QualityContentState.Interactive;
         }
 
-        if (state is QualityContentState.Motion or QualityContentState.Interactive)
+        if (recoveringFromContentActivity && state is QualityContentState.Motion or QualityContentState.Interactive)
         {
-            return observation.Timestamp - contentStableSince.Value >= InputRecentThreshold
-                ? QualityContentState.Recovery
-                : state.Value;
+            if (observation.Timestamp - contentStableSince.Value >= InputRecentThreshold)
+            {
+                recoveringFromContentActivity = false;
+                return QualityContentState.Recovery;
+            }
+
+            return state.Value;
         }
 
+        recoveringFromContentActivity = false;
         return QualityContentState.Idle;
     }
 
