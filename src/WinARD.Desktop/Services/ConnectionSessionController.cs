@@ -166,7 +166,25 @@ public sealed class ConnectionSessionController : IAsyncDisposable
     public async Task<ConnectionProfile> UpdateConnectedFrameRefreshPolicyAsync(
         FrameRefreshPolicy policy,
         CancellationToken cancellationToken)
+        => await UpdateConnectedProfileAsync(
+            profile => profile.WithFrameRefreshPolicy(policy),
+            cancellationToken).ConfigureAwait(false);
+
+    public async Task<ConnectionProfile> UpdateConnectedQualityProfileAsync(
+        QualityProfile quality,
+        CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(quality);
+        return await UpdateConnectedProfileAsync(
+            profile => profile.WithQualityProfile(quality),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<ConnectionProfile> UpdateConnectedProfileAsync(
+        Func<ConnectionProfile, ConnectionProfile> update,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(update);
         ConnectionProfile updated;
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -177,7 +195,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
             await ownership.EnterProfileUpdateAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                updated = ownership.Profile.WithFrameRefreshPolicy(policy);
+                updated = update(ownership.Profile);
                 await _repository.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
                 ownership.UpdateProfile(updated);
             }

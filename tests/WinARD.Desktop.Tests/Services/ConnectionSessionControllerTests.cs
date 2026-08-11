@@ -115,6 +115,29 @@ public sealed class ConnectionSessionControllerTests
     }
 
     [Fact]
+    public async Task Connected_quality_profile_update_persists_updates_ownership_and_publishes()
+    {
+        var repository = new RecordingRepository();
+        await using var sut = Controller(
+            new TrackingTransport(),
+            new Prompt(SshHostKeyPromptDecision.Cancel),
+            repository);
+        await sut.ConnectAsync(Profile(), CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+        ConnectionProfile? published = null;
+        sut.ProfileUpdated += profile => published = profile;
+
+        var updated = await sut.UpdateConnectedQualityProfileAsync(
+            QualityProfile.Smooth,
+            CancellationToken.None);
+
+        Assert.Same(updated, ownership.Profile);
+        Assert.Same(updated, published);
+        Assert.Same(QualityProfile.Smooth, updated.Quality);
+        Assert.Equal([updated], repository.Saved);
+    }
+
+    [Fact]
     public async Task Failed_connected_refresh_policy_persistence_keeps_transferred_ownership_profile()
     {
         var repository = new ThrowingRepository();

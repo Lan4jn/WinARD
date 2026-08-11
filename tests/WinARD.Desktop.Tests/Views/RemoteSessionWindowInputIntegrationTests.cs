@@ -10,6 +10,116 @@ namespace WinARD.Desktop.Tests.Views;
 public sealed class RemoteSessionWindowInputIntegrationTests
 {
     [Fact]
+    public async Task Quality_selection_applies_before_save_and_skips_duplicate()
+    {
+        var current = QualityProfile.Automatic;
+        var applied = new List<QualityProfile>();
+        var saved = new List<QualityProfile>();
+
+        current = await RemoteSessionWindow.ApplyQualityProfileSelectionAsync(
+            QualityProfile.Smooth,
+            current,
+            applied.Add,
+            (profile, _) => { saved.Add(profile); return Task.CompletedTask; },
+            _ => { },
+            () => false,
+            CancellationToken.None);
+        current = await RemoteSessionWindow.ApplyQualityProfileSelectionAsync(
+            QualityProfile.Smooth,
+            current,
+            applied.Add,
+            (profile, _) => { saved.Add(profile); return Task.CompletedTask; },
+            _ => { },
+            () => false,
+            CancellationToken.None);
+
+        Assert.Equal(QualityProfile.Smooth, current);
+        Assert.Equal([QualityProfile.Smooth], applied);
+        Assert.Equal([QualityProfile.Smooth], saved);
+    }
+
+    [Fact]
+    public async Task Failed_quality_save_keeps_session_value_and_reports_independent_status()
+    {
+        QualityProfile? applied = null;
+        string? status = null;
+
+        var selected = await RemoteSessionWindow.ApplyQualityProfileSelectionAsync(
+            QualityProfile.Balanced,
+            QualityProfile.Automatic,
+            value => applied = value,
+            (_, _) => Task.FromException(new InvalidOperationException("save failed")),
+            value => status = value,
+            () => false,
+            CancellationToken.None);
+
+        Assert.Same(QualityProfile.Balanced, selected);
+        Assert.Same(QualityProfile.Balanced, applied);
+        Assert.Equal("画质设置未保存，本次会话仍已应用", status);
+    }
+
+    [Fact]
+    public async Task Closing_cancels_quality_save_without_writing_status_after_close()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var statuses = new List<string>();
+
+        var selected = await RemoteSessionWindow.ApplyQualityProfileSelectionAsync(
+            QualityProfile.Smooth,
+            QualityProfile.Automatic,
+            _ => { },
+            (_, token) => { cancellation.Cancel(); return Task.FromCanceled(token); },
+            statuses.Add,
+            () => cancellation.IsCancellationRequested,
+            cancellation.Token);
+
+        Assert.Same(QualityProfile.Smooth, selected);
+        Assert.Empty(statuses);
+    }
+
+    [Fact]
+    public void Quality_controls_have_unique_stable_automation_ids_and_no_sensitive_fields()
+    {
+        var xaml = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml"));
+        var ids = System.Text.RegularExpressions.Regex.Matches(
+                xaml,
+                "AutomationProperties.AutomationId=\"(RemoteQuality[^\"]+)\"")
+            .Select(match => match.Groups[1].Value)
+            .ToArray();
+
+        Assert.True(ids.Length >= 12);
+        Assert.Equal(ids.Length, ids.Distinct(StringComparer.Ordinal).Count());
+        Assert.DoesNotContain("Host", string.Join('|', ids), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Path", string.Join('|', ids), StringComparison.OrdinalIgnoreCase);
+        foreach (var id in ids)
+        {
+            Assert.Matches(
+                $"AutomationProperties.AutomationId=\"{id}\"[^>]*AutomationProperties.Name=\"[^\"]+\"",
+                xaml);
+        }
+
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+        Assert.DoesNotContain(
+            "StatusText.Text = $\"诊断已导出：{path}\";",
+            source,
+            StringComparison.Ordinal);
+        Assert.Contains("QualityPresentation.SanitizePerformanceText", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Quality_selection_generation_rejects_stale_completion()
+    {
+        var coordinator = new QualityProfileSelectionCoordinator();
+        var first = coordinator.Begin();
+        var second = coordinator.Begin();
+
+        Assert.False(coordinator.IsCurrent(first));
+        Assert.True(coordinator.IsCurrent(second));
+    }
+
+    [Fact]
     public async Task Programmatic_refresh_selection_does_not_save()
     {
         var coordinator = new FrameRateSelectionCoordinator();

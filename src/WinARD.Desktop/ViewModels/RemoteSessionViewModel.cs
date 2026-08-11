@@ -63,6 +63,9 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private SessionPerformanceSnapshot _performance;
     private FrameRefreshPolicy _refreshPolicy;
     private QualityProfile _qualityProfile;
+    private QualityDecision? _latestQualityDecision;
+    private QualityTransitionStatus _latestQualityTransitionStatus = QualityTransitionStatus.NoChange;
+    private long _qualityPresentationVersion;
     private long _qualityDecisionGeneration;
     private long _qualityProfileEpoch;
     private int _pendingScrollInput;
@@ -238,6 +241,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
     public string SessionPerformance => FormatSessionPerformance(Performance);
 
+    public long QualityPresentationVersion => Interlocked.Read(ref _qualityPresentationVersion);
+
     internal SessionPerformanceDiagnosticSnapshot DiagnosticPerformance =>
         _performanceTracker.CurrentDiagnostics;
 
@@ -282,6 +287,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             previousOperations = _qualityProfileOperations;
             _qualityProfileOperations = new CancellationTokenSource();
             _qualityProfile = profile;
+            _latestQualityDecision = null;
+            _latestQualityTransitionStatus = QualityTransitionStatus.NoChange;
             _refreshPolicy = profile.Refresh;
             _adaptiveQualityController = controller;
             _ = Interlocked.Increment(ref _qualityProfileEpoch);
@@ -571,6 +578,10 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     internal QualityActivitySnapshot QualityActivity => _performanceTracker.CurrentActivity;
 
     internal QualityProfile QualityProfile => _qualityProfile;
+
+    internal QualityDecision? LatestQualityDecision => _latestQualityDecision;
+
+    internal QualityTransitionStatus LatestQualityTransitionStatus => _latestQualityTransitionStatus;
 
     internal long QualityDecisionGeneration => Interlocked.Read(ref _qualityDecisionGeneration);
 
@@ -1019,39 +1030,42 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             targetChanged,
             performanceGeneration,
             cancellationToken).ConfigureAwait(false);
+        var performancePublished = ReferenceEquals(Performance, snapshot);
         using var transitionCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             profileCancellationToken);
         var gateAcquired = false;
+        var transitionStatus = QualityTransitionStatus.NoChange;
         try
         {
             await _qualityOperationGate.WaitAsync(transitionCancellation.Token).ConfigureAwait(false);
             gateAcquired = true;
             if (profileEpoch != Volatile.Read(ref _qualityProfileEpoch))
             {
-                return QualityTransitionStatus.NoChange;
+                transitionStatus = QualityTransitionStatus.NoChange;
             }
-
-            if (!constraintsSatisfied)
+            else if (!constraintsSatisfied)
             {
-                return QualityTransitionStatus.CapabilityUnavailable;
+                transitionStatus = QualityTransitionStatus.CapabilityUnavailable;
             }
-
-            return await _qualityTransitionCoordinator.ApplyAtSafeBoundaryAsync(
-                decision,
-                new QualityTransitionBoundary(
-                    FrameResponseCompletedAndPresented: true,
-                    HasOutstandingFramebufferRequest: false,
-                    HasActiveReceive: false,
-                    NextFramebufferRequestProduced: false),
-                cancellationToken).ConfigureAwait(false);
+            else
+            {
+                transitionStatus = await _qualityTransitionCoordinator.ApplyAtSafeBoundaryAsync(
+                    decision,
+                    new QualityTransitionBoundary(
+                        FrameResponseCompletedAndPresented: true,
+                        HasOutstandingFramebufferRequest: false,
+                        HasActiveReceive: false,
+                        NextFramebufferRequestProduced: false),
+                    cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (
             !gateAcquired &&
             profileCancellationToken.IsCancellationRequested &&
             !cancellationToken.IsCancellationRequested)
         {
-            return QualityTransitionStatus.NoChange;
+            transitionStatus = QualityTransitionStatus.NoChange;
         }
         finally
         {
@@ -1060,6 +1074,39 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 _qualityOperationGate.Release();
             }
         }
+
+        bool presentationChanged;
+        lock (_sync)
+        {
+            if (profileEpoch != _qualityProfileEpoch)
+            {
+                return transitionStatus;
+            }
+
+            var previousDecision = _latestQualityDecision;
+            presentationChanged = previousDecision is null ||
+                previousDecision.Color != decision.Color ||
+                previousDecision.Scale != decision.Scale ||
+                previousDecision.TargetFramesPerSecond != decision.TargetFramesPerSecond ||
+                previousDecision.Reason != decision.Reason ||
+                previousDecision.TargetSatisfied != decision.TargetSatisfied ||
+                _latestQualityTransitionStatus != transitionStatus;
+            _latestQualityDecision = decision;
+            _latestQualityTransitionStatus = transitionStatus;
+            if (presentationChanged || performancePublished)
+            {
+                _ = Interlocked.Increment(ref _qualityPresentationVersion);
+            }
+        }
+
+        if (presentationChanged || performancePublished)
+        {
+            await _dispatcher.InvokeAsync(
+                () => OnPropertyChanged(nameof(QualityPresentationVersion)),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        return transitionStatus;
     }
 
     private int? ResolveTarget(FrameRefreshPolicy policy, int automaticTarget) => policy.Mode switch

@@ -539,7 +539,9 @@ public sealed partial class MainWindow : Window, IDisposable
                         retryToken),
                     profile: ownership.Profile,
                     updateFrameRefreshPolicy:
-                        _sessionController.UpdateConnectedFrameRefreshPolicyAsync);
+                        _sessionController.UpdateConnectedFrameRefreshPolicyAsync,
+                    updateQualityProfile:
+                        _sessionController.UpdateConnectedQualityProfileAsync);
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
                 _remoteSessionWindow = remoteWindow;
                 remoteWindow.Activate();

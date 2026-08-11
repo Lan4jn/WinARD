@@ -40,8 +40,11 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly FrameRateSelectionCoordinator _frameRateSelection = new();
     private readonly FrameRateSaveStatus _frameRateSaveStatus = new();
     private readonly PerformanceTextPresentationState _performanceTextPresentation = new();
+    private readonly QualityProfileSelectionCoordinator _qualityProfileSelection = new();
     private readonly Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>?
         _updateFrameRefreshPolicy;
+    private readonly Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>?
+        _updateQualityProfile;
     private ConnectionProfile? _profile;
     private readonly KeyEventHandler _keyDownHandler;
     private readonly KeyEventHandler _keyUpHandler;
@@ -57,6 +60,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private int _closingStarted;
     private bool _fullscreen;
     private bool _allowClose;
+    private int _qualitySynchronizationDepth;
 
     public RemoteSessionWindow(
         IRemoteSessionRuntime session,
@@ -69,7 +73,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         Func<CancellationToken, Task>? retryRequested = null,
         ConnectionProfile? profile = null,
         Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>?
-            updateFrameRefreshPolicy = null)
+            updateFrameRefreshPolicy = null,
+        Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>?
+            updateQualityProfile = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(ownership);
@@ -77,6 +83,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _saveCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _diagnosticExportService = diagnosticExportService;
         _updateFrameRefreshPolicy = updateFrameRefreshPolicy;
+        _updateQualityProfile = updateQualityProfile;
         _profile = profile;
         _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _diagnosticExportState = new RemoteSessionDiagnosticExportState(
@@ -137,9 +144,15 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             Path = new PropertyPath(nameof(RemoteSessionViewModel.StatusMessage)),
         });
         FrameRateComboBox.ItemsSource = ViewModel.FrameRefreshOptions;
+        QualityPresetComboBox.ItemsSource = QualityPresentation.PresetOptions;
+        QualityBandwidthComboBox.ItemsSource = QualityPresentation.BandwidthOptions;
+        QualityColorComboBox.ItemsSource = QualityPresentation.ColorOptions;
+        QualityScaleComboBox.ItemsSource = QualityPresentation.ScaleOptions;
+        QualityRefreshComboBox.ItemsSource = ViewModel.FrameRefreshOptions;
         RefreshFrameRateSelection();
         UpdatePerformanceVisual();
         UpdateConnectionQualityVisual();
+        RefreshQualityPresentation();
 
         var windowHandle = WindowNative.GetWindowHandle(this);
         var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(windowHandle);
@@ -211,6 +224,83 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             ShowFrameRateSaveStatus,
             IsInputClosing,
             _saveCancellation.Token);
+
+    internal async Task SelectQualityProfileAsync(QualityProfile quality, long? selection = null)
+    {
+        var current = ViewModel.QualityProfile;
+        var selected = await ApplyQualityProfileSelectionAsync(
+            quality,
+            current,
+            ViewModel.SetQualityProfile,
+            _updateQualityProfile is null
+                ? null
+                : async (value, cancellationToken) =>
+                {
+                    var updated = await _updateQualityProfile(value, cancellationToken);
+                    Volatile.Write(ref _profile, updated);
+                },
+            message =>
+            {
+                if (selection is null || _qualityProfileSelection.IsCurrent(selection.Value))
+                {
+                    ShowFrameRateSaveStatus(message);
+                }
+            },
+            IsInputClosing,
+            _saveCancellation.Token);
+        if (selected != current &&
+            !IsInputClosing() &&
+            (selection is null || _qualityProfileSelection.IsCurrent(selection.Value)))
+        {
+            RefreshQualityPresentation();
+        }
+    }
+
+    internal static async Task<QualityProfile> ApplyQualityProfileSelectionAsync(
+        QualityProfile selected,
+        QualityProfile current,
+        Action<QualityProfile> applyToSession,
+        Func<QualityProfile, CancellationToken, Task>? persist,
+        Action<string> showStatus,
+        Func<bool> isClosing,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(selected);
+        ArgumentNullException.ThrowIfNull(current);
+        ArgumentNullException.ThrowIfNull(applyToSession);
+        ArgumentNullException.ThrowIfNull(showStatus);
+        ArgumentNullException.ThrowIfNull(isClosing);
+        if (selected == current || isClosing() || cancellationToken.IsCancellationRequested)
+        {
+            return current;
+        }
+
+        applyToSession(selected);
+        if (persist is null)
+        {
+            return selected;
+        }
+
+        try
+        {
+            await persist(selected, cancellationToken);
+        }
+        catch (OperationCanceledException) when (isClosing() || cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (ObjectDisposedException) when (isClosing())
+        {
+        }
+        catch (Exception) when (isClosing() || cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            showStatus("画质设置未保存，本次会话仍已应用");
+        }
+
+        return selected;
+    }
 
     internal static async Task ApplyFrameRefreshPolicySelectionAsync(
         FrameRefreshPolicy policy,
@@ -479,6 +569,192 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                     item,
                     FrameRefreshOptionPresentation.AutomationName(option));
             }
+        }
+    }
+
+    private async void OnQualityPresetSelectionChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (_qualitySynchronizationDepth != 0 ||
+            QualityPresetComboBox.SelectedItem is not QualityChoice<QualityPreset> option)
+        {
+            return;
+        }
+
+        var profile = option.Value == QualityPreset.Custom
+            ? QualityPresentation.AsCustom(ViewModel.QualityProfile)
+            : QualityPresentation.ApplyPreset(option.Value);
+        await ApplyQualityFromUiAsync(profile);
+    }
+
+    private async void OnQualityDetailSelectionChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (_qualitySynchronizationDepth != 0)
+        {
+            return;
+        }
+
+        var profile = ViewModel.QualityProfile;
+        if (ReferenceEquals(sender, QualityBandwidthComboBox) &&
+            QualityBandwidthComboBox.SelectedItem is QualityChoice<long?> bandwidth)
+        {
+            // The final entry opens the custom-value affordance in a later interaction; it does not
+            // silently turn into the adjacent "unlimited" value.
+            if (QualityBandwidthComboBox.SelectedIndex == QualityPresentation.BandwidthOptions.Count - 1)
+            {
+                return;
+            }
+            profile = QualityPresentation.WithBandwidth(profile, bandwidth.Value);
+        }
+        else if (ReferenceEquals(sender, QualityColorComboBox) &&
+            QualityColorComboBox.SelectedItem is QualityChoice<QualityColor> color)
+        {
+            profile = QualityPresentation.WithColor(profile, color.Value);
+        }
+        else if (ReferenceEquals(sender, QualityScaleComboBox) &&
+            QualityScaleComboBox.SelectedItem is QualityChoice<QualityScale> scale)
+        {
+            profile = QualityPresentation.WithScale(profile, scale.Value);
+        }
+        else if (ReferenceEquals(sender, QualityRefreshComboBox) &&
+            QualityRefreshComboBox.SelectedItem is FrameRefreshOption refresh && refresh.IsEnabled)
+        {
+            profile = QualityPresentation.WithRefresh(profile, refresh.Policy);
+        }
+
+        await ApplyQualityFromUiAsync(profile);
+    }
+
+    private async void OnQualityDetailToggled(object sender, RoutedEventArgs args)
+    {
+        if (_qualitySynchronizationDepth == 0)
+        {
+            await ApplyQualityFromUiAsync(QualityPresentation.WithAutomaticGrayscale(
+                ViewModel.QualityProfile,
+                QualityGrayscaleToggle.IsOn));
+        }
+    }
+
+    private async void OnQualityCustomBandwidthChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_qualitySynchronizationDepth != 0 ||
+            QualityBandwidthComboBox.SelectedIndex != QualityPresentation.BandwidthOptions.Count - 1 ||
+            !double.IsFinite(args.NewValue) ||
+            args.NewValue <= 0)
+        {
+            return;
+        }
+
+        var bytes = checked((long)Math.Round(args.NewValue * 1024 * 1024));
+        await ApplyQualityFromUiAsync(QualityPresentation.WithBandwidth(ViewModel.QualityProfile, bytes));
+    }
+
+    private async void OnQualityLockClicked(object sender, RoutedEventArgs args)
+    {
+        if (_qualitySynchronizationDepth == 0)
+        {
+            await ApplyQualityFromUiAsync(QualityPresentation.WithLocks(
+                ViewModel.QualityProfile,
+                QualityBandwidthLock.IsChecked == true,
+                QualityColorLock.IsChecked == true,
+                QualityScaleLock.IsChecked == true,
+                QualityRefreshLock.IsChecked == true));
+        }
+    }
+
+    private void OnQualityRefreshDropDownOpened(object sender, object args)
+    {
+        for (var index = 0; index < ViewModel.FrameRefreshOptions.Count; index++)
+        {
+            if (QualityRefreshComboBox.ContainerFromIndex(index) is ComboBoxItem item)
+            {
+                var option = ViewModel.FrameRefreshOptions[index];
+                item.IsEnabled = option.IsEnabled;
+                AutomationProperties.SetName(item, FrameRefreshOptionPresentation.AutomationName(option));
+            }
+        }
+    }
+
+    private async Task ApplyQualityFromUiAsync(QualityProfile profile)
+    {
+        var selection = _qualityProfileSelection.Begin();
+        ClearFrameRateSaveStatus();
+        try
+        {
+            await SelectQualityProfileAsync(profile, selection);
+        }
+        catch (OperationCanceledException) when (_saveCancellation.IsCancellationRequested)
+        {
+        }
+        catch (ObjectDisposedException) when (IsInputClosing())
+        {
+        }
+        catch (Exception) when (IsInputClosing())
+        {
+        }
+        catch (Exception)
+        {
+            if (_qualityProfileSelection.IsCurrent(selection))
+            {
+                ShowFrameRateSaveStatus("画质设置应用失败");
+            }
+        }
+    }
+
+    private void RefreshQualityPresentation()
+    {
+        _qualitySynchronizationDepth++;
+        try
+        {
+            var profile = ViewModel.QualityProfile;
+            QualityPresetComboBox.SelectedItem = QualityPresentation.PresetOptions.Single(
+                option => option.Value == profile.Preset);
+            var bandwidthIndex = profile.TargetBytesPerSecond is null
+                ? 5
+                : QualityPresentation.BandwidthOptions
+                    .Take(5)
+                    .Select((option, index) => (option, index))
+                    .FirstOrDefault(pair => pair.option.Value == profile.TargetBytesPerSecond).index;
+            if (profile.TargetBytesPerSecond is not null &&
+                !QualityPresentation.BandwidthOptions.Take(5).Any(option => option.Value == profile.TargetBytesPerSecond))
+            {
+                bandwidthIndex = QualityPresentation.BandwidthOptions.Count - 1;
+                QualityCustomBandwidthBox.Value = profile.TargetBytesPerSecond.Value / (1024d * 1024d);
+            }
+            QualityBandwidthComboBox.SelectedIndex = bandwidthIndex;
+            QualityColorComboBox.SelectedItem = QualityPresentation.ColorOptions.Single(option => option.Value == profile.Color);
+            QualityScaleComboBox.SelectedItem = QualityPresentation.ScaleOptions.Single(option => option.Value == profile.Scale);
+            QualityRefreshComboBox.ItemsSource = ViewModel.FrameRefreshOptions;
+            QualityRefreshComboBox.SelectedItem = ViewModel.SelectedFrameRefreshOption;
+            QualityGrayscaleToggle.IsOn = profile.AllowAutomaticGrayscale;
+            QualityBandwidthLock.IsChecked = profile.BandwidthLocked;
+            QualityColorLock.IsChecked = profile.ColorLocked;
+            QualityScaleLock.IsChecked = profile.ScaleLocked;
+            QualityRefreshLock.IsChecked = profile.RefreshLocked;
+
+            var decision = ViewModel.LatestQualityDecision;
+            var summary = QualityPresentation.FormatSummary(
+                profile.Preset,
+                decision?.Color ?? profile.Color,
+                decision?.Scale ?? profile.Scale,
+                decision?.TargetFramesPerSecond ?? ViewModel.TargetFramesPerSecond,
+                ViewModel.Performance.SampleSequence > 0 ? ViewModel.Performance.ReceiveBytesPerSecond : null);
+            var status = decision is null
+                ? QualityPresentationStatus.Unknown
+                : QualityPresentation.StatusFor(
+                    decision.Reason,
+                    decision.TargetSatisfied,
+                    ViewModel.LatestQualityTransitionStatus);
+            QualitySummaryButton.Content = $"画质  {summary}";
+            QualityStatusText.Text = QualityPresentation.StatusText(status);
+            AutomationProperties.SetName(QualityStatusText, $"画质状态：{QualityPresentation.StatusText(status)}");
+            AutomationProperties.SetName(QualitySummaryButton, QualityPresentation.AutomationName(summary, status));
+            var encoding = QualityPresentation.EncodingName(ViewModel.Performance.PrimaryFramebufferEncoding);
+            QualityEncodingText.Text = encoding;
+            AutomationProperties.SetName(QualityEncodingText, $"当前编码：{encoding}");
+        }
+        finally
+        {
+            _qualitySynchronizationDepth--;
         }
     }
 
@@ -837,11 +1113,16 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             UpdatePerformanceVisual();
             UpdateConnectionQualityAutomationName();
         }
+        else if (args.PropertyName == nameof(RemoteSessionViewModel.QualityPresentationVersion))
+        {
+            RefreshQualityPresentation();
+        }
         else if (args.PropertyName == nameof(RemoteSessionViewModel.FrameRefreshOptions) ||
             args.PropertyName == nameof(RemoteSessionViewModel.SelectedFrameRefreshOption))
         {
             FrameRateComboBox.ItemsSource = ViewModel.FrameRefreshOptions;
             RefreshFrameRateSelection();
+            RefreshQualityPresentation();
         }
         else if (args.PropertyName == nameof(RemoteSessionViewModel.Error))
         {
@@ -888,7 +1169,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void UpdatePerformanceVisual()
     {
-        var performance = ViewModel.SessionPerformance;
+        var performance = QualityPresentation.SanitizePerformanceText(ViewModel.SessionPerformance);
         if (!_performanceTextPresentation.TryUpdate(performance))
         {
             return;
@@ -1007,7 +1288,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             cancellationToken);
         if (path is not null && !_diagnosticExportState.IsClosing)
         {
-            StatusText.Text = $"诊断已导出：{path}";
+            StatusText.Text = "诊断已导出。";
         }
     }
 
@@ -1264,6 +1545,15 @@ internal sealed class FrameRateSelectionCoordinator
             Interlocked.Exchange(ref _selectionActive, 0);
         }
     }
+}
+
+internal sealed class QualityProfileSelectionCoordinator
+{
+    private long _generation;
+
+    public long Begin() => Interlocked.Increment(ref _generation);
+
+    public bool IsCurrent(long generation) => generation == Volatile.Read(ref _generation);
 }
 
 internal sealed class FrameRateSaveStatus

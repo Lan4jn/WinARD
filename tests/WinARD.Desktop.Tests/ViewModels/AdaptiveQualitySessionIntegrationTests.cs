@@ -340,6 +340,46 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     }
 
     [Fact]
+    public async Task Completed_transition_from_old_profile_does_not_publish_stale_presentation()
+    {
+        var runtime = new StaleCompletingTransitionRuntime();
+        var capabilities = FullCapabilities();
+        var profile = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Color16,
+            QualityScale.Native,
+            FrameRefreshPolicy.Automatic,
+            allowAutomaticGrayscale: false,
+            colorLocked: true,
+            scaleLocked: true);
+        var coordinator = new QualityTransitionCoordinator(
+            runtime,
+            new RemoteQualitySettings(RemotePixelFormatKind.Bgra32, [6, 16, 0, 1, -239, -223], 1),
+            capabilities,
+            new QualityDecoderGates());
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new AsyncLifetime(),
+            new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            profile,
+            adaptiveQualityCapabilities: capabilities,
+            adaptiveQualityController: new AdaptiveQualityController(profile, capabilities),
+            qualityTransitionCoordinator: coordinator);
+
+        await viewModel.StartAsync(default);
+        await runtime.TransitionEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        viewModel.SetQualityProfile(QualityProfile.Original);
+        runtime.ReleaseTransition.TrySetResult();
+        await runtime.NextReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Null(viewModel.LatestQualityDecision);
+        Assert.Equal(0, viewModel.QualityPresentationVersion);
+    }
+
+    [Fact]
     public async Task Profile_change_does_not_hide_an_operation_canceled_after_wire_start()
     {
         var runtime = new WireCanceledTransitionRuntime();
@@ -677,6 +717,34 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         {
             if (Interlocked.Increment(ref _received) == 1)
                 return new RemoteFramebufferMessage(new(1, 1), [0, 0, 0, 255], 4, [new(0, 0, 1, 1)]);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException();
+        }
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class StaleCompletingTransitionRuntime : IRemoteSessionRuntime
+    {
+        private int _received;
+        public TaskCompletionSource TransitionEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseTransition { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource NextReceiveEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public async ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(RemoteQualitySettings settings, CancellationToken cancellationToken)
+        {
+            TransitionEntered.TrySetResult();
+            await ReleaseTransition.Task;
+            return QualityTransitionStatus.Applied;
+        }
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _received) == 1)
+                return new RemoteFramebufferMessage(new(1, 1), [0, 0, 0, 255], 4, [new(0, 0, 1, 1)]);
+            NextReceiveEntered.TrySetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             throw new InvalidOperationException();
         }
