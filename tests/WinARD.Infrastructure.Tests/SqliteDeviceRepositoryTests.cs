@@ -254,6 +254,36 @@ public sealed class SqliteDeviceRepositoryTests
         await Assert.ThrowsAsync<InvalidDataException>(() => repository.GetAsync(profile.Id, CancellationToken.None));
     }
 
+    [Theory]
+    [InlineData((int)QualityPreset.Automatic, (int)FrameRefreshMode.Fixed, 60)]
+    [InlineData((int)QualityPreset.Original, (int)FrameRefreshMode.Automatic, null)]
+    [InlineData((int)QualityPreset.Balanced, (int)FrameRefreshMode.Unlimited, null)]
+    [InlineData((int)QualityPreset.Smooth, (int)FrameRefreshMode.Fixed, 90)]
+    public async Task Named_preset_with_nonstandard_refresh_is_rejected(
+        int preset,
+        int refreshMode,
+        int? refreshFramesPerSecond)
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var named = preset switch
+        {
+            (int)QualityPreset.Automatic => QualityProfile.Automatic,
+            (int)QualityPreset.Original => QualityProfile.Original,
+            (int)QualityPreset.Balanced => QualityProfile.Balanced,
+            (int)QualityPreset.Smooth => QualityProfile.Smooth,
+            _ => throw new InvalidOperationException(),
+        };
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex")
+            .WithQualityProfile(named);
+        await repository.SaveAsync(profile, CancellationToken.None);
+        var persistedFramesPerSecond = refreshFramesPerSecond?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "NULL";
+        await fixture.ExecuteAsync(
+            $"PRAGMA ignore_check_constraints=ON; UPDATE devices SET refresh_mode={refreshMode}, refresh_fps={persistedFramesPerSecond} WHERE id='{profile.Id:D}';");
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => repository.GetAsync(profile.Id, CancellationToken.None));
+    }
+
     [Fact]
     public async Task Persisted_transport_mode_must_match_the_ssh_row()
     {

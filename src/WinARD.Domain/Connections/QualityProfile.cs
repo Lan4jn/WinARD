@@ -170,9 +170,15 @@ public sealed record QualityProfile
             scaleLocked,
             refreshLocked);
 
-    public QualityProfile WithRefresh(FrameRefreshPolicy refresh) =>
-        new(
-            Preset,
+    public QualityProfile WithRefresh(FrameRefreshPolicy refresh)
+    {
+        if (refresh == Refresh)
+        {
+            return this;
+        }
+
+        return new(
+            QualityPreset.Custom,
             TargetBytesPerSecond,
             Color,
             Scale,
@@ -182,4 +188,5 @@ public sealed record QualityProfile
             ColorLocked,
             ScaleLocked,
             RefreshLocked);
+    }
 }

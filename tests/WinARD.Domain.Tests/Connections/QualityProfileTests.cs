@@ -51,6 +51,40 @@ public sealed class QualityProfileTests
         Assert.Equal((false, false, false, false), Locks(QualityProfile.Smooth));
     }
 
+    [Fact]
+    public void Changing_refresh_on_any_named_preset_creates_custom_intent_and_preserves_other_details()
+    {
+        var cases = new[]
+        {
+            (QualityProfile.Automatic, FrameRefreshPolicy.Fixed(30)),
+            (QualityProfile.Original, FrameRefreshPolicy.Fixed(60)),
+            (QualityProfile.Balanced, FrameRefreshPolicy.Unlimited),
+            (QualityProfile.Smooth, FrameRefreshPolicy.Fixed(90)),
+        };
+
+        foreach (var (named, refresh) in cases)
+        {
+            var updated = named.WithRefresh(refresh);
+
+            Assert.Equal(QualityPreset.Custom, updated.Preset);
+            Assert.Equal(named.TargetBytesPerSecond, updated.TargetBytesPerSecond);
+            Assert.Equal(named.Color, updated.Color);
+            Assert.Equal(named.Scale, updated.Scale);
+            Assert.Equal(refresh, updated.Refresh);
+            Assert.Equal(named.AllowAutomaticGrayscale, updated.AllowAutomaticGrayscale);
+            Assert.Equal(Locks(named), Locks(updated));
+        }
+    }
+
+    [Fact]
+    public void Reapplying_named_preset_refresh_keeps_the_named_preset()
+    {
+        Assert.Same(QualityProfile.Automatic, QualityProfile.Automatic.WithRefresh(FrameRefreshPolicy.Automatic));
+        Assert.Same(QualityProfile.Original, QualityProfile.Original.WithRefresh(FrameRefreshPolicy.Unlimited));
+        Assert.Same(QualityProfile.Balanced, QualityProfile.Balanced.WithRefresh(FrameRefreshPolicy.Automatic));
+        Assert.Same(QualityProfile.Smooth, QualityProfile.Smooth.WithRefresh(FrameRefreshPolicy.Automatic));
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]

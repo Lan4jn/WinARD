@@ -391,20 +391,20 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
                 QualityPreset.Smooth => QualityProfile.Smooth,
                 _ => throw new InvalidDataException($"Unsupported persisted quality preset {(int)preset}."),
             };
-            var expected = named.WithRefresh(refresh);
-            if (bandwidth != expected.TargetBytesPerSecond ||
-                color != expected.Color ||
-                scale != expected.Scale ||
-                allowGray != expected.AllowAutomaticGrayscale ||
-                bandwidthLocked != expected.BandwidthLocked ||
-                colorLocked != expected.ColorLocked ||
-                scaleLocked != expected.ScaleLocked ||
-                refreshLocked != expected.RefreshLocked)
+            if (bandwidth != named.TargetBytesPerSecond ||
+                color != named.Color ||
+                scale != named.Scale ||
+                refresh != named.Refresh ||
+                allowGray != named.AllowAutomaticGrayscale ||
+                bandwidthLocked != named.BandwidthLocked ||
+                colorLocked != named.ColorLocked ||
+                scaleLocked != named.ScaleLocked ||
+                refreshLocked != named.RefreshLocked)
             {
                 throw new InvalidDataException("Persisted named quality preset has inconsistent fields.");
             }
 
-            return expected;
+            return named;
         }
         catch (ArgumentException exception)
         {
