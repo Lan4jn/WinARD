@@ -1201,7 +1201,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private void UpdateConnectionQualityAutomationName() =>
         AutomationProperties.SetName(
             QualityPanel,
-            $"连接质量：{ViewModel.ConnectionQuality.DisplayText}；会话性能：{ViewModel.SessionPerformance}");
+            QualityPresentation.ConnectionQualityAutomationName(
+                ViewModel.ConnectionQuality.DisplayText,
+                ViewModel.SessionPerformance));
 
     private void TriggerSmokeErrorAction()
     {

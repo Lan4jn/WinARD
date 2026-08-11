@@ -178,6 +178,13 @@ public static class QualityPresentation
         return string.Concat(text.AsSpan(0, start), "Unknown", text.AsSpan(end));
     }
 
+    public static string ConnectionQualityAutomationName(string displayText, string performanceText)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(displayText);
+        ArgumentNullException.ThrowIfNull(performanceText);
+        return $"连接质量：{displayText}；会话性能：{SanitizePerformanceText(performanceText)}";
+    }
+
     public static QualityProfile WithBandwidth(QualityProfile profile, long? value) =>
         QualityProfile.CreateCustom(
             value,

@@ -171,4 +171,17 @@ public sealed class QualityPresentationTests
         Assert.Equal("自动 45 FPS · 实际 44 FPS · 3.1 MiB/s · Unknown · 20 ms", text);
         Assert.DoesNotContain("-314", text, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void Connection_quality_automation_name_never_reads_unknown_raw_encoding_id()
+    {
+        var name = QualityPresentation.ConnectionQualityAutomationName(
+            "良好",
+            "自动 45 FPS · 实际 44 FPS · 3.1 MiB/s · 编码 -314 · 20 ms");
+
+        Assert.Equal(
+            "连接质量：良好；会话性能：自动 45 FPS · 实际 44 FPS · 3.1 MiB/s · Unknown · 20 ms",
+            name);
+        Assert.DoesNotContain("-314", name, StringComparison.Ordinal);
+    }
 }

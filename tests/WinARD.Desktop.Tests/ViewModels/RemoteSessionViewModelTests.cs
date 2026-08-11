@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
@@ -359,6 +360,41 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal(FrameRefreshPolicy.Fixed(120), viewModel.SelectedFrameRefreshOption.Policy);
         Assert.False(viewModel.SelectedFrameRefreshOption.IsEnabled);
         Assert.Equal("当前上限 59，有效 59", viewModel.SelectedFrameRefreshOption.ConstraintText);
+    }
+
+    [Fact]
+    public async Task Quality_capability_only_maximum_disables_higher_options_preserves_saved_value_and_clips_target()
+    {
+        await using var viewModel = new RemoteSessionViewModel(
+            new QualityCapabilityRuntime(60),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Fixed(120));
+
+        Assert.Equal(FrameRefreshPolicy.Fixed(120), viewModel.SelectedFrameRefreshOption.Policy);
+        Assert.False(viewModel.SelectedFrameRefreshOption.IsEnabled);
+        Assert.Equal("当前上限 60，有效 60", viewModel.SelectedFrameRefreshOption.ConstraintText);
+        Assert.False(FindOption(viewModel, FrameRefreshPolicy.Fixed(75)).IsEnabled);
+        Assert.Equal(60, viewModel.TargetFramesPerSecond);
+    }
+
+    [Fact]
+    public async Task Multiple_reliable_maximum_sources_use_the_lower_safe_limit()
+    {
+        await using var viewModel = new RemoteSessionViewModel(
+            new QualityCapabilityRuntime(90, displayMaximum: 60),
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            initialRefreshPolicy: FrameRefreshPolicy.Fixed(90));
+
+        Assert.False(FindOption(viewModel, FrameRefreshPolicy.Fixed(75)).IsEnabled);
+        Assert.Equal(60, viewModel.TargetFramesPerSecond);
     }
 
     [Fact]
@@ -2138,6 +2174,27 @@ public sealed class RemoteSessionViewModelTests
     {
         public RemoteFramebufferSize FramebufferSize => new(1, 1);
         public RemoteDisplayCapabilities DisplayCapabilities { get; } = new(maximum);
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) => ValueTask.FromResult<RemoteServerMessage>(new RemoteBellMessage());
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class QualityCapabilityRuntime(int maximum, int? displayMaximum = null) : IRemoteSessionRuntime
+    {
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public RemoteDisplayCapabilities DisplayCapabilities { get; } = new(displayMaximum);
+        public ArdDisplayCapabilities QualityCapabilities { get; } = new(
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            false,
+            false,
+            maximum);
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) => ValueTask.FromResult<RemoteServerMessage>(new RemoteBellMessage());
         public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;

@@ -157,11 +157,14 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
         _connectionQualityTracker = new ConnectionQualityTracker(_timeProvider);
         _connectionQuality = _connectionQualityTracker.Current;
-        _remoteMaximum = ValidateRemoteMaximum(session.DisplayCapabilities.MaximumRefreshRate);
+        var displayMaximum = ValidateRemoteMaximum(session.DisplayCapabilities.MaximumRefreshRate);
+        var qualityCapabilities = adaptiveQualityCapabilities ?? session.QualityCapabilities;
+        var qualityMaximum = ValidateRemoteMaximum(qualityCapabilities.MaximumRefreshRate);
+        _remoteMaximum = MinimumKnownMaximum(displayMaximum, qualityMaximum);
         _qualityProfile = qualityProfile ?? throw new ArgumentNullException(nameof(qualityProfile));
         _refreshPolicy = qualityProfile.Refresh;
-        _adaptiveQualityCapabilities = adaptiveQualityCapabilities ?? WithMaximumRefreshRate(
-            session.QualityCapabilities,
+        _adaptiveQualityCapabilities = WithMaximumRefreshRate(
+            qualityCapabilities,
             _remoteMaximum);
         _qualityDecoderGates = qualityDecoderGates ?? new QualityDecoderGates();
         _adaptiveQualityController = adaptiveQualityController ?? new AdaptiveQualityController(
@@ -1138,7 +1141,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
     private static ArdDisplayCapabilities WithMaximumRefreshRate(
         ArdDisplayCapabilities capabilities,
-        int? fallbackMaximumRefreshRate) => new(
+        int? effectiveMaximumRefreshRate) => new(
         capabilities.Zlib,
         capabilities.Rgb565,
         capabilities.ServerScaling,
@@ -1146,7 +1149,15 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         capabilities.AppleGrayscale1001,
         capabilities.SafeOnlinePixelFormatSwitch,
         capabilities.SafeOnlineScaleSwitch,
-        capabilities.MaximumRefreshRate ?? fallbackMaximumRefreshRate);
+        effectiveMaximumRefreshRate);
+
+    private static int? MinimumKnownMaximum(int? first, int? second) => (first, second) switch
+    {
+        ({ } left, { } right) => Math.Min(left, right),
+        ({ } left, null) => left,
+        (null, { } right) => right,
+        _ => null,
+    };
 
     private int? ValidateRemoteMaximum(int? maximum)
     {
