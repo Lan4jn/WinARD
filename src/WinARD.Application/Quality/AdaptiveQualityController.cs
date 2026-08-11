@@ -4,7 +4,8 @@ using System.Collections.ObjectModel;
 namespace WinARD.Application.Quality;
 
 /// <summary>
-/// Pure, connection-scoped controller. Its only clock is the timestamp carried by each observation.
+/// Holds mutable state for one connection session. Callers must serialize calls to <see cref="Observe"/>.
+/// Its only clock is the timestamp carried by each observation.
 /// </summary>
 public sealed class AdaptiveQualityController
 {
@@ -31,6 +32,7 @@ public sealed class AdaptiveQualityController
     private readonly ReadOnlyCollection<QualityLevel> availableLevels;
     private DateTimeOffset? lastTimestamp;
     private DateTimeOffset? nextLevelChangeAllowedAt;
+    private bool lastLevelChangeWasDegrade;
     private DateTimeOffset? lastCountedOverTargetWindow;
     private DateTimeOffset? stableUnderTargetSince;
     private DateTimeOffset? contentStableSince;
@@ -54,13 +56,12 @@ public sealed class AdaptiveQualityController
     }
 
     public static IReadOnlyList<(QualityLevel Level, QualityColor Color, QualityScale Scale, int FramesPerSecond)>
-        QualityTable { get; } = Array.AsReadOnly(FixedQualityTable);
+        QualityTable
+    { get; } = Array.AsReadOnly(FixedQualityTable);
 
     public QualityLevel CurrentLevel { get; private set; }
 
-    public QualityDecision Observe(QualityObservation observation) => Decide(observation);
-
-    public QualityDecision Decide(QualityObservation observation)
+    public QualityDecision Observe(QualityObservation observation)
     {
         ArgumentNullException.ThrowIfNull(observation);
         if (lastTimestamp is { } priorTimestamp && observation.Timestamp < priorTimestamp)
@@ -80,27 +81,31 @@ public sealed class AdaptiveQualityController
                 : QualityDecisionReason.Initial;
 
         var target = profile.TargetBytesPerSecond;
-        var bandwidthAdaptationEnabled = target is not null &&
-            profile.Preset != QualityPreset.Original &&
-            !(profile.Preset == QualityPreset.Custom && profile.BandwidthLocked);
+        var adaptiveQualityEnabled = profile.Preset != QualityPreset.Original;
         var targetSatisfied = target is null ||
-            observation.AverageBytesPerSecond5Seconds <= target.Value &&
-            observation.PeakBytesPerSecond5Seconds < target.Value * 1.5;
+            observation.AverageBytesPerSecond5s <= target.Value &&
+            observation.PeakBytesPerSecond5s < target.Value * 1.5;
+        var severe = adaptiveQualityEnabled &&
+            IsSeverelyOverTarget(observation, target, TargetFramesPerSecond(nextState, CurrentLevel));
+        var overTarget = target is not null &&
+            (observation.AverageBytesPerSecond5s > target.Value ||
+             observation.PeakBytesPerSecond5s >= target.Value * 1.5);
+        var levelChangedThisDecision = false;
 
-        if (bandwidthAdaptationEnabled)
+        if (adaptiveQualityEnabled)
         {
-            var severe = IsSeverelyOverTarget(observation, target!.Value, TargetFramesPerSecond(nextState, CurrentLevel));
-            if (severe && CanDegrade(observation.Timestamp))
+            if (severe && CanSeverelyDegrade(observation.Timestamp))
             {
                 if (MoveOneLevel(down: true))
                 {
                     MarkLevelChange(observation.Timestamp, down: true);
                     reason = QualityDecisionReason.SevereOverTarget;
+                    levelChangedThisDecision = true;
                 }
             }
-            else if (!severe && IsNewBandwidthWindow(observation.Timestamp))
+            else if (target is not null && IsNewBandwidthWindow(observation.Timestamp))
             {
-                if (observation.AverageBytesPerSecond5Seconds > target.Value * 1.10)
+                if (observation.AverageBytesPerSecond5s > target.Value * 1.10)
                 {
                     consecutiveOverTargetWindows++;
                     stableUnderTargetSince = null;
@@ -109,6 +114,7 @@ public sealed class AdaptiveQualityController
                         MarkLevelChange(observation.Timestamp, down: true);
                         consecutiveOverTargetWindows = 0;
                         reason = QualityDecisionReason.SustainedOverTarget;
+                        levelChangedThisDecision = true;
                     }
                 }
                 else
@@ -117,10 +123,21 @@ public sealed class AdaptiveQualityController
                 }
             }
 
-            if (IsStableUnderTarget(observation, target.Value))
+            var enteringRecovery = nextState == QualityContentState.Recovery &&
+                previousState != QualityContentState.Recovery;
+            if (!levelChangedThisDecision && !severe && !overTarget && enteringRecovery &&
+                CanUpgrade(observation.Timestamp) && MoveOneLevel(down: false))
+            {
+                MarkLevelChange(observation.Timestamp, down: false);
+                reason = QualityDecisionReason.StableRecovery;
+                levelChangedThisDecision = true;
+            }
+
+            if (IsStableUnderTarget(observation, target))
             {
                 stableUnderTargetSince ??= observation.Timestamp;
-                if (observation.Timestamp - stableUnderTargetSince >= StableUpgradeDuration &&
+                if (!levelChangedThisDecision &&
+                    observation.Timestamp - stableUnderTargetSince >= StableUpgradeDuration &&
                     CanUpgrade(observation.Timestamp) &&
                     MoveOneLevel(down: false))
                 {
@@ -136,8 +153,8 @@ public sealed class AdaptiveQualityController
         }
 
         var cannotMeetTarget = target is not null &&
-            (observation.AverageBytesPerSecond5Seconds > target.Value ||
-             observation.PeakBytesPerSecond5Seconds >= target.Value * 1.5) &&
+            (observation.AverageBytesPerSecond5s > target.Value ||
+             observation.PeakBytesPerSecond5s >= target.Value * 1.5) &&
             !CanMove(down: true);
         if (cannotMeetTarget)
         {
@@ -177,7 +194,7 @@ public sealed class AdaptiveQualityController
 
     private QualityContentState DetermineState(QualityObservation observation)
     {
-        if (observation.IsDragging || observation.IsScrolling)
+        if (observation.PointerDragActive || observation.ScrollActive)
         {
             highDirtySince = null;
             contentStableSince = null;
@@ -233,24 +250,29 @@ public sealed class AdaptiveQualityController
 
     private static bool IsSeverelyOverTarget(
         QualityObservation observation,
-        long target,
+        long? target,
         int targetFramesPerSecond)
     {
         var framePeriod = TimeSpan.FromSeconds(1d / targetFramesPerSecond);
-        return observation.AverageBytesPerSecond5Seconds >= target * 1.5 ||
-            observation.PeakBytesPerSecond5Seconds >= target * 1.5 ||
+        return target is not null &&
+            (observation.AverageBytesPerSecond5s >= target.Value * 1.5 ||
+             observation.PeakBytesPerSecond5s >= target.Value * 1.5) ||
             observation.ResponseTime >= framePeriod * 2 ||
             observation.PendingInputCount >= SeverePendingInputCount;
     }
 
-    private static bool IsStableUnderTarget(QualityObservation observation, long target) =>
-        observation.AverageBytesPerSecond5Seconds < target * .75 &&
-        observation.PeakBytesPerSecond5Seconds < target &&
+    private static bool IsStableUnderTarget(QualityObservation observation, long? target) =>
+        (target is null ||
+         observation.AverageBytesPerSecond5s < target.Value * .75 &&
+         observation.PeakBytesPerSecond5s < target.Value) &&
         observation.PendingInputCount == 0 &&
         observation.ResponseTime < TimeSpan.FromMilliseconds(50);
 
     private bool CanDegrade(DateTimeOffset timestamp) =>
         nextLevelChangeAllowedAt is null || timestamp >= nextLevelChangeAllowedAt;
+
+    private bool CanSeverelyDegrade(DateTimeOffset timestamp) =>
+        !lastLevelChangeWasDegrade || CanDegrade(timestamp);
 
     private bool CanUpgrade(DateTimeOffset timestamp) =>
         nextLevelChangeAllowedAt is null || timestamp >= nextLevelChangeAllowedAt;
@@ -299,6 +321,7 @@ public sealed class AdaptiveQualityController
     private void MarkLevelChange(DateTimeOffset timestamp, bool down)
     {
         nextLevelChangeAllowedAt = timestamp + (down ? DegradeCooldown : UpgradeCooldown);
+        lastLevelChangeWasDegrade = down;
         consecutiveOverTargetWindows = 0;
     }
 
@@ -408,6 +431,20 @@ public sealed class AdaptiveQualityController
             QualityPreset.Smooth => QualityLevel.Q3,
             _ => QualityLevel.Q0,
         };
+        if (profile.Preset == QualityPreset.Custom)
+        {
+            foreach (var candidate in FixedQualityTable)
+            {
+                var colorMatches = profile.Color == QualityColor.Automatic || profile.Color == candidate.Color;
+                var scaleMatches = profile.Scale == QualityScale.Automatic || profile.Scale == candidate.Scale;
+                if (colorMatches && scaleMatches && levels.Contains(candidate.Level))
+                {
+                    preferred = candidate.Level;
+                    break;
+                }
+            }
+        }
+
         return levels.Contains(preferred) ? preferred : levels[0];
     }
 

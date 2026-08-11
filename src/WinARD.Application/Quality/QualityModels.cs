@@ -114,29 +114,29 @@ public sealed record QualityObservation
 {
     public QualityObservation(
         DateTimeOffset timestamp,
-        double averageBytesPerSecond5Seconds,
-        double peakBytesPerSecond5Seconds,
+        double averageBytesPerSecond5s,
+        double peakBytesPerSecond5s,
         double actualFramesPerSecond,
         TimeSpan responseTime,
         TimeSpan decodeTime,
         TimeSpan presentationTime,
         double dirtyCoverage,
         TimeSpan sinceLastInput,
-        bool isDragging,
-        bool isScrolling,
+        bool pointerDragActive,
+        bool scrollActive,
         int pendingInputCount)
     {
         Timestamp = timestamp;
-        AverageBytesPerSecond5Seconds = ValidateFiniteNonNegative(
-            averageBytesPerSecond5Seconds,
-            nameof(averageBytesPerSecond5Seconds));
-        PeakBytesPerSecond5Seconds = ValidateFiniteNonNegative(
-            peakBytesPerSecond5Seconds,
-            nameof(peakBytesPerSecond5Seconds));
-        if (PeakBytesPerSecond5Seconds < AverageBytesPerSecond5Seconds)
+        AverageBytesPerSecond5s = ValidateFiniteNonNegative(
+            averageBytesPerSecond5s,
+            nameof(averageBytesPerSecond5s));
+        PeakBytesPerSecond5s = ValidateFiniteNonNegative(
+            peakBytesPerSecond5s,
+            nameof(peakBytesPerSecond5s));
+        if (PeakBytesPerSecond5s < AverageBytesPerSecond5s)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(peakBytesPerSecond5Seconds),
+                nameof(peakBytesPerSecond5s),
                 "Peak throughput cannot be lower than average throughput.");
         }
         ActualFramesPerSecond = ValidateFiniteNonNegative(actualFramesPerSecond, nameof(actualFramesPerSecond));
@@ -145,26 +145,24 @@ public sealed record QualityObservation
         PresentationTime = ValidateDuration(presentationTime, nameof(presentationTime));
         DirtyCoverage = ValidateCoverage(dirtyCoverage);
         SinceLastInput = ValidateDuration(sinceLastInput, nameof(sinceLastInput));
-        IsDragging = isDragging;
-        IsScrolling = isScrolling;
+        PointerDragActive = pointerDragActive;
+        ScrollActive = scrollActive;
         ArgumentOutOfRangeException.ThrowIfNegative(pendingInputCount);
 
         PendingInputCount = pendingInputCount;
     }
 
     public DateTimeOffset Timestamp { get; }
-    public double AverageBytesPerSecond5Seconds { get; }
-    public double PeakBytesPerSecond5Seconds { get; }
-    public double AverageBytesPerSecond5s => AverageBytesPerSecond5Seconds;
-    public double PeakBytesPerSecond5s => PeakBytesPerSecond5Seconds;
+    public double AverageBytesPerSecond5s { get; }
+    public double PeakBytesPerSecond5s { get; }
     public double ActualFramesPerSecond { get; }
     public TimeSpan ResponseTime { get; }
     public TimeSpan DecodeTime { get; }
     public TimeSpan PresentationTime { get; }
     public double DirtyCoverage { get; }
     public TimeSpan SinceLastInput { get; }
-    public bool IsDragging { get; }
-    public bool IsScrolling { get; }
+    public bool PointerDragActive { get; }
+    public bool ScrollActive { get; }
     public int PendingInputCount { get; }
 
     private static double ValidateFiniteNonNegative(double value, string parameterName)
@@ -202,7 +200,7 @@ public sealed record QualityDecision
 {
     public QualityDecision(
         long generation,
-        QualityContentState state,
+        QualityContentState contentState,
         QualityLevel level,
         WinARD.Domain.Connections.QualityColor color,
         WinARD.Domain.Connections.QualityScale scale,
@@ -210,15 +208,15 @@ public sealed record QualityDecision
         QualityDecisionReason reason,
         bool targetSatisfied,
         bool levelChanged,
-        bool stateChanged,
+        bool contentStateChanged,
         QualityLevel? previousLevel,
-        QualityContentState? previousState)
+        QualityContentState? previousContentState)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(generation);
 
-        if (!Enum.IsDefined(state))
+        if (!Enum.IsDefined(contentState))
         {
-            throw new ArgumentOutOfRangeException(nameof(state));
+            throw new ArgumentOutOfRangeException(nameof(contentState));
         }
 
         if (!Enum.IsDefined(level))
@@ -265,13 +263,13 @@ public sealed record QualityDecision
             throw new ArgumentOutOfRangeException(nameof(previousLevel));
         }
 
-        if (previousState is { } priorState && !Enum.IsDefined(priorState))
+        if (previousContentState is { } priorState && !Enum.IsDefined(priorState))
         {
-            throw new ArgumentOutOfRangeException(nameof(previousState));
+            throw new ArgumentOutOfRangeException(nameof(previousContentState));
         }
 
         Generation = generation;
-        State = state;
+        ContentState = contentState;
         Level = level;
         Color = color;
         Scale = scale;
@@ -279,22 +277,21 @@ public sealed record QualityDecision
         Reason = reason;
         TargetSatisfied = targetSatisfied;
         LevelChanged = levelChanged;
-        StateChanged = stateChanged;
+        ContentStateChanged = contentStateChanged;
         PreviousLevel = previousLevel;
-        PreviousState = previousState;
+        PreviousContentState = previousContentState;
     }
 
     public long Generation { get; }
-    public QualityContentState State { get; }
+    public QualityContentState ContentState { get; }
     public QualityLevel Level { get; }
     public WinARD.Domain.Connections.QualityColor Color { get; }
     public WinARD.Domain.Connections.QualityScale Scale { get; }
     public int TargetFramesPerSecond { get; }
-    public int TargetFps => TargetFramesPerSecond;
     public QualityDecisionReason Reason { get; }
     public bool TargetSatisfied { get; }
     public bool LevelChanged { get; }
-    public bool StateChanged { get; }
+    public bool ContentStateChanged { get; }
     public QualityLevel? PreviousLevel { get; }
-    public QualityContentState? PreviousState { get; }
+    public QualityContentState? PreviousContentState { get; }
 }

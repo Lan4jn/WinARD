@@ -15,9 +15,9 @@ public sealed class AdaptiveQualityControllerTests
     {
         var controller = CreateController();
 
-        var decision = controller.Decide(Observation(Epoch, scrolling: true));
+        var decision = controller.Observe(Observation(Epoch, scrolling: true));
 
-        Assert.Equal(QualityContentState.Motion, decision.State);
+        Assert.Equal(QualityContentState.Motion, decision.ContentState);
         Assert.Equal(60, decision.TargetFramesPerSecond);
         Assert.Equal(QualityDecisionReason.Initial, decision.Reason);
     }
@@ -38,9 +38,9 @@ public sealed class AdaptiveQualityControllerTests
     public void Two_distinct_over_target_windows_degrade_only_one_adjacent_level()
     {
         var controller = CreateController(target: 1_000);
-        controller.Decide(Observation(Epoch, average: 1_200));
-        var duplicateWindow = controller.Decide(Observation(Epoch.AddSeconds(1), average: 1_200));
-        var secondWindow = controller.Decide(Observation(Epoch.AddSeconds(5), average: 1_200));
+        controller.Observe(Observation(Epoch, average: 1_200));
+        var duplicateWindow = controller.Observe(Observation(Epoch.AddSeconds(1), average: 1_200));
+        var secondWindow = controller.Observe(Observation(Epoch.AddSeconds(5), average: 1_200));
 
         Assert.Equal(QualityLevel.Q0, duplicateWindow.Level);
         Assert.Equal(QualityLevel.Q1, secondWindow.Level);
@@ -58,7 +58,7 @@ public sealed class AdaptiveQualityControllerTests
     {
         var controller = CreateController(target: 1_000);
 
-        var decision = controller.Decide(Observation(
+        var decision = controller.Observe(Observation(
             Epoch,
             average: average,
             peak: average,
@@ -73,10 +73,10 @@ public sealed class AdaptiveQualityControllerTests
     public void Recovery_requires_fifteen_stable_seconds_and_five_second_upgrade_cooldown()
     {
         var controller = CreateController(target: 1_000);
-        controller.Decide(Observation(Epoch, average: 1_500));
-        var before = controller.Decide(Observation(Epoch.AddSeconds(14), average: 700));
-        var start = controller.Decide(Observation(Epoch.AddSeconds(15), average: 700));
-        var upgraded = controller.Decide(Observation(Epoch.AddSeconds(30), average: 700));
+        controller.Observe(Observation(Epoch, average: 1_500));
+        var before = controller.Observe(Observation(Epoch.AddSeconds(14), average: 700));
+        var start = controller.Observe(Observation(Epoch.AddSeconds(15), average: 700));
+        var upgraded = controller.Observe(Observation(Epoch.AddSeconds(30), average: 700));
 
         Assert.Equal(QualityLevel.Q1, before.Level);
         Assert.Equal(QualityLevel.Q1, start.Level);
@@ -85,14 +85,14 @@ public sealed class AdaptiveQualityControllerTests
     }
 
     [Fact]
-    public void Degrade_cooldown_is_two_seconds()
+    public void Repeated_severe_signals_respect_two_second_degrade_cooldown()
     {
         var controller = CreateController(target: 1_000);
-        controller.Decide(Observation(Epoch, average: 1_500));
-        var cooled = controller.Decide(Observation(Epoch.AddSeconds(1), average: 1_500));
-        var next = controller.Decide(Observation(Epoch.AddSeconds(2), average: 1_500));
+        controller.Observe(Observation(Epoch, average: 1_500));
+        var immediate = controller.Observe(Observation(Epoch.AddSeconds(1), average: 1_500));
+        var next = controller.Observe(Observation(Epoch.AddSeconds(2), average: 1_500));
 
-        Assert.Equal(QualityLevel.Q1, cooled.Level);
+        Assert.Equal(QualityLevel.Q1, immediate.Level);
         Assert.Equal(QualityLevel.Q2, next.Level);
     }
 
@@ -101,27 +101,27 @@ public sealed class AdaptiveQualityControllerTests
     {
         var controller = CreateController();
         Assert.Equal(QualityContentState.Interactive,
-            controller.Decide(Observation(Epoch, dirty: .1, sinceInput: TimeSpan.FromMilliseconds(100))).State);
+            controller.Observe(Observation(Epoch, dirty: .1, sinceInput: TimeSpan.FromMilliseconds(100))).ContentState);
         Assert.Equal(QualityContentState.Interactive,
-            controller.Decide(Observation(Epoch.AddMilliseconds(1), dirty: .01)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(1), dirty: .01)).ContentState);
         Assert.Equal(QualityContentState.Recovery,
-            controller.Decide(Observation(Epoch.AddMilliseconds(601), dirty: .01)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(601), dirty: .01)).ContentState);
         Assert.Equal(QualityContentState.Idle,
-            controller.Decide(Observation(Epoch.AddMilliseconds(602), dirty: .01)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(602), dirty: .01)).ContentState);
     }
 
     [Fact]
     public void Since_last_input_contributes_to_the_single_six_hundred_millisecond_recovery_period()
     {
         var controller = CreateController();
-        controller.Decide(Observation(Epoch, dirty: .01, sinceInput: TimeSpan.Zero));
+        controller.Observe(Observation(Epoch, dirty: .01, sinceInput: TimeSpan.Zero));
 
-        var decision = controller.Decide(Observation(
+        var decision = controller.Observe(Observation(
             Epoch.AddMilliseconds(600),
             dirty: .01,
             sinceInput: TimeSpan.FromMilliseconds(600)));
 
-        Assert.Equal(QualityContentState.Recovery, decision.State);
+        Assert.Equal(QualityContentState.Recovery, decision.ContentState);
     }
 
     [Fact]
@@ -130,45 +130,45 @@ public sealed class AdaptiveQualityControllerTests
         var controller = CreateController();
 
         Assert.Equal(QualityContentState.Interactive,
-            controller.Decide(Observation(Epoch, dirty: .25)).State);
+            controller.Observe(Observation(Epoch, dirty: .25)).ContentState);
         Assert.Equal(QualityContentState.Interactive,
-            controller.Decide(Observation(Epoch.AddMilliseconds(1), dirty: .25)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(1), dirty: .25)).ContentState);
         Assert.Equal(QualityContentState.Interactive,
-            controller.Decide(Observation(Epoch.AddMilliseconds(59), dirty: .25)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(59), dirty: .25)).ContentState);
         Assert.Equal(QualityContentState.Motion,
-            controller.Decide(Observation(Epoch.AddMilliseconds(60), dirty: .25)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(60), dirty: .25)).ContentState);
     }
 
     [Fact]
     public void Dirty_motion_timer_resets_when_coverage_drops_below_twenty_five_percent()
     {
         var controller = CreateController();
-        controller.Decide(Observation(Epoch, dirty: .25));
-        controller.Decide(Observation(Epoch.AddMilliseconds(30), dirty: .24));
+        controller.Observe(Observation(Epoch, dirty: .25));
+        controller.Observe(Observation(Epoch.AddMilliseconds(30), dirty: .24));
 
         Assert.Equal(QualityContentState.Interactive,
-            controller.Decide(Observation(Epoch.AddMilliseconds(100), dirty: .25)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(100), dirty: .25)).ContentState);
         Assert.Equal(QualityContentState.Interactive,
-            controller.Decide(Observation(Epoch.AddMilliseconds(159), dirty: .25)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(159), dirty: .25)).ContentState);
         Assert.Equal(QualityContentState.Motion,
-            controller.Decide(Observation(Epoch.AddMilliseconds(160), dirty: .25)).State);
+            controller.Observe(Observation(Epoch.AddMilliseconds(160), dirty: .25)).ContentState);
     }
 
     [Fact]
     public void Two_percent_is_interactive_while_coverage_below_it_is_idle()
     {
 
-        var boundary = CreateController().Decide(Observation(Epoch, dirty: .02));
-        var below = CreateController().Decide(Observation(Epoch, dirty: .0199));
-        Assert.Equal(QualityContentState.Interactive, boundary.State);
-        Assert.Equal(QualityContentState.Idle, below.State);
+        var boundary = CreateController().Observe(Observation(Epoch, dirty: .02));
+        var below = CreateController().Observe(Observation(Epoch, dirty: .0199));
+        Assert.Equal(QualityContentState.Interactive, boundary.ContentState);
+        Assert.Equal(QualityContentState.Idle, below.ContentState);
     }
 
     [Fact]
     public void Capabilities_and_decoder_gate_remove_unsafe_levels()
     {
         var unsafeController = CreateController(capabilities: Capabilities(rgb: CapabilitySupport.Unknown, scaling: CapabilitySupport.Unknown));
-        var unsafeDecision = unsafeController.Decide(Observation(Epoch, average: 9_000, peak: 9_000));
+        var unsafeDecision = unsafeController.Observe(Observation(Epoch, average: 9_000, peak: 9_000));
 
         var gatedController = CreateController(
             profile: QualityProfile.Automatic,
@@ -176,7 +176,7 @@ public sealed class AdaptiveQualityControllerTests
             gates: new QualityDecoderGates(false, true));
         for (var index = 0; index < 5; index++)
         {
-            gatedController.Decide(Observation(Epoch.AddSeconds(index * 2), average: 9_000_000, peak: 9_000_000));
+            gatedController.Observe(Observation(Epoch.AddSeconds(index * 2), average: 9_000_000, peak: 9_000_000));
         }
 
         Assert.Equal(QualityLevel.Q0, unsafeDecision.Level);
@@ -191,7 +191,7 @@ public sealed class AdaptiveQualityControllerTests
             capabilities: Capabilities(rgb: CapabilitySupport.Unknown),
             gates: new QualityDecoderGates(false, true));
 
-        var decision = controller.Decide(Observation(Epoch, average: 9_000, peak: 9_000));
+        var decision = controller.Observe(Observation(Epoch, average: 9_000, peak: 9_000));
 
         Assert.Equal(QualityLevel.Q0, decision.Level);
         Assert.Equal(QualityDecisionReason.TargetUnsatisfied, decision.Reason);
@@ -252,11 +252,122 @@ public sealed class AdaptiveQualityControllerTests
             refreshLocked: true);
         var controller = CreateController(profile: profile);
 
-        var decision = controller.Decide(Observation(Epoch, average: 900, peak: 900, scrolling: true));
+        var decision = controller.Observe(Observation(Epoch, average: 900, peak: 900, scrolling: true));
 
         Assert.Equal(QualityLevel.Q2, decision.Level);
         Assert.Equal(45, decision.TargetFramesPerSecond);
         Assert.Equal(QualityDecisionReason.UserConstraint, decision.Reason);
+    }
+
+    [Fact]
+    public void Bandwidth_lock_preserves_the_target_but_does_not_disable_quality_adaptation()
+    {
+        var profile = QualityProfile.CreateCustom(
+            1_000,
+            QualityColor.Automatic,
+            QualityScale.Automatic,
+            FrameRefreshPolicy.Automatic,
+            bandwidthLocked: true);
+        var controller = CreateController(profile: profile);
+
+        var decision = controller.Observe(Observation(Epoch, average: 1_500));
+
+        Assert.Equal(QualityLevel.Q1, decision.Level);
+        Assert.Equal(QualityDecisionReason.SevereOverTarget, decision.Reason);
+    }
+
+    [Fact]
+    public void Locked_dimensions_report_unsatisfied_when_no_quality_step_remains()
+    {
+        var profile = QualityProfile.CreateCustom(
+            1_000,
+            QualityColor.Color16,
+            QualityScale.Percent75,
+            FrameRefreshPolicy.Fixed(60),
+            allowAutomaticGrayscale: false,
+            bandwidthLocked: true,
+            colorLocked: true,
+            scaleLocked: true,
+            refreshLocked: true);
+        var controller = CreateController(profile: profile);
+
+        var decision = controller.Observe(Observation(Epoch, average: 1_500));
+
+        Assert.Equal(QualityLevel.Q2, decision.Level);
+        Assert.False(decision.TargetSatisfied);
+        Assert.Equal(QualityDecisionReason.TargetUnsatisfied, decision.Reason);
+    }
+
+    [Fact]
+    public void Recovery_restores_one_adjacent_level_once_with_unlimited_bandwidth()
+    {
+        var profile = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Color16,
+            QualityScale.Percent50,
+            FrameRefreshPolicy.Unlimited,
+            allowAutomaticGrayscale: false);
+        var controller = CreateController(profile: profile);
+        controller.Observe(Observation(Epoch, scrolling: true));
+        controller.Observe(Observation(Epoch.AddMilliseconds(1), dirty: .01));
+
+        var recovery = controller.Observe(Observation(Epoch.AddMilliseconds(601), dirty: .01));
+        var idle = controller.Observe(Observation(Epoch.AddMilliseconds(602), dirty: .01));
+        var stableIdle = controller.Observe(Observation(Epoch.AddSeconds(15), dirty: .01));
+        var immediateIdle = controller.Observe(Observation(Epoch.AddSeconds(15).AddMilliseconds(1), dirty: .01));
+
+        Assert.Equal(QualityContentState.Recovery, recovery.ContentState);
+        Assert.Equal(QualityLevel.Q2, recovery.Level);
+        Assert.Equal(QualityDecisionReason.StableRecovery, recovery.Reason);
+        Assert.Equal(QualityContentState.Idle, idle.ContentState);
+        Assert.Equal(QualityLevel.Q2, idle.Level);
+        Assert.Equal(QualityLevel.Q1, stableIdle.Level);
+        Assert.Equal(QualityLevel.Q1, immediateIdle.Level);
+    }
+
+    [Fact]
+    public void Severe_backlog_has_priority_over_recovery_with_unlimited_bandwidth()
+    {
+        var profile = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Color16,
+            QualityScale.Percent75,
+            FrameRefreshPolicy.Unlimited,
+            allowAutomaticGrayscale: false);
+        var controller = CreateController(profile: profile);
+        controller.Observe(Observation(Epoch, scrolling: true));
+        controller.Observe(Observation(Epoch.AddMilliseconds(1), dirty: .01));
+
+        var recovery = controller.Observe(Observation(
+            Epoch.AddMilliseconds(601),
+            dirty: .01,
+            pending: 3));
+
+        Assert.Equal(QualityContentState.Recovery, recovery.ContentState);
+        Assert.Equal(QualityLevel.Q3, recovery.Level);
+        Assert.Equal(QualityDecisionReason.SevereOverTarget, recovery.Reason);
+    }
+
+    [Fact]
+    public void Recovery_does_not_upgrade_while_an_ordinary_window_is_over_target()
+    {
+        var profile = QualityProfile.CreateCustom(
+            1_000,
+            QualityColor.Color16,
+            QualityScale.Percent50,
+            FrameRefreshPolicy.Automatic,
+            allowAutomaticGrayscale: false);
+        var controller = CreateController(profile: profile);
+        controller.Observe(Observation(Epoch, scrolling: true));
+        controller.Observe(Observation(Epoch.AddMilliseconds(1), dirty: .01));
+
+        var recovery = controller.Observe(Observation(
+            Epoch.AddMilliseconds(601),
+            average: 1_200,
+            dirty: .01));
+
+        Assert.Equal(QualityContentState.Recovery, recovery.ContentState);
+        Assert.Equal(QualityLevel.Q3, recovery.Level);
     }
 
     [Fact]
@@ -270,9 +381,9 @@ public sealed class AdaptiveQualityControllerTests
             refreshLocked: true);
         var controller = CreateController(profile: profile);
 
-        Assert.Equal(45, controller.Decide(Observation(Epoch)).TargetFramesPerSecond);
+        Assert.Equal(45, controller.Observe(Observation(Epoch)).TargetFramesPerSecond);
         Assert.Equal(QualityLevel.Q3, DegradeRepeatedlyFrom(controller, Epoch.AddSeconds(2)));
-        var exhausted = controller.Decide(Observation(Epoch.AddSeconds(12), average: 9_000_000, peak: 9_000_000));
+        var exhausted = controller.Observe(Observation(Epoch.AddSeconds(12), average: 9_000_000, peak: 9_000_000));
         Assert.Equal(45, exhausted.TargetFramesPerSecond);
         Assert.Equal(QualityDecisionReason.TargetUnsatisfied, exhausted.Reason);
     }
@@ -288,24 +399,25 @@ public sealed class AdaptiveQualityControllerTests
             refreshLocked: true);
         var controller = CreateController(profile: profile, capabilities: Capabilities(maximumRefresh: 90));
 
-        var decision = controller.Decide(Observation(Epoch, scrolling: true));
+        var decision = controller.Observe(Observation(Epoch, scrolling: true));
 
         Assert.Equal(QualityLevel.Q0, decision.Level);
         Assert.Equal(60, decision.TargetFramesPerSecond);
     }
 
     [Fact]
-    public void Five_second_upgrade_cooldown_also_blocks_a_reverse_degrade()
+    public void Severe_signal_bypasses_upgrade_cooldown_for_an_immediate_reverse_degrade()
     {
         var controller = CreateController(target: 1_000);
-        controller.Decide(Observation(Epoch, average: 1_500));
-        controller.Decide(Observation(Epoch.AddSeconds(1), average: 700));
+        controller.Observe(Observation(Epoch, average: 1_500));
+        controller.Observe(Observation(Epoch.AddSeconds(1), average: 700));
         Assert.Equal(QualityLevel.Q0,
-            controller.Decide(Observation(Epoch.AddSeconds(16), average: 700)).Level);
+            controller.Observe(Observation(Epoch.AddSeconds(16), average: 700)).Level);
 
-        var reverse = controller.Decide(Observation(Epoch.AddSeconds(18), average: 1_500));
+        var reverse = controller.Observe(Observation(Epoch.AddSeconds(18), average: 1_500));
 
-        Assert.Equal(QualityLevel.Q0, reverse.Level);
+        Assert.Equal(QualityLevel.Q1, reverse.Level);
+        Assert.Equal(QualityDecisionReason.SevereOverTarget, reverse.Reason);
     }
 
     [Fact]
@@ -313,7 +425,7 @@ public sealed class AdaptiveQualityControllerTests
     {
         var controller = CreateController(capabilities: Capabilities(maximumRefresh: 30));
 
-        var decision = controller.Decide(Observation(Epoch, scrolling: true));
+        var decision = controller.Observe(Observation(Epoch, scrolling: true));
 
         Assert.Equal(QualityLevel.Q0, decision.Level);
         Assert.Equal(30, decision.TargetFramesPerSecond);
@@ -324,7 +436,7 @@ public sealed class AdaptiveQualityControllerTests
     {
         var controller = CreateController(capabilities: Capabilities(maximumRefresh: 40));
 
-        var decision = controller.Decide(Observation(
+        var decision = controller.Observe(Observation(
             Epoch,
             dirty: .1,
             sinceInput: TimeSpan.FromMilliseconds(100)));
@@ -338,7 +450,7 @@ public sealed class AdaptiveQualityControllerTests
         var controller = CreateController(profile: QualityProfile.Smooth);
         DegradeRepeatedly(controller);
 
-        var decision = controller.Decide(Observation(Epoch.AddSeconds(10), average: 9_000_000, scrolling: true));
+        var decision = controller.Observe(Observation(Epoch.AddSeconds(10), average: 9_000_000, scrolling: true));
 
         Assert.Equal(QualityLevel.Q3, decision.Level);
         Assert.Equal(30, decision.TargetFramesPerSecond);
@@ -355,9 +467,31 @@ public sealed class AdaptiveQualityControllerTests
         Assert.Throws<ArgumentOutOfRangeException>(() => Observation(Epoch, average: 2, peak: 1));
         Assert.Throws<ArgumentOutOfRangeException>(() => Observation(Epoch, response: TimeSpan.FromTicks(-1)));
         var controller = CreateController();
-        controller.Decide(Observation(Epoch, dirty: .25));
+        controller.Observe(Observation(Epoch, dirty: .25));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            controller.Decide(Observation(Epoch.AddTicks(-1), dirty: .25)));
+            controller.Observe(Observation(Epoch.AddTicks(-1), dirty: .25)));
+    }
+
+    [Fact]
+    public void Adaptive_quality_models_expose_only_the_approved_public_names()
+    {
+        var controllerMethods = typeof(AdaptiveQualityController)
+            .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.DeclaredOnly)
+            .Where(method => !method.IsSpecialName)
+            .Select(method => method.Name);
+        var observationProperties = typeof(QualityObservation).GetProperties().Select(property => property.Name);
+        var decisionProperties = typeof(QualityDecision).GetProperties().Select(property => property.Name);
+
+        Assert.Equal([nameof(AdaptiveQualityController.Observe)], controllerMethods);
+        Assert.Contains(nameof(QualityObservation.AverageBytesPerSecond5s), observationProperties);
+        Assert.Contains(nameof(QualityObservation.PeakBytesPerSecond5s), observationProperties);
+        Assert.Contains(nameof(QualityObservation.PointerDragActive), observationProperties);
+        Assert.Contains(nameof(QualityObservation.ScrollActive), observationProperties);
+        Assert.DoesNotContain(observationProperties, name => name.Contains("5Seconds", StringComparison.Ordinal));
+        Assert.Contains(nameof(QualityDecision.ContentState), decisionProperties);
+        Assert.DoesNotContain("State", decisionProperties);
+        Assert.DoesNotContain("TargetFps", decisionProperties);
     }
 
     private static QualityLevel DegradeRepeatedly(AdaptiveQualityController controller)
@@ -369,7 +503,7 @@ public sealed class AdaptiveQualityControllerTests
     {
         for (var index = 0; index < 5; index++)
         {
-            controller.Decide(Observation(start.AddSeconds(index * 2), average: 9_000_000, peak: 9_000_000));
+            controller.Observe(Observation(start.AddSeconds(index * 2), average: 9_000_000, peak: 9_000_000));
         }
 
         return controller.CurrentLevel;
