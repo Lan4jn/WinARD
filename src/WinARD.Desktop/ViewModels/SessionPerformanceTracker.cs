@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Desktop.Input;
 using WinARD.Domain.Connections;
 using WinARD.Remote.Protocol.Encodings;
@@ -53,13 +54,17 @@ internal sealed class SessionPerformanceTracker
 {
     private const double NewSampleWeight = 0.25;
     private const int MaximumUnknownEncodingKeys = 32;
+    private const int QualityWindowBucketCount = 5;
+    private static readonly TimeSpan MinimumCompleteBucketDuration = TimeSpan.FromSeconds(1);
     private readonly object _sync = new();
     private readonly TimeProvider _timeProvider;
     private readonly Dictionary<int, long> _encodingCounts = [];
     private readonly Dictionary<int, long> _cumulativeEncodingCounts = [];
+    private readonly Queue<QualityBucket> _qualityBuckets = new(QualityWindowBucketCount);
     private long _windowStarted;
     private long _windowFrames;
     private long _windowBytes;
+    private double _windowDirtyCoverage;
     private long _sampleSequence;
     private double? _responseMilliseconds;
     private double? _inputWriteMilliseconds;
@@ -70,6 +75,8 @@ internal sealed class SessionPerformanceTracker
     private long _otherEncodingCount;
     private int _unknownEncodingKeyCount;
     private int _windowUnknownEncodingKeyCount;
+    private long? _lastInputTimestamp;
+    private QualityActivitySnapshot _currentActivity = QualityActivitySnapshot.Empty;
     private SessionPerformanceSnapshot _current;
 
     public SessionPerformanceTracker(
@@ -114,6 +121,93 @@ internal sealed class SessionPerformanceTracker
         }
     }
 
+    public QualityActivitySnapshot CurrentActivity
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _currentActivity;
+            }
+        }
+    }
+
+    public void RecordInputActivity(
+        QualityInputActivityKind kind,
+        bool pointerDragActive,
+        bool scrollActive,
+        int pendingInputCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(pendingInputCount);
+        if (!Enum.IsDefined(kind))
+        {
+            throw new ArgumentOutOfRangeException(nameof(kind));
+        }
+
+        lock (_sync)
+        {
+            _lastInputTimestamp = _timeProvider.GetTimestamp();
+            _currentActivity = new QualityActivitySnapshot(
+                _timeProvider.GetUtcNow(),
+                kind,
+                pointerDragActive,
+                scrollActive,
+                pendingInputCount);
+        }
+    }
+
+    /// <summary>
+    /// Creates a content-free quality observation. A null decode time is unmeasured and is published as zero.
+    /// </summary>
+    public QualityObservation CreateQualityObservation(TimeSpan? decodeTime = null)
+    {
+        if (decodeTime < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(decodeTime));
+        }
+
+        lock (_sync)
+        {
+            double totalBytesPerSecond = 0;
+            double totalFramesPerSecond = 0;
+            double peakBytesPerSecond = 0;
+            double dirtyCoverage = 0;
+            foreach (var bucket in _qualityBuckets)
+            {
+                totalBytesPerSecond += bucket.BytesPerSecond;
+                totalFramesPerSecond += bucket.FramesPerSecond;
+                peakBytesPerSecond = Math.Max(peakBytesPerSecond, bucket.BytesPerSecond);
+                dirtyCoverage = Math.Max(dirtyCoverage, bucket.DirtyCoverage);
+            }
+
+            var bucketCount = _qualityBuckets.Count;
+            var averageBytesPerSecond = bucketCount == 0
+                ? 0
+                : Math.Min(peakBytesPerSecond, totalBytesPerSecond / bucketCount);
+            var averageFramesPerSecond = bucketCount == 0 ? 0 : totalFramesPerSecond / bucketCount;
+            var sinceLastInput = _lastInputTimestamp is { } lastInput
+                ? SafeElapsed(lastInput, _timeProvider.GetTimestamp())
+                : TimeSpan.Zero;
+
+            return new QualityObservation(
+                _timeProvider.GetUtcNow(),
+                ClampFiniteNonNegative(averageBytesPerSecond),
+                ClampFiniteNonNegative(peakBytesPerSecond),
+                ClampFiniteNonNegative(averageFramesPerSecond),
+                TimeSpan.FromMilliseconds(_current.ResponseMilliseconds),
+                decodeTime ?? TimeSpan.Zero,
+                TimeSpan.FromMilliseconds(
+                    _presentationMilliseconds is { } presentation
+                        ? RoundMilliseconds(presentation)
+                        : 0),
+                Math.Clamp(dirtyCoverage, 0, 1),
+                sinceLastInput,
+                _currentActivity.PointerDragActive,
+                _currentActivity.ScrollActive,
+                _currentActivity.PendingInputCount);
+        }
+    }
+
     public void RecordAutomaticTargetChange()
     {
         lock (_sync)
@@ -155,6 +249,7 @@ internal sealed class SessionPerformanceTracker
 
         lock (_sync)
         {
+            _windowDirtyCoverage = Math.Max(_windowDirtyCoverage, CalculateDirtyCoverage(dirty, size));
             var window = ObserveUpdateNoLock(update, countFrame: true);
             _responseMilliseconds = Smooth(_responseMilliseconds, response.TotalMilliseconds);
             _presentationMilliseconds = Smooth(
@@ -238,11 +333,13 @@ internal sealed class SessionPerformanceTracker
             _current.ReceiveBytesPerSecond,
             _current.PrimaryFramebufferEncoding);
         var now = _timeProvider.GetTimestamp();
-        var elapsed = _timeProvider.GetElapsedTime(_windowStarted, now);
-        if (elapsed < TimeSpan.FromSeconds(1))
+        var elapsed = SafeElapsed(_windowStarted, now);
+        if (elapsed < MinimumCompleteBucketDuration)
         {
             return metrics;
         }
+
+        AddQualityBucketNoLock(elapsed);
 
         _actualFramesPerSecond = Smooth(
             _actualFramesPerSecond,
@@ -257,6 +354,7 @@ internal sealed class SessionPerformanceTracker
         _windowStarted = now;
         _windowFrames = 0;
         _windowBytes = 0;
+        _windowDirtyCoverage = 0;
         _encodingCounts.Clear();
         _windowUnknownEncodingKeyCount = 0;
         return metrics;
@@ -298,6 +396,7 @@ internal sealed class SessionPerformanceTracker
     private static bool IsKnownEncoding(int encoding) => encoding is
         (int)RfbEncodingType.Raw or
         (int)RfbEncodingType.CopyRect or
+        (int)RfbEncodingType.Zlib or
         (int)RfbEncodingType.Zrle or
         (int)RfbEncodingType.ArdDisplayInfo or
         (int)RfbEncodingType.ArdSessionEncryption or
@@ -332,8 +431,81 @@ internal sealed class SessionPerformanceTracker
     private static long SaturatingAdd(long left, long right) =>
         left > long.MaxValue - right ? long.MaxValue : left + right;
 
+    private void AddQualityBucketNoLock(TimeSpan elapsed)
+    {
+        var seconds = elapsed.TotalSeconds;
+        var bucket = new QualityBucket(
+            ClampFiniteNonNegative(_windowBytes / seconds),
+            ClampFiniteNonNegative(_windowFrames / seconds),
+            Math.Clamp(_windowDirtyCoverage, 0, 1));
+        if (_qualityBuckets.Count == QualityWindowBucketCount)
+        {
+            _ = _qualityBuckets.Dequeue();
+        }
+
+        _qualityBuckets.Enqueue(bucket);
+    }
+
+    private TimeSpan SafeElapsed(long start, long end)
+    {
+        if (end < start)
+        {
+            return TimeSpan.Zero;
+        }
+
+        try
+        {
+            return _timeProvider.GetElapsedTime(start, end);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return TimeSpan.MaxValue;
+        }
+        catch (OverflowException)
+        {
+            return TimeSpan.MaxValue;
+        }
+    }
+
+    private static double CalculateDirtyCoverage(
+        IReadOnlyList<RemoteRectangle> dirty,
+        RemoteFramebufferSize size)
+    {
+        var frameArea = checked((long)size.Width * size.Height);
+        long dirtyArea = 0;
+        foreach (var rectangle in dirty)
+        {
+            if (rectangle.Width <= 0 || rectangle.Height <= 0)
+            {
+                continue;
+            }
+
+            var left = Math.Clamp((long)rectangle.X, 0, size.Width);
+            var top = Math.Clamp((long)rectangle.Y, 0, size.Height);
+            var right = Math.Clamp((long)rectangle.X + rectangle.Width, 0, size.Width);
+            var bottom = Math.Clamp((long)rectangle.Y + rectangle.Height, 0, size.Height);
+            if (right <= left || bottom <= top)
+            {
+                continue;
+            }
+
+            var area = checked((right - left) * (bottom - top));
+            dirtyArea = SaturatingAdd(dirtyArea, area);
+        }
+
+        return Math.Clamp((double)dirtyArea / frameArea, 0, 1);
+    }
+
+    private static double ClampFiniteNonNegative(double value) =>
+        !double.IsFinite(value) ? double.MaxValue : Math.Max(0, value);
+
     private readonly record struct WindowMetrics(
         int ActualFramesPerSecond,
         long ReceiveBytesPerSecond,
         int? PrimaryFramebufferEncoding);
+
+    private readonly record struct QualityBucket(
+        double BytesPerSecond,
+        double FramesPerSecond,
+        double DirtyCoverage);
 }
