@@ -349,6 +349,10 @@ public interface IRemoteSessionRuntime
     /// </summary>
     ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Applies settings at a safe frame boundary. An <see cref="QualityTransitionStatus.Applied"/>
+    /// result guarantees that exactly one non-incremental repair request was written and is outstanding.
+    /// </summary>
     ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(
         RemoteQualitySettings settings,
         CancellationToken cancellationToken) =>

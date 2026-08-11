@@ -93,7 +93,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             dispatcher,
             _clipboardBridge,
             diagnosticSink,
-            profile?.FrameRefreshPolicy ?? FrameRefreshPolicy.Automatic);
+            profile?.Quality ?? QualityProfile.Automatic);
         _windowLifecycle = new RemoteSessionWindowLifecycle(
             ViewModel.Completion,
             () => ViewModel.Error is not null,
@@ -533,6 +533,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
 
         RecordPointerCaptured();
+        ViewModel.RecordScrollInput();
         var properties = args.GetCurrentPoint(FrameSurface).Properties;
         var baseMask = WindowsInputMapper.ToPointerMask(ToButtons(properties));
         var wheelMask = WindowsInputMapper.WithWheel(baseMask, properties.MouseWheelDelta);

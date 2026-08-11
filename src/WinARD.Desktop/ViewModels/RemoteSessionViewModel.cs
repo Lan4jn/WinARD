@@ -1,6 +1,7 @@
 using System.Globalization;
 using CommunityToolkit.Mvvm.ComponentModel;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Desktop.Clipboard;
 using WinARD.Desktop.Input;
 using WinARD.Desktop.Rendering;
@@ -36,7 +37,13 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private readonly ConnectionQualityPublicationGate _connectionQualityPublicationGate = new();
     private readonly TimeProvider _timeProvider;
     private readonly FramebufferRequestPacer _pacer;
-    private readonly AutomaticFrameRateController _automaticFrameRateController;
+    private AdaptiveQualityController _adaptiveQualityController;
+    private readonly ArdDisplayCapabilities _adaptiveQualityCapabilities;
+    private readonly QualityDecoderGates _qualityDecoderGates;
+    private readonly QualityTransitionCoordinator _qualityTransitionCoordinator;
+    private readonly SemaphoreSlim _qualityOperationGate = new(1, 1);
+    private CancellationTokenSource _qualityProfileOperations = new();
+    private readonly List<CancellationTokenSource> _retiredQualityProfileOperations = [];
     private readonly SessionPerformanceTracker _performanceTracker;
     private readonly SessionPerformancePublicationGate _performancePublication;
     private readonly int? _remoteMaximum;
@@ -56,6 +63,10 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private ConnectionQualitySnapshot _connectionQuality;
     private SessionPerformanceSnapshot _performance;
     private FrameRefreshPolicy _refreshPolicy;
+    private QualityProfile _qualityProfile;
+    private long _qualityDecisionGeneration;
+    private long _qualityProfileEpoch;
+    private int _pendingScrollInput;
     private IReadOnlyList<FrameRefreshOption> _frameRefreshOptions = [];
     private FrameRefreshOption _selectedFrameRefreshOption = null!;
     private WinArdError? _error;
@@ -102,6 +113,38 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         AutomaticFrameRateController? automaticFrameRateController = null,
         SessionPerformanceTracker? performanceTracker = null,
         TimeSpan? performancePublicationInterval = null)
+        : this(
+            session,
+            ownership,
+            presenter,
+            dispatcher,
+            clipboardBridge,
+            diagnosticSink,
+            QualityProfile.Automatic.WithRefresh(initialRefreshPolicy),
+            timeProvider,
+            pacer,
+            performanceTracker,
+            performancePublicationInterval: performancePublicationInterval)
+    {
+        _ = automaticFrameRateController;
+    }
+
+    internal RemoteSessionViewModel(
+        IRemoteSessionRuntime session,
+        IAsyncDisposable ownership,
+        IFramePresenter presenter,
+        IUiDispatcher dispatcher,
+        WindowsClipboardBridge? clipboardBridge,
+        ISafeDiagnosticSink? diagnosticSink,
+        QualityProfile qualityProfile,
+        TimeProvider? timeProvider = null,
+        FramebufferRequestPacer? pacer = null,
+        SessionPerformanceTracker? performanceTracker = null,
+        ArdDisplayCapabilities? adaptiveQualityCapabilities = null,
+        QualityDecoderGates? qualityDecoderGates = null,
+        AdaptiveQualityController? adaptiveQualityController = null,
+        QualityTransitionCoordinator? qualityTransitionCoordinator = null,
+        TimeSpan? performancePublicationInterval = null)
     {
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _ownership = ownership ?? throw new ArgumentNullException(nameof(ownership));
@@ -113,17 +156,31 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _connectionQualityTracker = new ConnectionQualityTracker(_timeProvider);
         _connectionQuality = _connectionQualityTracker.Current;
         _remoteMaximum = ValidateRemoteMaximum(session.DisplayCapabilities.MaximumRefreshRate);
-        _automaticFrameRateController = automaticFrameRateController ??
-            new AutomaticFrameRateController(_timeProvider, _remoteMaximum);
+        _qualityProfile = qualityProfile ?? throw new ArgumentNullException(nameof(qualityProfile));
+        _refreshPolicy = qualityProfile.Refresh;
+        _adaptiveQualityCapabilities = adaptiveQualityCapabilities ?? ConservativeCapabilities(_remoteMaximum);
+        _qualityDecoderGates = qualityDecoderGates ?? new QualityDecoderGates();
+        _adaptiveQualityController = adaptiveQualityController ?? CreateAdaptiveController(
+            _qualityProfile,
+            _adaptiveQualityCapabilities,
+            _qualityDecoderGates);
+        _qualityTransitionCoordinator = qualityTransitionCoordinator ?? new QualityTransitionCoordinator(
+            session,
+            new RemoteQualitySettings(
+                RemotePixelFormatKind.Bgra32,
+                [6, 16, 0, 1, -239, -223],
+                1),
+            _adaptiveQualityCapabilities,
+            _qualityDecoderGates);
         _pacer = pacer ?? new FramebufferRequestPacer(_timeProvider);
-        _refreshPolicy = initialRefreshPolicy;
-        var targetFramesPerSecond = ResolveTarget(initialRefreshPolicy);
+        var automaticTarget = InitialAdaptiveTarget(_adaptiveQualityController);
+        var targetFramesPerSecond = ResolveTarget(_refreshPolicy, automaticTarget);
         _pacer.SetPolicy(
-            initialRefreshPolicy,
-            _automaticFrameRateController.CurrentFramesPerSecond,
+            _refreshPolicy,
+            automaticTarget,
             _remoteMaximum);
         _performanceTracker = performanceTracker ??
-            new SessionPerformanceTracker(_timeProvider, initialRefreshPolicy, targetFramesPerSecond);
+            new SessionPerformanceTracker(_timeProvider, _refreshPolicy, targetFramesPerSecond);
         _performancePublication = new SessionPerformancePublicationGate(
             _timeProvider,
             performancePublicationInterval ?? TimeSpan.FromSeconds(1));
@@ -208,20 +265,40 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     public Task Completion => _completion.Task;
 
     public void SetFrameRefreshPolicy(FrameRefreshPolicy policy)
+        => SetQualityProfile(_qualityProfile.WithRefresh(policy));
+
+    public void SetQualityProfile(QualityProfile profile)
     {
+        ArgumentNullException.ThrowIfNull(profile);
+        var controller = CreateAdaptiveController(
+            profile,
+            _adaptiveQualityCapabilities,
+            _qualityDecoderGates);
+        CancellationTokenSource previousOperations;
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
-            _refreshPolicy = policy;
+            previousOperations = _qualityProfileOperations;
+            _retiredQualityProfileOperations.Add(previousOperations);
+            _qualityProfileOperations = new CancellationTokenSource();
+            _qualityProfile = profile;
+            _refreshPolicy = profile.Refresh;
+            _adaptiveQualityController = controller;
+            _ = Interlocked.Increment(ref _qualityProfileEpoch);
             _ = Interlocked.Increment(ref _performanceGeneration);
+            var automaticTarget = InitialAdaptiveTarget(_adaptiveQualityController);
             _pacer.SetPolicy(
-                policy,
-                _automaticFrameRateController.CurrentFramesPerSecond,
+                _refreshPolicy,
+                automaticTarget,
                 _remoteMaximum);
-            _performanceTracker.SetRefreshPolicy(policy, ResolveTarget(policy));
+            _performanceTracker.SetRefreshPolicy(
+                _refreshPolicy,
+                ResolveTarget(_refreshPolicy, automaticTarget));
             Performance = _performanceTracker.Current;
             RefreshFrameRefreshOptions();
         }
+
+        ObserveDetachedFailure(previousOperations.CancelAsync());
     }
 
     internal static string FormatSessionPerformance(SessionPerformanceSnapshot snapshot)
@@ -363,41 +440,59 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         int scanCode,
         bool isExtended,
         string? text,
-        CancellationToken cancellationToken) =>
-        _pointerWrites.BarrierAsync(
+        CancellationToken cancellationToken)
+    {
+        RecordInputOccurred(QualityInputActivityKind.Keyboard, PointerDragActive(), 1);
+        return _pointerWrites.BarrierAsync(
             token => _inputMapper.KeyDownAsync(key, scanCode, isExtended, text, token),
             cancellationToken);
+    }
 
     public ValueTask KeyUpAsync(
         Windows.System.VirtualKey key,
         int scanCode,
         bool isExtended,
         string? text,
-        CancellationToken cancellationToken) =>
-        _pointerWrites.BarrierAsync(
+        CancellationToken cancellationToken)
+    {
+        RecordInputOccurred(QualityInputActivityKind.Keyboard, PointerDragActive(), 1);
+        return _pointerWrites.BarrierAsync(
             token => _inputMapper.KeyUpAsync(key, scanCode, isExtended, text, token),
             cancellationToken);
+    }
 
-    public ValueTask TextInputAsync(string text, CancellationToken cancellationToken) =>
-        _pointerWrites.BarrierAsync(
+    public ValueTask TextInputAsync(string text, CancellationToken cancellationToken)
+    {
+        RecordInputOccurred(QualityInputActivityKind.Keyboard, PointerDragActive(), 1);
+        return _pointerWrites.BarrierAsync(
             token => _inputMapper.TextInputAsync(text, token),
             cancellationToken);
+    }
 
-    public ValueTask ReleaseInputAsync(CancellationToken cancellationToken) =>
-        _pointerWrites.BarrierAsync(
+    public ValueTask ReleaseInputAsync(CancellationToken cancellationToken)
+    {
+        RecordInputOccurred(QualityInputActivityKind.Keyboard, pointerDragActive: false, 1);
+        return _pointerWrites.BarrierAsync(
             token => _inputMapper.ReleaseAllAsync(token),
             cancellationToken);
+    }
 
-    public ValueTask SendSecureAttentionSequenceAsync(CancellationToken cancellationToken) =>
-        _pointerWrites.BarrierAsync(
+    public ValueTask SendSecureAttentionSequenceAsync(CancellationToken cancellationToken)
+    {
+        RecordInputOccurred(QualityInputActivityKind.Keyboard, PointerDragActive(), 1);
+        return _pointerWrites.BarrierAsync(
             token => _inputMapper.SendSecureAttentionSequenceAsync(token),
             cancellationToken);
+    }
 
     public ValueTask SendPointerAsync(
         byte buttons,
         RemotePoint point,
-        CancellationToken cancellationToken) =>
-        _session.SendPointerAsync(buttons, point.X, point.Y, cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        RecordInputOccurred(QualityInputActivityKind.Pointer, HasBasePointerButton(buttons), 1);
+        return _session.SendPointerAsync(buttons, point.X, point.Y, cancellationToken);
+    }
 
     public void QueuePointerMove(byte buttons, RemotePoint point)
     {
@@ -422,6 +517,10 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
         try
         {
+            RecordInputOccurred(
+                QualityInputActivityKind.Pointer,
+                HasBasePointerButton(buttons),
+                SaturatingPendingCount(_pointerWrites.Snapshot.PendingDepth, 1));
             _pointerWrites.QueueMove(new PointerWrite(buttons, point));
         }
         catch (ObjectDisposedException) when (IsInputUnavailable)
@@ -434,8 +533,71 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         CancellationToken token)
     {
         ThrowIfInputUnavailable();
+        ArgumentNullException.ThrowIfNull(writes);
+        var dragActive = writes.Count > 0 && HasBasePointerButton(writes[^1].Buttons);
+        if (Interlocked.Exchange(ref _pendingScrollInput, 0) == 0)
+        {
+            RecordInputOccurred(
+                QualityInputActivityKind.Pointer,
+                dragActive,
+                SaturatingPendingCount(_pointerWrites.Snapshot.PendingDepth, writes.Count));
+        }
+        else
+        {
+            _performanceTracker.SetInputActiveState(
+                dragActive,
+                SaturatingPendingCount(_pointerWrites.Snapshot.PendingDepth, writes.Count));
+        }
         return _pointerWrites.BarrierAsync(writes, token);
     }
+
+    public void RecordScrollInput()
+    {
+        lock (_sync)
+        {
+            if (_disposeTask is not null || _lifetime.IsCancellationRequested || IsInputUnavailable)
+            {
+                return;
+            }
+
+            _ = Interlocked.Exchange(ref _pendingScrollInput, 1);
+            _performanceTracker.RecordInputOccurred(
+                QualityInputActivityKind.Scroll,
+                _performanceTracker.CurrentActivity.PointerDragActive,
+                SaturatingPendingCount(_pointerWrites.Snapshot.PendingDepth, 1));
+        }
+    }
+
+    internal QualityActivitySnapshot QualityActivity => _performanceTracker.CurrentActivity;
+
+    internal long QualityDecisionGeneration => Interlocked.Read(ref _qualityDecisionGeneration);
+
+    private void RecordInputOccurred(
+        QualityInputActivityKind kind,
+        bool pointerDragActive,
+        int pendingInputCount)
+    {
+        lock (_sync)
+        {
+            if (_disposeTask is not null || _lifetime.IsCancellationRequested || IsInputUnavailable)
+            {
+                return;
+            }
+
+            _performanceTracker.RecordInputOccurred(
+                kind,
+                pointerDragActive,
+                Math.Max(0, pendingInputCount));
+        }
+    }
+
+    private bool PointerDragActive() => _performanceTracker.CurrentActivity.PointerDragActive;
+
+    private static bool HasBasePointerButton(byte buttons) =>
+        (buttons & (byte)(RemotePointerButtons.Left | RemotePointerButtons.Middle | RemotePointerButtons.Right)) != 0;
+
+    private static int SaturatingPendingCount(int current, int added) =>
+        current > int.MaxValue - added ? int.MaxValue : current + added;
 
     internal RemotePointerCoalescerSnapshot PointerCoalescerSnapshot =>
         _pointerWrites.Snapshot;
@@ -611,11 +773,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        MarkInputUnavailable();
         lock (_sync)
         {
             if (_disposeTask is null)
             {
+                MarkInputUnavailable();
+                _performanceTracker.SetInputActiveState(pointerDragActive: false, pendingInputCount: 0);
                 _ = Interlocked.Increment(ref _performanceGeneration);
                 _disposeTask = DisposeCoreAsync();
             }
@@ -680,11 +843,18 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                                 }
                             }
                         }
-                        await envelope.WaitForPresentationAsync(cancellationToken)
+                        var presentationResult = await envelope.WaitForPresentationAsync(cancellationToken)
                             .ConfigureAwait(false);
-                        await RequestFramebufferUpdateTrackedAsync(
-                            incremental: !framebufferResized,
-                            cancellationToken).ConfigureAwait(false);
+                        if (presentationResult.RepairRequestIssued)
+                        {
+                            TrackInternallyIssuedFramebufferRequest();
+                        }
+                        else
+                        {
+                            await RequestFramebufferUpdateTrackedAsync(
+                                incremental: !framebufferResized,
+                                cancellationToken).ConfigureAwait(false);
+                        }
                         break;
                     case RemoteCursorMessage cursorMessage:
                         var cursorQuality = _connectionQualityTracker.CompleteResponse();
@@ -753,11 +923,18 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                     var presentation = _timeProvider.GetElapsedTime(
                         presentationStarted,
                         _timeProvider.GetTimestamp());
-                    await ObservePerformanceAsync(
+                    var transitionStatus = await ObservePerformanceAndQualityAsync(
                         envelope.Performance,
                         presentation,
                         cancellationToken).ConfigureAwait(false);
-                    envelope.CompletePresentation();
+                    if (transitionStatus == QualityTransitionStatus.Faulted)
+                    {
+                        throw new InvalidOperationException("The adaptive quality transition failed.");
+                    }
+
+                    envelope.CompletePresentation(new SessionPresentationResult(
+                        transitionStatus,
+                        RepairRequestIssued: transitionStatus == QualityTransitionStatus.Applied));
                 }
                 catch (Exception exception)
                 {
@@ -782,7 +959,13 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _connectionQualityTracker.BeginRequest();
     }
 
-    private async Task ObservePerformanceAsync(
+    private void TrackInternallyIssuedFramebufferRequest()
+    {
+        _pacer.MarkRequestStarted();
+        _connectionQualityTracker.BeginRequest();
+    }
+
+    private async Task<QualityTransitionStatus> ObservePerformanceAndQualityAsync(
         SessionFramePerformance pending,
         TimeSpan presentation,
         CancellationToken cancellationToken)
@@ -790,28 +973,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         var runtime = _session.PerformanceSnapshot;
         var targetChanged = false;
         SessionPerformanceSnapshot snapshot;
+        QualityDecision decision;
+        long profileEpoch;
+        CancellationToken profileCancellationToken;
         long performanceGeneration;
         lock (_sync)
         {
-            if (_refreshPolicy.Mode == FrameRefreshMode.Automatic &&
-                _automaticFrameRateController.Observe(new FrameRateLoadSample(
-                    pending.Response,
-                    presentation,
-                    ChangedAreaRatio(pending.Dirty, pending.Size),
-                    TimeSpan.FromMilliseconds(Math.Max(0, runtime.InputWriteMilliseconds)))))
-            {
-                targetChanged = true;
-                _performanceTracker.RecordAutomaticTargetChange();
-                _ = Interlocked.Increment(ref _performanceGeneration);
-                _pacer.SetPolicy(
-                    _refreshPolicy,
-                    _automaticFrameRateController.CurrentFramesPerSecond,
-                    _remoteMaximum);
-                _performanceTracker.SetRefreshPolicy(
-                    _refreshPolicy,
-                    _automaticFrameRateController.CurrentFramesPerSecond);
-            }
-
             snapshot = _performanceTracker.ObserveFrame(
                 pending.Update,
                 pending.Dirty,
@@ -820,6 +987,27 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 presentation,
                 runtime,
                 _pointerWrites.Snapshot);
+            _performanceTracker.SetInputActiveState(
+                _performanceTracker.CurrentActivity.PointerDragActive,
+                SaturatingPendingCount(
+                    Math.Max(0, runtime.InputQueueDepth),
+                    _pointerWrites.Snapshot.PendingDepth));
+            var localDecision = _adaptiveQualityController.Observe(
+                _performanceTracker.CreateQualityObservation());
+            decision = WithGlobalGeneration(localDecision);
+            profileEpoch = _qualityProfileEpoch;
+            profileCancellationToken = _qualityProfileOperations.Token;
+            var target = ResolveTarget(_refreshPolicy, decision.TargetFramesPerSecond);
+            targetChanged = snapshot.TargetFramesPerSecond != target;
+            if (targetChanged)
+            {
+                _performanceTracker.RecordAutomaticTargetChange();
+                _ = Interlocked.Increment(ref _performanceGeneration);
+            }
+
+            _pacer.SetPolicy(_refreshPolicy, decision.TargetFramesPerSecond, _remoteMaximum);
+            _performanceTracker.SetRefreshPolicy(_refreshPolicy, target);
+            snapshot = _performanceTracker.Current;
             performanceGeneration = _performanceGeneration;
         }
         await PublishSessionPerformanceAsync(
@@ -827,15 +1015,104 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             targetChanged,
             performanceGeneration,
             cancellationToken).ConfigureAwait(false);
+        using var transitionCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            profileCancellationToken);
+        var gateAcquired = false;
+        try
+        {
+            await _qualityOperationGate.WaitAsync(transitionCancellation.Token).ConfigureAwait(false);
+            gateAcquired = true;
+            if (profileEpoch != Volatile.Read(ref _qualityProfileEpoch))
+            {
+                return QualityTransitionStatus.NoChange;
+            }
+
+            return await _qualityTransitionCoordinator.ApplyAtSafeBoundaryAsync(
+                decision,
+                new QualityTransitionBoundary(
+                    FrameResponseCompletedAndPresented: true,
+                    HasOutstandingFramebufferRequest: false,
+                    HasActiveReceive: false,
+                    NextFramebufferRequestProduced: false),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (
+            !gateAcquired &&
+            profileCancellationToken.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            return QualityTransitionStatus.NoChange;
+        }
+        finally
+        {
+            if (gateAcquired)
+            {
+                _qualityOperationGate.Release();
+            }
+        }
     }
 
-    private int? ResolveTarget(FrameRefreshPolicy policy) => policy.Mode switch
+    private int? ResolveTarget(FrameRefreshPolicy policy, int automaticTarget) => policy.Mode switch
     {
-        FrameRefreshMode.Automatic => _automaticFrameRateController.CurrentFramesPerSecond,
+        FrameRefreshMode.Automatic => _remoteMaximum is { } maximum
+            ? Math.Min(automaticTarget, maximum)
+            : automaticTarget,
         FrameRefreshMode.Fixed => policy.EffectiveMaximum(_remoteMaximum),
         FrameRefreshMode.Unlimited => null,
         _ => throw new ArgumentOutOfRangeException(nameof(policy)),
     };
+
+    private QualityDecision WithGlobalGeneration(QualityDecision decision) => new(
+        Interlocked.Increment(ref _qualityDecisionGeneration),
+        decision.ContentState,
+        decision.Level,
+        decision.Color,
+        decision.Scale,
+        decision.TargetFramesPerSecond,
+        decision.Reason,
+        decision.TargetSatisfied,
+        decision.LevelChanged,
+        decision.ContentStateChanged,
+        decision.PreviousLevel,
+        decision.PreviousContentState);
+
+    private static int InitialAdaptiveTarget(AdaptiveQualityController controller) =>
+        AdaptiveQualityController.QualityTable[(int)controller.CurrentLevel].FramesPerSecond;
+
+    private static AdaptiveQualityController CreateAdaptiveController(
+        QualityProfile profile,
+        ArdDisplayCapabilities capabilities,
+        QualityDecoderGates decoderGates)
+    {
+        try
+        {
+            return new AdaptiveQualityController(profile, capabilities, decoderGates);
+        }
+        catch (ArgumentException) when (HasUnknownCapabilities(capabilities))
+        {
+            // Preserve the saved refresh policy while failing closed on unobserved format/scale capabilities.
+            return new AdaptiveQualityController(
+                QualityProfile.Automatic.WithRefresh(profile.Refresh),
+                capabilities,
+                decoderGates);
+        }
+    }
+
+    private static bool HasUnknownCapabilities(ArdDisplayCapabilities capabilities) =>
+        capabilities.Zlib == CapabilitySupport.Unknown ||
+        capabilities.Rgb565 == CapabilitySupport.Unknown ||
+        capabilities.ServerScaling == CapabilitySupport.Unknown;
+
+    private static ArdDisplayCapabilities ConservativeCapabilities(int? maximumRefreshRate) => new(
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        CapabilitySupport.Unknown,
+        SafeOnlinePixelFormatSwitch: false,
+        SafeOnlineScaleSwitch: false,
+        maximumRefreshRate);
 
     private int? ValidateRemoteMaximum(int? maximum)
     {
@@ -855,16 +1132,6 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             "Remote display capabilities were ignored.",
             [new("Category", "InvalidRefreshRateRange")]));
         return null;
-    }
-
-    private static double ChangedAreaRatio(
-        IReadOnlyList<RemoteRectangle> dirty,
-        RemoteFramebufferSize size)
-    {
-        var total = (double)size.Width * size.Height;
-        var changed = dirty.Sum(rectangle =>
-            (double)Math.Max(0, rectangle.Width) * Math.Max(0, rectangle.Height));
-        return Math.Clamp(changed / total, 0, 1);
     }
 
     private async Task DisposeCoreAsync()
@@ -900,6 +1167,19 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             DisposePresenterAsync(),
             failures ??= []).ConfigureAwait(false);
         await CaptureFailureAsync(ownershipDisposal, failures ??= []).ConfigureAwait(false);
+        try
+        {
+            _qualityTransitionCoordinator.Dispose();
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
+        foreach (var operations in _retiredQualityProfileOperations)
+        {
+            operations.Dispose();
+        }
+        _qualityProfileOperations.Dispose();
         _completion.TrySetResult();
         _lifetime.Dispose();
         if (failures.Count != 0)
@@ -1424,7 +1704,7 @@ internal sealed class SessionFrameEnvelope(
     SessionFramePerformance performance) : IDisposable
 {
     private FramePacket? _frame = frame ?? throw new ArgumentNullException(nameof(frame));
-    private readonly TaskCompletionSource _presentationCompletion =
+    private readonly TaskCompletionSource<SessionPresentationResult> _presentationCompletion =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _presentationFailed;
 
@@ -1441,10 +1721,11 @@ internal sealed class SessionFrameEnvelope(
         Performance = Performance.MergeFrom(dropped.Performance, Frame.DirtyRectangles);
     }
 
-    public Task WaitForPresentationAsync(CancellationToken cancellationToken) =>
+    public Task<SessionPresentationResult> WaitForPresentationAsync(CancellationToken cancellationToken) =>
         _presentationCompletion.Task.WaitAsync(cancellationToken);
 
-    public void CompletePresentation() => _presentationCompletion.TrySetResult();
+    public void CompletePresentation(SessionPresentationResult result = default) =>
+        _presentationCompletion.TrySetResult(result);
 
     public void FailPresentation(Exception exception)
     {
@@ -1457,10 +1738,14 @@ internal sealed class SessionFrameEnvelope(
         Interlocked.Exchange(ref _frame, null)?.Dispose();
         if (Volatile.Read(ref _presentationFailed) == 0)
         {
-            _presentationCompletion.TrySetResult();
+            _presentationCompletion.TrySetResult(default);
         }
     }
 }
+
+internal readonly record struct SessionPresentationResult(
+    QualityTransitionStatus TransitionStatus,
+    bool RepairRequestIssued);
 
 internal sealed class SessionFrameMailbox : IAsyncDisposable
 {
