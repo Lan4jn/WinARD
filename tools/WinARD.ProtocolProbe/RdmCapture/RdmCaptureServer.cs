@@ -73,7 +73,11 @@ public sealed class RdmCaptureServer
         catch (OperationCanceledException exception)
             when (!cancellationToken.IsCancellationRequested && inactivity.IsCancellationRequested)
         {
-            throw new TimeoutException("RDM capture made no progress for 10 seconds.", exception);
+            var seconds = _inactivityTimeout.TotalSeconds;
+            throw new TimeoutException(
+                FormattableString.Invariant(
+                    $"RDM capture made no progress for {seconds:0.###} seconds."),
+                exception);
         }
     }
 

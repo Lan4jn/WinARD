@@ -356,7 +356,7 @@ public sealed class RdmCaptureTests
     }
 
     [Fact]
-    public async Task Capture_server_uses_ten_second_no_progress_timeout_without_echoing_input()
+    public async Task Capture_server_reports_configured_no_progress_timeout_without_echoing_input()
     {
         Assert.Equal(TimeSpan.FromSeconds(10), RdmCaptureServer.DefaultInactivityTimeout);
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -374,7 +374,7 @@ public sealed class RdmCaptureTests
         var exception = await Assert.ThrowsAsync<TimeoutException>(async () =>
             await serverTask.WaitAsync(cancellation.Token));
 
-        Assert.Equal("RDM capture made no progress for 10 seconds.", exception.Message);
+        Assert.Equal("RDM capture made no progress for 0.1 seconds.", exception.Message);
         Assert.DoesNotContain("RFB", exception.Message, StringComparison.Ordinal);
     }
 
