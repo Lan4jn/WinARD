@@ -24,7 +24,7 @@ WinARD then requests this canonical client format:
 | red/green/blue maximum | 255 / 255 / 255 |
 | red/green/blue shift | 16 / 8 / 0 |
 
-The declared encodings, in preference order, are ZRLE (`16`), Raw (`0`), CopyRect (`1`), Cursor (`-239`), and DesktopSize (`-223`). ZRLE is preferred for compressed updates, with Raw retained as the fallback. Encoding IDs are signed 32-bit big-endian values. This declaration does not establish that the real-Mac capture described below selected or sent ZRLE.
+The declared encodings, in preference order, are Zlib (`6`), ZRLE (`16`), Raw (`0`), CopyRect (`1`), Cursor (`-239`), and DesktopSize (`-223`). Zlib is preferred for compressed updates, ZRLE remains available, and Raw is retained as the fallback. Encoding IDs are signed 32-bit big-endian values. This declaration does not establish that the real-Mac capture described below selected or sent either compressed encoding.
 
 The initial framebuffer request is non-incremental and covers the complete dimensions returned by `ServerInit`.
 
@@ -44,7 +44,7 @@ component8 = (component * 255 + maximum / 2) / maximum
 
 `FramebufferUpdateReader.ApplyAsync` consumes a complete server-to-client message, including message type `0`. Rectangle counts above 4096 are rejected before the rectangle loop. Unknown encoding IDs are fatal because their payload length cannot be inferred safely.
 
-The one-shot `ApplyAsync` convenience API supports stateless encodings only. It rejects a ZRLE rectangle immediately after its 12-byte rectangle header, before consuming the compressed-length field, and directs callers to `CreateSession`. A connection that negotiates ZRLE must create exactly one `FramebufferUpdateSession` and reuse it for every update on that connection so the connection-level zlib dictionary is preserved.
+The one-shot `ApplyAsync` convenience API supports stateless encodings only. It rejects a Zlib or ZRLE rectangle immediately after its 12-byte rectangle header, before consuming the compressed-length field, and directs callers to `CreateSession`. A connection that negotiates either encoding must create exactly one `FramebufferUpdateSession` and reuse it for every update on that connection so each decoder's connection-level zlib dictionary is preserved.
 
 Supported encodings:
 
@@ -52,6 +52,7 @@ Supported encodings:
 - CopyRect: validates source and destination before copying. Overlap is handled with memmove-equivalent row ordering and overlapping row copies.
 - DesktopSize: requires origin `(0,0)`, validates and allocates atomically, and reports the resized full framebuffer as dirty.
 - Cursor: keeps cursor pixels separate from the desktop. Cursor mask bits are most-significant-bit first, with each mask row padded to a whole byte. A set bit makes the BGRA pixel opaque; a clear bit makes it transparent. A `0x0` cursor has no payload and represents an empty cursor.
+- Zlib: reads a big-endian compressed length and expands raw negotiated-format pixels with one persistent inflater per framebuffer-update session. The decompressed byte count must equal the rectangle's exact wire-pixel size before conversion and atomic commit. Truncation, trailing compressed data, cancellation, or a completed zlib stream faults the session.
 - ZRLE: uses one persistent zlib inflater per framebuffer-update session. Every rectangle must end at a `Z_SYNC_FLUSH` boundary; a completed zlib stream, truncated boundary, or any compressed trailing bytes are fatal. Decompression, tile expansion, and framebuffer commit are cancellation-aware and bounded by the configured compressed, decompressed, and work limits.
 
 Updates use rectangle-level commit semantics: rectangles completed before a later rectangle fails remain applied. The failing rectangle itself is not partially committed. Dirty rectangles preserve successful wire order.

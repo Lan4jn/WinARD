@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using WinARD.Application.Quality;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
 using WinARD.Infrastructure.Diagnostics;
@@ -10,7 +11,10 @@ internal static class DesktopDiagnosticContextFactory
 {
     public static DiagnosticExportContext CreateSession(
         ConnectionProfile? profile,
-        SessionPerformanceDiagnosticSnapshot session)
+        SessionPerformanceDiagnosticSnapshot session,
+        QualityPresentationSnapshot? qualityPresentation = null,
+        QualityObservation? qualityObservation = null,
+        ArdDisplayCapabilities? qualityCapabilities = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         var performance = session.Performance;
@@ -50,7 +54,18 @@ internal static class DesktopDiagnosticContextFactory
                     "ARD-30",
                     BuildEncodingStatistics(session.EncodingCounts, session.OtherEncodingCount)),
             ];
-        return Create(profiles, counters);
+        return Create(profiles, counters) with
+        {
+            Quality = qualityPresentation?.Decision is not { } decision ||
+                qualityObservation is null || qualityCapabilities is null
+                ? null
+                : BuildQualitySummary(
+                    qualityPresentation.Profile,
+                    qualityPresentation.Performance,
+                    decision,
+                    qualityObservation,
+                    qualityCapabilities),
+        };
     }
 
     public static DiagnosticExportContext Create(
@@ -72,6 +87,7 @@ internal static class DesktopDiagnosticContextFactory
         long otherEncodingCount)
     {
         var statistics = new Dictionary<string, long>(StringComparer.Ordinal);
+        var other = otherEncodingCount;
         foreach (var (encoding, count) in encodingCounts.OrderBy(pair => pair.Key))
         {
             if (count <= 0)
@@ -79,27 +95,85 @@ internal static class DesktopDiagnosticContextFactory
                 continue;
             }
 
-            statistics[EncodingName(encoding)] = count;
+            var name = KnownEncodingName(encoding);
+            if (name is null)
+            {
+                other = SaturatingAdd(other, count);
+                continue;
+            }
+
+            statistics[name] = count;
         }
 
-        if (otherEncodingCount > 0)
+        if (other > 0)
         {
-            statistics["Encoding.Other"] = otherEncodingCount;
+            statistics["Encoding.Other"] = other;
         }
 
         return statistics;
     }
 
-    private static string EncodingName(int encoding) => encoding switch
+    private static DiagnosticQualitySummary BuildQualitySummary(
+        QualityProfile profile,
+        SessionPerformanceSnapshot performance,
+        QualityDecision decision,
+        QualityObservation observation,
+        ArdDisplayCapabilities capabilities)
+    {
+        return new DiagnosticQualitySummary(
+            profile.Preset.ToString(),
+            profile.TargetBytesPerSecond,
+            decision.Level.ToString(),
+            decision.ContentState.ToString(),
+            decision.Color.ToString(),
+            ScalePercent(decision.Scale),
+            performance.PrimaryFramebufferEncoding is { } encoding
+                ? KnownEncodingName(encoding) ?? "Other"
+                : "Other",
+            decision.TargetFramesPerSecond,
+            RoundNonNegative(observation.ActualFramesPerSecond),
+            RoundNonNegativeLong(observation.AverageBytesPerSecond5s),
+            RoundNonNegativeLong(observation.PeakBytesPerSecond5s),
+            RoundNonNegative(observation.ResponseTime.TotalMilliseconds),
+            capabilities.Zlib.ToString(),
+            capabilities.Rgb565.ToString(),
+            capabilities.ServerScaling.ToString(),
+            capabilities.AppleColor1002.ToString(),
+            capabilities.AppleGrayscale1001.ToString(),
+            capabilities.SafeOnlinePixelFormatSwitch,
+            capabilities.SafeOnlineScaleSwitch,
+            decision.Reason.ToString(),
+            decision.TargetSatisfied);
+    }
+
+    private static int ScalePercent(QualityScale scale) => scale switch
+    {
+        QualityScale.Native => 100,
+        QualityScale.Percent75 => 75,
+        QualityScale.Percent50 => 50,
+        _ => throw new ArgumentOutOfRangeException(nameof(scale)),
+    };
+
+    private static int RoundNonNegative(double value) =>
+        (int)Math.Clamp(Math.Round(value, MidpointRounding.AwayFromZero), 0, int.MaxValue);
+
+    private static long RoundNonNegativeLong(double value) =>
+        (long)Math.Clamp(Math.Round(value, MidpointRounding.AwayFromZero), 0, long.MaxValue);
+
+    private static long SaturatingAdd(long first, long second) =>
+        second > long.MaxValue - first ? long.MaxValue : first + second;
+
+    private static string? KnownEncodingName(int encoding) => encoding switch
     {
         (int)RfbEncodingType.Raw => "Raw",
         (int)RfbEncodingType.CopyRect => "CopyRect",
+        (int)RfbEncodingType.Zlib => "Zlib",
         (int)RfbEncodingType.Zrle => "ZRLE",
         (int)RfbEncodingType.DesktopSize => "DesktopSize",
         (int)RfbEncodingType.Cursor => "Cursor",
         (int)RfbEncodingType.ArdDisplayInfo => "ARD.DisplayInfo",
         (int)RfbEncodingType.ArdSessionEncryption => "ARD.SessionEncryption",
         (int)RfbEncodingType.ArdDisplayInfo2 => "ARD.DisplayInfo2",
-        _ => $"Encoding.{encoding}",
+        _ => null,
     };
 }

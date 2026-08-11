@@ -24,11 +24,35 @@ public sealed record DiagnosticProfileSummary(
     string? ErrorCode = null,
     string? CorrelationId = null);
 
+public sealed record DiagnosticQualitySummary(
+    string Preset,
+    long? TargetBytesPerSecond,
+    string QualityLevel,
+    string ContentState,
+    string Color,
+    int ScalePercent,
+    string EncodingName,
+    int? TargetFramesPerSecond,
+    int ActualFramesPerSecond,
+    long AverageBytesPerSecond,
+    long PeakBytesPerSecond,
+    int ResponseMilliseconds,
+    string ZlibCapability,
+    string Rgb565Capability,
+    string ServerScalingCapability,
+    string AppleColor1002Capability,
+    string AppleGrayscale1001Capability,
+    bool SafeOnlinePixelFormatSwitch,
+    bool SafeOnlineScaleSwitch,
+    string Reason,
+    bool TargetSatisfied);
+
 public sealed record DiagnosticExportContext(
     DiagnosticApplicationInfo Application,
     IReadOnlyList<DiagnosticProfileSummary> Profiles,
     IReadOnlyDictionary<string, long> PerformanceCounters,
-    bool IncludeHosts)
+    bool IncludeHosts,
+    DiagnosticQualitySummary? Quality = null)
 {
     public static DiagnosticExportContext Empty { get; } = new(
         new DiagnosticApplicationInfo(
@@ -79,8 +103,38 @@ public sealed class DiagnosticExporter : IDisposable
     };
     private static readonly HashSet<string> AllowedEncodingStatisticKeys = new(StringComparer.Ordinal)
     {
-        "Raw", "CopyRect", "ZRLE", "DesktopSize", "Cursor",
+        "Raw", "CopyRect", "Zlib", "ZRLE", "DesktopSize", "Cursor",
         "ARD.DisplayInfo", "ARD.SessionEncryption", "ARD.DisplayInfo2", "Encoding.Other",
+    };
+    private static readonly HashSet<string> AllowedQualityPresets = new(StringComparer.Ordinal)
+    {
+        "Automatic", "Original", "Balanced", "Smooth", "Custom",
+    };
+    private static readonly HashSet<string> AllowedQualityLevels = new(StringComparer.Ordinal)
+    {
+        "Q0", "Q1", "Q2", "Q3", "Q4",
+    };
+    private static readonly HashSet<string> AllowedQualityContentStates = new(StringComparer.Ordinal)
+    {
+        "Idle", "Interactive", "Motion", "Recovery",
+    };
+    private static readonly HashSet<string> AllowedQualityColors = new(StringComparer.Ordinal)
+    {
+        "Automatic", "Full32", "Color16", "Grayscale",
+    };
+    private static readonly HashSet<string> AllowedQualityEncodingNames = new(StringComparer.Ordinal)
+    {
+        "Raw", "CopyRect", "Zlib", "ZRLE", "DesktopSize", "Cursor",
+        "ARD.DisplayInfo", "ARD.SessionEncryption", "ARD.DisplayInfo2", "Other",
+    };
+    private static readonly HashSet<string> AllowedCapabilitySupportValues = new(StringComparer.Ordinal)
+    {
+        "Unknown", "Unsupported", "Advertised", "Observed",
+    };
+    private static readonly HashSet<string> AllowedQualityDecisionReasons = new(StringComparer.Ordinal)
+    {
+        "Initial", "MotionDetected", "SustainedOverTarget", "SevereOverTarget", "StableRecovery",
+        "UserConstraint", "CapabilityLimited", "TargetUnsatisfied",
     };
     private static readonly HashSet<string> AllowedProfileProtocolVersions = new(StringComparer.Ordinal)
     {
@@ -302,6 +356,7 @@ public sealed class DiagnosticExporter : IDisposable
             performanceCounters = ExportPerformanceCounters(
                 context.PerformanceCounters,
                 _limits.MaxPerformanceCounters),
+            quality = context.Quality is null ? null : ExportQuality(context.Quality),
             events,
         };
         var manifest = new
@@ -461,6 +516,43 @@ public sealed class DiagnosticExporter : IDisposable
 
         return safe;
     }
+
+    private static object ExportQuality(DiagnosticQualitySummary quality) => new
+    {
+        preset = ExportAllowedValue(quality.Preset, AllowedQualityPresets),
+        targetBps = NonNegativeOrNull(quality.TargetBytesPerSecond),
+        qualityLevel = ExportAllowedValue(quality.QualityLevel, AllowedQualityLevels),
+        contentState = ExportAllowedValue(quality.ContentState, AllowedQualityContentStates),
+        color = ExportAllowedValue(quality.Color, AllowedQualityColors),
+        scalePercent = quality.ScalePercent is 50 or 75 or 100 ? quality.ScalePercent : (int?)null,
+        encodingName = ExportAllowedValue(quality.EncodingName, AllowedQualityEncodingNames) ?? "Other",
+        targetFps = PositiveOrNull(quality.TargetFramesPerSecond),
+        actualFps = NonNegativeOrNull(quality.ActualFramesPerSecond),
+        averageBps = NonNegativeOrNull(quality.AverageBytesPerSecond),
+        peakBps = NonNegativeOrNull(quality.PeakBytesPerSecond),
+        responseMs = NonNegativeOrNull(quality.ResponseMilliseconds),
+        zlibCapability = ExportAllowedValue(quality.ZlibCapability, AllowedCapabilitySupportValues),
+        rgb565Capability = ExportAllowedValue(quality.Rgb565Capability, AllowedCapabilitySupportValues),
+        serverScalingCapability = ExportAllowedValue(
+            quality.ServerScalingCapability,
+            AllowedCapabilitySupportValues),
+        appleColor1002Capability = ExportAllowedValue(
+            quality.AppleColor1002Capability,
+            AllowedCapabilitySupportValues),
+        appleGrayscale1001Capability = ExportAllowedValue(
+            quality.AppleGrayscale1001Capability,
+            AllowedCapabilitySupportValues),
+        safeOnlineColorSwitch = quality.SafeOnlinePixelFormatSwitch,
+        safeOnlineScaleSwitch = quality.SafeOnlineScaleSwitch,
+        reason = ExportAllowedValue(quality.Reason, AllowedQualityDecisionReasons),
+        targetSatisfied = quality.TargetSatisfied,
+    };
+
+    private static long? NonNegativeOrNull(long? value) => value >= 0 ? value : null;
+
+    private static int? NonNegativeOrNull(int value) => value >= 0 ? value : null;
+
+    private static int? PositiveOrNull(int? value) => value > 0 ? value : null;
 
     private KeyValuePair<string, string>? MapToFinalExportEntry(
         SafeDiagnosticField field,
@@ -628,9 +720,7 @@ public sealed class DiagnosticExporter : IDisposable
     }
 
     private static bool IsAllowedEncodingStatisticKey(string key) =>
-        AllowedEncodingStatisticKeys.Contains(key) ||
-        key.StartsWith("Encoding.", StringComparison.Ordinal) &&
-        int.TryParse(key.AsSpan("Encoding.".Length), out _);
+        AllowedEncodingStatisticKeys.Contains(key);
 
     private static string ExportEventCode(string code) =>
         code.Length is > 0 and <= 64 &&

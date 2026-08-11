@@ -415,8 +415,8 @@ public sealed record ArdDisplayCapabilities(
     CapabilitySupport Zlib,
     CapabilitySupport Rgb565,
     CapabilitySupport ServerScaling,
-    CapabilitySupport AppleThousands,
-    CapabilitySupport AppleGrayscale,
+    CapabilitySupport AppleColor1002,
+    CapabilitySupport AppleGrayscale1001,
     bool SafeOnlinePixelFormatSwitch,
     bool SafeOnlineScaleSwitch,
     int? MaximumRefreshRate);

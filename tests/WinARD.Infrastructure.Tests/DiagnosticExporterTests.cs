@@ -201,6 +201,135 @@ public sealed class DiagnosticExporterTests : IDisposable
     }
 
     [Fact]
+    public async Task AdaptiveQualityUsesOnlyTheFixedAllowlistedSchema()
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "quality-allowlist.zip");
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
+        var quality = new DiagnosticQualitySummary(
+            Preset: "Automatic",
+            TargetBytesPerSecond: 8_000_000,
+            QualityLevel: "Q3",
+            ContentState: "Motion",
+            Color: "Color16",
+            ScalePercent: 50,
+            EncodingName: "Zlib",
+            TargetFramesPerSecond: 45,
+            ActualFramesPerSecond: 38,
+            AverageBytesPerSecond: 9_000_000,
+            PeakBytesPerSecond: 12_000_000,
+            ResponseMilliseconds: 86,
+            ZlibCapability: "Observed",
+            Rgb565Capability: "Observed",
+            ServerScalingCapability: "Observed",
+            AppleColor1002Capability: "Unknown",
+            AppleGrayscale1001Capability: "Unsupported",
+            SafeOnlinePixelFormatSwitch: true,
+            SafeOnlineScaleSwitch: false,
+            Reason: "SevereOverTarget",
+            TargetSatisfied: false);
+        var context = DiagnosticExportContext.Empty with { Quality = quality };
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var exported = document.RootElement.GetProperty("quality");
+        string[] expectedNames =
+        [
+            "actualFps", "appleColor1002Capability", "appleGrayscale1001Capability",
+            "averageBps", "color", "contentState", "encodingName", "peakBps", "preset",
+            "qualityLevel", "reason", "responseMs", "rgb565Capability", "safeOnlineColorSwitch",
+            "safeOnlineScaleSwitch", "scalePercent",
+            "serverScalingCapability", "targetBps", "targetFps", "targetSatisfied",
+            "zlibCapability",
+        ];
+        Assert.Equal(expectedNames, exported.EnumerateObject().Select(property => property.Name).Order().ToArray());
+        Assert.Equal("Motion", exported.GetProperty("contentState").GetString());
+        Assert.Equal("SevereOverTarget", exported.GetProperty("reason").GetString());
+        Assert.False(exported.GetProperty("targetSatisfied").GetBoolean());
+        string[] forbiddenNameTokens =
+        [
+            "host", "username", "password", "coordinate", "mouse", "key", "text", "clipboard",
+            "pixel", "payload", "ciphertext", "sequence", "path",
+        ];
+        Assert.DoesNotContain(
+            exported.EnumerateObject().Select(property => property.Name),
+            name => forbiddenNameTokens.Any(token => name.Contains(token, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [Fact]
+    public async Task AdaptiveQualityRejectsUnlistedStringValuesAndLeaksNoSensitiveMarkers()
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "quality-privacy.zip");
+        string[] forbiddenMarkers =
+        [
+            "host-private-marker", "username-private-marker", "password-private-marker",
+            "mouse-coordinate-marker", "pressed-key-marker", "typed-text-marker",
+            "clipboard-private-marker", "pixel-private-marker", "payload-private-marker",
+            "ciphertext-private-marker", "crypto-key-marker", "iv-private-marker",
+            "sequence-private-marker", @"C:\Users\private\quality-payload.bin",
+            "arbitrary-reason-private-marker", "encoding-314159-private-marker",
+        ];
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        sink.Write(new SafeDiagnosticEventInput(
+            "EVENT",
+            Guid.NewGuid().ToString("N"),
+            string.Join('|', forbiddenMarkers),
+            forbiddenMarkers.Select(marker =>
+                new DiagnosticField("Unlisted" + marker.Length, marker)).ToArray()));
+        using var exporter = new DiagnosticExporter(sink, redactor);
+        var quality = new DiagnosticQualitySummary(
+            "arbitrary-preset-private-marker", null,
+            "arbitrary-level-private-marker", "arbitrary-state-private-marker",
+            "arbitrary-color-private-marker", 50,
+            forbiddenMarkers[^1], 45, 38, 9_000_000, 12_000_000, 86,
+            "arbitrary-zlib-capability-private-marker", "arbitrary-rgb-capability-private-marker",
+            "arbitrary-scale-capability-private-marker", "arbitrary-1002-capability-private-marker",
+            "arbitrary-1001-capability-private-marker",
+            true, false, forbiddenMarkers[^2], false);
+        var context = DiagnosticExportContext.Empty with
+        {
+            Quality = quality,
+            Profiles =
+            [
+                new DiagnosticProfileSummary(
+                    "Remote session", forbiddenMarkers[0], 5900, forbiddenMarkers[1],
+                    "RFB 3.x", "ARD-30",
+                    new Dictionary<string, long> { ["Encoding.314159"] = 1 }),
+            ],
+        };
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        var content = await ReadAllAsync(archive);
+        foreach (var marker in forbiddenMarkers)
+        {
+            Assert.DoesNotContain(marker, content, StringComparison.OrdinalIgnoreCase);
+        }
+
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var exported = document.RootElement.GetProperty("quality");
+        Assert.Equal("Other", exported.GetProperty("encodingName").GetString());
+        Assert.Equal(JsonValueKind.Null, exported.GetProperty("reason").ValueKind);
+        foreach (var propertyName in new[]
+        {
+            "preset", "qualityLevel", "contentState", "color", "zlibCapability",
+            "rgb565Capability", "serverScalingCapability", "appleColor1002Capability",
+            "appleGrayscale1001Capability",
+        })
+        {
+            Assert.Equal(JsonValueKind.Null, exported.GetProperty(propertyName).ValueKind);
+        }
+        Assert.False(document.RootElement.GetProperty("profiles")[0]
+            .GetProperty("encodingStatistics").TryGetProperty("Encoding.314159", out _));
+    }
+
+    [Fact]
     public async Task ExportOmitsForbiddenProtocolAndSensitiveEventFieldsAtTheBoundary()
     {
         Directory.CreateDirectory(_directory);

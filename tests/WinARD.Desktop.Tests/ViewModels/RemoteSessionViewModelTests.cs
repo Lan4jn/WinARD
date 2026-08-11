@@ -8,6 +8,7 @@ using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Remote.Protocol.Encodings;
 using WinARD.Remote.Protocol.Errors;
 using Xunit;
 
@@ -435,6 +436,24 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal(
             "固定 60 FPS · 实际 38 FPS · 12.4 MiB/s · ZRLE · 86 ms",
             RemoteSessionViewModel.FormatSessionPerformance(snapshot));
+    }
+
+    [Fact]
+    public void Performance_text_uses_the_stable_zlib_encoding_name()
+    {
+        var snapshot = new SessionPerformanceSnapshot(
+            FrameRefreshMode.Automatic,
+            45,
+            38,
+            13_002_342,
+            (int)RfbEncodingType.Zlib,
+            86,
+            0,
+            0,
+            0,
+            1);
+
+        Assert.Contains(" · Zlib · ", RemoteSessionViewModel.FormatSessionPerformance(snapshot));
     }
 
     [Fact]

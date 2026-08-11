@@ -260,6 +260,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     internal SessionPerformanceDiagnosticSnapshot DiagnosticPerformance =>
         _performanceTracker.CurrentDiagnostics;
 
+    internal QualityObservation DiagnosticQualityObservation =>
+        _performanceTracker.CreateQualityObservation();
+
+    internal ArdDisplayCapabilities DiagnosticQualityCapabilities =>
+        _adaptiveQualityCapabilities;
+
     internal bool HasPendingPerformancePublication =>
         Volatile.Read(ref _activePerformancePublicationCount) != 0;
 
@@ -365,6 +371,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     {
         null => "—",
         (int)RfbEncodingType.Raw => "Raw",
+        (int)RfbEncodingType.Zlib => "Zlib",
         (int)RfbEncodingType.Zrle => "ZRLE",
         (int)RfbEncodingType.CopyRect => "CopyRect",
         (int)RfbEncodingType.DesktopSize => "DesktopSize",

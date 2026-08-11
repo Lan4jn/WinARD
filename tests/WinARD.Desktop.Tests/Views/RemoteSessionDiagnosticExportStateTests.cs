@@ -1,6 +1,7 @@
 using System.IO.Compression;
 using System.Text.Json;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Desktop.Services;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
@@ -105,7 +106,7 @@ public sealed class RemoteSessionDiagnosticExportStateTests
             TargetFramesPerSecond: 90,
             ActualFramesPerSecond: 64,
             ReceiveBytesPerSecond: 1_234_567,
-            PrimaryFramebufferEncoding: (int)RfbEncodingType.Zrle,
+            PrimaryFramebufferEncoding: (int)RfbEncodingType.Zlib,
             ResponseMilliseconds: 17,
             InputWriteMilliseconds: 3,
             InputQueueDepth: 2,
@@ -117,12 +118,60 @@ public sealed class RemoteSessionDiagnosticExportStateTests
             AutomaticTargetChanges: 4,
             new Dictionary<int, long>
             {
+                [(int)RfbEncodingType.Zlib] = 9,
                 [(int)RfbEncodingType.Zrle] = 18,
                 [(int)RfbEncodingType.Raw] = 7,
                 [-321] = 2,
             },
             OtherEncodingCount: 68);
-        var context = DesktopDiagnosticContextFactory.CreateSession(profile, session);
+        var decision = new QualityDecision(
+            generation: 4,
+            QualityContentState.Motion,
+            QualityLevel.Q3,
+            QualityColor.Color16,
+            QualityScale.Percent50,
+            targetFramesPerSecond: 45,
+            QualityDecisionReason.SevereOverTarget,
+            targetSatisfied: false,
+            levelChanged: true,
+            contentStateChanged: true,
+            previousLevel: QualityLevel.Q2,
+            previousContentState: QualityContentState.Interactive);
+        var observation = new QualityObservation(
+            DateTimeOffset.UtcNow,
+            averageBytesPerSecond5s: 9_000_000,
+            peakBytesPerSecond5s: 12_000_000,
+            actualFramesPerSecond: 38,
+            responseTime: TimeSpan.FromMilliseconds(86),
+            decodeTime: TimeSpan.FromMilliseconds(5),
+            presentationTime: TimeSpan.FromMilliseconds(4),
+            dirtyCoverage: 0.9,
+            sinceLastInput: TimeSpan.FromMilliseconds(20),
+            pointerDragActive: false,
+            scrollActive: true,
+            pendingInputCount: 2);
+        var capabilities = new ArdDisplayCapabilities(
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            CapabilitySupport.Observed,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unsupported,
+            SafeOnlinePixelFormatSwitch: true,
+            SafeOnlineScaleSwitch: false,
+            MaximumRefreshRate: 90);
+        var presentation = new QualityPresentationSnapshot(
+            profile.Quality,
+            decision,
+            QualityTransitionStatus.Applied,
+            performance,
+            Epoch: 1,
+            Version: 1);
+        var context = DesktopDiagnosticContextFactory.CreateSession(
+            profile,
+            session,
+            presentation,
+            observation,
+            capabilities);
         var destination = Path.Combine(Path.GetTempPath(), $"winard-session-diag-{Guid.NewGuid():N}.zip");
         try
         {
@@ -170,10 +219,22 @@ public sealed class RemoteSessionDiagnosticExportStateTests
             Assert.Equal(0, counters.GetProperty("Session.ReceiveRateInsideSshTunnel").GetInt64());
             Assert.Equal(18, root.GetProperty("profiles")[0]
                 .GetProperty("encodingStatistics").GetProperty("ZRLE").GetInt64());
-            Assert.Equal(2, root.GetProperty("profiles")[0]
-                .GetProperty("encodingStatistics").GetProperty("Encoding.-321").GetInt64());
-            Assert.Equal(68, root.GetProperty("profiles")[0]
+            Assert.Equal(9, root.GetProperty("profiles")[0]
+                .GetProperty("encodingStatistics").GetProperty("Zlib").GetInt64());
+            Assert.False(root.GetProperty("profiles")[0]
+                .GetProperty("encodingStatistics").TryGetProperty("Encoding.-321", out _));
+            Assert.Equal(70, root.GetProperty("profiles")[0]
                 .GetProperty("encodingStatistics").GetProperty("Encoding.Other").GetInt64());
+
+            var quality = root.GetProperty("quality");
+            Assert.Equal("Automatic", quality.GetProperty("preset").GetString());
+            Assert.Equal("Motion", quality.GetProperty("contentState").GetString());
+            Assert.Equal("Q3", quality.GetProperty("qualityLevel").GetString());
+            Assert.Equal("Zlib", quality.GetProperty("encodingName").GetString());
+            Assert.Equal(9_000_000, quality.GetProperty("averageBps").GetInt64());
+            Assert.Equal(12_000_000, quality.GetProperty("peakBps").GetInt64());
+            Assert.Equal("SevereOverTarget", quality.GetProperty("reason").GetString());
+            Assert.False(quality.GetProperty("targetSatisfied").GetBoolean());
 
             var json = root.GetRawText();
             foreach (var forbidden in new[]
@@ -238,6 +299,32 @@ public sealed class RemoteSessionDiagnosticExportStateTests
 
         Assert.Empty(context.Profiles);
         Assert.DoesNotContain("Session.ReceiveRateInsideSshTunnel", context.PerformanceCounters.Keys);
+    }
+
+    [Fact]
+    public void Unknown_encoding_counts_saturate_the_fixed_other_category()
+    {
+        var performance = new SessionPerformanceSnapshot(
+            FrameRefreshMode.Automatic,
+            TargetFramesPerSecond: 60,
+            ActualFramesPerSecond: 0,
+            ReceiveBytesPerSecond: 0,
+            PrimaryFramebufferEncoding: -1,
+            ResponseMilliseconds: 0,
+            InputWriteMilliseconds: 0,
+            InputQueueDepth: 0,
+            CoalescedPointerMoves: 0,
+            SampleSequence: 0);
+        var session = new SessionPerformanceDiagnosticSnapshot(
+            performance,
+            0,
+            0,
+            new Dictionary<int, long> { [-1] = long.MaxValue, [-2] = 1 });
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.internal", 5900, "operator");
+
+        var context = DesktopDiagnosticContextFactory.CreateSession(profile, session);
+
+        Assert.Equal(long.MaxValue, context.Profiles[0].EncodingStatistics!["Encoding.Other"]);
     }
 
     private static async Task<string> ReadEntryAsync(ZipArchive archive, string name)
