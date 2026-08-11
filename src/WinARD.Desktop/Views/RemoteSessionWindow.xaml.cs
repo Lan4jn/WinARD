@@ -250,7 +250,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             _saveCancellation.Token);
         if (selected != current &&
             !IsInputClosing() &&
-            (selection is null || _qualityProfileSelection.IsCurrent(selection.Value)))
+            selection is null)
         {
             RefreshQualityPresentation();
         }
@@ -595,11 +595,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
         var profile = ViewModel.QualityProfile;
         if (ReferenceEquals(sender, QualityBandwidthComboBox) &&
-            QualityBandwidthComboBox.SelectedItem is QualityChoice<long?> bandwidth)
+            QualityBandwidthComboBox.SelectedItem is QualityBandwidthOption bandwidth)
         {
-            // The final entry opens the custom-value affordance in a later interaction; it does not
-            // silently turn into the adjacent "unlimited" value.
-            if (QualityBandwidthComboBox.SelectedIndex == QualityPresentation.BandwidthOptions.Count - 1)
+            if (bandwidth.Kind == QualityBandwidthOptionKind.Custom)
             {
                 return;
             }
@@ -637,7 +635,10 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private async void OnQualityCustomBandwidthChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
     {
         if (_qualitySynchronizationDepth != 0 ||
-            QualityBandwidthComboBox.SelectedIndex != QualityPresentation.BandwidthOptions.Count - 1 ||
+            QualityBandwidthComboBox.SelectedItem is not QualityBandwidthOption
+            {
+                Kind: QualityBandwidthOptionKind.Custom
+            } ||
             !double.IsFinite(args.NewValue) ||
             args.NewValue <= 0)
         {
@@ -676,28 +677,38 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private async Task ApplyQualityFromUiAsync(QualityProfile profile)
     {
-        var selection = _qualityProfileSelection.Begin();
         ClearFrameRateSaveStatus();
-        try
-        {
-            await SelectQualityProfileAsync(profile, selection);
-        }
-        catch (OperationCanceledException) when (_saveCancellation.IsCancellationRequested)
-        {
-        }
-        catch (ObjectDisposedException) when (IsInputClosing())
-        {
-        }
-        catch (Exception) when (IsInputClosing())
-        {
-        }
-        catch (Exception)
-        {
-            if (_qualityProfileSelection.IsCurrent(selection))
+        await _qualityProfileSelection.RunLatestAsync(
+            async selection =>
             {
-                ShowFrameRateSaveStatus("画质设置应用失败");
-            }
-        }
+                try
+                {
+                    await SelectQualityProfileAsync(profile, selection);
+                }
+                catch (OperationCanceledException) when (_saveCancellation.IsCancellationRequested)
+                {
+                }
+                catch (ObjectDisposedException) when (IsInputClosing())
+                {
+                }
+                catch (Exception) when (IsInputClosing())
+                {
+                }
+                catch (Exception)
+                {
+                    if (_qualityProfileSelection.IsCurrent(selection))
+                    {
+                        ShowFrameRateSaveStatus("画质设置应用失败");
+                    }
+                }
+            },
+            () =>
+            {
+                if (!IsInputClosing())
+                {
+                    RefreshQualityPresentation();
+                }
+            });
     }
 
     private void RefreshQualityPresentation()
@@ -705,22 +716,24 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _qualitySynchronizationDepth++;
         try
         {
-            var profile = ViewModel.QualityProfile;
+            var presentation = ViewModel.QualityPresentationSnapshot;
+            var profile = presentation.Profile;
             QualityPresetComboBox.SelectedItem = QualityPresentation.PresetOptions.Single(
                 option => option.Value == profile.Preset);
-            var bandwidthIndex = profile.TargetBytesPerSecond is null
-                ? 5
-                : QualityPresentation.BandwidthOptions
-                    .Take(5)
-                    .Select((option, index) => (option, index))
-                    .FirstOrDefault(pair => pair.option.Value == profile.TargetBytesPerSecond).index;
-            if (profile.TargetBytesPerSecond is not null &&
-                !QualityPresentation.BandwidthOptions.Take(5).Any(option => option.Value == profile.TargetBytesPerSecond))
+            var targetBytesPerSecond = profile.TargetBytesPerSecond;
+            var bandwidthOption = targetBytesPerSecond is null
+                ? QualityPresentation.BandwidthOptions.Single(
+                    option => option.Kind == QualityBandwidthOptionKind.Unlimited)
+                : QualityPresentation.BandwidthOptions.FirstOrDefault(
+                    option => option.Kind == QualityBandwidthOptionKind.Preset &&
+                        option.Value == targetBytesPerSecond);
+            if (bandwidthOption is null)
             {
-                bandwidthIndex = QualityPresentation.BandwidthOptions.Count - 1;
-                QualityCustomBandwidthBox.Value = profile.TargetBytesPerSecond.Value / (1024d * 1024d);
+                bandwidthOption = QualityPresentation.BandwidthOptions.Single(
+                    option => option.Kind == QualityBandwidthOptionKind.Custom);
+                QualityCustomBandwidthBox.Value = targetBytesPerSecond.GetValueOrDefault() / (1024d * 1024d);
             }
-            QualityBandwidthComboBox.SelectedIndex = bandwidthIndex;
+            QualityBandwidthComboBox.SelectedItem = bandwidthOption;
             QualityColorComboBox.SelectedItem = QualityPresentation.ColorOptions.Single(option => option.Value == profile.Color);
             QualityScaleComboBox.SelectedItem = QualityPresentation.ScaleOptions.Single(option => option.Value == profile.Scale);
             QualityRefreshComboBox.ItemsSource = ViewModel.FrameRefreshOptions;
@@ -731,24 +744,25 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             QualityScaleLock.IsChecked = profile.ScaleLocked;
             QualityRefreshLock.IsChecked = profile.RefreshLocked;
 
-            var decision = ViewModel.LatestQualityDecision;
+            var decision = presentation.Decision;
+            var performance = presentation.Performance;
             var summary = QualityPresentation.FormatSummary(
                 profile.Preset,
                 decision?.Color ?? profile.Color,
                 decision?.Scale ?? profile.Scale,
-                decision?.TargetFramesPerSecond ?? ViewModel.TargetFramesPerSecond,
-                ViewModel.Performance.SampleSequence > 0 ? ViewModel.Performance.ReceiveBytesPerSecond : null);
+                decision?.TargetFramesPerSecond ?? performance.TargetFramesPerSecond,
+                performance.SampleSequence > 0 ? performance.ReceiveBytesPerSecond : null);
             var status = decision is null
                 ? QualityPresentationStatus.Unknown
                 : QualityPresentation.StatusFor(
                     decision.Reason,
                     decision.TargetSatisfied,
-                    ViewModel.LatestQualityTransitionStatus);
+                    presentation.TransitionStatus);
             QualitySummaryButton.Content = $"画质  {summary}";
             QualityStatusText.Text = QualityPresentation.StatusText(status);
             AutomationProperties.SetName(QualityStatusText, $"画质状态：{QualityPresentation.StatusText(status)}");
             AutomationProperties.SetName(QualitySummaryButton, QualityPresentation.AutomationName(summary, status));
-            var encoding = QualityPresentation.EncodingName(ViewModel.Performance.PrimaryFramebufferEncoding);
+            var encoding = QualityPresentation.EncodingName(performance.PrimaryFramebufferEncoding);
             QualityEncodingText.Text = encoding;
             AutomationProperties.SetName(QualityEncodingText, $"当前编码：{encoding}");
         }
@@ -1556,6 +1570,18 @@ internal sealed class QualityProfileSelectionCoordinator
     public long Begin() => Interlocked.Increment(ref _generation);
 
     public bool IsCurrent(long generation) => generation == Volatile.Read(ref _generation);
+
+    public async Task RunLatestAsync(Func<long, Task> operation, Action onCurrentCompletion)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(onCurrentCompletion);
+        var generation = Begin();
+        await operation(generation);
+        if (IsCurrent(generation))
+        {
+            onCurrentCompletion();
+        }
+    }
 }
 
 internal sealed class FrameRateSaveStatus

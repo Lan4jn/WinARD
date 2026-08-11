@@ -23,6 +23,27 @@ public sealed record QualityChoice<T>(
     bool IsEnabled = true,
     string? ConstraintText = null);
 
+public enum QualityBandwidthOptionKind
+{
+    Preset,
+    Unlimited,
+    Custom,
+}
+
+public sealed record QualityBandwidthOption(
+    string Id,
+    QualityBandwidthOptionKind Kind,
+    long? Value,
+    string DisplayName);
+
+public sealed record QualityPresentationSnapshot(
+    QualityProfile Profile,
+    QualityDecision? Decision,
+    QualityTransitionStatus TransitionStatus,
+    SessionPerformanceSnapshot Performance,
+    long Epoch,
+    long Version);
+
 public static class QualityPresentation
 {
     private const long MiB = 1024L * 1024;
@@ -36,15 +57,15 @@ public static class QualityPresentation
             new(QualityPreset.Custom, "自定义"),
         ]);
 
-    public static IReadOnlyList<QualityChoice<long?>> BandwidthOptions { get; } =
-        ReadOnly<long?>([
-            new(1 * MiB, "1 MiB/s"),
-            new(2 * MiB, "2 MiB/s"),
-            new(4 * MiB, "4 MiB/s"),
-            new(8 * MiB, "8 MiB/s"),
-            new(16 * MiB, "16 MiB/s"),
-            new(null, "不限制"),
-            new(null, "自定义…"),
+    public static IReadOnlyList<QualityBandwidthOption> BandwidthOptions { get; } =
+        new ReadOnlyCollection<QualityBandwidthOption>([
+            new("preset-1", QualityBandwidthOptionKind.Preset, 1 * MiB, "1 MiB/s"),
+            new("preset-2", QualityBandwidthOptionKind.Preset, 2 * MiB, "2 MiB/s"),
+            new("preset-4", QualityBandwidthOptionKind.Preset, 4 * MiB, "4 MiB/s"),
+            new("preset-8", QualityBandwidthOptionKind.Preset, 8 * MiB, "8 MiB/s"),
+            new("preset-16", QualityBandwidthOptionKind.Preset, 16 * MiB, "16 MiB/s"),
+            new("unlimited", QualityBandwidthOptionKind.Unlimited, null, "不限制"),
+            new("custom", QualityBandwidthOptionKind.Custom, null, "自定义…"),
         ]);
 
     public static IReadOnlyList<QualityChoice<QualityColor>> ColorOptions { get; } =

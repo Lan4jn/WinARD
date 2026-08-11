@@ -380,6 +380,58 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     }
 
     [Fact]
+    public async Task Presentation_snapshot_read_during_profile_commit_is_entirely_old_or_new()
+    {
+        var runtime = new StaleCompletingTransitionRuntime();
+        var capabilities = FullCapabilities();
+        var oldProfile = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Color16,
+            QualityScale.Native,
+            FrameRefreshPolicy.Automatic,
+            allowAutomaticGrayscale: false,
+            colorLocked: true,
+            scaleLocked: true);
+        var coordinator = new QualityTransitionCoordinator(
+            runtime,
+            new RemoteQualitySettings(RemotePixelFormatKind.Bgra32, [6, 16, 0, 1, -239, -223], 1),
+            capabilities,
+            new QualityDecoderGates());
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new AsyncLifetime(),
+            new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            oldProfile,
+            adaptiveQualityCapabilities: capabilities,
+            adaptiveQualityController: new AdaptiveQualityController(oldProfile, capabilities),
+            qualityTransitionCoordinator: coordinator);
+        await viewModel.StartAsync(default);
+        await runtime.TransitionEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        runtime.ReleaseTransition.TrySetResult();
+        await runtime.NextReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var old = viewModel.QualityPresentationSnapshot;
+        var observed = new ConcurrentBag<QualityPresentationSnapshot>();
+
+        var reader = Task.Run(() =>
+        {
+            for (var index = 0; index < 10_000; index++)
+                observed.Add(viewModel.QualityPresentationSnapshot);
+        });
+        var writer = Task.Run(() => viewModel.SetQualityProfile(QualityProfile.Original));
+        await Task.WhenAll(reader, writer);
+        var current = viewModel.QualityPresentationSnapshot;
+
+        Assert.All(observed, snapshot => Assert.True(snapshot == old || snapshot == current));
+        Assert.Same(oldProfile, old.Profile);
+        Assert.NotNull(old.Decision);
+        Assert.Same(QualityProfile.Original, current.Profile);
+        Assert.Null(current.Decision);
+    }
+
+    [Fact]
     public async Task Profile_change_does_not_hide_an_operation_canceled_after_wire_start()
     {
         var runtime = new WireCanceledTransitionRuntime();

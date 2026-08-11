@@ -66,6 +66,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private QualityDecision? _latestQualityDecision;
     private QualityTransitionStatus _latestQualityTransitionStatus = QualityTransitionStatus.NoChange;
     private long _qualityPresentationVersion;
+    private QualityPresentationSnapshot _qualityPresentationSnapshot = null!;
     private long _qualityDecisionGeneration;
     private long _qualityProfileEpoch;
     private int _pendingScrollInput;
@@ -192,6 +193,13 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             _timeProvider,
             performancePublicationInterval ?? TimeSpan.FromSeconds(1));
         _performance = _performanceTracker.Current;
+        _qualityPresentationSnapshot = new(
+            _qualityProfile,
+            null,
+            QualityTransitionStatus.NoChange,
+            _performance,
+            _qualityProfileEpoch,
+            _qualityPresentationVersion);
         RefreshFrameRefreshOptions();
         _inputMapper = new WindowsInputMapper(_session.SendKeyAsync);
         _pointerWrites = new RemotePointerWriteCoalescer(
@@ -245,6 +253,9 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     public string SessionPerformance => FormatSessionPerformance(Performance);
 
     public long QualityPresentationVersion => Interlocked.Read(ref _qualityPresentationVersion);
+
+    internal QualityPresentationSnapshot QualityPresentationSnapshot =>
+        Volatile.Read(ref _qualityPresentationSnapshot);
 
     internal SessionPerformanceDiagnosticSnapshot DiagnosticPerformance =>
         _performanceTracker.CurrentDiagnostics;
@@ -305,6 +316,13 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 _refreshPolicy,
                 ResolveTarget(_refreshPolicy, automaticTarget));
             Performance = _performanceTracker.Current;
+            _qualityPresentationSnapshot = new(
+                _qualityProfile,
+                null,
+                QualityTransitionStatus.NoChange,
+                Performance,
+                _qualityProfileEpoch,
+                _qualityPresentationVersion);
             RefreshFrameRefreshOptions();
         }
 
@@ -1100,6 +1118,13 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             {
                 _ = Interlocked.Increment(ref _qualityPresentationVersion);
             }
+            _qualityPresentationSnapshot = new(
+                _qualityProfile,
+                decision,
+                transitionStatus,
+                snapshot,
+                _qualityProfileEpoch,
+                _qualityPresentationVersion);
         }
 
         if (presentationChanged || performancePublished)

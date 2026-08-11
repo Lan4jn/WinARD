@@ -99,6 +99,18 @@ public sealed class QualityPresentationTests
     }
 
     [Fact]
+    public void Bandwidth_choices_have_stable_unique_ids_and_explicit_kinds()
+    {
+        Assert.Equal(
+            ["preset-1", "preset-2", "preset-4", "preset-8", "preset-16", "unlimited", "custom"],
+            QualityPresentation.BandwidthOptions.Select(option => option.Id));
+        Assert.Equal(QualityBandwidthOptionKind.Unlimited, QualityPresentation.BandwidthOptions[5].Kind);
+        Assert.Equal(QualityBandwidthOptionKind.Custom, QualityPresentation.BandwidthOptions[6].Kind);
+        Assert.Null(QualityPresentation.BandwidthOptions[5].Value);
+        Assert.Null(QualityPresentation.BandwidthOptions[6].Value);
+    }
+
+    [Fact]
     public void Runtime_reason_and_transition_map_to_visible_status()
     {
         Assert.Equal(

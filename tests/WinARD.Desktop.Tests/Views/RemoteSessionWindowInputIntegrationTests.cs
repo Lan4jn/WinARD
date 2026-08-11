@@ -120,6 +120,29 @@ public sealed class RemoteSessionWindowInputIntegrationTests
     }
 
     [Fact]
+    public async Task Quality_selection_coordinator_only_completes_latest_async_handler()
+    {
+        var coordinator = new QualityProfileSelectionCoordinator();
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completed = new List<string>();
+
+        var first = coordinator.RunLatestAsync(
+            async _ =>
+            {
+                firstEntered.TrySetResult();
+                await releaseFirst.Task;
+            },
+            () => completed.Add("first"));
+        await firstEntered.Task;
+        await coordinator.RunLatestAsync(_ => Task.CompletedTask, () => completed.Add("second"));
+        releaseFirst.TrySetResult();
+        await first;
+
+        Assert.Equal(["second"], completed);
+    }
+
+    [Fact]
     public async Task Programmatic_refresh_selection_does_not_save()
     {
         var coordinator = new FrameRateSelectionCoordinator();
