@@ -80,13 +80,13 @@ if ([string]::IsNullOrWhiteSpace($rdmProductVersion)) { throw 'RDM Product Versi
 | 加密/安全模式 | 记录实际值并在七组间冻结 |
 | 其他可能改变 encoding 声明的开关 | 全部记录并在七组间冻结 |
 
-RDM 版本之间的设置页分组可能不同，应记录当前 UI 的原始标签。捕获期间不要按键、点击或移动鼠标。
+RDM 版本之间的设置页分组可能不同。每个泛化类别都必须分别记录当前 UI 中实际显示的原始标签和对应值，不能只记录类别名或留空；若该版本没有独立选项，记录其所在页面/分组的实际标签，并把值明确记为 `Not exposed`。捕获期间不要按键、点击或移动鼠标。
 
 用以下脱敏记录保存版本和公共设置。它只保存在本批次 artifacts 中，不得提交；不要在回答中记录主机名、真实账户或路径：
 
 ```powershell
 $commonSettings = [ordered]@{}
-@(
+$settingCategories = @(
   'ARD/VNC engine',
   'Color depth or Pixel format',
   'Display selection',
@@ -97,7 +97,21 @@ $commonSettings = [ordered]@{}
   'Shared session and reconnect options',
   'Encryption or security mode',
   'Other encoding-affecting switches'
-) | ForEach-Object { $commonSettings[$_] = Read-Host "Record actual RDM setting: $_" }
+)
+
+foreach ($category in $settingCategories) {
+  $uiLabel = ([string](Read-Host "Actual RDM UI label for category '$category'")).Trim()
+  $value = ([string](Read-Host "Actual RDM value shown for '$uiLabel'")).Trim()
+  if ([string]::IsNullOrWhiteSpace($uiLabel) -or [string]::IsNullOrWhiteSpace($value)) {
+    & $clearCaptureEnvironment
+    throw "RDM setting '$category' requires both an actual UI label and value."
+  }
+
+  $commonSettings[$category] = [ordered]@{
+    uiLabel = $uiLabel
+    value = $value
+  }
+}
 
 $matrix = @(
   [pscustomobject]@{ Profile = 'full-default';     Quality = 'Full';     Resolution = 'Default' },
