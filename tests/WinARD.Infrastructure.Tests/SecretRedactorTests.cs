@@ -271,7 +271,7 @@ public sealed class SecretRedactorTests
     [Fact]
     public void OversizeCharRegistrationHasLengthGuardBeforeUtf8ByteCounting()
     {
-        var source = File.ReadAllText(RepositoryFile(
+        var source = File.ReadAllText(RepositoryFile.Find(
             "src", "WinARD.Infrastructure", "Diagnostics", "SecretRedactor.cs"));
         var method = source.IndexOf(
             "public IDisposable Register(ReadOnlySpan<char> secret)",
@@ -496,19 +496,6 @@ public sealed class SecretRedactorTests
         }
 
         return new string(characters);
-    }
-
-    private static string RepositoryFile(params string[] segments)
-    {
-        var directory = new DirectoryInfo(AppContext.BaseDirectory);
-        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "WinARD.sln")))
-        {
-            directory = directory.Parent;
-        }
-
-        return directory is null
-            ? throw new FileNotFoundException("Could not locate repository root.")
-            : Path.Combine([directory.FullName, .. segments]);
     }
 
     private sealed class ThrowingSink : ISafeDiagnosticSink

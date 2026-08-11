@@ -239,25 +239,12 @@ public sealed class DnssdServiceWatcherTests
     [Fact]
     public void Production_source_has_no_hidden_compile_gate_or_missing_dnssd_instance_api()
     {
-        var sourcePath = RepositoryFile("src", "WinARD.Infrastructure", "Discovery", "DnssdServiceWatcher.cs");
+        var sourcePath = RepositoryFile.Find("src", "WinARD.Infrastructure", "Discovery", "DnssdServiceWatcher.cs");
         var source = File.ReadAllText(sourcePath);
 
         Assert.DoesNotContain("WINARD_DNSSD_DEVICE_WATCHER", source, StringComparison.Ordinal);
         Assert.DoesNotContain("DnssdServiceInstance", source, StringComparison.Ordinal);
         Assert.DoesNotContain("#if", source, StringComparison.Ordinal);
-    }
-
-    private static string RepositoryFile(params string[] segments)
-    {
-        var directory = new DirectoryInfo(AppContext.BaseDirectory);
-        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "WinARD.sln")))
-        {
-            directory = directory.Parent;
-        }
-
-        return directory is null
-            ? throw new FileNotFoundException("Could not locate repository root.")
-            : Path.Combine([directory.FullName, .. segments]);
     }
 
     private static Dictionary<string, object?> CompleteProperties(string name, string? host, object port) =>
