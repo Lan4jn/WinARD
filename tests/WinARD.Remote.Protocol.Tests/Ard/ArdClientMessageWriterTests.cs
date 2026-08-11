@@ -73,6 +73,21 @@ public sealed class ArdClientMessageWriterTests
     }
 
     [Fact]
+    public async Task Invalid_scaling_factor_takes_priority_over_pre_cancellation()
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            writer.WriteScalingFactorAsync(double.NaN, cancellation.Token).AsTask());
+
+        Assert.Empty(stream.ToArray());
+        Assert.Equal(0, stream.WriteCount);
+    }
+
+    [Fact]
     public async Task Set_encryption_request_and_acknowledgement_write_exact_messages()
     {
         await using var stream = new TrackingMemoryStream();

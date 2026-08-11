@@ -8,17 +8,29 @@ namespace WinARD.Application.Tests.Quality;
 public sealed class QualityModelsTests
 {
     [Theory]
-    [InlineData(CapabilitySupport.Unknown, false, false)]
-    [InlineData(CapabilitySupport.Unsupported, false, false)]
-    [InlineData(CapabilitySupport.Advertised, true, false)]
-    [InlineData(CapabilitySupport.Observed, true, true)]
-    public void Capability_queries_preserve_evidence_strength(
+    [InlineData(CapabilitySupport.Unknown, false)]
+    [InlineData(CapabilitySupport.Unsupported, false)]
+    [InlineData(CapabilitySupport.Advertised, false)]
+    [InlineData(CapabilitySupport.Observed, true)]
+    public void Only_observed_evidence_is_observed(
         CapabilitySupport support,
-        bool isSupported,
         bool isObserved)
     {
-        Assert.Equal(isSupported, support.IsSupported());
         Assert.Equal(isObserved, support.IsObserved());
+    }
+
+    [Fact]
+    public void Evidence_queries_do_not_generalize_advertising_into_enablement()
+    {
+        var booleanQueries = typeof(CapabilitySupportExtensions)
+            .GetMethods(System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.Static |
+                System.Reflection.BindingFlags.DeclaredOnly)
+            .Where(method => method.ReturnType == typeof(bool))
+            .Select(method => method.Name);
+
+        Assert.Equal([nameof(CapabilitySupportExtensions.IsObserved)], booleanQueries);
+        Assert.False(CapabilitySupport.Advertised.IsObserved());
     }
 
     [Fact]
@@ -37,8 +49,8 @@ public sealed class QualityModelsTests
         Assert.Equal(CapabilitySupport.Advertised, capabilities.Zlib);
         Assert.Equal(CapabilitySupport.Observed, capabilities.Rgb565);
         Assert.Equal(CapabilitySupport.Unknown, capabilities.ServerScaling);
-        Assert.Equal(CapabilitySupport.Unsupported, capabilities.AppleThousands);
-        Assert.Equal(CapabilitySupport.Advertised, capabilities.AppleGrayscale);
+        Assert.Equal(CapabilitySupport.Unsupported, capabilities.AppleColor1002);
+        Assert.Equal(CapabilitySupport.Advertised, capabilities.AppleGrayscale1001);
         Assert.True(capabilities.SafeOnlinePixelFormatSwitch);
         Assert.False(capabilities.SafeOnlineScaleSwitch);
         Assert.Equal(120, capabilities.MaximumRefreshRate);
@@ -64,30 +76,38 @@ public sealed class QualityModelsTests
     }
 
     [Theory]
-    [InlineData(-1)]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
     [InlineData(4)]
-    [InlineData(255)]
-    public void Capabilities_reject_undefined_evidence_values(int invalidValue)
+    public void Each_capability_rejects_an_undefined_evidence_value(int capabilityIndex)
     {
+        var values = Enumerable.Repeat(CapabilitySupport.Unknown, 5).ToArray();
+        values[capabilityIndex] = (CapabilitySupport)4;
+
         Assert.Throws<ArgumentOutOfRangeException>(() => new ArdDisplayCapabilities(
-            (CapabilitySupport)invalidValue,
-            CapabilitySupport.Unknown,
-            CapabilitySupport.Unknown,
-            CapabilitySupport.Unknown,
-            CapabilitySupport.Unknown,
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
             SafeOnlinePixelFormatSwitch: false,
             SafeOnlineScaleSwitch: false,
             MaximumRefreshRate: null));
     }
 
     [Fact]
-    public void Model_does_not_expose_apple_black_and_white_encoding_1000()
+    public void Apple_evidence_properties_use_explicit_encoding_names_without_1000()
     {
         var propertyNames = typeof(ArdDisplayCapabilities).GetProperties().Select(property => property.Name);
 
+        Assert.Contains(nameof(ArdDisplayCapabilities.AppleColor1002), propertyNames);
+        Assert.Contains(nameof(ArdDisplayCapabilities.AppleGrayscale1001), propertyNames);
         Assert.DoesNotContain(propertyNames, name =>
             name.Contains("Black", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("1000", StringComparison.Ordinal));
+            name.Contains("1000", StringComparison.Ordinal) ||
+            name is "AppleThousands" or "AppleGrayscale");
     }
 
     private static ArdDisplayCapabilities CreateCapabilities(int? maximumRefreshRate) =>

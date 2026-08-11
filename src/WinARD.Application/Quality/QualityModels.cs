@@ -4,18 +4,17 @@ public enum CapabilitySupport
 {
     Unknown,
     Unsupported,
+
+    /// <summary>
+    /// The peer advertised the capability. Advertisement is neither observation nor approval to enable it.
+    /// </summary>
     Advertised,
+
     Observed,
 }
 
 public static class CapabilitySupportExtensions
 {
-    public static bool IsSupported(this CapabilitySupport support)
-    {
-        Validate(support);
-        return support is CapabilitySupport.Advertised or CapabilitySupport.Observed;
-    }
-
     public static bool IsObserved(this CapabilitySupport support)
     {
         Validate(support);
@@ -33,12 +32,16 @@ public static class CapabilitySupportExtensions
     }
 }
 
+/// <summary>
+/// Records connection-specific protocol evidence. These values do not by themselves authorize
+/// negotiating or decoding an Apple-private encoding.
+/// </summary>
 public sealed record ArdDisplayCapabilities(
     CapabilitySupport Zlib,
     CapabilitySupport Rgb565,
     CapabilitySupport ServerScaling,
-    CapabilitySupport AppleThousands,
-    CapabilitySupport AppleGrayscale,
+    CapabilitySupport AppleColor1002,
+    CapabilitySupport AppleGrayscale1001,
     bool SafeOnlinePixelFormatSwitch,
     bool SafeOnlineScaleSwitch,
     int? MaximumRefreshRate)
@@ -46,8 +49,20 @@ public sealed record ArdDisplayCapabilities(
     public CapabilitySupport Zlib { get; } = CapabilitySupportExtensions.Validate(Zlib);
     public CapabilitySupport Rgb565 { get; } = CapabilitySupportExtensions.Validate(Rgb565);
     public CapabilitySupport ServerScaling { get; } = CapabilitySupportExtensions.Validate(ServerScaling);
-    public CapabilitySupport AppleThousands { get; } = CapabilitySupportExtensions.Validate(AppleThousands);
-    public CapabilitySupport AppleGrayscale { get; } = CapabilitySupportExtensions.Validate(AppleGrayscale);
+
+    /// <summary>
+    /// Gets evidence about encoding 1002, not permission to enable it. Formal availability requires
+    /// a separate, explicit decoder evidence gate; no such gate exists in this model.
+    /// </summary>
+    public CapabilitySupport AppleColor1002 { get; } = CapabilitySupportExtensions.Validate(AppleColor1002);
+
+    /// <summary>
+    /// Gets evidence about encoding 1001, not permission to enable it. Formal availability requires
+    /// a separate, explicit decoder evidence gate; no such gate exists in this model.
+    /// </summary>
+    public CapabilitySupport AppleGrayscale1001 { get; } =
+        CapabilitySupportExtensions.Validate(AppleGrayscale1001);
+
     public int? MaximumRefreshRate { get; } = ValidateMaximumRefreshRate(MaximumRefreshRate);
 
     private static int? ValidateMaximumRefreshRate(int? maximumRefreshRate)
