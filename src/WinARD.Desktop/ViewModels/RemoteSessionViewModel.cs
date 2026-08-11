@@ -5,6 +5,7 @@ using WinARD.Application.Quality;
 using WinARD.Desktop.Clipboard;
 using WinARD.Desktop.Input;
 using WinARD.Desktop.Rendering;
+using WinARD.Desktop.Services;
 using WinARD.Desktop.Threading;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
@@ -1507,8 +1508,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         if (failure.EncodingId is { } encodingId)
         {
             fields.Add(new DiagnosticField(
-                "EncodingId",
-                encodingId.ToString(CultureInfo.InvariantCulture),
+                "EncodingName",
+                DesktopDiagnosticContextFactory.KnownEncodingName(encodingId) ?? "Other",
                 DiagnosticFieldCategory.Public));
         }
 

@@ -163,7 +163,7 @@ internal static class DesktopDiagnosticContextFactory
     private static long SaturatingAdd(long first, long second) =>
         second > long.MaxValue - first ? long.MaxValue : first + second;
 
-    private static string? KnownEncodingName(int encoding) => encoding switch
+    internal static string? KnownEncodingName(int encoding) => encoding switch
     {
         (int)RfbEncodingType.Raw => "Raw",
         (int)RfbEncodingType.CopyRect => "CopyRect",

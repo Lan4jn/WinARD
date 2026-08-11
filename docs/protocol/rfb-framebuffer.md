@@ -85,4 +85,4 @@ On 2026-07-25, the user confirmed a successful first-frame capture against a rea
 
 The generated BMP decoded successfully during visual inspection. Its orientation and color channels were correct, and the captured content covered the complete screen. The Mac host, username, password, capture path, and screenshot contents were not recorded. The specific macOS major version was not provided, so this result is not attributed to a particular macOS release.
 
-This capture did not record the selected framebuffer encoding and therefore is not evidence that a real Mac selected or transmitted ZRLE. Real-Mac ZRLE interoperability remains unverified.
+This capture did not record the selected framebuffer encoding and therefore is not evidence that a real Mac selected or transmitted Zlib or ZRLE. Real-Mac Zlib and ZRLE interoperability both remain unverified.

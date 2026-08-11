@@ -122,7 +122,7 @@ public sealed class DiagnosticExporter : IDisposable
     {
         "Automatic", "Full32", "Color16", "Grayscale",
     };
-    private static readonly HashSet<string> AllowedQualityEncodingNames = new(StringComparer.Ordinal)
+    private static readonly HashSet<string> AllowedEncodingNames = new(StringComparer.Ordinal)
     {
         "Raw", "CopyRect", "Zlib", "ZRLE", "DesktopSize", "Cursor",
         "ARD.DisplayInfo", "ARD.SessionEncryption", "ARD.DisplayInfo2", "Other",
@@ -525,7 +525,7 @@ public sealed class DiagnosticExporter : IDisposable
         contentState = ExportAllowedValue(quality.ContentState, AllowedQualityContentStates),
         color = ExportAllowedValue(quality.Color, AllowedQualityColors),
         scalePercent = quality.ScalePercent is 50 or 75 or 100 ? quality.ScalePercent : (int?)null,
-        encodingName = ExportAllowedValue(quality.EncodingName, AllowedQualityEncodingNames) ?? "Other",
+        encodingName = ExportAllowedValue(quality.EncodingName, AllowedEncodingNames) ?? "Other",
         targetFps = PositiveOrNull(quality.TargetFramesPerSecond),
         actualFps = NonNegativeOrNull(quality.ActualFramesPerSecond),
         averageBps = NonNegativeOrNull(quality.AverageBytesPerSecond),
@@ -585,7 +585,7 @@ public sealed class DiagnosticExporter : IDisposable
             "SessionSelectRequired" or "SessionSelectCompleted" or "RequestedMode" or "FinalState" or
             "Status" or "Flags" or "Action" or "ProtocolFailureKind" or "RfbHandshakeStage" or
             "ExpectedByteCount" or "ActualByteCount" or "PresentationStage" or "ProtocolReadStage" or
-            "ServerMessageType" or "EncodingId" or "RectangleIndex" or "ArdEncryptionStage" or
+            "ServerMessageType" or "EncodingName" or "RectangleIndex" or "ArdEncryptionStage" or
             "ArdEncryptionDirection" or "securityType" or "endpoint" or "fingerprint" or
             "oldFingerprint" or "newFingerprint" => field.Name,
             "ArdCiphertextLength" => "ArdEncryptedPacketLength",
@@ -643,7 +643,7 @@ public sealed class DiagnosticExporter : IDisposable
         "PresentationStage" => ExportAllowedValue(value, AllowedPresentationStages),
         "ProtocolReadStage" => ExportAllowedValue(value, AllowedProtocolReadStages),
         "ServerMessageType" => ExportFixedHex(value, 2),
-        "EncodingId" => ExportInt32(value),
+        "EncodingName" => ExportAllowedValue(value, AllowedEncodingNames) ?? "Other",
         "ArdEncryptionStage" => ExportAllowedValue(value, AllowedArdEncryptionStages),
         "ArdEncryptionDirection" => value is "Send" or "Receive" ? value : null,
         "securityType" => value == "30" ? value : null,
@@ -669,11 +669,6 @@ public sealed class DiagnosticExporter : IDisposable
 
     private static string? ExportNonNegativeUInt16(string value) =>
         ushort.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
-            ? parsed.ToString(CultureInfo.InvariantCulture)
-            : null;
-
-    private static string? ExportInt32(string value) =>
-        int.TryParse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var parsed)
             ? parsed.ToString(CultureInfo.InvariantCulture)
             : null;
 

@@ -549,7 +549,7 @@ public sealed class DiagnosticExporterTests : IDisposable
     }
 
     [Fact]
-    public async Task EveryAllowedEventFieldRejectsAUniqueUnregisteredValue()
+    public async Task EveryAllowedEventFieldRejectsOrNormalizesAUniqueUnregisteredValue()
     {
         string[] fieldNames =
         [
@@ -558,7 +558,7 @@ public sealed class DiagnosticExporterTests : IDisposable
             "SessionSelectRequired", "SessionSelectCompleted", "RequestedMode", "FinalState",
             "Status", "Flags", "Action", "ProtocolFailureKind", "RfbHandshakeStage",
             "ExpectedByteCount", "ActualByteCount", "PresentationStage", "ProtocolReadStage",
-            "ServerMessageType", "EncodingId", "RectangleIndex", "ArdEncryptionStage",
+            "ServerMessageType", "EncodingName", "RectangleIndex", "ArdEncryptionStage",
             "ArdEncryptionDirection", "securityType", "endpoint", "fingerprint", "oldFingerprint",
             "newFingerprint", "ArdCiphertextLength",
         ];
@@ -589,7 +589,10 @@ public sealed class DiagnosticExporterTests : IDisposable
             Assert.DoesNotContain(marker, json, StringComparison.Ordinal);
         }
 
-        Assert.Empty(document.RootElement.GetProperty("events")[0].GetProperty("fields").EnumerateObject());
+        var exported = document.RootElement.GetProperty("events")[0].GetProperty("fields");
+        var encodingName = Assert.Single(exported.EnumerateObject());
+        Assert.Equal("EncodingName", encodingName.Name);
+        Assert.Equal("Other", encodingName.Value.GetString());
     }
 
     [Fact]
@@ -624,7 +627,7 @@ public sealed class DiagnosticExporterTests : IDisposable
             new("PresentationStage", "Present1", DiagnosticFieldCategory.Public),
             new("ProtocolReadStage", "FramebufferRectanglePayload", DiagnosticFieldCategory.Public),
             new("ServerMessageType", "0xFA", DiagnosticFieldCategory.Public),
-            new("EncodingId", "-223", DiagnosticFieldCategory.Public),
+            new("EncodingName", "DesktopSize", DiagnosticFieldCategory.Public),
             new("RectangleIndex", "7", DiagnosticFieldCategory.Public),
             new("ArdEncryptionStage", "Integrity", DiagnosticFieldCategory.Public),
             new("ArdEncryptionDirection", "Receive", DiagnosticFieldCategory.Public),
@@ -657,10 +660,42 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.Equal("True", exported.GetProperty("SessionSelectCompleted").GetString());
         Assert.Equal("65535", exported.GetProperty("Status").GetString());
         Assert.Equal("0x00AF", exported.GetProperty("Flags").GetString());
-        Assert.Equal("-223", exported.GetProperty("EncodingId").GetString());
+        Assert.Equal("DesktopSize", exported.GetProperty("EncodingName").GetString());
         Assert.Equal("safe.example", exported.GetProperty("endpoint").GetString());
         Assert.Equal(fingerprint, exported.GetProperty("fingerprint").GetString());
         Assert.Equal("48", exported.GetProperty("ArdEncryptedPacketLength").GetString());
+    }
+
+    [Fact]
+    public async Task RawEncodingIdentifiersAreNeverExportedAndUnknownNamesBecomeOther()
+    {
+        Directory.CreateDirectory(_directory);
+        const string rawEncodingIdMarker = "-2147483123";
+        const string unknownEncodingNameMarker = "raw-encoding-name-marker";
+        var diagnosticEvent = new SafeDiagnosticEvent(
+            DateTimeOffset.UtcNow,
+            "EVENT_ENCODING_SCHEMA_TEST",
+            Guid.NewGuid().ToString("N"),
+            "ignored",
+            [
+                new("EncodingId", rawEncodingIdMarker, DiagnosticFieldCategory.Public),
+                new("EncodingName", unknownEncodingNameMarker, DiagnosticFieldCategory.Public),
+            ],
+            null);
+        var destination = Path.Combine(_directory, "encoding-schema.zip");
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new StaticSnapshotSink([diagnosticEvent]), redactor);
+
+        await exporter.ExportAsync(destination, DiagnosticExportContext.Empty, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        var content = await ReadAllAsync(archive);
+        Assert.DoesNotContain(rawEncodingIdMarker, content, StringComparison.Ordinal);
+        Assert.DoesNotContain(unknownEncodingNameMarker, content, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"EncodingId\"", content, StringComparison.Ordinal);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
+        Assert.Equal("Other", fields.GetProperty("EncodingName").GetString());
     }
 
     [Theory]

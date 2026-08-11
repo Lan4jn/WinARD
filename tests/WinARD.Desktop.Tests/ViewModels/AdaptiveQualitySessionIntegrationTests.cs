@@ -457,11 +457,15 @@ public sealed class AdaptiveQualitySessionIntegrationTests
             adaptiveQualityCapabilities: capabilities,
             adaptiveQualityController: new AdaptiveQualityController(oldProfile, capabilities),
             qualityTransitionCoordinator: coordinator);
+        var beforeTransition = viewModel.CreateDiagnosticQualitySnapshot();
         await viewModel.StartAsync(default);
         await runtime.TransitionEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var whileTransitionPending = viewModel.CreateDiagnosticQualitySnapshot();
+        Assert.Same(beforeTransition, whileTransitionPending);
         runtime.ReleaseTransition.TrySetResult();
         await runtime.NextReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         var old = viewModel.CreateDiagnosticQualitySnapshot();
+        Assert.NotSame(whileTransitionPending, old);
         var observed = new ConcurrentBag<RemoteSessionDiagnosticQualitySnapshot>();
         using var start = new Barrier(participantCount: 2);
 
@@ -478,6 +482,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         });
         await Task.WhenAll(reader, writer);
         var current = viewModel.CreateDiagnosticQualitySnapshot();
+        Assert.NotSame(old, current);
 
         Assert.All(observed, snapshot =>
         {

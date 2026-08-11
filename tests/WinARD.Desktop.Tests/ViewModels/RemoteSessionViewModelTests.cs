@@ -919,7 +919,7 @@ public sealed class RemoteSessionViewModelTests
                 ("ProtocolFailureKind", "DecoderFailure"),
                 ("ProtocolReadStage", "FramebufferRectanglePayload"),
                 ("ServerMessageType", "0xFA"),
-                ("EncodingId", "-239"),
+                ("EncodingName", "Cursor"),
                 ("RectangleIndex", "7"),
             ],
             fields.Select(field => (field.Name, field.Value)).ToArray());
@@ -999,7 +999,7 @@ public sealed class RemoteSessionViewModelTests
             item => item.Code == "REMOTE_SESSION_INTERRUPTED");
         var fields = Assert.IsAssignableFrom<IReadOnlyList<DiagnosticField>>(diagnostic.Fields);
         Assert.Equal(
-            [("ProtocolFailureKind", "UnsupportedEncoding"), ("EncodingId", "16")],
+            [("ProtocolFailureKind", "UnsupportedEncoding"), ("EncodingName", "ZRLE")],
             fields.Select(field => (field.Name, field.Value)).ToArray());
         Assert.All(fields, field => Assert.Equal(DiagnosticFieldCategory.Public, field.Category));
     }
@@ -1066,7 +1066,7 @@ public sealed class RemoteSessionViewModelTests
                 ("ProtocolFailureKind", "TruncatedRead"),
                 ("ProtocolReadStage", "FramebufferRectanglePayload"),
                 ("ServerMessageType", "0x00"),
-                ("EncodingId", "7"),
+                ("EncodingName", "Other"),
                 ("RectangleIndex", "3"),
             ],
             diagnostic.Fields!.Select(field => (field.Name, field.Value)).ToArray());
