@@ -313,16 +313,62 @@ public sealed class AdaptiveQualityControllerTests
 
         var recovery = controller.Observe(Observation(Epoch.AddMilliseconds(601), dirty: .01));
         var idle = controller.Observe(Observation(Epoch.AddMilliseconds(602), dirty: .01));
-        var stableIdle = controller.Observe(Observation(Epoch.AddSeconds(15), dirty: .01));
-        var immediateIdle = controller.Observe(Observation(Epoch.AddSeconds(15).AddMilliseconds(1), dirty: .01));
+        var beforeStableIdle = controller.Observe(Observation(Epoch.AddMilliseconds(15_600), dirty: .01));
+        var stableIdle = controller.Observe(Observation(Epoch.AddMilliseconds(15_601), dirty: .01));
+        var immediateIdle = controller.Observe(Observation(Epoch.AddMilliseconds(15_602), dirty: .01));
 
         Assert.Equal(QualityContentState.Recovery, recovery.ContentState);
         Assert.Equal(QualityLevel.Q2, recovery.Level);
         Assert.Equal(QualityDecisionReason.StableRecovery, recovery.Reason);
         Assert.Equal(QualityContentState.Idle, idle.ContentState);
         Assert.Equal(QualityLevel.Q2, idle.Level);
+        Assert.Equal(QualityLevel.Q2, beforeStableIdle.Level);
         Assert.Equal(QualityLevel.Q1, stableIdle.Level);
         Assert.Equal(QualityLevel.Q1, immediateIdle.Level);
+    }
+
+    [Theory]
+    [InlineData("scroll")]
+    [InlineData("drag")]
+    [InlineData("dirty-motion")]
+    [InlineData("interactive")]
+    public void Continuous_activity_never_accumulates_stable_quality_recovery(string activity)
+    {
+        var profile = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Color16,
+            QualityScale.Percent50,
+            FrameRefreshPolicy.Unlimited,
+            allowAutomaticGrayscale: false);
+        var controller = CreateController(profile: profile);
+
+        QualityDecision decision;
+        switch (activity)
+        {
+            case "scroll":
+                controller.Observe(Observation(Epoch, scrolling: true));
+                decision = controller.Observe(Observation(Epoch.AddSeconds(16), scrolling: true));
+                break;
+            case "drag":
+                controller.Observe(Observation(Epoch, dragging: true));
+                decision = controller.Observe(Observation(Epoch.AddSeconds(16), dragging: true));
+                break;
+            case "dirty-motion":
+                controller.Observe(Observation(Epoch, dirty: .25));
+                controller.Observe(Observation(Epoch.AddMilliseconds(60), dirty: .25));
+                decision = controller.Observe(Observation(Epoch.AddSeconds(16), dirty: .25));
+                break;
+            default:
+                controller.Observe(Observation(Epoch, dirty: .1));
+                decision = controller.Observe(Observation(Epoch.AddSeconds(16), dirty: .1));
+                break;
+        }
+
+        Assert.Equal(QualityLevel.Q3, decision.Level);
+        Assert.NotEqual(QualityDecisionReason.StableRecovery, decision.Reason);
+        Assert.Equal(
+            activity == "interactive" ? QualityContentState.Interactive : QualityContentState.Motion,
+            decision.ContentState);
     }
 
     [Fact]

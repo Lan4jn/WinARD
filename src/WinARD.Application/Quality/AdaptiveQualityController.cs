@@ -133,7 +133,8 @@ public sealed class AdaptiveQualityController
                 levelChangedThisDecision = true;
             }
 
-            if (IsStableUnderTarget(observation, target))
+            var contentIsStable = nextState is QualityContentState.Recovery or QualityContentState.Idle;
+            if (contentIsStable && IsStableUnderTarget(observation, target))
             {
                 stableUnderTargetSince ??= observation.Timestamp;
                 if (!levelChangedThisDecision &&
