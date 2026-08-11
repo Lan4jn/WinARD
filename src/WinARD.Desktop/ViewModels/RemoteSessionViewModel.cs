@@ -43,7 +43,6 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private readonly QualityTransitionCoordinator _qualityTransitionCoordinator;
     private readonly SemaphoreSlim _qualityOperationGate = new(1, 1);
     private CancellationTokenSource _qualityProfileOperations = new();
-    private readonly List<CancellationTokenSource> _retiredQualityProfileOperations = [];
     private readonly SessionPerformanceTracker _performanceTracker;
     private readonly SessionPerformancePublicationGate _performancePublication;
     private readonly int? _remoteMaximum;
@@ -160,7 +159,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _refreshPolicy = qualityProfile.Refresh;
         _adaptiveQualityCapabilities = adaptiveQualityCapabilities ?? ConservativeCapabilities(_remoteMaximum);
         _qualityDecoderGates = qualityDecoderGates ?? new QualityDecoderGates();
-        _adaptiveQualityController = adaptiveQualityController ?? CreateAdaptiveController(
+        _adaptiveQualityController = adaptiveQualityController ?? new AdaptiveQualityController(
             _qualityProfile,
             _adaptiveQualityCapabilities,
             _qualityDecoderGates);
@@ -270,7 +269,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     public void SetQualityProfile(QualityProfile profile)
     {
         ArgumentNullException.ThrowIfNull(profile);
-        var controller = CreateAdaptiveController(
+        var controller = new AdaptiveQualityController(
             profile,
             _adaptiveQualityCapabilities,
             _qualityDecoderGates);
@@ -279,7 +278,6 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         {
             ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
             previousOperations = _qualityProfileOperations;
-            _retiredQualityProfileOperations.Add(previousOperations);
             _qualityProfileOperations = new CancellationTokenSource();
             _qualityProfile = profile;
             _refreshPolicy = profile.Refresh;
@@ -298,7 +296,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             RefreshFrameRefreshOptions();
         }
 
-        ObserveDetachedFailure(previousOperations.CancelAsync());
+        ObserveDetachedFailure(CancelAndDisposeAsync(previousOperations));
     }
 
     internal static string FormatSessionPerformance(SessionPerformanceSnapshot snapshot)
@@ -569,6 +567,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     }
 
     internal QualityActivitySnapshot QualityActivity => _performanceTracker.CurrentActivity;
+
+    internal QualityProfile QualityProfile => _qualityProfile;
 
     internal long QualityDecisionGeneration => Interlocked.Read(ref _qualityDecisionGeneration);
 
@@ -974,6 +974,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         var targetChanged = false;
         SessionPerformanceSnapshot snapshot;
         QualityDecision decision;
+        bool constraintsSatisfied;
         long profileEpoch;
         CancellationToken profileCancellationToken;
         long performanceGeneration;
@@ -995,6 +996,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             var localDecision = _adaptiveQualityController.Observe(
                 _performanceTracker.CreateQualityObservation());
             decision = WithGlobalGeneration(localDecision);
+            constraintsSatisfied = _adaptiveQualityController.ConstraintsSatisfied;
             profileEpoch = _qualityProfileEpoch;
             profileCancellationToken = _qualityProfileOperations.Token;
             var target = ResolveTarget(_refreshPolicy, decision.TargetFramesPerSecond);
@@ -1026,6 +1028,11 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             if (profileEpoch != Volatile.Read(ref _qualityProfileEpoch))
             {
                 return QualityTransitionStatus.NoChange;
+            }
+
+            if (!constraintsSatisfied)
+            {
+                return QualityTransitionStatus.CapabilityUnavailable;
             }
 
             return await _qualityTransitionCoordinator.ApplyAtSafeBoundaryAsync(
@@ -1079,30 +1086,6 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
     private static int InitialAdaptiveTarget(AdaptiveQualityController controller) =>
         AdaptiveQualityController.QualityTable[(int)controller.CurrentLevel].FramesPerSecond;
-
-    private static AdaptiveQualityController CreateAdaptiveController(
-        QualityProfile profile,
-        ArdDisplayCapabilities capabilities,
-        QualityDecoderGates decoderGates)
-    {
-        try
-        {
-            return new AdaptiveQualityController(profile, capabilities, decoderGates);
-        }
-        catch (ArgumentException) when (HasUnknownCapabilities(capabilities))
-        {
-            // Preserve the saved refresh policy while failing closed on unobserved format/scale capabilities.
-            return new AdaptiveQualityController(
-                QualityProfile.Automatic.WithRefresh(profile.Refresh),
-                capabilities,
-                decoderGates);
-        }
-    }
-
-    private static bool HasUnknownCapabilities(ArdDisplayCapabilities capabilities) =>
-        capabilities.Zlib == CapabilitySupport.Unknown ||
-        capabilities.Rgb565 == CapabilitySupport.Unknown ||
-        capabilities.ServerScaling == CapabilitySupport.Unknown;
 
     private static ArdDisplayCapabilities ConservativeCapabilities(int? maximumRefreshRate) => new(
         CapabilitySupport.Unknown,
@@ -1175,11 +1158,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         {
             failures.Add(exception);
         }
-        foreach (var operations in _retiredQualityProfileOperations)
-        {
-            operations.Dispose();
-        }
         _qualityProfileOperations.Dispose();
+        _qualityOperationGate.Dispose();
         _completion.TrySetResult();
         _lifetime.Dispose();
         if (failures.Count != 0)
@@ -1205,6 +1185,18 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         catch (Exception exception)
         {
             failures.Add(exception);
+        }
+    }
+
+    private static async Task CancelAndDisposeAsync(CancellationTokenSource cancellation)
+    {
+        try
+        {
+            await cancellation.CancelAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            cancellation.Dispose();
         }
     }
 
@@ -1741,6 +1733,7 @@ internal sealed class SessionFrameEnvelope(
             _presentationCompletion.TrySetResult(default);
         }
     }
+
 }
 
 internal readonly record struct SessionPresentationResult(

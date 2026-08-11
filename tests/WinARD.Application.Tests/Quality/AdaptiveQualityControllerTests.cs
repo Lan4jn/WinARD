@@ -555,6 +555,40 @@ public sealed class AdaptiveQualityControllerTests
         return controller.CurrentLevel;
     }
 
+    [Fact]
+    public void Unavailable_locked_profile_is_preserved_as_an_unsatisfied_safe_level()
+    {
+        var profile = QualityProfile.CreateCustom(
+            1_000,
+            QualityColor.Color16,
+            QualityScale.Percent75,
+            FrameRefreshPolicy.Fixed(30),
+            allowAutomaticGrayscale: false,
+            bandwidthLocked: true,
+            colorLocked: true,
+            scaleLocked: true,
+            refreshLocked: true);
+        var unknown = new ArdDisplayCapabilities(
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            CapabilitySupport.Unknown,
+            false,
+            false,
+            null);
+
+        var controller = new AdaptiveQualityController(profile, unknown);
+        var decision = controller.Observe(Observation(Epoch));
+
+        Assert.Same(profile, controller.Profile);
+        Assert.False(controller.ConstraintsSatisfied);
+        Assert.Equal(QualityLevel.Q0, decision.Level);
+        Assert.False(decision.TargetSatisfied);
+        Assert.Equal(QualityDecisionReason.TargetUnsatisfied, decision.Reason);
+        Assert.Equal(30, decision.TargetFramesPerSecond);
+    }
+
     private static AdaptiveQualityController CreateController(
         long target = 1_000,
         QualityProfile? profile = null,

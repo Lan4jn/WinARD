@@ -74,6 +74,8 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     [Fact]
     public async Task Unknown_capabilities_fail_closed_instead_of_rejecting_a_locked_profile()
     {
+        var events = new ConcurrentQueue<string>();
+        var runtime = new TransitionRuntime(events, frameCount: 1);
         var locked = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
@@ -83,17 +85,21 @@ public sealed class AdaptiveQualitySessionIntegrationTests
             colorLocked: true,
             scaleLocked: true);
         await using var viewModel = new RemoteSessionViewModel(
-            new BlockingRuntime(),
+            runtime,
             new AsyncLifetime(),
-            new EventPresenter(new ConcurrentQueue<string>()),
+            new EventPresenter(events),
             new InlineDispatcher(),
             clipboardBridge: null,
             diagnosticSink: null,
             locked);
 
         viewModel.SetQualityProfile(locked);
+        await viewModel.StartAsync(default);
+        await runtime.SecondRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
+        Assert.Same(locked, viewModel.QualityProfile);
         Assert.Equal(30, viewModel.TargetFramesPerSecond);
+        Assert.DoesNotContain("ApplyTransition", events);
     }
 
     [Fact]

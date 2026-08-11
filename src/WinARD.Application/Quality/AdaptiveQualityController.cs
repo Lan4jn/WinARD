@@ -30,6 +30,7 @@ public sealed class AdaptiveQualityController
     private readonly QualityProfile profile;
     private readonly ArdDisplayCapabilities capabilities;
     private readonly ReadOnlyCollection<QualityLevel> availableLevels;
+    private readonly bool constraintsUnsatisfied;
     private DateTimeOffset? lastTimestamp;
     private DateTimeOffset? nextLevelChangeAllowedAt;
     private bool lastLevelChangeWasDegrade;
@@ -51,7 +52,11 @@ public sealed class AdaptiveQualityController
         this.profile = profile;
         this.capabilities = capabilities;
         decoderGates ??= new QualityDecoderGates();
-        availableLevels = BuildAvailableLevels(profile, capabilities, decoderGates);
+        var supportedLevels = BuildAvailableLevels(profile, capabilities, decoderGates);
+        constraintsUnsatisfied = supportedLevels.Count == 0;
+        availableLevels = constraintsUnsatisfied
+            ? new List<QualityLevel> { QualityLevel.Q0 }.AsReadOnly()
+            : supportedLevels;
         CurrentLevel = SelectInitialLevel(profile, availableLevels);
     }
 
@@ -60,6 +65,10 @@ public sealed class AdaptiveQualityController
     { get; } = Array.AsReadOnly(FixedQualityTable);
 
     public QualityLevel CurrentLevel { get; private set; }
+
+    public QualityProfile Profile => profile;
+
+    public bool ConstraintsSatisfied => !constraintsUnsatisfied;
 
     public QualityDecision Observe(QualityObservation observation)
     {
@@ -157,7 +166,7 @@ public sealed class AdaptiveQualityController
             (observation.AverageBytesPerSecond5s > target.Value ||
              observation.PeakBytesPerSecond5s >= target.Value * 1.5) &&
             !CanMove(down: true);
-        if (cannotMeetTarget)
+        if (cannotMeetTarget || constraintsUnsatisfied)
         {
             targetSatisfied = false;
             reason = QualityDecisionReason.TargetUnsatisfied;
@@ -173,7 +182,7 @@ public sealed class AdaptiveQualityController
         state = nextState;
         var specification = FixedQualityTable[(int)CurrentLevel];
         var targetFramesPerSecond = TargetFramesPerSecond(nextState, CurrentLevel);
-        if (cannotMeetTarget && !HasLockedFixedRefresh(profile))
+        if ((cannotMeetTarget || constraintsUnsatisfied) && !HasLockedFixedRefresh(profile))
         {
             targetFramesPerSecond = Math.Min(targetFramesPerSecond, 30);
         }
@@ -414,11 +423,6 @@ public sealed class AdaptiveQualityController
             }
 
             result.Add(candidate.Level);
-        }
-
-        if (result.Count == 0)
-        {
-            throw new ArgumentException("The profile locks and observed capabilities leave no safe quality level.", nameof(profile));
         }
 
         return result.AsReadOnly();
