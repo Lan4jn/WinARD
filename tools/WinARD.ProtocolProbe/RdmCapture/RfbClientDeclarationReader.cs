@@ -106,12 +106,12 @@ public static class RfbClientDeclarationReader
 
                 case 0x03:
                     {
-                        var payload = await input.ReadAsync(9, cancellationToken).ConfigureAwait(false);
+                        _ = await input.ReadAsync(9, cancellationToken).ConfigureAwait(false);
                         messages.Add(new CapturedClientMessage(
                             type,
                             "FramebufferUpdateRequest",
                             10,
-                            Convert.ToHexString(payload),
+                            null,
                             null));
                         return new RfbClientDeclarationResult(pixelFormat, encodings, messages, true, null);
                     }

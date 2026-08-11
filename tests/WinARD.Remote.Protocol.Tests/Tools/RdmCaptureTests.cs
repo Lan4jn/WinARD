@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -70,7 +71,7 @@ public sealed class RdmCaptureTests
                 null,
                 Convert.ToHexString(SHA256.HashData(viewerInfo))),
             result.Messages[0]);
-        Assert.Equal("000000000007800438", result.Messages[^1].NumericPayloadHex);
+        Assert.Null(result.Messages[^1].NumericPayloadHex);
 
         var report = new RdmCaptureReport(
             1,
@@ -126,7 +127,7 @@ public sealed class RdmCaptureTests
                     0x03,
                     "FramebufferUpdateRequest",
                     10,
-                    "010001000200030004",
+                    null,
                     null),
                 message));
     }
@@ -173,6 +174,23 @@ public sealed class RdmCaptureTests
             RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None));
 
         Assert.Equal("The RFB client declaration exceeds 64 messages.", exception.Message);
+    }
+
+    [Fact]
+    public async Task Declaration_reader_accepts_framebuffer_request_as_exactly_64th_message()
+    {
+        byte[] setMode = [0x0A, 0x00, 0x00, 0x01];
+        byte[] framebufferRequest = [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x80, 0x04, 0x38];
+        await using var stream = new MemoryStream(
+            [.. Enumerable.Range(0, 63).SelectMany(_ => setMode), .. framebufferRequest]);
+
+        var result = await RfbClientDeclarationReader.ReadAsync(stream, CancellationToken.None);
+
+        Assert.True(result.ReachedFramebufferRequest);
+        Assert.Null(result.StoppedAtUnknownMessageType);
+        Assert.Equal(64, result.Messages.Count);
+        Assert.Equal("FramebufferUpdateRequest", result.Messages[^1].Name);
+        Assert.Null(result.Messages[^1].NumericPayloadHex);
     }
 
     [Fact]
@@ -358,6 +376,54 @@ public sealed class RdmCaptureTests
 
         Assert.Equal("RDM capture made no progress for 10 seconds.", exception.Message);
         Assert.DoesNotContain("RFB", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Capture_server_resets_inactivity_timeout_while_declaration_bytes_keep_progressing()
+    {
+        var inactivityTimeout = TimeSpan.FromSeconds(1);
+        var progressInterval = TimeSpan.FromMilliseconds(400);
+        using var hardTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cancellationToken = hardTimeout.Token;
+        var port = ReserveLoopbackPort();
+        var serverTask = new RdmCaptureServer(inactivityTimeout).CaptureOnceAsync(
+            port,
+            "adaptive-default",
+            cancellationToken);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port, cancellationToken);
+        await using var stream = client.GetStream();
+        using var username = SecretMaterial.FromUtf8("synthetic-user");
+        using var password = SecretMaterial.FromUtf8("synthetic-password");
+        var handshake = await RfbHandshake.NegotiateAsync(stream, cancellationToken);
+        using var authentication = await new ArdAuthenticator().AuthenticateAsync(
+            stream,
+            handshake.Version,
+            username,
+            password,
+            cancellationToken);
+        await stream.WriteAsync(new byte[] { 0xC1 }, cancellationToken);
+        var serverInitHeader = await ReadExactlyAsync(stream, 24, cancellationToken);
+        var extendedNameLength = checked((int)BinaryPrimitives.ReadUInt32BigEndian(serverInitHeader.AsSpan(20)));
+        _ = await ReadExactlyAsync(stream, extendedNameLength, cancellationToken);
+
+        byte[] framebufferRequest = [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x80, 0x04, 0x38];
+        var progressStopwatch = Stopwatch.StartNew();
+        for (var offset = 0; offset < framebufferRequest.Length; offset += 2)
+        {
+            await stream.WriteAsync(framebufferRequest.AsMemory(offset, 2), cancellationToken);
+            if (offset + 2 < framebufferRequest.Length)
+            {
+                await Task.Delay(progressInterval, cancellationToken);
+            }
+        }
+
+        var report = await serverTask.WaitAsync(cancellationToken);
+
+        Assert.True(progressStopwatch.Elapsed > inactivityTimeout);
+        Assert.True(report.ReachedFramebufferRequest);
+        Assert.Null(report.StoppedAtUnknownMessageType);
+        Assert.Null(report.Messages[^1].NumericPayloadHex);
     }
 
     [Fact]
