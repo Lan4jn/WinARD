@@ -380,7 +380,56 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     }
 
     [Fact]
-    public async Task Presentation_snapshot_read_during_profile_commit_is_entirely_old_or_new()
+    public async Task Diagnostic_snapshot_changes_only_when_the_matching_decision_commits()
+    {
+        var runtime = new StaleCompletingTransitionRuntime();
+        var capabilities = FullCapabilities();
+        var profile = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Color16,
+            QualityScale.Native,
+            FrameRefreshPolicy.Automatic,
+            allowAutomaticGrayscale: false,
+            colorLocked: true,
+            scaleLocked: true);
+        var coordinator = new QualityTransitionCoordinator(
+            runtime,
+            new RemoteQualitySettings(RemotePixelFormatKind.Bgra32, [6, 16, 0, 1, -239, -223], 1),
+            capabilities,
+            new QualityDecoderGates());
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new AsyncLifetime(),
+            new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            profile,
+            adaptiveQualityCapabilities: capabilities,
+            adaptiveQualityController: new AdaptiveQualityController(profile, capabilities),
+            qualityTransitionCoordinator: coordinator);
+        var initial = viewModel.CreateDiagnosticQualitySnapshot();
+
+        await viewModel.StartAsync(default);
+        await runtime.TransitionEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var whileTransitionPending = viewModel.CreateDiagnosticQualitySnapshot();
+
+        runtime.ReleaseTransition.TrySetResult();
+        await runtime.NextReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var committed = viewModel.CreateDiagnosticQualitySnapshot();
+
+        Assert.Same(initial, whileTransitionPending);
+        Assert.NotSame(initial, committed);
+        Assert.NotNull(committed.QualityPresentation.Decision);
+        Assert.Equal(
+            committed.QualityPresentation.Performance,
+            committed.Performance.Performance);
+        Assert.True(committed.Performance.Performance.SampleSequence > 0);
+        Assert.Equal(capabilities, committed.QualityCapabilities);
+    }
+
+    [Fact]
+    public async Task Diagnostic_snapshot_read_during_profile_commit_is_entirely_old_or_new()
     {
         var runtime = new StaleCompletingTransitionRuntime();
         var capabilities = FullCapabilities();
@@ -412,23 +461,38 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         await runtime.TransitionEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         runtime.ReleaseTransition.TrySetResult();
         await runtime.NextReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        var old = viewModel.QualityPresentationSnapshot;
-        var observed = new ConcurrentBag<QualityPresentationSnapshot>();
+        var old = viewModel.CreateDiagnosticQualitySnapshot();
+        var observed = new ConcurrentBag<RemoteSessionDiagnosticQualitySnapshot>();
+        using var start = new Barrier(participantCount: 2);
 
         var reader = Task.Run(() =>
         {
+            Assert.True(start.SignalAndWait(TimeSpan.FromSeconds(2)));
             for (var index = 0; index < 10_000; index++)
-                observed.Add(viewModel.QualityPresentationSnapshot);
+                observed.Add(viewModel.CreateDiagnosticQualitySnapshot());
         });
-        var writer = Task.Run(() => viewModel.SetQualityProfile(QualityProfile.Original));
+        var writer = Task.Run(() =>
+        {
+            Assert.True(start.SignalAndWait(TimeSpan.FromSeconds(2)));
+            viewModel.SetQualityProfile(QualityProfile.Original);
+        });
         await Task.WhenAll(reader, writer);
-        var current = viewModel.QualityPresentationSnapshot;
+        var current = viewModel.CreateDiagnosticQualitySnapshot();
 
-        Assert.All(observed, snapshot => Assert.True(snapshot == old || snapshot == current));
-        Assert.Same(oldProfile, old.Profile);
-        Assert.NotNull(old.Decision);
-        Assert.Same(QualityProfile.Original, current.Profile);
-        Assert.Null(current.Decision);
+        Assert.All(observed, snapshot =>
+        {
+            var presentation = snapshot.QualityPresentation;
+            Assert.True(ReferenceEquals(snapshot, old) || ReferenceEquals(snapshot, current));
+            Assert.Equal(presentation.Performance, snapshot.Performance.Performance);
+            Assert.Equal(
+                snapshot.Performance.Performance.ActualFramesPerSecond,
+                snapshot.QualityObservation.ActualFramesPerSecond);
+            Assert.Equal(capabilities, snapshot.QualityCapabilities);
+        });
+        Assert.Same(oldProfile, old.QualityPresentation.Profile);
+        Assert.NotNull(old.QualityPresentation.Decision);
+        Assert.Same(QualityProfile.Original, current.QualityPresentation.Profile);
+        Assert.Null(current.QualityPresentation.Decision);
     }
 
     [Fact]

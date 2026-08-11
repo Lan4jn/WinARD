@@ -14,6 +14,12 @@ using WinARD.Remote.Protocol.Errors;
 
 namespace WinARD.Desktop.ViewModels;
 
+internal sealed record RemoteSessionDiagnosticQualitySnapshot(
+    SessionPerformanceDiagnosticSnapshot Performance,
+    QualityPresentationSnapshot QualityPresentation,
+    QualityObservation QualityObservation,
+    ArdDisplayCapabilities QualityCapabilities);
+
 public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 {
     // Bound diagnostics work for malformed or adversarial exception graphs.
@@ -67,6 +73,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private QualityTransitionStatus _latestQualityTransitionStatus = QualityTransitionStatus.NoChange;
     private long _qualityPresentationVersion;
     private QualityPresentationSnapshot _qualityPresentationSnapshot = null!;
+    private RemoteSessionDiagnosticQualitySnapshot _diagnosticQualitySnapshot = null!;
     private long _qualityDecisionGeneration;
     private long _qualityProfileEpoch;
     private int _pendingScrollInput;
@@ -200,6 +207,11 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             _performance,
             _qualityProfileEpoch,
             _qualityPresentationVersion);
+        Volatile.Write(
+            ref _diagnosticQualitySnapshot,
+            CreateDiagnosticQualitySnapshotNoLock(
+                _performanceTracker.CreateDiagnosticQualityMeasurements(),
+                _qualityPresentationSnapshot));
         RefreshFrameRefreshOptions();
         _inputMapper = new WindowsInputMapper(_session.SendKeyAsync);
         _pointerWrites = new RemotePointerWriteCoalescer(
@@ -257,14 +269,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     internal QualityPresentationSnapshot QualityPresentationSnapshot =>
         Volatile.Read(ref _qualityPresentationSnapshot);
 
-    internal SessionPerformanceDiagnosticSnapshot DiagnosticPerformance =>
-        _performanceTracker.CurrentDiagnostics;
-
-    internal QualityObservation DiagnosticQualityObservation =>
-        _performanceTracker.CreateQualityObservation();
-
-    internal ArdDisplayCapabilities DiagnosticQualityCapabilities =>
-        _adaptiveQualityCapabilities;
+    internal RemoteSessionDiagnosticQualitySnapshot CreateDiagnosticQualitySnapshot() =>
+        Volatile.Read(ref _diagnosticQualitySnapshot);
 
     internal bool HasPendingPerformancePublication =>
         Volatile.Read(ref _activePerformancePublicationCount) != 0;
@@ -329,6 +335,11 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 Performance,
                 _qualityProfileEpoch,
                 _qualityPresentationVersion);
+            Volatile.Write(
+                ref _diagnosticQualitySnapshot,
+                CreateDiagnosticQualitySnapshotNoLock(
+                    _performanceTracker.CreateDiagnosticQualityMeasurements(),
+                    _qualityPresentationSnapshot));
             RefreshFrameRefreshOptions();
         }
 
@@ -1014,6 +1025,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         var runtime = _session.PerformanceSnapshot;
         var targetChanged = false;
         SessionPerformanceSnapshot snapshot;
+        SessionDiagnosticQualityMeasurements decisionMeasurements;
         QualityDecision decision;
         bool constraintsSatisfied;
         long profileEpoch;
@@ -1034,8 +1046,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 SaturatingPendingCount(
                     Math.Max(0, runtime.InputQueueDepth),
                     _pointerWrites.Snapshot.PendingDepth));
-            var localDecision = _adaptiveQualityController.Observe(
-                _performanceTracker.CreateQualityObservation());
+            decisionMeasurements = _performanceTracker.CreateDiagnosticQualityMeasurements();
+            var localDecision = _adaptiveQualityController.Observe(decisionMeasurements.Observation);
             decision = WithGlobalGeneration(localDecision);
             constraintsSatisfied = _adaptiveQualityController.ConstraintsSatisfied;
             profileEpoch = _qualityProfileEpoch;
@@ -1132,6 +1144,15 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 snapshot,
                 _qualityProfileEpoch,
                 _qualityPresentationVersion);
+            var diagnosticPresentation = _qualityPresentationSnapshot with
+            {
+                Performance = decisionMeasurements.Performance.Performance,
+            };
+            Volatile.Write(
+                ref _diagnosticQualitySnapshot,
+                CreateDiagnosticQualitySnapshotNoLock(
+                    decisionMeasurements,
+                    diagnosticPresentation));
         }
 
         if (presentationChanged || performancePublished)
@@ -1143,6 +1164,14 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
         return transitionStatus;
     }
+
+    private RemoteSessionDiagnosticQualitySnapshot CreateDiagnosticQualitySnapshotNoLock(
+        SessionDiagnosticQualityMeasurements measurements,
+        QualityPresentationSnapshot presentation) => new(
+            measurements.Performance,
+            presentation,
+            measurements.Observation,
+            _adaptiveQualityCapabilities);
 
     private int? ResolveTarget(FrameRefreshPolicy policy, int automaticTarget) => policy.Mode switch
     {

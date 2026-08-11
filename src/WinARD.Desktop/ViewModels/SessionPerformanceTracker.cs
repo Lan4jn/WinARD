@@ -50,6 +50,10 @@ public sealed record SessionPerformanceDiagnosticSnapshot
     public long OtherEncodingCount { get; }
 }
 
+internal sealed record SessionDiagnosticQualityMeasurements(
+    SessionPerformanceDiagnosticSnapshot Performance,
+    QualityObservation Observation);
+
 internal sealed class SessionPerformanceTracker
 {
     private const double NewSampleWeight = 0.25;
@@ -117,15 +121,19 @@ internal sealed class SessionPerformanceTracker
         {
             lock (_sync)
             {
-                return new SessionPerformanceDiagnosticSnapshot(
-                    _current,
-                    _presentationMilliseconds is { } presentation
-                        ? RoundMilliseconds(presentation)
-                        : 0,
-                    _automaticTargetChanges,
-                    _cumulativeEncodingCounts,
-                    _otherEncodingCount);
+                return CreateCurrentDiagnosticsNoLock();
             }
+        }
+    }
+
+    public SessionDiagnosticQualityMeasurements CreateDiagnosticQualityMeasurements()
+    {
+        lock (_sync)
+        {
+            var observation = CreateQualityObservationNoLock(decodeTime: null);
+            return new SessionDiagnosticQualityMeasurements(
+                CreateCurrentDiagnosticsNoLock(),
+                observation);
         }
     }
 
@@ -194,44 +202,50 @@ internal sealed class SessionPerformanceTracker
 
         lock (_sync)
         {
-            var now = _timeProvider.GetTimestamp();
-            PrepareTimestampNoLock(now);
-            PruneQualityIntervalsNoLock(now);
-            double totalBytesPerSecond = 0;
-            double totalFramesPerSecond = 0;
-            double peakBytesPerSecond = 0;
-            double dirtyCoverage = 0;
-            double totalOverlapSeconds = 0;
-            foreach (var interval in _qualityIntervals)
-            {
-                var ageAtEnd = SafeElapsed(interval.EndTimestamp, now).TotalSeconds;
-                var overlapSeconds = Math.Min(
-                    interval.DurationSeconds,
-                    QualityObservationDuration.TotalSeconds - ageAtEnd);
-                if (overlapSeconds <= 0)
-                {
-                    continue;
-                }
+            return CreateQualityObservationNoLock(decodeTime);
+        }
+    }
 
-                totalOverlapSeconds += overlapSeconds;
-                totalBytesPerSecond += interval.BytesPerSecond * overlapSeconds;
-                totalFramesPerSecond += interval.FramesPerSecond * overlapSeconds;
-                peakBytesPerSecond = Math.Max(peakBytesPerSecond, interval.BytesPerSecond);
-                dirtyCoverage = Math.Max(dirtyCoverage, interval.DirtyCoverage);
+    private QualityObservation CreateQualityObservationNoLock(TimeSpan? decodeTime)
+    {
+        var now = _timeProvider.GetTimestamp();
+        PrepareTimestampNoLock(now);
+        PruneQualityIntervalsNoLock(now);
+        double totalBytesPerSecond = 0;
+        double totalFramesPerSecond = 0;
+        double peakBytesPerSecond = 0;
+        double dirtyCoverage = 0;
+        double totalOverlapSeconds = 0;
+        foreach (var interval in _qualityIntervals)
+        {
+            var ageAtEnd = SafeElapsed(interval.EndTimestamp, now).TotalSeconds;
+            var overlapSeconds = Math.Min(
+                interval.DurationSeconds,
+                QualityObservationDuration.TotalSeconds - ageAtEnd);
+            if (overlapSeconds <= 0)
+            {
+                continue;
             }
 
-            var averageBytesPerSecond = totalOverlapSeconds == 0
-                ? 0
-                : Math.Min(peakBytesPerSecond, totalBytesPerSecond / totalOverlapSeconds);
-            var averageFramesPerSecond = totalOverlapSeconds == 0
-                ? 0
-                : totalFramesPerSecond / totalOverlapSeconds;
-            var sinceLastInput = _lastInputTimestamp is { } lastInput
-                ? SafeElapsed(lastInput, now)
-                : TimeSpan.Zero;
-            var activity = CreateActivitySnapshotNoLock(now);
+            totalOverlapSeconds += overlapSeconds;
+            totalBytesPerSecond += interval.BytesPerSecond * overlapSeconds;
+            totalFramesPerSecond += interval.FramesPerSecond * overlapSeconds;
+            peakBytesPerSecond = Math.Max(peakBytesPerSecond, interval.BytesPerSecond);
+            dirtyCoverage = Math.Max(dirtyCoverage, interval.DirtyCoverage);
+        }
 
-            return new QualityObservation(
+        var averageBytesPerSecond = totalOverlapSeconds == 0
+            ? 0
+            : Math.Min(peakBytesPerSecond, totalBytesPerSecond / totalOverlapSeconds);
+        var averageFramesPerSecond = totalOverlapSeconds == 0
+            ? 0
+            : totalFramesPerSecond / totalOverlapSeconds;
+        var sinceLastInput = _lastInputTimestamp is { } lastInput
+            ? SafeElapsed(lastInput, now)
+            : TimeSpan.Zero;
+        var activity = CreateActivitySnapshotNoLock(now);
+
+        return new QualityObservation(
                 _timeProvider.GetUtcNow(),
                 ClampFiniteNonNegative(averageBytesPerSecond),
                 ClampFiniteNonNegative(peakBytesPerSecond),
@@ -247,8 +261,14 @@ internal sealed class SessionPerformanceTracker
                 activity.PointerDragActive,
                 activity.ScrollActive,
                 activity.PendingInputCount);
-        }
     }
+
+    private SessionPerformanceDiagnosticSnapshot CreateCurrentDiagnosticsNoLock() => new(
+        _current,
+        _presentationMilliseconds is { } presentation ? RoundMilliseconds(presentation) : 0,
+        _automaticTargetChanges,
+        _cumulativeEncodingCounts,
+        _otherEncodingCount);
 
     public void RecordAutomaticTargetChange()
     {

@@ -11,12 +11,13 @@ internal static class DesktopDiagnosticContextFactory
 {
     public static DiagnosticExportContext CreateSession(
         ConnectionProfile? profile,
-        SessionPerformanceDiagnosticSnapshot session,
-        QualityPresentationSnapshot? qualityPresentation = null,
-        QualityObservation? qualityObservation = null,
-        ArdDisplayCapabilities? qualityCapabilities = null)
+        RemoteSessionDiagnosticQualitySnapshot snapshot)
     {
-        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var session = snapshot.Performance;
+        var qualityPresentation = snapshot.QualityPresentation;
+        var qualityObservation = snapshot.QualityObservation;
+        var qualityCapabilities = snapshot.QualityCapabilities;
         var performance = session.Performance;
         var counters = new Dictionary<string, long>(StringComparer.Ordinal)
         {
@@ -56,8 +57,7 @@ internal static class DesktopDiagnosticContextFactory
             ];
         return Create(profiles, counters) with
         {
-            Quality = qualityPresentation?.Decision is not { } decision ||
-                qualityObservation is null || qualityCapabilities is null
+            Quality = qualityPresentation.Decision is not { } decision
                 ? null
                 : BuildQualitySummary(
                     qualityPresentation.Profile,

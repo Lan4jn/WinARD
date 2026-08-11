@@ -1300,10 +1300,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             this,
             DesktopDiagnosticContextFactory.CreateSession(
                 Volatile.Read(ref _profile),
-                ViewModel.DiagnosticPerformance,
-                ViewModel.QualityPresentationSnapshot,
-                ViewModel.DiagnosticQualityObservation,
-                ViewModel.DiagnosticQualityCapabilities),
+                ViewModel.CreateDiagnosticQualitySnapshot()),
             cancellationToken);
         if (path is not null && !_diagnosticExportState.IsClosing)
         {

@@ -168,10 +168,11 @@ public sealed class RemoteSessionDiagnosticExportStateTests
             Version: 1);
         var context = DesktopDiagnosticContextFactory.CreateSession(
             profile,
-            session,
-            presentation,
-            observation,
-            capabilities);
+            new RemoteSessionDiagnosticQualitySnapshot(
+                session,
+                presentation,
+                observation,
+                capabilities));
         var destination = Path.Combine(Path.GetTempPath(), $"winard-session-diag-{Guid.NewGuid():N}.zip");
         try
         {
@@ -271,7 +272,9 @@ public sealed class RemoteSessionDiagnosticExportStateTests
 
         var context = DesktopDiagnosticContextFactory.CreateSession(
             profile,
-            new SessionPerformanceDiagnosticSnapshot(performance, 0, 0, new Dictionary<int, long>()));
+            CreateDiagnosticSnapshot(
+                profile,
+                new SessionPerformanceDiagnosticSnapshot(performance, 0, 0, new Dictionary<int, long>())));
 
         Assert.DoesNotContain("Session.TargetFps", context.PerformanceCounters.Keys);
         Assert.DoesNotContain(context.PerformanceCounters.Keys, key =>
@@ -295,7 +298,9 @@ public sealed class RemoteSessionDiagnosticExportStateTests
 
         var context = DesktopDiagnosticContextFactory.CreateSession(
             profile: null,
-            new SessionPerformanceDiagnosticSnapshot(performance, 0, 0, new Dictionary<int, long>()));
+            CreateDiagnosticSnapshot(
+                profile: null,
+                new SessionPerformanceDiagnosticSnapshot(performance, 0, 0, new Dictionary<int, long>())));
 
         Assert.Empty(context.Profiles);
         Assert.DoesNotContain("Session.ReceiveRateInsideSshTunnel", context.PerformanceCounters.Keys);
@@ -322,9 +327,42 @@ public sealed class RemoteSessionDiagnosticExportStateTests
             new Dictionary<int, long> { [-1] = long.MaxValue, [-2] = 1 });
         var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.internal", 5900, "operator");
 
-        var context = DesktopDiagnosticContextFactory.CreateSession(profile, session);
+        var context = DesktopDiagnosticContextFactory.CreateSession(
+            profile,
+            CreateDiagnosticSnapshot(profile, session));
 
         Assert.Equal(long.MaxValue, context.Profiles[0].EncodingStatistics!["Encoding.Other"]);
+    }
+
+    private static RemoteSessionDiagnosticQualitySnapshot CreateDiagnosticSnapshot(
+        ConnectionProfile? profile,
+        SessionPerformanceDiagnosticSnapshot performance)
+    {
+        var presentation = new QualityPresentationSnapshot(
+            profile?.Quality ?? QualityProfile.Automatic,
+            Decision: null,
+            QualityTransitionStatus.NoChange,
+            performance.Performance,
+            Epoch: 0,
+            Version: 0);
+        var observation = new QualityObservation(
+            DateTimeOffset.UnixEpoch,
+            averageBytesPerSecond5s: performance.Performance.ReceiveBytesPerSecond,
+            peakBytesPerSecond5s: performance.Performance.ReceiveBytesPerSecond,
+            actualFramesPerSecond: performance.Performance.ActualFramesPerSecond,
+            responseTime: TimeSpan.FromMilliseconds(performance.Performance.ResponseMilliseconds),
+            decodeTime: TimeSpan.Zero,
+            presentationTime: TimeSpan.FromMilliseconds(performance.PresentationMilliseconds),
+            dirtyCoverage: 0,
+            sinceLastInput: TimeSpan.Zero,
+            pointerDragActive: false,
+            scrollActive: false,
+            pendingInputCount: 0);
+        return new RemoteSessionDiagnosticQualitySnapshot(
+            performance,
+            presentation,
+            observation,
+            ArdDisplayCapabilities.Unknown);
     }
 
     private static async Task<string> ReadEntryAsync(ZipArchive archive, string name)
