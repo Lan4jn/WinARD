@@ -9,7 +9,8 @@ public sealed record RfbSessionDeclaration
     {
         ArgumentNullException.ThrowIfNull(pixelFormat);
         ArgumentNullException.ThrowIfNull(encodings);
-        if (encodings.Count > ushort.MaxValue)
+        var encodingSnapshot = encodings.ToArray();
+        if (encodingSnapshot.Length > ushort.MaxValue)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(encodings),
@@ -17,7 +18,7 @@ public sealed record RfbSessionDeclaration
         }
 
         PixelFormat = pixelFormat;
-        Encodings = Array.AsReadOnly(encodings.ToArray());
+        Encodings = Array.AsReadOnly(encodingSnapshot);
     }
 
     public static RfbSessionDeclaration Default { get; } = new(

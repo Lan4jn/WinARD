@@ -99,6 +99,27 @@ public sealed class RfbSessionInitializerTests
     }
 
     [Fact]
+    public async Task Session_declaration_validates_the_snapshot_before_initializer_io()
+    {
+        var encodings = new MisreportedEncodingList(
+            reportedCount: 0,
+            actualCount: ushort.MaxValue + 1);
+        await using var stream = new ScriptedDuplexStream([]);
+
+        var exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                Handshake(RfbVersion.V3_8),
+                new RfbSessionDeclaration(PixelFormat.WinArdBgra32, encodings),
+                ProtocolLimits.Default,
+                CancellationToken.None));
+
+        Assert.Equal("encodings", exception.ParamName);
+        Assert.Empty(stream.WrittenBytes);
+        Assert.Equal(0, stream.ReadPosition);
+    }
+
+    [Fact]
     public async Task Session_declaration_controls_standard_pixel_format_and_encoding_wire_order()
     {
         var declaration = new RfbSessionDeclaration(
@@ -131,6 +152,42 @@ public sealed class RfbSessionInitializerTests
             [typeof(Stream), typeof(RfbHandshakeResult), typeof(ProtocolLimits), typeof(CancellationToken)]);
 
         Assert.NotNull(overload);
+    }
+
+    [Fact]
+    public void Initializer_public_overload_shapes_remain_available()
+    {
+        Assert.NotNull(typeof(RfbSessionInitializer).GetMethod(
+            nameof(RfbSessionInitializer.InitializeAsync),
+            [typeof(Stream), typeof(RfbHandshakeResult), typeof(ProtocolLimits), typeof(CancellationToken)]));
+        Assert.NotNull(typeof(RfbSessionInitializer).GetMethod(
+            nameof(RfbSessionInitializer.InitializeAsync),
+            [
+                typeof(Stream),
+                typeof(RfbHandshakeResult),
+                typeof(ProtocolLimits),
+                typeof(ArdSessionEncryption),
+                typeof(CancellationToken),
+            ]));
+        Assert.NotNull(typeof(RfbSessionInitializer).GetMethod(
+            nameof(RfbSessionInitializer.InitializeAsync),
+            [
+                typeof(Stream),
+                typeof(RfbHandshakeResult),
+                typeof(RfbSessionDeclaration),
+                typeof(ProtocolLimits),
+                typeof(CancellationToken),
+            ]));
+        Assert.NotNull(typeof(RfbSessionInitializer).GetMethod(
+            nameof(RfbSessionInitializer.InitializeAsync),
+            [
+                typeof(Stream),
+                typeof(RfbHandshakeResult),
+                typeof(ProtocolLimits),
+                typeof(RfbSessionDeclaration),
+                typeof(ArdSessionEncryption),
+                typeof(CancellationToken),
+            ]));
     }
 
     [Fact]
@@ -1039,6 +1096,17 @@ public sealed class RfbSessionInitializerTests
         }
 
         return message;
+    }
+
+    private sealed class MisreportedEncodingList(int reportedCount, int actualCount) : IReadOnlyList<int>
+    {
+        public int Count => reportedCount;
+
+        public int this[int index] => 0;
+
+        public IEnumerator<int> GetEnumerator() => Enumerable.Repeat(0, actualCount).GetEnumerator();
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     private static byte[] ExtendedNameField(uint flags, byte[] bitmap, string displayName)
