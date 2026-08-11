@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using WinARD.ProtocolProbe;
+using WinARD.ProtocolProbe.EncodingResearch;
 using WinARD.ProtocolProbe.RdmCapture;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
@@ -166,6 +167,87 @@ public sealed class ProtocolProbeTests
         Assert.DoesNotContain("MVS", comparison, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("payload", comparison, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("private-workstation", comparison, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Encoding_prefix_output_formatter_emits_only_safe_metadata()
+    {
+        var capture = new EncodingPrefixCapture(
+            1,
+            12345,
+            new CapturedRectangle(0, 0, 1920, 1080),
+            4,
+            new string('A', 64),
+            [0xDE, 0xAD, 0xBE, 0xEF]);
+
+        var formatted = ProbeOutput.FormatEncodingPrefixCaptured(capture);
+
+        Assert.Equal(
+            "Encoding prefix captured: signed encoding ID 12345, rectangle (0,0) 1920x1080, 4 bytes. Saved as manifest.json and payload-prefix.bin.",
+            formatted);
+        Assert.DoesNotContain("DEADBEEF", formatted, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(capture.PayloadSha256, formatted, StringComparison.Ordinal);
+        Assert.DoesNotContain("MVS", formatted, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Differential_prefix_command_dispatches_capture_without_printing_sensitive_values()
+    {
+        const string host = "private-workstation.invalid";
+        const string usernameText = "private-user";
+        const string passwordText = "private-password";
+        var calls = 0;
+        using var output = new StringWriter(CultureInfo.InvariantCulture);
+        using var error = new StringWriter(CultureInfo.InvariantCulture);
+
+        var exitCode = await global::Program.RunAsync(
+            [
+                "--capture-differential-prefix",
+                "baseline.json",
+                "adaptive.json",
+                "prefix-output",
+                "--confirm-synthetic-screen",
+            ],
+            name => name switch
+            {
+                "WINARD_HOST" => host,
+                "WINARD_USERNAME" => usernameText,
+                "WINARD_PORT" => "5900",
+                _ => null,
+            },
+            output,
+            error,
+            CancellationToken.None,
+            captureEncodingPrefix: (capturedHost, port, username, password, baseline, adaptive, directory, confirmed, _) =>
+            {
+                calls++;
+                Assert.Equal(host, capturedHost);
+                Assert.Equal(5900, port);
+                Assert.Equal("baseline.json", baseline);
+                Assert.Equal("adaptive.json", adaptive);
+                Assert.Equal("prefix-output", directory);
+                Assert.True(confirmed);
+                Assert.Equal(usernameText.Length, username.Length);
+                Assert.Equal(passwordText.Length, password.Length);
+                return Task.FromResult(new EncodingPrefixCapture(
+                    1,
+                    12345,
+                    new CapturedRectangle(0, 0, 1920, 1080),
+                    4,
+                    new string('A', 64),
+                    [1, 2, 3, 4]));
+            },
+            readPassword: _ => SecretMaterial.FromUtf8(passwordText));
+
+        var console = output.ToString();
+        Assert.Equal(0, exitCode);
+        Assert.Equal(1, calls);
+        Assert.Equal(string.Empty, error.ToString());
+        Assert.Contains("Encoding prefix captured", console, StringComparison.Ordinal);
+        Assert.DoesNotContain(host, console, StringComparison.Ordinal);
+        Assert.DoesNotContain(usernameText, console, StringComparison.Ordinal);
+        Assert.DoesNotContain(passwordText, console, StringComparison.Ordinal);
+        Assert.DoesNotContain("01020304", console, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]

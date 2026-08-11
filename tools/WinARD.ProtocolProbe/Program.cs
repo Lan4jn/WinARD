@@ -1,5 +1,6 @@
 using System.Globalization;
 using WinARD.ProtocolProbe;
+using WinARD.ProtocolProbe.EncodingResearch;
 using WinARD.ProtocolProbe.RdmCapture;
 using WinARD.Remote.Protocol.Authentication;
 
@@ -61,7 +62,9 @@ internal static class Program
         TextWriter output,
         TextWriter error,
         CancellationToken cancellationToken,
-        Func<int, string, CancellationToken, Task<RdmCaptureReport>>? captureRdm = null)
+        Func<int, string, CancellationToken, Task<RdmCaptureReport>>? captureRdm = null,
+        EncodingPrefixCaptureOperation? captureEncodingPrefix = null,
+        Func<CancellationToken, ISecretMaterial?>? readPassword = null)
     {
         ArgumentNullException.ThrowIfNull(readEnvironmentVariable);
         ArgumentNullException.ThrowIfNull(output);
@@ -119,11 +122,29 @@ internal static class Program
             }
 
             using var username = SecretMaterial.FromUtf8(usernameText);
-            using var password = HiddenPasswordReader.Read(new SystemPasswordConsole(), cancellationToken);
+            readPassword ??= token => HiddenPasswordReader.Read(new SystemPasswordConsole(), token);
+            using var password = readPassword(cancellationToken);
             if (password is null)
             {
                 PrintUsage(error);
                 return 2;
+            }
+
+            if (request.Mode == ProbeMode.CaptureDifferentialEncodingPrefix)
+            {
+                captureEncodingPrefix ??= new EncodingPrefixCaptureRunner().RunAsync;
+                var prefixCapture = await captureEncodingPrefix(
+                    host,
+                    port,
+                    username,
+                    password,
+                    request.BaselineCapturePath!,
+                    request.AdaptiveCapturePath!,
+                    request.OutputPath!,
+                    request.SyntheticScreenConfirmed,
+                    cancellationToken).ConfigureAwait(false);
+                output.WriteLine(ProbeOutput.FormatEncodingPrefixCaptured(prefixCapture));
+                return 0;
             }
 
             var result = await new ProbeRunner().RunRequestAsync(

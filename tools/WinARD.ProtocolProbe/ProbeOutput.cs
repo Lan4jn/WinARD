@@ -1,5 +1,7 @@
 namespace WinARD.ProtocolProbe;
 
+using WinARD.ProtocolProbe.EncodingResearch;
+
 public static class ProbeOutput
 {
     private const int MaximumDisplayedDirtyRectangles = 8;
@@ -40,6 +42,15 @@ public static class ProbeOutput
 
     public static string FormatRdmComparisonCandidate(int encodingId) =>
         $"RDM comparison candidate signed encoding ID: {encodingId}.";
+
+    public static string FormatEncodingPrefixCaptured(EncodingPrefixCapture capture)
+    {
+        ArgumentNullException.ThrowIfNull(capture);
+        return $"Encoding prefix captured: signed encoding ID {capture.EncodingId}, "
+            + $"rectangle ({capture.Rectangle.X},{capture.Rectangle.Y}) "
+            + $"{capture.Rectangle.Width}x{capture.Rectangle.Height}, {capture.PrefixLength} bytes. "
+            + "Saved as manifest.json and payload-prefix.bin.";
+    }
 
     public static string FormatFailure(Exception exception)
     {
