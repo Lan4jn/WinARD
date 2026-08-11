@@ -7,7 +7,6 @@ using System.Text;
 using System.Text.Json;
 using WinARD.ProtocolProbe;
 using WinARD.ProtocolProbe.EncodingResearch;
-using WinARD.ProtocolProbe.RdmCapture;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Encodings;
@@ -22,7 +21,7 @@ namespace WinARD.Remote.Protocol.Tests.Tools;
 
 public sealed class EncodingPrefixCaptureTests
 {
-    private const int CandidateEncoding = 12345;
+    private const int CandidateEncoding = 1002;
 
     [Fact]
     public void Capture_snapshots_the_constructor_payload()
@@ -89,14 +88,17 @@ public sealed class EncodingPrefixCaptureTests
     }
 
     [Fact]
-    public async Task Reader_rejects_raw_fallback()
+    public async Task Reader_reports_stable_candidate_not_observed_category_and_encoding()
     {
-        await using var stream = new MemoryStream(CreateUpdate(0, [1, 2, 3, 4], includeLength: false));
+        await using var stream = new MemoryStream(
+            CreateUpdate(0, [1, 2, 3, 4], includeLength: false, width: 0, height: 0));
 
-        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var exception = await Assert.ThrowsAsync<EncodingCandidateNotObservedException>(() =>
             EncodingPrefixReader.ReadAsync(stream, CandidateEncoding, 1024, CancellationToken.None));
 
-        Assert.Contains("Raw", exception.Message, StringComparison.Ordinal);
+        Assert.Equal("candidate-not-observed", exception.Category);
+        Assert.Equal(0, exception.ObservedEncodingId);
+        Assert.Equal(16, stream.Position);
     }
 
     [Fact]
@@ -173,6 +175,7 @@ public sealed class EncodingPrefixCaptureTests
             CancellationToken.None);
 
         Assert.Equal(7, capture.PrefixLength);
+        Assert.Equal(uint.MaxValue, capture.DeclaredPayloadLength);
         Assert.Equal(1, stream.PayloadReadCount);
         Assert.Equal(64 * 1024, stream.PayloadReadRequestedLength);
     }
@@ -241,6 +244,18 @@ public sealed class EncodingPrefixCaptureTests
     }
 
     [Fact]
+    public async Task Reader_rejects_zero_sized_candidate_rectangle()
+    {
+        await using var stream = new MemoryStream(
+            CreateUpdate(CandidateEncoding, [1], width: 0, height: 1));
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            EncodingPrefixReader.ReadAsync(stream, CandidateEncoding, 1024, CancellationToken.None));
+
+        Assert.Contains("non-zero", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Capture_file_writes_only_safe_manifest_and_payload_without_overwriting()
     {
         var directory = Path.Combine(Path.GetTempPath(), $"winard-prefix-{Guid.NewGuid():N}");
@@ -264,6 +279,8 @@ public sealed class EncodingPrefixCaptureTests
             Assert.Equal(1, root.GetProperty("schemaVersion").GetInt32());
             Assert.Equal(CandidateEncoding, root.GetProperty("encodingId").GetInt32());
             Assert.Equal(payload.Length, root.GetProperty("prefixLength").GetInt32());
+            Assert.Equal((uint)payload.Length, root.GetProperty("declaredPayloadLength").GetUInt32());
+            Assert.Equal(payload.Length, root.GetProperty("observedPrefixLength").GetInt32());
             Assert.True(root.GetProperty("syntheticScreenConfirmed").GetBoolean());
             Assert.DoesNotContain("payloadPrefix", manifest, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("host", manifest, StringComparison.OrdinalIgnoreCase);
@@ -279,6 +296,43 @@ public sealed class EncodingPrefixCaptureTests
             {
                 Directory.Delete(directory, recursive: true);
             }
+        }
+    }
+
+    [Fact]
+    public async Task Capture_file_creates_independent_bounded_sample_directories()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-prefix-set-{Guid.NewGuid():N}");
+        try
+        {
+            foreach (var sample in EncodingPrefixCaptureFile.RequiredSampleNames)
+            {
+                await EncodingPrefixCaptureFile.WriteSampleAsync(
+                    directory,
+                    CandidateEncoding,
+                    sample,
+                    CreateCapture([1, 2, 3, 4]),
+                    syntheticScreenConfirmed: true,
+                    CancellationToken.None);
+            }
+
+            Assert.Equal(
+                EncodingPrefixCaptureFile.RequiredSampleNames.Order(),
+                Directory.GetDirectories(directory)
+                    .Select(Path.GetFileName)
+                    .Order());
+            foreach (var manifestPath in Directory.GetFiles(directory, "manifest.json", SearchOption.AllDirectories))
+            {
+                var manifest = await File.ReadAllTextAsync(manifestPath);
+                Assert.DoesNotContain("host", manifest, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("user", manifest, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("password", manifest, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain(directory, manifest, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
     }
 
@@ -328,8 +382,7 @@ public sealed class EncodingPrefixCaptureTests
             5900,
             username,
             password,
-            "missing-baseline.json",
-            "missing-adaptive.json",
+            CandidateEncoding,
             "missing-output",
             syntheticScreenConfirmed: false,
             CancellationToken.None));
@@ -340,37 +393,28 @@ public sealed class EncodingPrefixCaptureTests
     }
 
     [Theory]
-    [InlineData(new int[0])]
-    [InlineData(new[] { 12345, 12346 })]
-    public async Task Runner_rejects_non_unique_differential_candidate_before_network(int[] adaptiveOnly)
+    [InlineData(1000)]
+    [InlineData(1003)]
+    public async Task Runner_rejects_non_allowlisted_candidate_before_network(int candidate)
     {
         var directory = Path.Combine(Path.GetTempPath(), $"winard-runner-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(directory);
-        var baselinePath = Path.Combine(directory, "baseline.json");
-        var adaptivePath = Path.Combine(directory, "adaptive.json");
-        await RdmCaptureFile.WriteAsync(baselinePath, CreateRdmReport([0]), CancellationToken.None);
-        await RdmCaptureFile.WriteAsync(
-            adaptivePath,
-            CreateRdmReport([0, .. adaptiveOnly]),
-            CancellationToken.None);
         using var username = SecretMaterial.FromUtf8("user");
         using var password = SecretMaterial.FromUtf8("password");
         try
         {
-            await Assert.ThrowsAsync<InvalidDataException>(() => new EncodingPrefixCaptureRunner().RunAsync(
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => new EncodingPrefixCaptureRunner().RunAsync(
                 "unresolvable.invalid",
                 5900,
                 username,
                 password,
-                baselinePath,
-                adaptivePath,
+                candidate,
                 Path.Combine(directory, "output"),
                 syntheticScreenConfirmed: true,
                 CancellationToken.None));
         }
         finally
         {
-            Directory.Delete(directory, recursive: true);
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
     }
 
@@ -390,16 +434,46 @@ public sealed class EncodingPrefixCaptureTests
                 5900,
                 username,
                 password,
-                Path.Combine(directory, "missing-baseline.json"),
-                Path.Combine(directory, "missing-adaptive.json"),
+                CandidateEncoding,
                 outputDirectory,
                 syntheticScreenConfirmed: true,
                 CancellationToken.None));
-            Assert.Contains("not empty", exception.Message, StringComparison.Ordinal);
+            Assert.Contains("already exists", exception.Message, StringComparison.Ordinal);
         }
         finally
         {
-            Directory.Delete(directory, recursive: true);
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Runner_removes_private_staging_when_sample_confirmation_fails()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-staging-{Guid.NewGuid():N}");
+        var outputDirectory = Path.Combine(directory, "output");
+        using var username = SecretMaterial.FromUtf8("user");
+        using var password = SecretMaterial.FromUtf8("password");
+        try
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                new EncodingPrefixCaptureRunner(
+                    TimeSpan.FromSeconds(5),
+                    (_, _) => throw new InvalidOperationException("sample not confirmed")).RunAsync(
+                    "unresolvable.invalid",
+                    5900,
+                    username,
+                    password,
+                    CandidateEncoding,
+                    outputDirectory,
+                    syntheticScreenConfirmed: true,
+                    CancellationToken.None));
+
+            Assert.False(Directory.Exists(outputDirectory));
+            Assert.Empty(Directory.GetDirectories(directory, "output.staging-*"));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
     }
 
@@ -407,11 +481,6 @@ public sealed class EncodingPrefixCaptureTests
     public async Task Runner_maps_overall_timeout_to_probe_timeout()
     {
         var directory = Path.Combine(Path.GetTempPath(), $"winard-timeout-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(directory);
-        var baselinePath = Path.Combine(directory, "baseline.json");
-        var adaptivePath = Path.Combine(directory, "adaptive.json");
-        await RdmCaptureFile.WriteAsync(baselinePath, CreateRdmReport([0]), CancellationToken.None);
-        await RdmCaptureFile.WriteAsync(adaptivePath, CreateRdmReport([0, CandidateEncoding]), CancellationToken.None);
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var accepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -433,13 +502,14 @@ public sealed class EncodingPrefixCaptureTests
         try
         {
             var exception = await Assert.ThrowsAsync<ProbeTimeoutException>(() =>
-                new EncodingPrefixCaptureRunner(TimeSpan.FromMilliseconds(200)).RunAsync(
+                new EncodingPrefixCaptureRunner(
+                    TimeSpan.FromMilliseconds(200),
+                    (_, token) => Task.Delay(TimeSpan.FromMilliseconds(300), token)).RunAsync(
                     IPAddress.Loopback.ToString(),
                     ((IPEndPoint)listener.LocalEndpoint).Port,
                     username,
                     password,
-                    baselinePath,
-                    adaptivePath,
+                    CandidateEncoding,
                     Path.Combine(directory, "output"),
                     syntheticScreenConfirmed: true,
                     CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
@@ -449,7 +519,50 @@ public sealed class EncodingPrefixCaptureTests
         }
         finally
         {
-            Directory.Delete(directory, recursive: true);
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Runner_cancels_sample_confirmation_without_network_or_artifacts()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-confirm-cancel-{Guid.NewGuid():N}");
+        var outputDirectory = Path.Combine(directory, "output");
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var cancellation = new CancellationTokenSource();
+        var confirmationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var username = SecretMaterial.FromUtf8("user");
+        using var password = SecretMaterial.FromUtf8("password");
+        try
+        {
+            var runTask = new EncodingPrefixCaptureRunner(
+                TimeSpan.FromMilliseconds(100),
+                async (_, token) =>
+                {
+                    confirmationStarted.TrySetResult();
+                    await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                }).RunAsync(
+                IPAddress.Loopback.ToString(),
+                ((IPEndPoint)listener.LocalEndpoint).Port,
+                username,
+                password,
+                CandidateEncoding,
+                outputDirectory,
+                syntheticScreenConfirmed: true,
+                cancellation.Token);
+
+            await confirmationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+            Assert.False(listener.Pending());
+            Assert.False(Directory.Exists(outputDirectory));
+            Assert.Empty(Directory.GetDirectories(directory, "output.staging-*"));
+        }
+        finally
+        {
+            listener.Stop();
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
     }
 
@@ -457,16 +570,8 @@ public sealed class EncodingPrefixCaptureTests
     public async Task Runner_completes_encrypted_loopback_capture_in_protocol_order()
     {
         var directory = Path.Combine(Path.GetTempPath(), $"winard-success-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(directory);
-        var baselinePath = Path.Combine(directory, "baseline.json");
-        var adaptivePath = Path.Combine(directory, "adaptive.json");
         var outputDirectory = Path.Combine(directory, "output");
         var expectedPrefix = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray();
-        await RdmCaptureFile.WriteAsync(baselinePath, CreateRdmReport([0]), CancellationToken.None);
-        await RdmCaptureFile.WriteAsync(
-            adaptivePath,
-            CreateRdmReport([0, CandidateEncoding]),
-            CancellationToken.None);
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         using var hardTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
@@ -479,45 +584,56 @@ public sealed class EncodingPrefixCaptureTests
         using var password = SecretMaterial.FromUtf8("synthetic-password");
         try
         {
-            var runTask = new EncodingPrefixCaptureRunner(TimeSpan.FromSeconds(5)).RunAsync(
+            var confirmedSamples = new List<string>();
+            var runTask = new EncodingPrefixCaptureRunner(
+                TimeSpan.FromSeconds(5),
+                (sample, _) => { confirmedSamples.Add(sample); return Task.CompletedTask; }).RunAsync(
                 IPAddress.Loopback.ToString(),
                 ((IPEndPoint)listener.LocalEndpoint).Port,
                 username,
                 password,
-                baselinePath,
-                adaptivePath,
+                CandidateEncoding,
                 outputDirectory,
                 syntheticScreenConfirmed: true,
                 hardTimeout.Token);
 
             await Task.WhenAll(serverTask, runTask).WaitAsync(TimeSpan.FromSeconds(10));
-            var capture = await runTask;
+            var captures = await runTask;
+            var capture = Assert.Single(captures.DistinctBy(item => item.PayloadSha256));
 
-            Assert.Equal(1, await serverTask);
+            Assert.Equal(EncodingPrefixCaptureFile.RequiredSampleNames.Count, await serverTask);
+            Assert.Equal(EncodingPrefixCaptureFile.RequiredSampleNames, confirmedSamples);
             Assert.Equal(CandidateEncoding, capture.EncodingId);
             Assert.Equal(new CapturedRectangle(0, 0, 4, 2), capture.Rectangle);
             Assert.Equal(expectedPrefix, capture.PayloadPrefix);
             Assert.Equal(Convert.ToHexString(SHA256.HashData(expectedPrefix)), capture.PayloadSha256);
             Assert.Equal(
-                ["manifest.json", "payload-prefix.bin"],
-                Directory.GetFiles(outputDirectory)
-                    .Select(path => Path.GetFileName(path)!)
-                    .Order()
-                    .ToArray());
+                EncodingPrefixCaptureFile.RequiredSampleNames.Order(),
+                Directory.GetDirectories(outputDirectory)
+                    .Select(Path.GetFileName)
+                    .Order());
             Assert.Equal(
                 expectedPrefix,
                 await File.ReadAllBytesAsync(
-                    Path.Combine(outputDirectory, "payload-prefix.bin"),
+                    Path.Combine(outputDirectory, "solid-color", "payload-prefix.bin"),
                     hardTimeout.Token));
             var manifest = await File.ReadAllTextAsync(
-                Path.Combine(outputDirectory, "manifest.json"),
+                Path.Combine(outputDirectory, "solid-color", "manifest.json"),
                 hardTimeout.Token);
             Assert.Contains(capture.PayloadSha256, manifest, StringComparison.Ordinal);
+            var setManifest = await File.ReadAllTextAsync(
+                Path.Combine(outputDirectory, "capture-set.json"),
+                hardTimeout.Token);
+            Assert.Contains("\"status\": \"complete\"", setManifest, StringComparison.Ordinal);
+            foreach (var sampleName in EncodingPrefixCaptureFile.RequiredSampleNames)
+            {
+                Assert.Contains(sampleName, setManifest, StringComparison.Ordinal);
+            }
         }
         finally
         {
             listener.Stop();
-            Directory.Delete(directory, recursive: true);
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
     }
 
@@ -529,18 +645,6 @@ public sealed class EncodingPrefixCaptureTests
             payload.Length,
             Convert.ToHexString(SHA256.HashData(payload)),
             payload);
-
-    private static RdmCaptureReport CreateRdmReport(IReadOnlyList<int> encodings) =>
-        new(
-            1,
-            "test-profile",
-            "RFB 003.889",
-            0xC1,
-            new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
-            encodings,
-            [],
-            true,
-            null);
 
     private static byte[] CreateUpdate(
         int encodingId,
@@ -566,6 +670,25 @@ public sealed class EncodingPrefixCaptureTests
     }
 
     private static async Task<int> RunEncryptedCaptureServerAsync(
+        TcpListener listener,
+        int candidateEncodingId,
+        byte[] payloadPrefix,
+        CancellationToken cancellationToken)
+    {
+        var activationRequests = 0;
+        foreach (var _ in EncodingPrefixCaptureFile.RequiredSampleNames)
+        {
+            activationRequests += await RunEncryptedCaptureSessionAsync(
+                listener,
+                candidateEncodingId,
+                payloadPrefix,
+                cancellationToken);
+        }
+
+        return activationRequests;
+    }
+
+    private static async Task<int> RunEncryptedCaptureSessionAsync(
         TcpListener listener,
         int candidateEncodingId,
         byte[] payloadPrefix,
@@ -650,42 +773,33 @@ public sealed class EncodingPrefixCaptureTests
             sessionIv,
             sequence: 0,
             cancellationToken);
-        var expectedSetEncodings = new byte[12];
+        var expectedSetEncodings = new byte[20];
         expectedSetEncodings[0] = 2;
-        BinaryPrimitives.WriteUInt16BigEndian(expectedSetEncodings.AsSpan(2), 2);
+        BinaryPrimitives.WriteUInt16BigEndian(expectedSetEncodings.AsSpan(2), 4);
         BinaryPrimitives.WriteInt32BigEndian(expectedSetEncodings.AsSpan(4), candidateEncodingId);
         BinaryPrimitives.WriteInt32BigEndian(
             expectedSetEncodings.AsSpan(8),
+            (int)RfbEncodingType.Zlib);
+        BinaryPrimitives.WriteInt32BigEndian(
+            expectedSetEncodings.AsSpan(12),
+            (int)RfbEncodingType.Zrle);
+        BinaryPrimitives.WriteInt32BigEndian(
+            expectedSetEncodings.AsSpan(16),
             (int)RfbEncodingType.Raw);
         Assert.Equal(expectedSetEncodings, firstClientPacket.Payload);
 
-        var secondClientPacket = await ReadEncryptedPacketAsync(
+        var update = CreateUpdate(candidateEncodingId, payloadPrefix, width: 4, height: 2);
+        var requestPacket = await ReadEncryptedPacketAsync(
             stream,
             sessionKey,
             firstClientPacket.NextIv,
             sequence: 1,
             cancellationToken);
-        Assert.Equal(CreateFullRequest(4, 2), secondClientPacket.Payload);
-
-        var emptyUpdatePacket = ArdEncryptedPacketCodec.Encrypt(
+        Assert.Equal(CreateFullRequest(4, 2), requestPacket.Payload);
+        var serverPacket = ArdEncryptedPacketCodec.Encrypt(
             sessionKey,
             sessionIv,
             sequence: 0,
-            new byte[] { 0, 0, 0, 0 });
-        await stream.WriteAsync(emptyUpdatePacket, cancellationToken);
-        var thirdClientPacket = await ReadEncryptedPacketAsync(
-            stream,
-            sessionKey,
-            secondClientPacket.NextIv,
-            sequence: 2,
-            cancellationToken);
-        Assert.Equal(CreateFullRequest(4, 2), thirdClientPacket.Payload);
-
-        var update = CreateUpdate(candidateEncodingId, payloadPrefix, width: 4, height: 2);
-        var serverPacket = ArdEncryptedPacketCodec.Encrypt(
-            sessionKey,
-            emptyUpdatePacket.AsSpan(^16),
-            sequence: 1,
             update);
         await stream.WriteAsync(serverPacket, cancellationToken);
         Assert.Equal(0, await stream.ReadAsync(new byte[1], cancellationToken));

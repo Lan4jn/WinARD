@@ -24,6 +24,8 @@ public static class EncodingPrefixReader
             stream,
             candidateEncodingId,
             maximumPrefixLength,
+            framebufferWidth: null,
+            framebufferHeight: null,
             requestNextUpdate: null,
             cancellationToken);
 
@@ -39,6 +41,28 @@ public static class EncodingPrefixReader
             stream,
             candidateEncodingId,
             maximumPrefixLength,
+            framebufferWidth: null,
+            framebufferHeight: null,
+            requestNextUpdate,
+            cancellationToken);
+    }
+
+    internal static Task<EncodingPrefixCapture> ReadAsync(
+        Stream stream,
+        int candidateEncodingId,
+        int maximumPrefixLength,
+        ushort framebufferWidth,
+        ushort framebufferHeight,
+        Func<CancellationToken, Task> requestNextUpdate,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(requestNextUpdate);
+        return ReadCoreAsync(
+            stream,
+            candidateEncodingId,
+            maximumPrefixLength,
+            framebufferWidth,
+            framebufferHeight,
             requestNextUpdate,
             cancellationToken);
     }
@@ -47,6 +71,8 @@ public static class EncodingPrefixReader
         Stream stream,
         int candidateEncodingId,
         int maximumPrefixLength,
+        ushort? framebufferWidth,
+        ushort? framebufferHeight,
         Func<CancellationToken, Task>? requestNextUpdate,
         CancellationToken cancellationToken)
     {
@@ -99,16 +125,20 @@ public static class EncodingPrefixReader
                 await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false),
                 await reader.ReadUInt16Async(cancellationToken).ConfigureAwait(false));
             var encodingId = await reader.ReadInt32Async(cancellationToken).ConfigureAwait(false);
-            if (encodingId == (int)RfbEncodingType.Raw)
-            {
-                throw new RfbProtocolException(
-                    "The server returned Raw fallback instead of the candidate encoding.");
-            }
-
             if (encodingId != candidateEncodingId)
             {
+                throw new EncodingCandidateNotObservedException(encodingId);
+            }
+
+            if (rectangle.Width == 0
+                || rectangle.Height == 0
+                || (framebufferWidth is { } width
+                    && checked((uint)rectangle.X + rectangle.Width) > width)
+                || (framebufferHeight is { } height
+                    && checked((uint)rectangle.Y + rectangle.Height) > height))
+            {
                 throw new RfbProtocolException(
-                    $"Expected candidate encoding ID {candidateEncodingId}, received {encodingId}.");
+                    "The candidate rectangle must have non-zero dimensions within the framebuffer.");
             }
 
             var payloadLength = await reader.ReadUInt32Async(cancellationToken).ConfigureAwait(false);
@@ -132,10 +162,25 @@ public static class EncodingPrefixReader
                 rectangle,
                 prefix.Length,
                 Convert.ToHexString(SHA256.HashData(prefix)),
-                prefix);
+                prefix,
+                payloadLength);
         }
 
         throw new RfbProtocolException(
             $"The server returned {MaximumEmptyUpdates} empty framebuffer updates without a candidate rectangle.");
     }
+}
+
+public sealed class EncodingCandidateNotObservedException : IOException
+{
+    public EncodingCandidateNotObservedException(int observedEncodingId)
+        : base($"candidate-not-observed; observed-encoding={observedEncodingId}.")
+    {
+        ObservedEncodingId = observedEncodingId;
+        Category = "candidate-not-observed";
+    }
+
+    public string Category { get; }
+
+    public int ObservedEncodingId { get; }
 }

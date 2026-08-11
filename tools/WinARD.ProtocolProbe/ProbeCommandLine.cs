@@ -7,7 +7,7 @@ public enum ProbeMode
     PointerSmoke,
     ListenRdm,
     CompareRdmCaptures,
-    CaptureDifferentialEncodingPrefix,
+    CaptureKnownEncodingPrefix,
 }
 
 public sealed record ProbeRequest(
@@ -16,7 +16,8 @@ public sealed record ProbeRequest(
     string? ProfileName = null,
     string? BaselineCapturePath = null,
     string? AdaptiveCapturePath = null,
-    bool SyntheticScreenConfirmed = false)
+    bool SyntheticScreenConfirmed = false,
+    int? CandidateEncodingId = null)
 {
     public string? CaptureFirstFramePath =>
         Mode == ProbeMode.CaptureFirstFrame ? OutputPath : null;
@@ -72,22 +73,38 @@ public static class ProbeCommandLine
             return true;
         }
 
-        if (args.Length == 5
-            && string.Equals(args[0], "--capture-differential-prefix", StringComparison.Ordinal)
-            && !string.IsNullOrWhiteSpace(args[1])
+        if (args.Length == 4
+            && string.Equals(args[0], "--capture-known-encoding-prefix", StringComparison.Ordinal)
+            && TryParseKnownEncodingId(args[1], out var candidateEncodingId)
             && !string.IsNullOrWhiteSpace(args[2])
-            && !string.IsNullOrWhiteSpace(args[3])
-            && string.Equals(args[4], "--confirm-synthetic-screen", StringComparison.Ordinal))
+            && string.Equals(args[3], "--confirm-synthetic-screen", StringComparison.Ordinal))
         {
             request = new ProbeRequest(
-                ProbeMode.CaptureDifferentialEncodingPrefix,
-                OutputPath: args[3],
-                BaselineCapturePath: args[1],
-                AdaptiveCapturePath: args[2],
-                SyntheticScreenConfirmed: true);
+                ProbeMode.CaptureKnownEncodingPrefix,
+                OutputPath: args[2],
+                SyntheticScreenConfirmed: true,
+                CandidateEncodingId: candidateEncodingId);
             return true;
         }
 
+        return false;
+    }
+
+    private static bool TryParseKnownEncodingId(string value, out int encodingId)
+    {
+        if (string.Equals(value, "1002", StringComparison.Ordinal))
+        {
+            encodingId = 1002;
+            return true;
+        }
+
+        if (string.Equals(value, "1001", StringComparison.Ordinal))
+        {
+            encodingId = 1001;
+            return true;
+        }
+
+        encodingId = 0;
         return false;
     }
 

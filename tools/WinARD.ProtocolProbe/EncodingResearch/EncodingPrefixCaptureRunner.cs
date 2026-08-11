@@ -1,5 +1,4 @@
 using System.Net.Sockets;
-using WinARD.ProtocolProbe.RdmCapture;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Encodings;
@@ -11,13 +10,12 @@ using WinARD.Remote.Protocol.IO;
 
 namespace WinARD.ProtocolProbe.EncodingResearch;
 
-public delegate Task<EncodingPrefixCapture> EncodingPrefixCaptureOperation(
+public delegate Task<IReadOnlyList<EncodingPrefixCapture>> EncodingPrefixCaptureOperation(
     string host,
     int port,
     ISecretMaterial username,
     ISecretMaterial password,
-    string baselineCapturePath,
-    string adaptiveCapturePath,
+    int candidateEncodingId,
     string outputDirectory,
     bool syntheticScreenConfirmed,
     CancellationToken cancellationToken);
@@ -28,13 +26,21 @@ public sealed class EncodingPrefixCaptureRunner
     private const int MaximumActivationUpdates = 8;
     private const int MaximumPrefixLength = 64 * 1024;
     private readonly TimeSpan _operationTimeout;
+    private readonly Func<string, CancellationToken, Task> _confirmSample;
 
     public EncodingPrefixCaptureRunner()
-        : this(DefaultOperationTimeout)
+        : this(DefaultOperationTimeout, ConfirmSampleAtConsoleAsync)
     {
     }
 
     public EncodingPrefixCaptureRunner(TimeSpan operationTimeout)
+        : this(operationTimeout, ConfirmSampleAtConsoleAsync)
+    {
+    }
+
+    internal EncodingPrefixCaptureRunner(
+        TimeSpan operationTimeout,
+        Func<string, CancellationToken, Task> confirmSample)
     {
         if (operationTimeout <= TimeSpan.Zero || operationTimeout == Timeout.InfiniteTimeSpan)
         {
@@ -42,15 +48,15 @@ public sealed class EncodingPrefixCaptureRunner
         }
 
         _operationTimeout = operationTimeout;
+        _confirmSample = confirmSample ?? throw new ArgumentNullException(nameof(confirmSample));
     }
 
-    public async Task<EncodingPrefixCapture> RunAsync(
+    public async Task<IReadOnlyList<EncodingPrefixCapture>> RunAsync(
         string host,
         int port,
         ISecretMaterial username,
         ISecretMaterial password,
-        string baselineCapturePath,
-        string adaptiveCapturePath,
+        int candidateEncodingId,
         string outputDirectory,
         bool syntheticScreenConfirmed,
         CancellationToken cancellationToken)
@@ -61,98 +67,171 @@ public sealed class EncodingPrefixCaptureRunner
         ArgumentOutOfRangeException.ThrowIfGreaterThan(port, ushort.MaxValue);
         ArgumentNullException.ThrowIfNull(username);
         ArgumentNullException.ThrowIfNull(password);
-        ArgumentException.ThrowIfNullOrWhiteSpace(baselineCapturePath);
-        ArgumentException.ThrowIfNullOrWhiteSpace(adaptiveCapturePath);
+        if (candidateEncodingId is not (1002 or 1001))
+        {
+            throw new ArgumentOutOfRangeException(nameof(candidateEncodingId));
+        }
         EncodingPrefixCaptureFile.EnsureDestinationAvailable(outputDirectory);
+        var fullOutputDirectory = Path.GetFullPath(outputDirectory);
+        var parentDirectory = Directory.GetParent(fullOutputDirectory)
+            ?? throw new IOException("The encoding prefix output directory must have a parent directory.");
+        Directory.CreateDirectory(parentDirectory.FullName);
+        var stagingDirectory = fullOutputDirectory + $".staging-{Guid.NewGuid():N}";
+        Directory.CreateDirectory(stagingDirectory);
 
-        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        operationCancellation.CancelAfter(_operationTimeout);
         try
         {
-            var baseline = await RdmCaptureFile.ReadAsync(
-                baselineCapturePath,
-                operationCancellation.Token).ConfigureAwait(false);
-            var adaptive = await RdmCaptureFile.ReadAsync(
-                adaptiveCapturePath,
-                operationCancellation.Token).ConfigureAwait(false);
-            var candidateEncodingId = RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(baseline, adaptive);
-
-            using var client = new TcpClient();
-            await client.ConnectAsync(host, port, operationCancellation.Token).ConfigureAwait(false);
-            await using var networkStream = client.GetStream();
-            var handshake = await RfbHandshake.NegotiateAsync(networkStream, operationCancellation.Token)
-                .ConfigureAwait(false);
-            if (handshake.Version != RfbVersion.V3_889
-                || handshake.SecurityType != RfbSecurityType.AppleRemoteDesktop)
+            var captures = new List<EncodingPrefixCapture>(EncodingPrefixCaptureFile.RequiredSampleNames.Count);
+            foreach (var sampleName in EncodingPrefixCaptureFile.RequiredSampleNames)
             {
-                throw new RfbProtocolException(
-                    "Encoding prefix capture requires an Apple RFB 3.889 security type 30 session.");
-            }
-
-            var authentication = await new ArdAuthenticator().AuthenticateAsync(
-                networkStream,
-                handshake.Version,
-                username,
-                password,
-                operationCancellation.Token).ConfigureAwait(false);
-            await using var transport = new ArdEncryptedStream(networkStream, ProtocolLimits.Default);
-            await using var encryption = new ArdSessionEncryption(transport, authentication);
-            var server = await RfbSessionInitializer.InitializeAsync(
-                transport,
-                handshake,
-                ProtocolLimits.Default,
-                encryption,
-                operationCancellation.Token).ConfigureAwait(false);
-
-            using var framebuffer = new Framebuffer(server.Width, server.Height, ProtocolLimits.Default);
-            await using var updates = FramebufferUpdateReader.CreateSession(
-                framebuffer,
-                PixelFormat.WinArdBgra32,
-                encryption.CreateDecoder());
-            for (var updateIndex = 0;
-                 updateIndex < MaximumActivationUpdates && !transport.IsEncrypted;
-                 updateIndex++)
-            {
-                await WriteFullRequestAsync(transport, framebuffer, operationCancellation.Token)
+                await _confirmSample(sampleName, cancellationToken).ConfigureAwait(false);
+                var capture = await CaptureOneWithTimeoutAsync(
+                    host, port, username, password, candidateEncodingId, cancellationToken)
                     .ConfigureAwait(false);
-                await ReadInitialUpdateAsync(
-                    transport,
-                    updates,
-                    operationCancellation.Token).ConfigureAwait(false);
-                await encryption.CompleteFramebufferUpdateAsync(operationCancellation.Token)
-                    .ConfigureAwait(false);
+                await EncodingPrefixCaptureFile.WriteSampleAsync(
+                    stagingDirectory,
+                    candidateEncodingId,
+                    sampleName,
+                    capture,
+                    syntheticScreenConfirmed,
+                    cancellationToken).ConfigureAwait(false);
+                captures.Add(capture);
             }
 
-            if (!transport.IsEncrypted)
-            {
-                throw new RfbProtocolException(
-                    $"ARD session encryption did not activate within {MaximumActivationUpdates} framebuffer updates.");
-            }
-
-            await RfbSessionInitializer.WriteSetEncodingsAsync(
-                transport,
-                [candidateEncodingId, (int)RfbEncodingType.Raw],
-                operationCancellation.Token).ConfigureAwait(false);
-            await WriteFullRequestAsync(transport, framebuffer, operationCancellation.Token)
-                .ConfigureAwait(false);
-            var capture = await EncodingPrefixReader.ReadAsync(
-                transport,
+            await EncodingPrefixCaptureFile.WriteSetManifestAsync(
+                stagingDirectory,
                 candidateEncodingId,
-                MaximumPrefixLength,
-                token => WriteFullRequestAsync(transport, framebuffer, token),
-                operationCancellation.Token).ConfigureAwait(false);
-            await EncodingPrefixCaptureFile.WriteAsync(
-                outputDirectory,
-                capture,
-                syntheticScreenConfirmed,
-                operationCancellation.Token).ConfigureAwait(false);
-            return capture;
+                captures,
+                cancellationToken).ConfigureAwait(false);
+            Directory.Move(stagingDirectory, fullOutputDirectory);
+            return captures;
+        }
+        finally
+        {
+            if (Directory.Exists(stagingDirectory))
+            {
+                Directory.Delete(stagingDirectory, recursive: true);
+            }
+        }
+    }
+
+    private static async Task ConfirmSampleAtConsoleAsync(
+        string sampleName,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (Console.IsInputRedirected)
+        {
+            throw new InvalidOperationException(
+                "Each synthetic sample requires interactive visual confirmation before network capture.");
+        }
+
+        Console.Write($"Display only the synthetic '{sampleName}' sample, then type its name to confirm: ");
+        var confirmation = await Console.In.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+        if (!string.Equals(confirmation, sampleName, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Synthetic sample '{sampleName}' was not confirmed; capture did not start.");
+        }
+
+    }
+
+    private async Task<EncodingPrefixCapture> CaptureOneWithTimeoutAsync(
+        string host,
+        int port,
+        ISecretMaterial username,
+        ISecretMaterial password,
+        int candidateEncodingId,
+        CancellationToken cancellationToken)
+    {
+        using var networkCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        networkCancellation.CancelAfter(_operationTimeout);
+        try
+        {
+            return await CaptureOneAsync(
+                host, port, username, password, candidateEncodingId, networkCancellation.Token)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException exception)
-            when (!cancellationToken.IsCancellationRequested && operationCancellation.IsCancellationRequested)
+            when (!cancellationToken.IsCancellationRequested && networkCancellation.IsCancellationRequested)
         {
             throw new ProbeTimeoutException(exception);
         }
+    }
+
+    private static async Task<EncodingPrefixCapture> CaptureOneAsync(
+        string host,
+        int port,
+        ISecretMaterial username,
+        ISecretMaterial password,
+        int candidateEncodingId,
+        CancellationToken cancellationToken)
+    {
+        using var client = new TcpClient();
+        await client.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
+        await using var networkStream = client.GetStream();
+        var handshake = await RfbHandshake.NegotiateAsync(networkStream, cancellationToken)
+            .ConfigureAwait(false);
+        if (handshake.Version != RfbVersion.V3_889
+            || handshake.SecurityType != RfbSecurityType.AppleRemoteDesktop)
+        {
+            throw new RfbProtocolException(
+                "Encoding prefix capture requires an Apple RFB 3.889 security type 30 session.");
+        }
+
+        var authentication = await new ArdAuthenticator().AuthenticateAsync(
+            networkStream,
+            handshake.Version,
+            username,
+            password,
+            cancellationToken).ConfigureAwait(false);
+        await using var transport = new ArdEncryptedStream(networkStream, ProtocolLimits.Default);
+        await using var encryption = new ArdSessionEncryption(transport, authentication);
+        var server = await RfbSessionInitializer.InitializeAsync(
+            transport,
+            handshake,
+            ProtocolLimits.Default,
+            encryption,
+            cancellationToken).ConfigureAwait(false);
+
+        using var framebuffer = new Framebuffer(server.Width, server.Height, ProtocolLimits.Default);
+        await using var updates = FramebufferUpdateReader.CreateSession(
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            encryption.CreateDecoder());
+        for (var updateIndex = 0;
+             updateIndex < MaximumActivationUpdates && !transport.IsEncrypted;
+             updateIndex++)
+        {
+            await WriteFullRequestAsync(transport, framebuffer, cancellationToken)
+            .ConfigureAwait(false);
+            await ReadInitialUpdateAsync(
+                transport,
+                updates,
+                cancellationToken).ConfigureAwait(false);
+            await encryption.CompleteFramebufferUpdateAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (!transport.IsEncrypted)
+        {
+            throw new RfbProtocolException(
+                $"ARD session encryption did not activate within {MaximumActivationUpdates} framebuffer updates.");
+        }
+
+        await RfbSessionInitializer.WriteSetEncodingsAsync(
+            transport,
+            [candidateEncodingId, (int)RfbEncodingType.Zlib, (int)RfbEncodingType.Zrle, (int)RfbEncodingType.Raw],
+            cancellationToken).ConfigureAwait(false);
+        await WriteFullRequestAsync(transport, framebuffer, cancellationToken).ConfigureAwait(false);
+        return await EncodingPrefixReader.ReadAsync(
+            transport,
+            candidateEncodingId,
+            MaximumPrefixLength,
+            checked((ushort)framebuffer.Width),
+            checked((ushort)framebuffer.Height),
+            token => WriteFullRequestAsync(transport, framebuffer, token),
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task ReadInitialUpdateAsync(

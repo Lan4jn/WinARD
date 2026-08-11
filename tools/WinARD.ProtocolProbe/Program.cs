@@ -19,7 +19,7 @@ internal static class Program
         + Environment.NewLine
         + @"  & '.\WinARD.ProtocolProbe.exe' --compare-rdm-captures '.\artifacts\protocol-research\rdm\full.json' '.\artifacts\protocol-research\rdm\adaptive-default.json'"
         + Environment.NewLine
-        + @"  & '.\WinARD.ProtocolProbe.exe' --capture-differential-prefix '.\artifacts\protocol-research\rdm\full.json' '.\artifacts\protocol-research\rdm\adaptive-default.json' '.\artifacts\protocol-research\prefix' --confirm-synthetic-screen";
+        + @"  & '.\WinARD.ProtocolProbe.exe' --capture-known-encoding-prefix 1002 '.\artifacts\protocol-research\mac\apple-1002' --confirm-synthetic-screen";
 
     internal static bool TryParseRdmListenPort(string? value, out int port)
     {
@@ -155,20 +155,22 @@ internal static class Program
                 return 2;
             }
 
-            if (request.Mode == ProbeMode.CaptureDifferentialEncodingPrefix)
+            if (request.Mode == ProbeMode.CaptureKnownEncodingPrefix)
             {
                 captureEncodingPrefix ??= new EncodingPrefixCaptureRunner().RunAsync;
-                var prefixCapture = await captureEncodingPrefix(
+                var prefixCaptures = await captureEncodingPrefix(
                     host,
                     port,
                     username,
                     password,
-                    request.BaselineCapturePath!,
-                    request.AdaptiveCapturePath!,
+                    request.CandidateEncodingId!.Value,
                     request.OutputPath!,
                     request.SyntheticScreenConfirmed,
                     cancellationToken).ConfigureAwait(false);
-                output.WriteLine(ProbeOutput.FormatEncodingPrefixCaptured(prefixCapture));
+                foreach (var prefixCapture in prefixCaptures)
+                {
+                    output.WriteLine(ProbeOutput.FormatEncodingPrefixCaptured(prefixCapture));
+                }
                 return 0;
             }
 

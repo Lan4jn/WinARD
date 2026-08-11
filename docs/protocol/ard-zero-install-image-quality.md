@@ -28,6 +28,19 @@ This control changes the requested remote image scale; it does not create eviden
 
 **Apple 1000** is a black-and-white encoding and does not enter automatic mode. WinARD must not automatically select it as an image-quality or bandwidth adaptation step.
 
+### Direct prefix research boundary
+
+The research probe accepts only `--capture-known-encoding-prefix {1002|1001} <output-dir> --confirm-synthetic-screen`. It declares encodings in the exact order `[candidate, 6, 16, 0]`. A response using encoding 6, 16, or 0 is recorded as `candidate-not-observed` with the observed encoding ID; it is never counted as candidate success.
+
+For each candidate, research requires separate `solid-color`, `gradient`, `text`, and `multiple-rectangle-sizes` sample directories. Before each connection the interactive probe names the required synthetic scene and requires the operator to type that exact sample name; a redirected/non-interactive run stops before connecting. Each sample then uses a fresh connection because a bounded prefix does not establish where the unknown payload ends; bytes from one sample are never reused as the next sample's framing. Each directory contains only a bounded payload prefix, its declared payload length, observed prefix length, SHA-256 hash and safe rectangle metadata. These files live under the Git-ignored `artifacts/protocol-research` tree, outside ordinary diagnostics. Manifests contain no host, username, password, or absolute path. The four directories are built in a private staging root; only a complete set with a `capture-set.json` sample/hash index is atomically published. Any failure removes the staging root and leaves the requested output path absent.
+
+The prefix reader records only an outer rectangle header, the untrusted declared length, and an observed bounded prefix. It does not prove that the declared length is a complete payload boundary or establish pixel decoding.
+
+- **Apple 1002: 关闭（未验证）.** There is no evidence for complete payload boundaries, pixel semantics, continuous-state behavior, malicious-input handling, or macOS 26.5 interoperability.
+- **Apple 1001: 关闭（未验证）.** There is no evidence for complete payload boundaries, pixel semantics, continuous-state behavior, malicious-input handling, or macOS 26.5 interoperability.
+
+No real-device hard-gate capture was executed for this decision. In this task the user has not visually confirmed a single-display synthetic screen with no sensitive content and notifications/private filenames disabled. Until that on-site confirmation and the full evidence set exist, both gates remain closed; no decoder is implemented or enabled.
+
 MVS is governed by the separate closed delivery gate in [MVS delivery evidence and decision](ard-mvs-evidence.md) and is not part of this baseline.
 
 ## Deployment boundary

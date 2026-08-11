@@ -79,21 +79,19 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
-    public void Probe_command_line_parses_confirmed_differential_prefix_capture()
+    public void Probe_command_line_parses_confirmed_known_prefix_capture()
     {
         Assert.True(ProbeCommandLine.TryParse(
             [
-                "--capture-differential-prefix",
-                "full.json",
-                "adaptive.json",
+                "--capture-known-encoding-prefix",
+                "1002",
                 "capture-directory",
                 "--confirm-synthetic-screen",
             ],
             out var request));
 
-        Assert.Equal(ProbeMode.CaptureDifferentialEncodingPrefix, request.Mode);
-        Assert.Equal("full.json", request.BaselineCapturePath);
-        Assert.Equal("adaptive.json", request.AdaptiveCapturePath);
+        Assert.Equal(ProbeMode.CaptureKnownEncodingPrefix, request.Mode);
+        Assert.Equal(1002, request.CandidateEncodingId);
         Assert.Equal("capture-directory", request.OutputPath);
         Assert.True(request.SyntheticScreenConfirmed);
     }
@@ -102,7 +100,7 @@ public sealed class ProtocolProbeTests
     public void Probe_command_line_requires_synthetic_screen_confirmation()
     {
         Assert.False(ProbeCommandLine.TryParse(
-            ["--capture-differential-prefix", "full.json", "adaptive.json", "capture-directory"],
+            ["--capture-known-encoding-prefix", "1001", "capture-directory"],
             out _));
     }
 
@@ -130,8 +128,10 @@ public sealed class ProtocolProbeTests
     [InlineData("--listen-rdm", "adaptive-default", "capture.json", "extra")]
     [InlineData("--compare-rdm-captures", "full.json")]
     [InlineData("--compare-rdm-captures", "full.json", "adaptive.json", "extra")]
-    [InlineData("--capture-differential-prefix", "full.json", "adaptive.json", "out", "--wrong")]
-    [InlineData("--capture-differential-prefix", "full.json", "adaptive.json", "out", "--confirm-synthetic-screen", "--confirm-synthetic-screen")]
+    [InlineData("--capture-known-encoding-prefix", "1000", "out", "--confirm-synthetic-screen")]
+    [InlineData("--capture-known-encoding-prefix", "1002", "", "--confirm-synthetic-screen")]
+    [InlineData("--capture-known-encoding-prefix", "1002", "out", "--wrong")]
+    [InlineData("--capture-known-encoding-prefix", "1002", "out", "--confirm-synthetic-screen", "--confirm-synthetic-screen")]
     public void Probe_command_line_rejects_invalid_arguments(params string[] args)
     {
         Assert.False(ProbeCommandLine.TryParse(args, out _));
@@ -191,7 +191,7 @@ public sealed class ProtocolProbeTests
     }
 
     [Fact]
-    public async Task Differential_prefix_command_dispatches_capture_without_printing_sensitive_values()
+    public async Task Known_prefix_command_dispatches_capture_without_printing_sensitive_values()
     {
         const string host = "private-workstation.invalid";
         const string usernameText = "private-user";
@@ -202,9 +202,8 @@ public sealed class ProtocolProbeTests
 
         var exitCode = await global::Program.RunAsync(
             [
-                "--capture-differential-prefix",
-                "baseline.json",
-                "adaptive.json",
+                "--capture-known-encoding-prefix",
+                "1001",
                 "prefix-output",
                 "--confirm-synthetic-screen",
             ],
@@ -218,24 +217,23 @@ public sealed class ProtocolProbeTests
             output,
             error,
             CancellationToken.None,
-            captureEncodingPrefix: (capturedHost, port, username, password, baseline, adaptive, directory, confirmed, _) =>
+            captureEncodingPrefix: (capturedHost, port, username, password, candidate, directory, confirmed, _) =>
             {
                 calls++;
                 Assert.Equal(host, capturedHost);
                 Assert.Equal(5900, port);
-                Assert.Equal("baseline.json", baseline);
-                Assert.Equal("adaptive.json", adaptive);
+                Assert.Equal(1001, candidate);
                 Assert.Equal("prefix-output", directory);
                 Assert.True(confirmed);
                 Assert.Equal(usernameText.Length, username.Length);
                 Assert.Equal(passwordText.Length, password.Length);
-                return Task.FromResult(new EncodingPrefixCapture(
+                return Task.FromResult<IReadOnlyList<EncodingPrefixCapture>>([new EncodingPrefixCapture(
                     1,
                     12345,
                     new CapturedRectangle(0, 0, 1920, 1080),
                     4,
                     new string('A', 64),
-                    [1, 2, 3, 4]));
+                    [1, 2, 3, 4])]);
             },
             readPassword: _ => SecretMaterial.FromUtf8(passwordText));
 
@@ -248,6 +246,31 @@ public sealed class ProtocolProbeTests
         Assert.DoesNotContain(usernameText, console, StringComparison.Ordinal);
         Assert.DoesNotContain(passwordText, console, StringComparison.Ordinal);
         Assert.DoesNotContain("01020304", console, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Missing_known_prefix_confirmation_fails_before_environment_or_capture()
+    {
+        var environmentRead = false;
+        var captureStarted = false;
+        using var output = new StringWriter(CultureInfo.InvariantCulture);
+        using var error = new StringWriter(CultureInfo.InvariantCulture);
+
+        var exitCode = await global::Program.RunAsync(
+            ["--capture-known-encoding-prefix", "1002", "prefix-output"],
+            _ => { environmentRead = true; return null; },
+            output,
+            error,
+            CancellationToken.None,
+            captureEncodingPrefix: (_, _, _, _, _, _, _, _) =>
+            {
+                captureStarted = true;
+                throw new InvalidOperationException();
+            });
+
+        Assert.Equal(2, exitCode);
+        Assert.False(environmentRead);
+        Assert.False(captureStarted);
     }
 
     [Theory]
@@ -298,7 +321,7 @@ public sealed class ProtocolProbeTests
             usage,
             StringComparison.Ordinal);
         Assert.Contains("--compare-rdm-captures", usage, StringComparison.Ordinal);
-        Assert.Contains("--capture-differential-prefix", usage, StringComparison.Ordinal);
+        Assert.Contains("--capture-known-encoding-prefix", usage, StringComparison.Ordinal);
     }
 
     [Fact]

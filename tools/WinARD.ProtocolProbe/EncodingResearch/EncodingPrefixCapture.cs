@@ -10,7 +10,8 @@ public sealed record EncodingPrefixCapture
         CapturedRectangle rectangle,
         int prefixLength,
         string payloadSha256,
-        byte[] payloadPrefix)
+        byte[] payloadPrefix,
+        uint? declaredPayloadLength = null)
     {
         ArgumentNullException.ThrowIfNull(payloadSha256);
         ArgumentNullException.ThrowIfNull(payloadPrefix);
@@ -19,6 +20,7 @@ public sealed record EncodingPrefixCapture
         Rectangle = rectangle;
         PrefixLength = prefixLength;
         PayloadSha256 = payloadSha256;
+        DeclaredPayloadLength = declaredPayloadLength ?? checked((uint)prefixLength);
         _payloadPrefix = payloadPrefix.ToArray();
     }
 
@@ -31,6 +33,8 @@ public sealed record EncodingPrefixCapture
     public int PrefixLength { get; init; }
 
     public string PayloadSha256 { get; init; }
+
+    public uint DeclaredPayloadLength { get; init; }
 
     public byte[] PayloadPrefix => _payloadPrefix.ToArray();
 }
