@@ -2,18 +2,11 @@
 
 本手册用于复现两类隔离研究证据：Remote Desktop Manager（RDM）连接本机回环模拟服务端时发送的 ARD 初始化声明，以及真实 Mac 返回的候选编码有界载荷前缀。它不是常规远程连接流程，也不证明候选编码就是 MVS。
 
-所有命令都应从仓库根目录 `F:\Documents\Windows ARD Client` 的 PowerShell 中执行。研究产物位于已被 Git 忽略的 `artifacts\protocol-research`；不得把其中的 JSON、manifest 或 `.bin` 文件强制加入 Git。
+所有命令都应从仓库根目录 `F:\Documents\Windows ARD Client` 的同一个 PowerShell 会话中执行。研究产物位于已被 Git 忽略的 `artifacts\protocol-research`；不得把其中的 JSON、manifest 或 `.bin` 文件强制加入 Git。
 
-## 1. 前置条件与构建
+## 1. 构建并创建唯一批次
 
-准备以下环境：
-
-- Windows x64、.NET 8 SDK；
-- 已安装 Remote Desktop Manager，并能新建 Apple Remote Desktop（ARD）连接；
-- 本机回环端口（默认 5901）未被占用；
-- 进行真实 Mac 捕获时，目标 Mac 已启用远程管理，且使用专用测试画面和获授权的测试账户。
-
-构建探针并把可执行文件保存为 PowerShell 路径对象：
+准备 Windows x64、.NET 8 SDK、已安装的 Remote Desktop Manager，以及一个未占用的本机回环端口。构建探针并把可执行文件保存为 PowerShell 路径对象：
 
 ```powershell
 dotnet publish tools/WinARD.ProtocolProbe/WinARD.ProtocolProbe.csproj -c Release -p:Platform=x64 --self-contained false
@@ -22,75 +15,164 @@ $probe = Resolve-Path 'tools\WinARD.ProtocolProbe\bin\x64\Release\net8.0-windows
 
 后续所有探针调用都必须使用 PowerShell 调用运算符 `& $probe`。不要把带引号的 exe 路径直接写在命令开头，否则 PowerShell 会把参数解析成表达式并报 `Unexpected token`。
 
-## 2. 配置临时 RDM 条目
+每次完整矩阵使用一个全新的时间戳批次。以下变量创建后不得在本批次中重新赋值：
 
-本阶段的监听器只绑定 `127.0.0.1`、只接受一个连接，并在收到首个 FramebufferUpdateRequest 后关闭连接。它会完成固定的 ARD security type 30 握手，但不会解密或验证认证响应。
+```powershell
+$batchRoot = Join-Path 'artifacts\protocol-research' (Get-Date -Format 'yyyyMMdd-HHmmss')
+if (Test-Path -LiteralPath $batchRoot) { throw "Capture batch already exists: $batchRoot" }
 
-在 RDM 中新建一个仅用于本次研究的临时 Apple Remote Desktop（ARD）条目，并设置：
+$rdmRoot = Join-Path $batchRoot 'rdm'
+$macRoot = Join-Path $batchRoot 'mac'
+$macCaptureRoot = Join-Path $macRoot 'adaptive-default'
+New-Item -ItemType Directory -Path $rdmRoot, $macRoot | Out-Null
+```
 
-1. 主机/IP 为 `127.0.0.1`，端口与 `$env:WINARD_LISTEN_PORT` 相同；不要配置网关、SSH 隧道或端口转发。
-2. 用户名使用 `rdm-probe`，密码使用 `synthetic-only`。这些是合成值，不得使用任何真实账户或复用密码。
-3. 关闭剪贴板同步。捕获期间不要按键、点击或移动鼠标。
-4. 保存一个干净模板，再复制出七个临时条目。除矩阵中指定的“图像质量”和“分辨率”外，所有设置必须完全相同。
+监听、逐组验证、比较、真实 Mac 输出、manifest/hash 验证、清理和 Git 检查必须始终引用这三个根变量。不要改用另一个新路径后继续比较旧批次的固定路径。
 
-RDM 版本之间的设置页分组可能不同；应按字段含义选择 Apple Remote Desktop 条目中的 Image quality（Full、High、Medium、Low、Adaptive）和 Resolution（Default、Low、High），不要用显示窗口缩放代替远端 Resolution 设置。
+先定义所有成功、失败或中止路径都要调用的环境清理动作：
 
-## 3. 捕获七组 RDM 声明
+```powershell
+$clearCaptureEnvironment = {
+  Remove-Item Env:WINARD_HOST, Env:WINARD_PORT, Env:WINARD_USERNAME -ErrorAction SilentlyContinue
+  Remove-Item Env:WINARD_LISTEN_PORT -ErrorAction SilentlyContinue
+  Write-Warning 'Close any active RDM probe connection and delete the seven temporary RDM entries.'
+}
+```
 
-使用两个窗口：在 PowerShell 窗口 A 启动一次监听器；看到 `RDM capture listening on 127.0.0.1:5901 ...` 后，在 RDM 中连接对应的临时条目。连接在数秒内被服务端关闭、随后出现 `RDM capture saved: ...` 是预期行为。一次捕获结束后再开始下一组，不要并行运行监听器。
+## 2. 记录实际 RDM 版本并冻结设置
 
-先设置端口：
+捕获前先获取实际使用的 `RemoteDesktopManager.exe` ProductVersion：
+
+```powershell
+$rdmCommand = Get-Command 'RemoteDesktopManager.exe' -ErrorAction SilentlyContinue
+$rdmCandidates = @(
+  $rdmCommand.Source
+  (Join-Path $env:ProgramFiles 'Devolutions\Remote Desktop Manager\RemoteDesktopManager.exe')
+  $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'Devolutions\Remote Desktop Manager\RemoteDesktopManager.exe' })
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+$rdmExe = $rdmCandidates | Select-Object -First 1
+if ($rdmExe) {
+  $rdmProductVersion = (Get-Item -LiteralPath $rdmExe).VersionInfo.ProductVersion
+} else {
+  Write-Warning 'RemoteDesktopManager.exe was not found automatically. Open Help/About in RDM and record Product Version manually.'
+  $rdmProductVersion = (Read-Host 'RDM Product Version shown in Help/About').Trim()
+}
+if ([string]::IsNullOrWhiteSpace($rdmProductVersion)) { throw 'RDM Product Version is required.' }
+```
+
+在 RDM 中新建一个仅用于本批次的 Apple Remote Desktop（ARD）模板条目。主机/IP 为 `127.0.0.1`，端口与稍后设置的 `$env:WINARD_LISTEN_PORT` 相同；用户名使用 `rdm-probe`，密码使用 `synthetic-only`。模拟服务端不会解密或验证认证响应，因此不得使用真实账户或复用密码。不要配置网关、SSH 隧道或端口转发。
+
+复制模板形成七个临时条目。开始前逐项核对并记录 UI 中实际显示的标签和值：
+
+| 设置类别 | 冻结要求 |
+|---|---|
+| 条目类型/协议 | Apple Remote Desktop（ARD），七组相同 |
+| ARD/VNC engine 或实现 | 明确记录实际选择的 engine；七组相同，不允许某组自动切换实现 |
+| 色深/Pixel format | 七组相同；记录 Auto 或明确位数的实际值 |
+| 显示器选择 | 七组相同；记录主显示器、全部显示器或具体显示器的实际值 |
+| 控制/观察模式 | 七组相同；明确记录 Control/Assist 或 View/Observe |
+| 剪贴板 | 全部关闭同步 |
+| 本地缩放/Fit/Stretch | 七组相同；不能把窗口缩放误当作远端 Resolution |
+| 远端 Resolution | 仅 `adaptive-low` 和 `adaptive-high` 按矩阵改变 |
+| Image quality | 仅 Full/High/Medium/Low/Adaptive 按矩阵改变 |
+| 压缩、缓存、共享会话、自动重连 | 记录实际值并在七组间冻结 |
+| 加密/安全模式 | 记录实际值并在七组间冻结 |
+| 其他可能改变 encoding 声明的开关 | 全部记录并在七组间冻结 |
+
+RDM 版本之间的设置页分组可能不同，应记录当前 UI 的原始标签。捕获期间不要按键、点击或移动鼠标。
+
+用以下脱敏记录保存版本和公共设置。它只保存在本批次 artifacts 中，不得提交；不要在回答中记录主机名、真实账户或路径：
+
+```powershell
+$commonSettings = [ordered]@{}
+@(
+  'ARD/VNC engine',
+  'Color depth or Pixel format',
+  'Display selection',
+  'Control or Observe mode',
+  'Clipboard synchronization',
+  'Local scaling or Fit mode',
+  'Compression and cache options',
+  'Shared session and reconnect options',
+  'Encryption or security mode',
+  'Other encoding-affecting switches'
+) | ForEach-Object { $commonSettings[$_] = Read-Host "Record actual RDM setting: $_" }
+
+$matrix = @(
+  [pscustomobject]@{ Profile = 'full-default';     Quality = 'Full';     Resolution = 'Default' },
+  [pscustomobject]@{ Profile = 'high-default';     Quality = 'High';     Resolution = 'Default' },
+  [pscustomobject]@{ Profile = 'medium-default';   Quality = 'Medium';   Resolution = 'Default' },
+  [pscustomobject]@{ Profile = 'low-default';      Quality = 'Low';      Resolution = 'Default' },
+  [pscustomobject]@{ Profile = 'adaptive-default'; Quality = 'Adaptive'; Resolution = 'Default' },
+  [pscustomobject]@{ Profile = 'adaptive-low';     Quality = 'Adaptive'; Resolution = 'Low' },
+  [pscustomobject]@{ Profile = 'adaptive-high';    Quality = 'Adaptive'; Resolution = 'High' }
+)
+
+[ordered]@{
+  schemaVersion = 1
+  rdmProductVersion = $rdmProductVersion
+  commonSettings = $commonSettings
+  matrix = $matrix
+} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $batchRoot 'rdm-context.json') -Encoding utf8
+```
+
+证据文档只能摘录非敏感的版本号和设置结论；`rdm-context.json` 与原始捕获一样不得进入 Git。
+
+## 3. 捕获并硬校验七组 RDM 声明
+
+监听器只绑定 `127.0.0.1`、只接受一个连接，并在收到首个 FramebufferUpdateRequest 后关闭连接。它完成固定的 ARD security type 30 握手，但不解密或验证认证响应。
+
+设置端口后执行整个循环。每轮看到监听提示后，在 RDM 中连接提示所指的临时条目。连接被模拟服务端关闭，随后出现保存提示是预期行为。循环会在每组返回后立即验证 JSON；任一组失败都会停止后续矩阵。
 
 ```powershell
 $env:WINARD_LISTEN_PORT = '5901'
+
+try {
+  foreach ($case in $matrix) {
+    $capturePath = Join-Path $rdmRoot ($case.Profile + '.json')
+    if (Test-Path -LiteralPath $capturePath) { throw "Capture already exists: $capturePath" }
+
+    Write-Host "Set RDM entry '$($case.Profile)' to Quality=$($case.Quality), Resolution=$($case.Resolution), then connect it."
+    & $probe --listen-rdm $case.Profile $capturePath
+    if ($LASTEXITCODE -ne 0) { throw "Listener failed for profile $($case.Profile)." }
+
+    $capture = Get-Content -LiteralPath $capturePath -Raw | ConvertFrom-Json
+    $propertyNames = @($capture.PSObject.Properties.Name)
+    foreach ($requiredProperty in @('schemaVersion', 'profile', 'reachedFramebufferRequest', 'stoppedAtUnknownMessageType')) {
+      if ($propertyNames -notcontains $requiredProperty) { throw "$($case.Profile): missing $requiredProperty." }
+    }
+    if ([int]$capture.schemaVersion -ne 1) { throw "$($case.Profile): schemaVersion is not 1." }
+    if ([string]$capture.profile -cne [string]$case.Profile) { throw "$($case.Profile): profile does not match its file." }
+    if ($capture.reachedFramebufferRequest -ne $true) { throw "$($case.Profile): first framebuffer request was not reached." }
+    if ($null -ne $capture.stoppedAtUnknownMessageType) { throw "$($case.Profile): stopped at unknown message type $($capture.stoppedAtUnknownMessageType)." }
+  }
+} catch {
+  & $clearCaptureEnvironment
+  throw
+}
 ```
 
-严格按下表逐组操作：
+出现未知消息类型时不要根据 TCP 分块猜测消息长度。保留本批次现场，先为该消息增加有界 parser 和测试。
 
-| Profile/文件 | RDM 图像质量 | RDM 分辨率 | 本组唯一允许改变的设置 |
-|---|---|---|---|
-| `full-default` | Full | Default | 基线 |
-| `high-default` | High | Default | 图像质量 |
-| `medium-default` | Medium | Default | 图像质量 |
-| `low-default` | Low | Default | 图像质量 |
-| `adaptive-default` | Adaptive | Default | 图像质量 |
-| `adaptive-low` | Adaptive | Low | 分辨率 |
-| `adaptive-high` | Adaptive | High | 分辨率 |
+## 4. 比较同一批次的 Full 与 Adaptive
 
-每组先在窗口 A 运行相应命令，再在 RDM 中连接名称相同的条目：
+只使用本批次变量构造比较输入：
 
 ```powershell
-& $probe --listen-rdm full-default 'artifacts\protocol-research\rdm\full-default.json'
-& $probe --listen-rdm high-default 'artifacts\protocol-research\rdm\high-default.json'
-& $probe --listen-rdm medium-default 'artifacts\protocol-research\rdm\medium-default.json'
-& $probe --listen-rdm low-default 'artifacts\protocol-research\rdm\low-default.json'
-& $probe --listen-rdm adaptive-default 'artifacts\protocol-research\rdm\adaptive-default.json'
-& $probe --listen-rdm adaptive-low 'artifacts\protocol-research\rdm\adaptive-low.json'
-& $probe --listen-rdm adaptive-high 'artifacts\protocol-research\rdm\adaptive-high.json'
+$fullCapture = Join-Path $rdmRoot 'full-default.json'
+$adaptiveCapture = Join-Path $rdmRoot 'adaptive-default.json'
+
+try {
+  & $probe --compare-rdm-captures $fullCapture $adaptiveCapture
+  if ($LASTEXITCODE -ne 0) { throw 'Full/Adaptive comparison did not produce one candidate.' }
+} catch {
+  & $clearCaptureEnvironment
+  throw
+}
 ```
 
-这些命令是七次独立运行，不是一次性粘贴后等待七个连接。每个目标文件必须与命令中的 profile 同名；若目标文件已经存在，先确认它是否应保留，再使用新的空输出路径，避免混淆不同批次证据。
-
-每组结束后检查 JSON 的结构和终止点：
-
-```powershell
-$capture = Get-Content 'artifacts\protocol-research\rdm\full-default.json' -Raw | ConvertFrom-Json
-$capture | Select-Object schemaVersion, profile, reachedFramebufferRequest, stoppedAtUnknownMessageType
-```
-
-期望 `schemaVersion` 为 `1`、`profile` 与文件名一致、`reachedFramebufferRequest` 为 `True`、`stoppedAtUnknownMessageType` 为空。若出现未知消息类型，停止余下矩阵，不要根据 TCP 分块猜测消息长度。
-
-## 4. 比较 Full 与 Adaptive
-
-完成并验证 `full-default` 和 `adaptive-default` 后运行：
-
-```powershell
-& $probe --compare-rdm-captures `
-  'artifacts\protocol-research\rdm\full-default.json' `
-  'artifacts\protocol-research\rdm\adaptive-default.json'
-```
-
-只有输出恰好一个 `RDM comparison candidate signed encoding ID: ...` 才能进入真实 Mac 捕获。若工具报告零个或多个 Adaptive-only ID，停止；不要人工选择 ID，也不要运行下一节命令。
+只有输出恰好一个 `RDM comparison candidate signed encoding ID: ...` 才能进入真实 Mac 捕获。若工具报告零个或多个 Adaptive-only ID，停止；不要人工选择 ID。此时执行 `& $clearCaptureEnvironment`，处理七个临时 RDM 条目，并保留该批次供调查。
 
 ## 5. 真实 Mac 捕获安全硬门
 
@@ -100,78 +182,83 @@ $capture | Select-Object schemaVersion, profile, reachedFramebufferRequest, stop
 - 唯一显示器全屏展示专用、无敏感信息的合成测试图；
 - 已关闭通知预览、桌面小组件、菜单栏敏感内容，以及显示私人文件名、账户名、消息或浏览器内容的窗口；
 - 没有其他用户或自动化会在捕获期间切换画面；
-- Full/Adaptive 比较已产生唯一候选 ID；
-- 输出目录 `artifacts\protocol-research\mac\adaptive-default` 不存在或为空，且其中没有需要保留的旧证据。
+- 本批次 Full/Adaptive 比较已产生唯一候选 ID；
+- `$macCaptureRoot` 不存在，且本批次变量没有被重新赋值。
 
-`--confirm-synthetic-screen` 只是操作者作出的明确声明，程序无法判断屏幕是否真的脱敏。任何一项不能确认时都不得运行。
+`--confirm-synthetic-screen` 只是操作者作出的明确声明，程序无法判断屏幕是否真的脱敏。任何一项不能确认时都不得运行；应立即调用 `& $clearCaptureEnvironment` 并处理临时 RDM 条目。
 
-设置真实 Mac 的连接信息。密码不要写入环境变量或命令行；探针会在交互式控制台中无回显读取：
+交互读取真实 Mac 的连接信息。密码不要写入环境变量或命令行；探针会在控制台中无回显读取：
 
 ```powershell
-$env:WINARD_HOST = '测试 Mac 的主机名或 IP'
-$env:WINARD_PORT = '5900'
-$env:WINARD_USERNAME = '获授权的测试账户'
+$env:WINARD_HOST = (Read-Host 'Authorized test Mac host or IP').Trim()
+$env:WINARD_PORT = (Read-Host 'ARD port; press Enter only if you will then set 5900').Trim()
+if ([string]::IsNullOrWhiteSpace($env:WINARD_PORT)) { $env:WINARD_PORT = '5900' }
+$env:WINARD_USERNAME = (Read-Host 'Authorized test account').Trim()
 ```
 
-再次目视确认目标 Mac 仍是合成测试图，然后运行：
+再次目视确认目标 Mac 仍是合成测试图，然后只用本批次路径运行：
 
 ```powershell
 & $probe --capture-differential-prefix `
-  'artifacts\protocol-research\rdm\full-default.json' `
-  'artifacts\protocol-research\rdm\adaptive-default.json' `
-  'artifacts\protocol-research\mac\adaptive-default' `
+  $fullCapture `
+  $adaptiveCapture `
+  $macCaptureRoot `
   --confirm-synthetic-screen
+if ($LASTEXITCODE -ne 0) { & $clearCaptureEnvironment; throw 'Encoding prefix capture failed.' }
 ```
 
 成功输出只报告 signed encoding ID、矩形、前缀字节数，以及文件名 `manifest.json` 和 `payload-prefix.bin`；不会打印载荷十六进制。该文件只是最多 64 KiB 的有界前缀，不是完整帧或可分发测试夹具。
 
-## 6. 验证 manifest、长度和哈希
+## 6. 验证同一批次的 manifest、长度和哈希
 
-捕获后立即验证 manifest 与二进制文件一致：
-
-```powershell
-$manifestPath = 'artifacts\protocol-research\mac\adaptive-default\manifest.json'
-$payloadPath = 'artifacts\protocol-research\mac\adaptive-default\payload-prefix.bin'
-$manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-$payload = Get-Item $payloadPath
-$hash = (Get-FileHash $payloadPath -Algorithm SHA256).Hash
-
-if ($manifest.schemaVersion -ne 1) { throw 'Unexpected manifest schema.' }
-if ($manifest.syntheticScreenConfirmed -ne $true) { throw 'Synthetic-screen confirmation is absent.' }
-if ($payload.Length -ne $manifest.prefixLength) { throw 'Payload length does not match manifest.' }
-if ($hash -cne $manifest.payloadSha256) { throw 'Payload SHA-256 does not match manifest.' }
-
-$manifest | ConvertTo-Json -Depth 5
-$hash
-```
-
-manifest 应只含 schema、signed encoding ID、矩形、前缀长度、SHA-256 和合成画面确认，不得含主机、端口、用户名、密码、绝对路径或载荷内容。若长度或哈希不一致，不要继续提取证据；保留现场并先排查写入或文件被改动的问题。
-
-## 7. 清理与禁止提交规则
-
-完成证据提取后：
-
-1. 清除当前 PowerShell 会话中的真实 Mac 连接变量：
-
-   ```powershell
-   Remove-Item Env:WINARD_HOST, Env:WINARD_PORT, Env:WINARD_USERNAME -ErrorAction SilentlyContinue
-   Remove-Item Env:WINARD_LISTEN_PORT -ErrorAction SilentlyContinue
-   ```
-
-2. 删除 RDM 中的七个临时条目，确保合成凭据没有被保留到日常连接配置。
-3. `artifacts\protocol-research` 已由仓库根目录 `.gitignore` 中的 `artifacts/` 规则忽略。不得使用 `git add -f`、不得复制到受版本控制目录，也不得提交任何捕获 JSON、`manifest.json` 或 `payload-prefix.bin`。
-4. 正式证据文档只能记录经核验的协议数值、矩形、长度和 SHA-256，不得嵌入二进制载荷、凭据、主机名或绝对路径。
-5. 普通 WinARD diagnostics 不包含 `payload-prefix.bin`。完成证据提取后，由用户决定保留还是删除该敏感前缀；不再需要时可单独删除：
-
-   ```powershell
-   Remove-Item -LiteralPath 'artifacts\protocol-research\mac\adaptive-default\payload-prefix.bin'
-   ```
-
-提交文档前必须确认研究产物仍未被 Git 跟踪或暂存：
+捕获后立即验证：
 
 ```powershell
-git ls-files artifacts/protocol-research
-git status --short --ignored artifacts/protocol-research
+try {
+  $manifestPath = Join-Path $macCaptureRoot 'manifest.json'
+  $payloadPath = Join-Path $macCaptureRoot 'payload-prefix.bin'
+  $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+  $payload = Get-Item -LiteralPath $payloadPath
+  $hash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash
+
+  if ($manifest.schemaVersion -ne 1) { throw 'Unexpected manifest schema.' }
+  if ($manifest.syntheticScreenConfirmed -ne $true) { throw 'Synthetic-screen confirmation is absent.' }
+  if ($payload.Length -ne $manifest.prefixLength) { throw 'Payload length does not match manifest.' }
+  if ($hash -cne $manifest.payloadSha256) { throw 'Payload SHA-256 does not match manifest.' }
+
+  $manifest | ConvertTo-Json -Depth 5
+  $hash
+} finally {
+  & $clearCaptureEnvironment
+}
 ```
 
-第一条命令必须无输出；第二条只能显示忽略状态 `!!`，不能显示已暂存状态。
+manifest 应只含 schema、signed encoding ID、矩形、前缀长度、SHA-256 和合成画面确认，不得含主机、端口、用户名、密码、绝对路径或载荷内容。若长度或哈希不一致，不要继续提取证据；保留本批次现场并先排查文件是否被改动。
+
+## 7. 所有退出路径的清理与禁止提交规则
+
+无论捕获成功、命令失败、验证抛错，还是操作者用 Ctrl+C 中止，都必须执行以下动作：
+
+1. 若 PowerShell 会话仍在，运行 `& $clearCaptureEnvironment`。若会话已经关闭，环境变量已随进程消失，但仍要完成下面的 RDM 清理。
+2. 关闭 RDM 中仍活动的 probe 连接。成功结束或不再重试时删除七个临时条目；需要重试时将它们禁用并明确标为本批次研究专用，完成重试后删除。不得把普通生产条目改造成捕获条目。
+3. `artifacts\protocol-research` 已由仓库根目录 `.gitignore` 中的 `artifacts/` 规则忽略。不得使用 `git add -f`、不得复制到受版本控制目录，也不得提交任何捕获 JSON、`rdm-context.json`、`manifest.json` 或 `payload-prefix.bin`。
+4. 正式证据文档只能记录经核验的非敏感 RDM 版本/设置结论、协议数值、矩形、长度和 SHA-256，不得嵌入原始记录、二进制载荷、凭据、主机名或绝对路径。
+5. 普通 WinARD diagnostics 不包含 `payload-prefix.bin`。证据提取后由用户决定是否删除该敏感前缀；不再需要时使用本批次变量删除：
+
+   ```powershell
+   $payloadPath = Join-Path $macCaptureRoot 'payload-prefix.bin'
+   if (Test-Path -LiteralPath $payloadPath) { Remove-Item -LiteralPath $payloadPath }
+   ```
+
+最后确认同一批次研究产物仍未被 Git 跟踪或暂存：
+
+```powershell
+$tracked = @(git ls-files -- $batchRoot)
+if ($tracked.Count -ne 0) { throw "Research artifacts are tracked: $($tracked -join ', ')" }
+
+$batchStatus = @(git status --short --ignored -- $batchRoot)
+if ($batchStatus | Where-Object { $_ -notmatch '^!! ' }) { throw 'Research artifacts are staged or unignored.' }
+$batchStatus
+```
+
+`git ls-files` 必须无输出；状态输出只能以忽略标记 `!!` 开头，不能出现暂存状态。需要删除整个批次时，先人工确认 `$batchRoot` 正是本次时间戳目录，再使用文件管理器删除；不要对未经核对的计算路径执行递归删除。
