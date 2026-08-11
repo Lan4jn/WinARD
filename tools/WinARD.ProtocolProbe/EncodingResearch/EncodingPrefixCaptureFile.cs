@@ -1,4 +1,8 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Security.Cryptography;
+using System.Security.AccessControl;
+using System.Security.Principal;
 
 namespace WinARD.ProtocolProbe.EncodingResearch;
 
@@ -10,6 +14,7 @@ public static class EncodingPrefixCaptureFile
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         WriteIndented = true,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
     };
     public static IReadOnlyList<string> RequiredSampleNames { get; } =
         ["solid-color", "gradient", "text", "multiple-rectangle-sizes"];
@@ -26,7 +31,7 @@ public static class EncodingPrefixCaptureFile
     public static void EnsureDestinationAvailable(string outputDirectory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputDirectory);
-        var fullDirectory = Path.GetFullPath(outputDirectory);
+        var fullDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outputDirectory));
         RejectReparsePoints(fullDirectory);
         if (Directory.Exists(fullDirectory) || File.Exists(fullDirectory))
         {
@@ -167,6 +172,7 @@ public static class EncodingPrefixCaptureFile
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(stagingDirectory);
         ArgumentNullException.ThrowIfNull(captures);
+        RejectReparsePoints(Path.GetFullPath(stagingDirectory));
         if (candidateEncodingId is not (1002 or 1001)
             || captures.Count != RequiredCaptureVariantNames.Count
             || captures.Any(capture => capture.EncodingId != candidateEncodingId))
@@ -204,6 +210,182 @@ public static class EncodingPrefixCaptureFile
             .ConfigureAwait(false);
         await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
         destination.Flush(flushToDisk: true);
+    }
+
+    public static async Task VerifyCaptureSetAsync(
+        string stagingDirectory,
+        int candidateEncodingId,
+        IReadOnlyList<EncodingPrefixCapture> captures,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(stagingDirectory);
+        ArgumentNullException.ThrowIfNull(captures);
+        var fullDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(stagingDirectory));
+        RejectReparsePoints(fullDirectory);
+        if (captures.Count != RequiredCaptureVariantNames.Count)
+        {
+            throw new InvalidDataException("The encoding prefix capture set is incomplete.");
+        }
+
+        var expectedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            Path.Combine(fullDirectory, "capture-set.json"),
+        };
+        var expectedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < RequiredCaptureVariantNames.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var name = RequiredCaptureVariantNames[index];
+            var sampleDirectory = Path.Combine(fullDirectory, name);
+            for (var expectedDirectory = sampleDirectory;
+                 !string.Equals(expectedDirectory, fullDirectory, StringComparison.OrdinalIgnoreCase);
+                 expectedDirectory = Directory.GetParent(expectedDirectory)?.FullName
+                     ?? throw new InvalidDataException("The sample directory escaped the staging root."))
+            {
+                expectedDirectories.Add(Path.GetFullPath(expectedDirectory));
+            }
+            RejectReparsePoints(sampleDirectory);
+            var manifestPath = Path.Combine(sampleDirectory, "manifest.json");
+            var payloadPath = Path.Combine(sampleDirectory, "payload-prefix.bin");
+            RejectFileReparse(manifestPath);
+            RejectFileReparse(payloadPath);
+            expectedFiles.Add(Path.GetFullPath(manifestPath));
+            expectedFiles.Add(Path.GetFullPath(payloadPath));
+            await using var manifestSource = new FileStream(
+                manifestPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
+            if (manifestSource.Length is < 1 or > 64 * 1024)
+            {
+                throw new InvalidDataException("The encoding prefix sample manifest has an invalid length.");
+            }
+            CaptureManifest manifest;
+            try
+            {
+                manifest = await JsonSerializer.DeserializeAsync<CaptureManifest>(
+                    manifestSource, SerializerOptions, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidDataException("The encoding prefix sample manifest is invalid.");
+            }
+            catch (JsonException exception)
+            {
+                throw new InvalidDataException("The encoding prefix sample manifest is invalid.", exception);
+            }
+            await using var payloadSource = new FileStream(
+                payloadPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
+            if (payloadSource.Length is < 1 or > 64 * 1024)
+            {
+                throw new InvalidDataException("The encoding prefix payload file has an invalid length.");
+            }
+            var payload = new byte[checked((int)payloadSource.Length)];
+            await payloadSource.ReadExactlyAsync(payload, cancellationToken).ConfigureAwait(false);
+            var expected = captures[index];
+            if (manifest.SchemaVersion != 1
+                || manifest.EncodingId != candidateEncodingId
+                || manifest.Sample != name
+                || manifest.Rectangle != expected.Rectangle
+                || manifest.PrefixLength != expected.PrefixLength
+                || manifest.ObservedPrefixLength != expected.PrefixLength
+                || manifest.DeclaredPayloadLength != expected.DeclaredPayloadLength
+                || !manifest.SyntheticScreenConfirmed
+                || !string.Equals(manifest.PayloadSha256, expected.PayloadSha256, StringComparison.Ordinal)
+                || !payload.SequenceEqual(expected.PayloadPrefix)
+                || !string.Equals(
+                    Convert.ToHexString(SHA256.HashData(payload)),
+                    expected.PayloadSha256,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("The encoding prefix sample changed before publication.");
+            }
+        }
+
+        var actualFiles = Directory.EnumerateFiles(fullDirectory, "*", SearchOption.AllDirectories)
+            .Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (!actualFiles.SetEquals(expectedFiles))
+        {
+            throw new InvalidDataException("The encoding prefix staging directory contains unexpected files.");
+        }
+        var actualDirectories = Directory.EnumerateDirectories(fullDirectory, "*", SearchOption.AllDirectories)
+            .Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (!actualDirectories.SetEquals(expectedDirectories))
+        {
+            throw new InvalidDataException("The encoding prefix staging directory contains unexpected directories.");
+        }
+
+        var setManifestPath = Path.Combine(fullDirectory, "capture-set.json");
+        RejectFileReparse(setManifestPath);
+        await using var setSource = new FileStream(
+            setManifestPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
+        if (setSource.Length is < 1 or > 64 * 1024)
+        {
+            throw new InvalidDataException("The encoding prefix set manifest has an invalid length.");
+        }
+        CaptureSetManifest setManifest;
+        try
+        {
+            setManifest = await JsonSerializer.DeserializeAsync<CaptureSetManifest>(
+                setSource, SerializerOptions, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidDataException("The encoding prefix set manifest is invalid.");
+        }
+        catch (JsonException exception)
+        {
+            throw new InvalidDataException("The encoding prefix set manifest is invalid.", exception);
+        }
+        if (setManifest.SchemaVersion != 1
+            || setManifest.CandidateEncodingId != candidateEncodingId
+            || !string.Equals(setManifest.Status, "complete", StringComparison.Ordinal)
+            || setManifest.Samples.Count != captures.Count)
+        {
+            throw new InvalidDataException("The encoding prefix set manifest changed before publication.");
+        }
+        for (var index = 0; index < captures.Count; index++)
+        {
+            var sample = setManifest.Samples[index];
+            if (sample.Name != RequiredCaptureVariantNames[index]
+                || sample.Rectangle != captures[index].Rectangle
+                || sample.PayloadSha256 != captures[index].PayloadSha256)
+            {
+                throw new InvalidDataException("The encoding prefix set manifest changed before publication.");
+            }
+        }
+
+        RejectReparsePoints(fullDirectory);
+    }
+
+    internal static void ValidatePublishPaths(
+        string stagingDirectory,
+        string parentDirectory,
+        string outputDirectory)
+    {
+        RejectReparsePoints(Path.GetFullPath(parentDirectory));
+        RejectReparsePoints(Path.GetFullPath(stagingDirectory));
+        RejectReparsePoints(Path.GetFullPath(outputDirectory));
+        if (Directory.Exists(outputDirectory) || File.Exists(outputDirectory))
+        {
+            throw new IOException("The encoding prefix output path appeared before publication.");
+        }
+    }
+
+    internal static void RestrictStagingDirectory(string stagingDirectory)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                stagingDirectory,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            return;
+        }
+
+        using var identity = WindowsIdentity.GetCurrent();
+        var user = identity.User
+            ?? throw new InvalidOperationException("Unable to determine the current Windows user.");
+        var security = new DirectorySecurity();
+        security.SetOwner(user);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(
+            user,
+            FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        new DirectoryInfo(stagingDirectory).SetAccessControl(security);
     }
 
     private static async Task WriteSampleCoreAsync(
@@ -319,6 +501,15 @@ public static class EncodingPrefixCaptureFile
             {
                 throw new IOException("Encoding prefix output paths must not contain reparse points.");
             }
+        }
+    }
+
+    private static void RejectFileReparse(string path)
+    {
+        if (!File.Exists(path)
+            || File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new IOException("Encoding prefix files must exist and must not be reparse points.");
         }
     }
 

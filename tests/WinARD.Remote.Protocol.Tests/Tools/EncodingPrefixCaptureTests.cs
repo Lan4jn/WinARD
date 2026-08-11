@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
@@ -403,6 +404,94 @@ public sealed class EncodingPrefixCaptureTests
     }
 
     [Fact]
+    public async Task Capture_set_verification_rejects_tampered_sample_payload()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-tampered-set-{Guid.NewGuid():N}");
+        var captures = CreateDistinctCaptureSet();
+        try
+        {
+            await WriteCaptureSetAsync(directory, captures);
+            await File.WriteAllBytesAsync(
+                Path.Combine(directory, "solid-color", "payload-prefix.bin"),
+                [0xFF]);
+
+            await Assert.ThrowsAsync<InvalidDataException>(() =>
+                EncodingPrefixCaptureFile.VerifyCaptureSetAsync(
+                    directory, CandidateEncoding, captures, CancellationToken.None));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Capture_set_verification_rejects_sample_directory_reparse_replacement()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-reparse-set-{Guid.NewGuid():N}");
+        var external = Path.Combine(Path.GetTempPath(), $"winard-reparse-target-{Guid.NewGuid():N}");
+        var captures = CreateDistinctCaptureSet();
+        try
+        {
+            await WriteCaptureSetAsync(directory, captures);
+            Directory.CreateDirectory(external);
+            var sampleDirectory = Path.Combine(directory, "solid-color");
+            Directory.Delete(sampleDirectory, recursive: true);
+            await CreateJunctionAsync(sampleDirectory, external);
+
+            await Assert.ThrowsAsync<IOException>(() =>
+                EncodingPrefixCaptureFile.VerifyCaptureSetAsync(
+                    directory, CandidateEncoding, captures, CancellationToken.None));
+        }
+        finally
+        {
+            if (Directory.Exists(Path.Combine(directory, "solid-color")))
+            {
+                Directory.Delete(Path.Combine(directory, "solid-color"));
+            }
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+            if (Directory.Exists(external)) Directory.Delete(external, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("sample-host")]
+    [InlineData("set-absolute-path")]
+    [InlineData("extra-directory")]
+    public async Task Capture_set_verification_rejects_unknown_metadata_and_directories(string mutation)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-unknown-set-{Guid.NewGuid():N}");
+        var captures = CreateDistinctCaptureSet();
+        try
+        {
+            await WriteCaptureSetAsync(directory, captures);
+            if (mutation == "extra-directory")
+            {
+                Directory.CreateDirectory(Path.Combine(directory, "unexpected-empty"));
+            }
+            else
+            {
+                var path = mutation == "sample-host"
+                    ? Path.Combine(directory, "solid-color", "manifest.json")
+                    : Path.Combine(directory, "capture-set.json");
+                var property = mutation == "sample-host"
+                    ? "\"host\": \"private.invalid\""
+                    : "\"absolutePath\": \"C:\\\\private\"";
+                var json = (await File.ReadAllTextAsync(path)).TrimEnd();
+                await File.WriteAllTextAsync(path, json[..^1] + "," + property + "}");
+            }
+
+            await Assert.ThrowsAsync<InvalidDataException>(() =>
+                EncodingPrefixCaptureFile.VerifyCaptureSetAsync(
+                    directory, CandidateEncoding, captures, CancellationToken.None));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Capture_file_requires_synthetic_screen_confirmation()
     {
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
@@ -521,7 +610,7 @@ public sealed class EncodingPrefixCaptureTests
         using var password = SecretMaterial.FromUtf8("password");
         try
         {
-            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 new EncodingPrefixCaptureRunner(
                     TimeSpan.FromSeconds(5),
                     (_, _) => throw new InvalidOperationException("sample not confirmed")).RunAsync(
@@ -534,12 +623,101 @@ public sealed class EncodingPrefixCaptureTests
                     syntheticScreenConfirmed: true,
                     CancellationToken.None));
 
+            Assert.Equal("succeeded", exception.Data["EncodingPrefixStagingCleanup"]);
             Assert.False(Directory.Exists(outputDirectory));
             Assert.Empty(Directory.GetDirectories(directory, "output.staging-*"));
         }
         finally
         {
             if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Runner_preserves_primary_failure_when_staging_cleanup_is_locked()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-cleanup-lock-{Guid.NewGuid():N}");
+        var outputDirectory = Path.Combine(directory, "output");
+        var primary = new InvalidOperationException("primary capture failure");
+        FileStream? locked = null;
+        using var username = SecretMaterial.FromUtf8("user");
+        using var password = SecretMaterial.FromUtf8("password");
+        try
+        {
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                new EncodingPrefixCaptureRunner(
+                    TimeSpan.FromSeconds(5),
+                    (_, _) =>
+                    {
+                        var staging = Assert.Single(Directory.GetDirectories(directory, "output.staging-*"));
+                        locked = new FileStream(
+                            Path.Combine(staging, "locked.tmp"),
+                            FileMode.CreateNew,
+                            FileAccess.ReadWrite,
+                            FileShare.None);
+                        throw primary;
+                    }).RunAsync(
+                    "unresolvable.invalid",
+                    5900,
+                    username,
+                    password,
+                    CandidateEncoding,
+                    outputDirectory,
+                    syntheticScreenConfirmed: true,
+                    CancellationToken.None));
+
+            Assert.Same(primary, exception);
+            Assert.Equal("failed", exception.Data["EncodingPrefixStagingCleanup"]);
+            Assert.False(Directory.Exists(outputDirectory));
+        }
+        finally
+        {
+            locked?.Dispose();
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Runner_cleanup_deletes_replaced_staging_root_without_following_junction()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-root-junction-{Guid.NewGuid():N}");
+        var outputDirectory = Path.Combine(directory, "output");
+        var external = Path.Combine(Path.GetTempPath(), $"winard-root-target-{Guid.NewGuid():N}");
+        var primary = new InvalidOperationException("primary after root replacement");
+        using var username = SecretMaterial.FromUtf8("user");
+        using var password = SecretMaterial.FromUtf8("password");
+        try
+        {
+            Directory.CreateDirectory(external);
+            await File.WriteAllTextAsync(Path.Combine(external, "must-remain.txt"), "evidence");
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                new EncodingPrefixCaptureRunner(
+                    TimeSpan.FromSeconds(5),
+                    async (_, _) =>
+                    {
+                        var staging = Assert.Single(Directory.GetDirectories(directory, "output.staging-*"));
+                        Directory.Delete(staging, recursive: true);
+                        await CreateJunctionAsync(staging, external);
+                        throw primary;
+                    }).RunAsync(
+                    "unresolvable.invalid",
+                    5900,
+                    username,
+                    password,
+                    CandidateEncoding,
+                    outputDirectory,
+                    syntheticScreenConfirmed: true,
+                    CancellationToken.None));
+
+            Assert.Same(primary, exception);
+            Assert.Equal("succeeded", exception.Data["EncodingPrefixStagingCleanup"]);
+            Assert.True(File.Exists(Path.Combine(external, "must-remain.txt")));
+            Assert.Empty(Directory.GetDirectories(directory, "output.staging-*"));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+            if (Directory.Exists(external)) Directory.Delete(external, recursive: true);
         }
     }
 
@@ -632,11 +810,13 @@ public sealed class EncodingPrefixCaptureTests
         }
     }
 
-    [Fact]
-    public async Task Runner_completes_encrypted_loopback_capture_in_protocol_order()
+    [Theory]
+    [InlineData("/")]
+    [InlineData("\\")]
+    public async Task Runner_completes_encrypted_loopback_capture_with_trailing_separator(string separator)
     {
         var directory = Path.Combine(Path.GetTempPath(), $"winard-success-{Guid.NewGuid():N}");
-        var outputDirectory = Path.Combine(directory, "output");
+        var outputDirectory = Path.Combine(directory, "output") + separator;
         var expectedPrefix = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray();
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -746,8 +926,132 @@ public sealed class EncodingPrefixCaptureTests
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Runner_refuses_tampered_staging_without_publishing(bool replaceWithJunction)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"winard-runner-tamper-{Guid.NewGuid():N}");
+        var outputDirectory = Path.Combine(directory, "output");
+        var external = Path.Combine(Path.GetTempPath(), $"winard-runner-target-{Guid.NewGuid():N}");
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var hardTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        var serverTask = RunEncryptedCaptureServerAsync(
+            listener, CandidateEncoding, [1, 2, 3, 4], hardTimeout.Token);
+        var confirmationCount = 0;
+        using var username = SecretMaterial.FromUtf8("synthetic-user");
+        using var password = SecretMaterial.FromUtf8("synthetic-password");
+        try
+        {
+            var exception = await Assert.ThrowsAnyAsync<Exception>(() =>
+                new EncodingPrefixCaptureRunner(
+                    TimeSpan.FromSeconds(5),
+                    async (_, token) =>
+                    {
+                        if (confirmationCount++ != 1)
+                        {
+                            return;
+                        }
+
+                        var staging = Assert.Single(Directory.GetDirectories(directory, "output.staging-*"));
+                        var solidDirectory = Path.Combine(staging, "solid-color");
+                        if (replaceWithJunction)
+                        {
+                            Directory.CreateDirectory(external);
+                            Directory.Delete(solidDirectory, recursive: true);
+                            await CreateJunctionAsync(solidDirectory, external);
+                        }
+                        else
+                        {
+                            await File.WriteAllBytesAsync(
+                                Path.Combine(solidDirectory, "payload-prefix.bin"),
+                                [0xFF],
+                                token);
+                        }
+                    }).RunAsync(
+                    IPAddress.Loopback.ToString(),
+                    ((IPEndPoint)listener.LocalEndpoint).Port,
+                    username,
+                    password,
+                    CandidateEncoding,
+                    outputDirectory,
+                    syntheticScreenConfirmed: true,
+                    hardTimeout.Token));
+
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(10));
+            if (replaceWithJunction)
+            {
+                Assert.IsType<IOException>(exception);
+            }
+            else
+            {
+                Assert.IsType<InvalidDataException>(exception);
+            }
+            Assert.NotEmpty(exception.Message);
+            Assert.False(Directory.Exists(outputDirectory));
+            Assert.Empty(Directory.GetDirectories(directory, "output.staging-*"));
+        }
+        finally
+        {
+            listener.Stop();
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+            if (Directory.Exists(external)) Directory.Delete(external, recursive: true);
+        }
+    }
+
     private static EncodingPrefixCapture CreateCapture(byte[] payload) =>
         CreateCapture(payload, new CapturedRectangle(0, 0, 1920, 1080));
+
+    private static EncodingPrefixCapture[] CreateDistinctCaptureSet()
+    {
+        var rectangles = new[]
+        {
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+            new CapturedRectangle(0, 0, 2, 1),
+            new CapturedRectangle(0, 0, 3, 2),
+            new CapturedRectangle(0, 0, 4, 2),
+        };
+        return rectangles.Select(rectangle => CreateCapture([1, 2, 3, 4], rectangle)).ToArray();
+    }
+
+    private static async Task WriteCaptureSetAsync(
+        string directory,
+        IReadOnlyList<EncodingPrefixCapture> captures)
+    {
+        foreach (var pair in EncodingPrefixCaptureFile.RequiredCaptureVariantNames.Zip(captures))
+        {
+            await EncodingPrefixCaptureFile.WriteSampleAsync(
+                directory,
+                CandidateEncoding,
+                pair.First,
+                pair.Second,
+                syntheticScreenConfirmed: true,
+                CancellationToken.None);
+        }
+        await EncodingPrefixCaptureFile.WriteSetManifestAsync(
+            directory, CandidateEncoding, captures, CancellationToken.None);
+    }
+
+    private static async Task CreateJunctionAsync(string path, string target)
+    {
+        using var process = Process.Start(new ProcessStartInfo(
+            "cmd.exe",
+            $"/d /c mklink /J \"{path}\" \"{target}\"")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        }) ?? throw new InvalidOperationException("Unable to start junction creation helper.");
+        await process.WaitForExitAsync();
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException(await process.StandardError.ReadToEndAsync());
+        }
+    }
 
     private static EncodingPrefixCapture CreateCapture(
         byte[] payload,

@@ -72,7 +72,7 @@ public sealed class EncodingPrefixCaptureRunner
             throw new ArgumentOutOfRangeException(nameof(candidateEncodingId));
         }
         EncodingPrefixCaptureFile.EnsureDestinationAvailable(outputDirectory);
-        var fullOutputDirectory = Path.GetFullPath(outputDirectory);
+        var fullOutputDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outputDirectory));
         var parentDirectory = Directory.GetParent(fullOutputDirectory)
             ?? throw new IOException("The encoding prefix output directory must have a parent directory.");
         Directory.CreateDirectory(parentDirectory.FullName);
@@ -81,6 +81,7 @@ public sealed class EncodingPrefixCaptureRunner
 
         try
         {
+            EncodingPrefixCaptureFile.RestrictStagingDirectory(stagingDirectory);
             var captures = new List<EncodingPrefixCapture>(EncodingPrefixCaptureFile.RequiredCaptureVariantNames.Count);
             foreach (var sampleName in EncodingPrefixCaptureFile.RequiredCaptureVariantNames)
             {
@@ -103,14 +104,68 @@ public sealed class EncodingPrefixCaptureRunner
                 candidateEncodingId,
                 captures,
                 cancellationToken).ConfigureAwait(false);
+            await EncodingPrefixCaptureFile.VerifyCaptureSetAsync(
+                stagingDirectory,
+                candidateEncodingId,
+                captures,
+                cancellationToken).ConfigureAwait(false);
+            EncodingPrefixCaptureFile.ValidatePublishPaths(
+                stagingDirectory,
+                parentDirectory.FullName,
+                fullOutputDirectory);
             Directory.Move(stagingDirectory, fullOutputDirectory);
             return captures;
         }
-        finally
+        catch (Exception exception)
         {
-            if (Directory.Exists(stagingDirectory))
+            TryCleanupStaging(stagingDirectory, exception);
+            throw;
+        }
+    }
+
+    private static void TryCleanupStaging(string stagingDirectory, Exception? primaryException)
+    {
+        try
+        {
+            if (File.GetAttributes(stagingDirectory).HasFlag(FileAttributes.ReparsePoint))
             {
+                Directory.Delete(stagingDirectory);
+            }
+            else
+            {
+                DeleteReparseChildrenWithoutFollowing(stagingDirectory);
                 Directory.Delete(stagingDirectory, recursive: true);
+            }
+            if (primaryException is not null)
+            {
+                primaryException.Data["EncodingPrefixStagingCleanup"] = "succeeded";
+            }
+        }
+#pragma warning disable CA1031 // Best-effort cleanup must never replace the primary capture failure.
+        catch (Exception cleanupException)
+#pragma warning restore CA1031
+        {
+            if (primaryException is null)
+            {
+                throw;
+            }
+
+            primaryException.Data["EncodingPrefixStagingCleanup"] = "failed";
+            primaryException.Data["EncodingPrefixStagingCleanupException"] = cleanupException.GetType().Name;
+        }
+    }
+
+    private static void DeleteReparseChildrenWithoutFollowing(string directory)
+    {
+        foreach (var child in Directory.EnumerateDirectories(directory))
+        {
+            if (File.GetAttributes(child).HasFlag(FileAttributes.ReparsePoint))
+            {
+                Directory.Delete(child);
+            }
+            else
+            {
+                DeleteReparseChildrenWithoutFollowing(child);
             }
         }
     }
