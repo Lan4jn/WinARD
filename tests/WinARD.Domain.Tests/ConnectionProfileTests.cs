@@ -92,7 +92,32 @@ public sealed class ConnectionProfileTests
     {
         var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user");
 
+        Assert.Equal(QualityProfile.Automatic, profile.Quality);
         Assert.Equal(FrameRefreshPolicy.Automatic, profile.FrameRefreshPolicy);
+    }
+
+    [Fact]
+    public void Updating_quality_replaces_entire_intent_and_preserves_connection_fields()
+    {
+        var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user")
+            .WithCredential(CredentialReference.Create("windows", "mac-device-1"));
+        var quality = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Full32,
+            QualityScale.Native,
+            FrameRefreshPolicy.Fixed(60),
+            allowAutomaticGrayscale: false,
+            bandwidthLocked: true,
+            colorLocked: true,
+            scaleLocked: true,
+            refreshLocked: true);
+
+        var updated = original.WithQualityProfile(quality);
+
+        Assert.Equal(quality, updated.Quality);
+        Assert.Equal(quality.Refresh, updated.FrameRefreshPolicy);
+        Assert.Equal(original.CredentialReference, updated.CredentialReference);
+        Assert.Equal(original.Host, updated.Host);
     }
 
     [Theory]
@@ -180,6 +205,8 @@ public sealed class ConnectionProfileTests
         var updated = original.WithFrameRefreshPolicy(FrameRefreshPolicy.Unlimited);
 
         Assert.Equal(FrameRefreshPolicy.Unlimited, updated.FrameRefreshPolicy);
+        Assert.Equal(FrameRefreshPolicy.Unlimited, updated.Quality.Refresh);
+        Assert.Equal(original.Quality.WithRefresh(FrameRefreshPolicy.Unlimited), updated.Quality);
         Assert.Equal(original.CredentialReference, updated.CredentialReference);
         Assert.Equal(original.Host, updated.Host);
     }
@@ -217,6 +244,28 @@ public sealed class ConnectionProfileTests
         var updated = original.WithoutSsh();
 
         Assert.Equal(original.FrameRefreshPolicy, updated.FrameRefreshPolicy);
+    }
+
+    [Fact]
+    public void Other_with_methods_preserve_complete_quality_intent()
+    {
+        var quality = QualityProfile.CreateCustom(
+            8L * 1024 * 1024,
+            QualityColor.Grayscale,
+            QualityScale.Percent75,
+            FrameRefreshPolicy.Fixed(105),
+            allowAutomaticGrayscale: true,
+            bandwidthLocked: true,
+            colorLocked: false,
+            scaleLocked: true,
+            refreshLocked: true);
+        var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user")
+            .WithQualityProfile(quality);
+        var ssh = SshProfile.Create("bastion", 22, "jump", null, "mac", 5900, null, null, null);
+
+        Assert.Equal(quality, original.WithCredential(CredentialReference.Create("windows", "key")).Quality);
+        Assert.Equal(quality, original.WithSsh(ssh).Quality);
+        Assert.Equal(quality, original.WithSsh(ssh).WithoutSsh().Quality);
     }
 
 }

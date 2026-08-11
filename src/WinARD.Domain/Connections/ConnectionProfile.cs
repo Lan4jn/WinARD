@@ -13,7 +13,7 @@ public sealed record ConnectionProfile
         TransportMode transportMode,
         CredentialReference? credentialReference,
         SshProfile? sshProfile,
-        FrameRefreshPolicy frameRefreshPolicy)
+        QualityProfile quality)
     {
         Id = id;
         DisplayName = displayName;
@@ -23,7 +23,7 @@ public sealed record ConnectionProfile
         TransportMode = transportMode;
         CredentialReference = credentialReference;
         SshProfile = sshProfile;
-        FrameRefreshPolicy = frameRefreshPolicy;
+        Quality = quality;
     }
 
     public Guid Id { get; }
@@ -42,7 +42,9 @@ public sealed record ConnectionProfile
 
     public SshProfile? SshProfile { get; }
 
-    public FrameRefreshPolicy FrameRefreshPolicy { get; }
+    public QualityProfile Quality { get; }
+
+    public FrameRefreshPolicy FrameRefreshPolicy => Quality.Refresh;
 
     public static ConnectionProfile Create(Guid id, string displayName, string host, int port, string macUsername)
     {
@@ -60,7 +62,7 @@ public sealed record ConnectionProfile
             TransportMode.Direct,
             null,
             null,
-            FrameRefreshPolicy.Automatic);
+            QualityProfile.Automatic);
     }
 
     public ConnectionProfile WithCredential(CredentialReference reference)
@@ -75,7 +77,7 @@ public sealed record ConnectionProfile
             TransportMode,
             reference,
             SshProfile,
-            FrameRefreshPolicy);
+            Quality);
     }
 
     public ConnectionProfile WithSsh(SshProfile sshProfile)
@@ -90,14 +92,20 @@ public sealed record ConnectionProfile
             TransportMode.Ssh,
             CredentialReference,
             sshProfile,
-            FrameRefreshPolicy);
+            Quality);
     }
 
     public ConnectionProfile WithoutSsh() =>
-        new(Id, DisplayName, Host, Port, MacUsername, TransportMode.Direct, CredentialReference, null, FrameRefreshPolicy);
+        new(Id, DisplayName, Host, Port, MacUsername, TransportMode.Direct, CredentialReference, null, Quality);
 
     public ConnectionProfile WithFrameRefreshPolicy(FrameRefreshPolicy policy) =>
-        new(Id, DisplayName, Host, Port, MacUsername, TransportMode, CredentialReference, SshProfile, policy);
+        new(Id, DisplayName, Host, Port, MacUsername, TransportMode, CredentialReference, SshProfile, Quality.WithRefresh(policy));
+
+    public ConnectionProfile WithQualityProfile(QualityProfile quality)
+    {
+        ArgumentNullException.ThrowIfNull(quality);
+        return new(Id, DisplayName, Host, Port, MacUsername, TransportMode, CredentialReference, SshProfile, quality);
+    }
 
     private static string RequiredTrimmed(string value, string parameterName)
     {

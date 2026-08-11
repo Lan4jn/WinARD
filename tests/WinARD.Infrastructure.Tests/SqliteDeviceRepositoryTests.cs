@@ -35,6 +35,52 @@ public sealed class SqliteDeviceRepositoryTests
     }
 
     [Fact]
+    public async Task Repository_round_trips_every_quality_profile_field()
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var quality = QualityProfile.CreateCustom(
+            8L * 1024 * 1024,
+            QualityColor.Grayscale,
+            QualityScale.Percent75,
+            FrameRefreshPolicy.Fixed(75),
+            allowAutomaticGrayscale: true,
+            bandwidthLocked: true,
+            colorLocked: false,
+            scaleLocked: true,
+            refreshLocked: true);
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user")
+            .WithQualityProfile(quality);
+
+        await repository.SaveAsync(profile, CancellationToken.None);
+
+        Assert.Equal(quality, (await repository.GetAsync(profile.Id, CancellationToken.None))!.Quality);
+    }
+
+    [Fact]
+    public async Task Save_updates_every_quality_profile_field()
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user");
+        await repository.SaveAsync(original, CancellationToken.None);
+        var quality = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Full32,
+            QualityScale.Native,
+            FrameRefreshPolicy.Unlimited,
+            allowAutomaticGrayscale: false,
+            bandwidthLocked: true,
+            colorLocked: true,
+            scaleLocked: true,
+            refreshLocked: true);
+
+        await repository.SaveAsync(original.WithQualityProfile(quality), CancellationToken.None);
+
+        Assert.Equal(quality, (await repository.GetAsync(original.Id, CancellationToken.None))!.Quality);
+    }
+
+    [Fact]
     public async Task Save_updates_existing_refresh_policy()
     {
         await using var fixture = await DatabaseFixture.CreateAsync();
@@ -151,6 +197,61 @@ public sealed class SqliteDeviceRepositoryTests
         {
             Assert.IsType<ArgumentOutOfRangeException>(exception.InnerException);
         }
+    }
+
+    [Theory]
+    [InlineData("quality_preset", "99")]
+    [InlineData("quality_color", "99")]
+    [InlineData("quality_scale", "99")]
+    [InlineData("quality_bandwidth_bps", "0")]
+    [InlineData("quality_bandwidth_bps", "-1")]
+    [InlineData("quality_bandwidth_bps", "1099511627777")]
+    [InlineData("quality_allow_gray", "2")]
+    [InlineData("quality_bandwidth_locked", "-1")]
+    [InlineData("quality_color_locked", "2")]
+    [InlineData("quality_scale_locked", "2")]
+    [InlineData("quality_refresh_locked", "2")]
+    public async Task Invalid_persisted_quality_scalar_is_rejected_on_read(string column, string value)
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex");
+        await repository.SaveAsync(profile, CancellationToken.None);
+        await fixture.ExecuteAsync(
+            $"PRAGMA ignore_check_constraints=ON; UPDATE devices SET {column}={value} WHERE id='{profile.Id:D}';");
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => repository.GetAsync(profile.Id, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Invalid_persisted_quality_combination_is_rejected_on_read()
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex");
+        await repository.SaveAsync(profile, CancellationToken.None);
+        await fixture.ExecuteAsync(
+            $"PRAGMA ignore_check_constraints=ON; UPDATE devices SET quality_preset={(int)QualityPreset.Custom}, quality_color={(int)QualityColor.Full32}, quality_color_locked=1, quality_allow_gray=1 WHERE id='{profile.Id:D}';");
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(
+            () => repository.GetAsync(profile.Id, CancellationToken.None));
+        Assert.IsType<ArgumentException>(exception.InnerException);
+    }
+
+    [Theory]
+    [InlineData("quality_bandwidth_bps", "4194304")]
+    [InlineData("quality_color", "1")]
+    [InlineData("quality_scale_locked", "1")]
+    public async Task Named_preset_with_inconsistent_persisted_fields_is_rejected(string column, string value)
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex");
+        await repository.SaveAsync(profile, CancellationToken.None);
+        await fixture.ExecuteAsync(
+            $"PRAGMA ignore_check_constraints=ON; UPDATE devices SET {column}={value} WHERE id='{profile.Id:D}';");
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => repository.GetAsync(profile.Id, CancellationToken.None));
     }
 
     [Fact]

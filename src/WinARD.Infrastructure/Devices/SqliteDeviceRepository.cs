@@ -106,10 +106,16 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         command.CommandText = """
             INSERT INTO devices (
                 id, display_name, host, port, mac_username, transport_mode,
-                credential_store, credential_key, refresh_mode, refresh_fps, created_utc, updated_utc)
+                credential_store, credential_key, refresh_mode, refresh_fps,
+                quality_preset, quality_bandwidth_bps, quality_color, quality_scale, quality_allow_gray,
+                quality_bandwidth_locked, quality_color_locked, quality_scale_locked, quality_refresh_locked,
+                created_utc, updated_utc)
             VALUES (
                 $id, $display_name, $host, $port, $mac_username, $transport_mode,
-                $credential_store, $credential_key, $refresh_mode, $refresh_fps, $now, $now)
+                $credential_store, $credential_key, $refresh_mode, $refresh_fps,
+                $quality_preset, $quality_bandwidth_bps, $quality_color, $quality_scale, $quality_allow_gray,
+                $quality_bandwidth_locked, $quality_color_locked, $quality_scale_locked, $quality_refresh_locked,
+                $now, $now)
             ON CONFLICT(id) DO UPDATE SET
                 display_name = excluded.display_name,
                 host = excluded.host,
@@ -120,6 +126,15 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
                 credential_key = excluded.credential_key,
                 refresh_mode = excluded.refresh_mode,
                 refresh_fps = excluded.refresh_fps,
+                quality_preset = excluded.quality_preset,
+                quality_bandwidth_bps = excluded.quality_bandwidth_bps,
+                quality_color = excluded.quality_color,
+                quality_scale = excluded.quality_scale,
+                quality_allow_gray = excluded.quality_allow_gray,
+                quality_bandwidth_locked = excluded.quality_bandwidth_locked,
+                quality_color_locked = excluded.quality_color_locked,
+                quality_scale_locked = excluded.quality_scale_locked,
+                quality_refresh_locked = excluded.quality_refresh_locked,
                 updated_utc = excluded.updated_utc;
             """;
         command.Parameters.AddWithValue("$id", profile.Id.ToString("D"));
@@ -133,6 +148,15 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         command.Parameters.AddWithValue(
             "$refresh_fps",
             profile.FrameRefreshPolicy.FixedFramesPerSecond is { } framesPerSecond ? framesPerSecond : DBNull.Value);
+        command.Parameters.AddWithValue("$quality_preset", (int)profile.Quality.Preset);
+        command.Parameters.AddWithValue("$quality_bandwidth_bps", profile.Quality.TargetBytesPerSecond is { } bandwidth ? bandwidth : DBNull.Value);
+        command.Parameters.AddWithValue("$quality_color", (int)profile.Quality.Color);
+        command.Parameters.AddWithValue("$quality_scale", (int)profile.Quality.Scale);
+        command.Parameters.AddWithValue("$quality_allow_gray", profile.Quality.AllowAutomaticGrayscale ? 1 : 0);
+        command.Parameters.AddWithValue("$quality_bandwidth_locked", profile.Quality.BandwidthLocked ? 1 : 0);
+        command.Parameters.AddWithValue("$quality_color_locked", profile.Quality.ColorLocked ? 1 : 0);
+        command.Parameters.AddWithValue("$quality_scale_locked", profile.Quality.ScaleLocked ? 1 : 0);
+        command.Parameters.AddWithValue("$quality_refresh_locked", profile.Quality.RefreshLocked ? 1 : 0);
         command.Parameters.AddWithValue("$now", now);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -199,6 +223,8 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
             SELECT
                 d.id, d.display_name, d.host, d.port, d.mac_username, d.transport_mode,
                 d.credential_store, d.credential_key, d.refresh_mode, d.refresh_fps,
+                d.quality_preset, d.quality_bandwidth_bps, d.quality_color, d.quality_scale, d.quality_allow_gray,
+                d.quality_bandwidth_locked, d.quality_color_locked, d.quality_scale_locked, d.quality_refresh_locked,
                 s.ssh_host, s.ssh_port, s.ssh_username, s.private_key_path, s.target_host, s.target_port,
                 s.password_credential_store, s.password_credential_key,
                 s.passphrase_credential_store, s.passphrase_credential_key,
@@ -213,27 +239,27 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
 
     private static ConnectionProfile ReadProfile(SqliteDataReader reader)
     {
-        var transportModeValue = reader.GetInt32(5);
+        var transportModeValue = reader.GetInt32(Columns.TransportMode);
         var transportMode = transportModeValue switch
         {
             (int)TransportMode.Direct => TransportMode.Direct,
             (int)TransportMode.Ssh => TransportMode.Ssh,
             _ => throw new InvalidDataException($"Unsupported persisted transport mode {transportModeValue}."),
         };
-        var hasSshProfile = !reader.IsDBNull(10);
+        var hasSshProfile = !reader.IsDBNull(Columns.SshHost);
         if ((transportMode == TransportMode.Ssh) != hasSshProfile)
         {
             throw new InvalidDataException("Persisted transport mode does not match the SSH profile row.");
         }
 
         var profile = ConnectionProfile.Create(
-            Guid.Parse(reader.GetString(0)),
-            reader.GetString(1),
-            reader.GetString(2),
-            reader.GetInt32(3),
-            reader.GetString(4))
-            .WithFrameRefreshPolicy(ReadRefreshPolicy(reader, 8, 9));
-        var macCredential = ReadCredential(reader, 6, 7);
+            Guid.Parse(reader.GetString(Columns.Id)),
+            reader.GetString(Columns.DisplayName),
+            reader.GetString(Columns.Host),
+            reader.GetInt32(Columns.Port),
+            reader.GetString(Columns.MacUsername))
+            .WithQualityProfile(ReadQualityProfile(reader));
+        var macCredential = ReadCredential(reader, Columns.CredentialStore, Columns.CredentialKey);
         if (macCredential is not null)
         {
             profile = profile.WithCredential(macCredential);
@@ -242,23 +268,27 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         if (hasSshProfile)
         {
             var ssh = SshProfile.Create(
-                    reader.GetString(10),
-                    reader.GetInt32(11),
-                    reader.GetString(12),
-                    ReadNullableString(reader, 13),
-                    reader.GetString(14),
-                    reader.GetInt32(15),
+                    reader.GetString(Columns.SshHost),
+                    reader.GetInt32(Columns.SshPort),
+                    reader.GetString(Columns.SshUsername),
+                    ReadNullableString(reader, Columns.PrivateKeyPath),
+                    reader.GetString(Columns.TargetHost),
+                    reader.GetInt32(Columns.TargetPort),
                     null,
-                    ReadNullableString(reader, 20),
-                    ReadNullableString(reader, 21))
-                .WithAuthenticationCredentials(ReadCredential(reader, 16, 17), ReadCredential(reader, 18, 19));
-            if (!reader.IsDBNull(22))
+                    ReadNullableString(reader, Columns.PinnedHostKeyAlgorithm),
+                    ReadNullableString(reader, Columns.PinnedHostKeySha256))
+                .WithAuthenticationCredentials(
+                    ReadCredential(reader, Columns.PasswordCredentialStore, Columns.PasswordCredentialKey),
+                    ReadCredential(reader, Columns.PassphraseCredentialStore, Columns.PassphraseCredentialKey));
+            if (!reader.IsDBNull(Columns.HostKeyEndpointHost))
             {
                 ssh = ssh.WithHostKeyPin(new SshHostKeyPin(
-                    new SshHostKeyEndpoint(reader.GetString(22), reader.GetInt32(23)),
-                    reader.GetString(24),
-                    reader.GetString(25),
-                    reader.GetString(26)));
+                    new SshHostKeyEndpoint(
+                        reader.GetString(Columns.HostKeyEndpointHost),
+                        reader.GetInt32(Columns.HostKeyEndpointPort)),
+                    reader.GetString(Columns.HostKeyAlgorithm),
+                    reader.GetString(Columns.HostKeyPublicKeyBase64),
+                    reader.GetString(Columns.HostKeyFingerprint)));
             }
 
             profile = profile.WithSsh(ssh);
@@ -322,10 +352,130 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         };
     }
 
+    private static QualityProfile ReadQualityProfile(SqliteDataReader reader)
+    {
+        var refresh = ReadRefreshPolicy(reader, Columns.RefreshMode, Columns.RefreshFps);
+        var preset = ReadEnum<QualityPreset>(reader, Columns.QualityPreset, "quality preset");
+        var color = ReadEnum<QualityColor>(reader, Columns.QualityColor, "quality color");
+        var scale = ReadEnum<QualityScale>(reader, Columns.QualityScale, "quality scale");
+        var bandwidth = reader.IsDBNull(Columns.QualityBandwidth)
+            ? (long?)null
+            : reader.GetInt64(Columns.QualityBandwidth);
+        var allowGray = ReadBoolean(reader, Columns.QualityAllowGray, "quality allow-gray");
+        var bandwidthLocked = ReadBoolean(reader, Columns.QualityBandwidthLocked, "quality bandwidth lock");
+        var colorLocked = ReadBoolean(reader, Columns.QualityColorLocked, "quality color lock");
+        var scaleLocked = ReadBoolean(reader, Columns.QualityScaleLocked, "quality scale lock");
+        var refreshLocked = ReadBoolean(reader, Columns.QualityRefreshLocked, "quality refresh lock");
+
+        try
+        {
+            if (preset == QualityPreset.Custom)
+            {
+                return QualityProfile.CreateCustom(
+                    bandwidth,
+                    color,
+                    scale,
+                    refresh,
+                    allowGray,
+                    bandwidthLocked,
+                    colorLocked,
+                    scaleLocked,
+                    refreshLocked);
+            }
+
+            var named = preset switch
+            {
+                QualityPreset.Automatic => QualityProfile.Automatic,
+                QualityPreset.Original => QualityProfile.Original,
+                QualityPreset.Balanced => QualityProfile.Balanced,
+                QualityPreset.Smooth => QualityProfile.Smooth,
+                _ => throw new InvalidDataException($"Unsupported persisted quality preset {(int)preset}."),
+            };
+            var expected = named.WithRefresh(refresh);
+            if (bandwidth != expected.TargetBytesPerSecond ||
+                color != expected.Color ||
+                scale != expected.Scale ||
+                allowGray != expected.AllowAutomaticGrayscale ||
+                bandwidthLocked != expected.BandwidthLocked ||
+                colorLocked != expected.ColorLocked ||
+                scaleLocked != expected.ScaleLocked ||
+                refreshLocked != expected.RefreshLocked)
+            {
+                throw new InvalidDataException("Persisted named quality preset has inconsistent fields.");
+            }
+
+            return expected;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new InvalidDataException("Persisted quality profile is invalid.", exception);
+        }
+    }
+
+    private static TEnum ReadEnum<TEnum>(SqliteDataReader reader, int ordinal, string fieldName)
+        where TEnum : struct, Enum
+    {
+        var value = reader.GetInt32(ordinal);
+        if (!Enum.IsDefined(typeof(TEnum), value))
+        {
+            throw new InvalidDataException($"Unsupported persisted {fieldName} {value}.");
+        }
+
+        return (TEnum)Enum.ToObject(typeof(TEnum), value);
+    }
+
+    private static bool ReadBoolean(SqliteDataReader reader, int ordinal, string fieldName) =>
+        reader.GetInt32(ordinal) switch
+        {
+            0 => false,
+            1 => true,
+            var value => throw new InvalidDataException($"Unsupported persisted {fieldName} value {value}."),
+        };
+
     private static string? ReadNullableString(SqliteDataReader reader, int ordinal) =>
         reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
 
     private static object DbValue(string? value) => value is null ? DBNull.Value : value;
+
+    private static class Columns
+    {
+        public const int Id = 0;
+        public const int DisplayName = 1;
+        public const int Host = 2;
+        public const int Port = 3;
+        public const int MacUsername = 4;
+        public const int TransportMode = 5;
+        public const int CredentialStore = 6;
+        public const int CredentialKey = 7;
+        public const int RefreshMode = 8;
+        public const int RefreshFps = 9;
+        public const int QualityPreset = 10;
+        public const int QualityBandwidth = 11;
+        public const int QualityColor = 12;
+        public const int QualityScale = 13;
+        public const int QualityAllowGray = 14;
+        public const int QualityBandwidthLocked = 15;
+        public const int QualityColorLocked = 16;
+        public const int QualityScaleLocked = 17;
+        public const int QualityRefreshLocked = 18;
+        public const int SshHost = 19;
+        public const int SshPort = 20;
+        public const int SshUsername = 21;
+        public const int PrivateKeyPath = 22;
+        public const int TargetHost = 23;
+        public const int TargetPort = 24;
+        public const int PasswordCredentialStore = 25;
+        public const int PasswordCredentialKey = 26;
+        public const int PassphraseCredentialStore = 27;
+        public const int PassphraseCredentialKey = 28;
+        public const int PinnedHostKeyAlgorithm = 29;
+        public const int PinnedHostKeySha256 = 30;
+        public const int HostKeyEndpointHost = 31;
+        public const int HostKeyEndpointPort = 32;
+        public const int HostKeyAlgorithm = 33;
+        public const int HostKeyPublicKeyBase64 = 34;
+        public const int HostKeyFingerprint = 35;
+    }
 
     private void ThrowIfDisposed() =>
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);

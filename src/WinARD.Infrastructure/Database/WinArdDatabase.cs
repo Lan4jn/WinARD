@@ -31,7 +31,9 @@ public sealed class WinArdDatabase : IAsyncDisposable
     public string ConnectionString { get; }
 
     public Task InitializeAsync(CancellationToken cancellationToken) =>
-        InitializeAsync([new Migration001Initial(), new Migration002FrameRefreshPolicy()], cancellationToken);
+        InitializeAsync(
+            [new Migration001Initial(), new Migration002FrameRefreshPolicy(), new Migration003QualityProfile()],
+            cancellationToken);
 
     public async Task InitializeAsync(
         IReadOnlyCollection<IDatabaseMigration> migrations,
