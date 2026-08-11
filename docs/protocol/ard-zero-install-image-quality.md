@@ -16,7 +16,9 @@ All three operate with a negotiated **standard PixelFormat**. Pixel depth, byte 
 
 ## ARD scaling control
 
-The deliverable scaling control is the ARD wire sequence **`08 00 + IEEE 754 binary64 big-endian`**: bytes `08 00` followed by the requested scale value encoded as an eight-byte IEEE754 binary64 value in network (big-endian) byte order. The scale value and accepted operating range must remain subject to the connection's validation and resource limits.
+The deliverable scaling control is the ARD wire sequence **`08 00 + IEEE 754 binary64 big-endian`**: bytes `08 00` followed by the requested scale value encoded as an eight-byte IEEE754 binary64 value in network (big-endian) byte order. The accepted range is **`0 < factor <= 1`**; non-finite values and values outside that range are rejected before any bytes are written.
+
+The wire shape and interoperability basis come from the reviewed specification and real-device evidence. Automated tests prove deterministic byte order and rejection of malicious boundary inputs; they do not by themselves claim that a capability was observed on a particular connection.
 
 This control changes the requested remote image scale; it does not create evidence for any private framebuffer decoder.
 

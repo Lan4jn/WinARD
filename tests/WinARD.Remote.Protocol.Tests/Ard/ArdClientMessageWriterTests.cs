@@ -9,6 +9,69 @@ namespace WinARD.Remote.Protocol.Tests.Ard;
 
 public sealed class ArdClientMessageWriterTests
 {
+    [Theory]
+    [InlineData(1.0, "08003FF0000000000000")]
+    [InlineData(0.75, "08003FE8000000000000")]
+    [InlineData(0.5, "08003FE0000000000000")]
+    public async Task Scaling_factor_writes_network_order_binary64(double factor, string expectedHex)
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await writer.WriteScalingFactorAsync(factor, CancellationToken.None);
+
+        Assert.Equal(Convert.FromHexString(expectedHex), stream.ToArray());
+        Assert.Equal(1, stream.WriteCount);
+        Assert.Equal(0, stream.FlushCount);
+        Assert.Equal(0, stream.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Scaling_factor_accepts_the_smallest_positive_binary64_value()
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await writer.WriteScalingFactorAsync(double.Epsilon, CancellationToken.None);
+
+        Assert.Equal(Convert.FromHexString("08000000000000000001"), stream.ToArray());
+    }
+
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(double.NegativeInfinity)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(-1.0)]
+    [InlineData(0.0)]
+    [InlineData(1.0000000000000002)]
+    public async Task Scaling_factor_rejects_invalid_values_before_writing(double factor)
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            writer.WriteScalingFactorAsync(factor, CancellationToken.None).AsTask());
+
+        Assert.Empty(stream.ToArray());
+        Assert.Equal(0, stream.WriteCount);
+    }
+
+    [Fact]
+    public async Task Scaling_factor_honors_pre_cancellation_without_writing()
+    {
+        await using var stream = new TrackingMemoryStream();
+        var writer = new ArdClientMessageWriter(new RfbWriter(stream));
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            writer.WriteScalingFactorAsync(0.75, cancellation.Token).AsTask());
+
+        Assert.Empty(stream.ToArray());
+        Assert.Equal(0, stream.WriteCount);
+        Assert.Equal(0, stream.FlushCount);
+    }
+
     [Fact]
     public async Task Set_encryption_request_and_acknowledgement_write_exact_messages()
     {

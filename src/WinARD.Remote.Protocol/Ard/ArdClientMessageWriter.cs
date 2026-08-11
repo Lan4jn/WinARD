@@ -12,6 +12,7 @@ public sealed class ArdClientMessageWriter
     private const int SessionCommandUsernameOffset = 10;
     private const int SessionCommandUsernameLength = 63;
     private const int AutoFramebufferUpdateLength = 16;
+    private const int ScalingFactorMessageLength = 10;
 
     private readonly RfbWriter _writer;
 
@@ -47,6 +48,22 @@ public sealed class ArdClientMessageWriter
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(10), 0);
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(12), width);
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(14), height);
+        return _writer.WriteMessageAsync(message, cancellationToken);
+    }
+
+    public ValueTask WriteScalingFactorAsync(
+        double factor,
+        CancellationToken cancellationToken)
+    {
+        if (!double.IsFinite(factor) || factor <= 0 || factor > 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(factor));
+        }
+
+        var message = new byte[ScalingFactorMessageLength];
+        message[0] = ArdProtocolConstants.ScalingFactor;
+        var bits = BitConverter.DoubleToInt64Bits(factor);
+        BinaryPrimitives.WriteInt64BigEndian(message.AsSpan(2), bits);
         return _writer.WriteMessageAsync(message, cancellationToken);
     }
 

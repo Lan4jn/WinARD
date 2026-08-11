@@ -22,6 +22,7 @@ public enum ArdControlMode : byte
 
 internal static class ArdProtocolConstants
 {
+    internal const byte ScalingFactor = 0x08;
     internal const byte ViewerInfo = 0x21;
     internal const byte AutoFramebufferUpdate = 0x09;
     internal const byte SetMode = 0x0A;
