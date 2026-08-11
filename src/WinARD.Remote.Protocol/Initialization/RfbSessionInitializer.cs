@@ -12,32 +12,12 @@ namespace WinARD.Remote.Protocol.Initialization;
 public static class RfbSessionInitializer
 {
     private const int MaximumDisplayNameCharacters = 4096;
-    private static readonly int[] RequestedEncodings =
-    [
-        (int)RfbEncodingType.Zrle,
-        (int)RfbEncodingType.Raw,
-        (int)RfbEncodingType.CopyRect,
-        (int)RfbEncodingType.Cursor,
-        (int)RfbEncodingType.DesktopSize,
-    ];
     private static readonly int[] ArdBootstrapRequestedEncodings =
     [
         (int)RfbEncodingType.ArdDisplayInfo,
         (int)RfbEncodingType.ArdDisplayInfo2,
         (int)RfbEncodingType.DesktopSize,
     ];
-    private static readonly int[] ArdRequestedEncodings =
-    [
-        .. RequestedEncodings,
-        (int)RfbEncodingType.ArdDisplayInfo,
-        (int)RfbEncodingType.ArdDisplayInfo2,
-    ];
-    private static readonly int[] ArdEncryptedRequestedEncodings =
-    [
-        .. ArdRequestedEncodings,
-        (int)RfbEncodingType.ArdSessionEncryption,
-    ];
-
     /// <summary>
     /// Sends ClientInit, consumes ServerInit, and declares WinARD's pixel format and encodings.
     /// The write-through stream is neither flushed nor disposed.
@@ -47,18 +27,48 @@ public static class RfbSessionInitializer
         RfbHandshakeResult handshake,
         ProtocolLimits limits,
         CancellationToken cancellationToken) =>
-        InitializeAsync(stream, handshake, limits, null, cancellationToken);
+        InitializeAsync(
+            stream,
+            handshake,
+            limits,
+            RfbSessionDeclaration.Default,
+            null,
+            cancellationToken);
+
+    public static Task<RfbServerInit> InitializeAsync(
+        Stream stream,
+        RfbHandshakeResult handshake,
+        RfbSessionDeclaration declaration,
+        ProtocolLimits limits,
+        CancellationToken cancellationToken) =>
+        InitializeAsync(stream, handshake, limits, declaration, null, cancellationToken);
+
+    public static Task<RfbServerInit> InitializeAsync(
+        Stream stream,
+        RfbHandshakeResult handshake,
+        ProtocolLimits limits,
+        ArdSessionEncryption? sessionEncryption,
+        CancellationToken cancellationToken) =>
+        InitializeAsync(
+            stream,
+            handshake,
+            limits,
+            RfbSessionDeclaration.Default,
+            sessionEncryption,
+            cancellationToken);
 
     public static async Task<RfbServerInit> InitializeAsync(
         Stream stream,
         RfbHandshakeResult handshake,
         ProtocolLimits limits,
+        RfbSessionDeclaration declaration,
         ArdSessionEncryption? sessionEncryption,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(handshake);
         ArgumentNullException.ThrowIfNull(limits);
+        ArgumentNullException.ThrowIfNull(declaration);
         cancellationToken.ThrowIfCancellationRequested();
         if (handshake.SecurityType != RfbSecurityType.AppleRemoteDesktop)
         {
@@ -67,6 +77,9 @@ public static class RfbSessionInitializer
                 nameof(handshake));
         }
 
+        var ardEncodings = handshake.Version == RfbVersion.V3_889
+            ? BuildArdRequestedEncodings(declaration, sessionEncryption)
+            : null;
         var reader = new RfbReader(stream, limits);
         var writer = new RfbWriter(stream);
         if (handshake.Version == RfbVersion.V3_889)
@@ -76,6 +89,8 @@ public static class RfbSessionInitializer
                     reader,
                     writer,
                     limits,
+                    declaration,
+                    ardEncodings!,
                     sessionEncryption,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -88,13 +103,15 @@ public static class RfbSessionInitializer
                 nameof(sessionEncryption));
         }
 
-        return await InitializeStandardAsync(reader, writer, limits, cancellationToken).ConfigureAwait(false);
+        return await InitializeStandardAsync(reader, writer, limits, declaration, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private static async Task<RfbServerInit> InitializeStandardAsync(
         RfbReader reader,
         RfbWriter writer,
         ProtocolLimits limits,
+        RfbSessionDeclaration declaration,
         CancellationToken cancellationToken)
     {
         await writer.WriteByteAsync(1, cancellationToken).ConfigureAwait(false);
@@ -119,8 +136,8 @@ public static class RfbSessionInitializer
             .ConfigureAwait(false);
         var (name, isTruncated) = CreateDisplayName(nameBytes);
 
-        await WriteSetPixelFormatAsync(writer, cancellationToken).ConfigureAwait(false);
-        await WriteSetEncodingsAsync(writer, cancellationToken).ConfigureAwait(false);
+        await WriteSetPixelFormatAsync(writer, declaration.PixelFormat, cancellationToken).ConfigureAwait(false);
+        await WriteSetEncodingsAsync(writer, declaration.Encodings, cancellationToken).ConfigureAwait(false);
         return new RfbServerInit(width, height, serverPixelFormat, name, isTruncated);
     }
 
@@ -129,6 +146,8 @@ public static class RfbSessionInitializer
         RfbReader reader,
         RfbWriter writer,
         ProtocolLimits limits,
+        RfbSessionDeclaration declaration,
+        IReadOnlyList<int> ardEncodings,
         ArdSessionEncryption? sessionEncryption,
         CancellationToken cancellationToken)
     {
@@ -169,12 +188,12 @@ public static class RfbSessionInitializer
         await ardWriter.WriteViewerInfoAsync(cancellationToken).ConfigureAwait(false);
         await ardWriter.WriteSetModeAsync(ArdControlMode.Shared, cancellationToken).ConfigureAwait(false);
         await ardWriter.WriteSetDisplayAsync(cancellationToken).ConfigureAwait(false);
-        await WriteSetPixelFormatAsync(writer, cancellationToken).ConfigureAwait(false);
+        await WriteSetPixelFormatAsync(writer, declaration.PixelFormat, cancellationToken).ConfigureAwait(false);
         await WriteSetEncodingsAsync(
                 writer,
                 requiresBootstrap
                     ? ArdBootstrapRequestedEncodings
-                    : SelectArdRequestedEncodings(sessionEncryption),
+                    : ardEncodings,
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -186,7 +205,7 @@ public static class RfbSessionInitializer
             height = displaySize.Height;
             await WriteSetEncodingsAsync(
                     writer,
-                    SelectArdRequestedEncodings(sessionEncryption),
+                    ardEncodings,
                     cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -202,8 +221,41 @@ public static class RfbSessionInitializer
         };
     }
 
-    private static int[] SelectArdRequestedEncodings(ArdSessionEncryption? sessionEncryption) =>
-        sessionEncryption is null ? ArdRequestedEncodings : ArdEncryptedRequestedEncodings;
+    private static List<int> BuildArdRequestedEncodings(
+        RfbSessionDeclaration declaration,
+        ArdSessionEncryption? sessionEncryption)
+    {
+        var encodings = declaration.Encodings.ToList();
+        AddIfMissing(encodings, (int)RfbEncodingType.ArdDisplayInfo);
+        AddIfMissing(encodings, (int)RfbEncodingType.ArdDisplayInfo2);
+        AddIfMissing(encodings, (int)RfbEncodingType.DesktopSize);
+        if (sessionEncryption is not null)
+        {
+            AddIfMissing(encodings, (int)RfbEncodingType.ArdSessionEncryption);
+        }
+
+        ValidateEncodingCount(encodings);
+
+        return encodings;
+    }
+
+    private static void ValidateEncodingCount(List<int> encodings)
+    {
+        if (encodings.Count > ushort.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(encodings),
+                "An RFB SetEncodings message cannot contain more than 65535 entries.");
+        }
+    }
+
+    private static void AddIfMissing(List<int> encodings, int encoding)
+    {
+        if (!encodings.Contains(encoding))
+        {
+            encodings.Add(encoding);
+        }
+    }
 
     public static async Task WriteFramebufferUpdateRequestAsync(
         Stream stream,
@@ -231,10 +283,24 @@ public static class RfbSessionInitializer
         await new RfbWriter(stream).WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task WriteSetPixelFormatAsync(RfbWriter writer, CancellationToken cancellationToken)
+    public static Task WriteSetPixelFormatAsync(
+        Stream stream,
+        PixelFormat pixelFormat,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(pixelFormat);
+        cancellationToken.ThrowIfCancellationRequested();
+        return WriteSetPixelFormatAsync(new RfbWriter(stream), pixelFormat, cancellationToken);
+    }
+
+    private static async Task WriteSetPixelFormatAsync(
+        RfbWriter writer,
+        PixelFormat pixelFormat,
+        CancellationToken cancellationToken)
     {
         var message = new byte[20];
-        PixelFormat.WinArdBgra32.ToWireBytes().CopyTo(message, 4);
+        pixelFormat.ToWireBytes().CopyTo(message, 4);
         await writer.WriteMessageAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
@@ -250,9 +316,6 @@ public static class RfbSessionInitializer
             BuildSetEncodingsMessage(encodings),
             cancellationToken);
     }
-
-    private static Task WriteSetEncodingsAsync(RfbWriter writer, CancellationToken cancellationToken) =>
-        WriteSetEncodingsAsync(writer, RequestedEncodings, cancellationToken);
 
     private static async Task WriteSetEncodingsAsync(
         RfbWriter writer,

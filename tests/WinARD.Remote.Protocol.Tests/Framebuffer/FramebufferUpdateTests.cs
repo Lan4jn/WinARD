@@ -201,6 +201,22 @@ public sealed class FramebufferUpdateTests
     }
 
     [Fact]
+    public async Task Raw_decodes_winard_little_endian_rgb565_fixture()
+    {
+        using var framebuffer = new FramebufferModel(4, 1, ProtocolLimits.Default);
+
+        _ = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(Update(Raw(0, 0, 4, 1, [0, 0xF8, 0xE0, 0x07, 0x1F, 0, 0xFF, 0xFF]))),
+            framebuffer,
+            PixelFormat.WinArdRgb565,
+            CancellationToken.None);
+
+        Assert.Equal(
+            [0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu],
+            Enumerable.Range(0, 4).Select(x => framebuffer.GetBgra32(x, 0)));
+    }
+
+    [Fact]
     public async Task Raw_supports_8_bit_true_color()
     {
         using var framebuffer = new FramebufferModel(4, 1, ProtocolLimits.Default);

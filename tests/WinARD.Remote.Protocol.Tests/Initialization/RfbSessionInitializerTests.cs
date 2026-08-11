@@ -17,6 +17,113 @@ namespace WinARD.Remote.Protocol.Tests.Initialization;
 public sealed class RfbSessionInitializerTests
 {
     [Fact]
+    public async Task Set_pixel_format_writer_emits_exact_rgb565_wire_message()
+    {
+        await using var stream = new ScriptedDuplexStream([]);
+
+        await RfbSessionInitializer.WriteSetPixelFormatAsync(
+            stream,
+            PixelFormat.WinArdRgb565,
+            CancellationToken.None);
+
+        Assert.Equal(
+            Convert.FromHexString("0000000010100001001F003F001F0B0500000000"),
+            stream.WrittenBytes);
+        Assert.Equal([20], stream.WriteLengths);
+        Assert.Equal(0, stream.FlushCount);
+        Assert.False(stream.WasDisposed);
+    }
+
+    [Fact]
+    public async Task Set_pixel_format_writer_emits_exact_bgra32_wire_message()
+    {
+        await using var stream = new MemoryStream();
+
+        await RfbSessionInitializer.WriteSetPixelFormatAsync(
+            stream,
+            PixelFormat.WinArdBgra32,
+            CancellationToken.None);
+
+        Assert.Equal(
+            Convert.FromHexString("000000002018000100FF00FF00FF100800000000"),
+            stream.ToArray());
+    }
+
+    [Fact]
+    public async Task Set_pixel_format_writer_validates_before_writing()
+    {
+        await using var stream = new MemoryStream();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            RfbSessionInitializer.WriteSetPixelFormatAsync(
+                null!, PixelFormat.WinArdBgra32, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            RfbSessionInitializer.WriteSetPixelFormatAsync(
+                stream, null!, CancellationToken.None));
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            RfbSessionInitializer.WriteSetPixelFormatAsync(
+                stream, PixelFormat.WinArdBgra32, cancellation.Token));
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.Empty(stream.ToArray());
+    }
+
+    [Fact]
+    public void Session_declaration_defensively_copies_encodings_and_preserves_signed_order()
+    {
+        int[] encodings = [6, 16, 0, 1, -239, -223];
+        var declaration = new RfbSessionDeclaration(PixelFormat.WinArdRgb565, encodings);
+
+        encodings[0] = 999;
+
+        Assert.Same(PixelFormat.WinArdRgb565, declaration.PixelFormat);
+        Assert.Equal([6, 16, 0, 1, -239, -223], declaration.Encodings);
+        var mutableView = Assert.IsAssignableFrom<IList<int>>(declaration.Encodings);
+        Assert.True(mutableView.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => mutableView[0] = 999);
+    }
+
+    [Fact]
+    public void Session_declaration_validates_inputs_and_default_excludes_zlib()
+    {
+        Assert.Throws<ArgumentNullException>(() => new RfbSessionDeclaration(null!, []));
+        Assert.Throws<ArgumentNullException>(() => new RfbSessionDeclaration(PixelFormat.WinArdBgra32, null!));
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new RfbSessionDeclaration(PixelFormat.WinArdBgra32, new int[ushort.MaxValue + 1]));
+
+        Assert.Equal("encodings", exception.ParamName);
+        Assert.Same(PixelFormat.WinArdBgra32, RfbSessionDeclaration.Default.PixelFormat);
+        Assert.DoesNotContain(6, RfbSessionDeclaration.Default.Encodings);
+    }
+
+    [Fact]
+    public async Task Session_declaration_controls_standard_pixel_format_and_encoding_wire_order()
+    {
+        var declaration = new RfbSessionDeclaration(
+            PixelFormat.WinArdRgb565,
+            [6, 16, 0, 1, -239, -223]);
+        await using var stream = new ScriptedDuplexStream(
+            ServerInit(640, 480, PixelFormat.WinArdBgra32, "Studio Mac"));
+
+        _ = await RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_8),
+            declaration,
+            ProtocolLimits.Default,
+            CancellationToken.None);
+
+        Assert.Equal(
+            [
+                new byte[] { 1 },
+                Convert.FromHexString("0000000010100001001F003F001F0B0500000000"),
+                SetEncodingsMessage(6, 16, 0, 1, -239, -223),
+            ],
+            stream.Writes);
+    }
+
+    [Fact]
     public void Explicit_handshake_initializer_overload_is_available()
     {
         var overload = typeof(RfbSessionInitializer).GetMethod(
@@ -91,6 +198,7 @@ public sealed class RfbSessionInitializerTests
     public async Task Explicit_initializer_validates_nulls_and_pre_cancellation_before_io()
     {
         await using var stream = new ScriptedDuplexStream([]);
+        await using var compatibilityStream = new ScriptedDuplexStream([]);
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
 
@@ -100,11 +208,19 @@ public sealed class RfbSessionInitializerTests
             RfbSessionInitializer.InitializeAsync(stream, null!, ProtocolLimits.Default, CancellationToken.None));
         await Assert.ThrowsAsync<ArgumentNullException>(() =>
             RfbSessionInitializer.InitializeAsync(stream, Handshake(RfbVersion.V3_8), null!, CancellationToken.None));
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                compatibilityStream,
+                Handshake(RfbVersion.V3_8),
+                ProtocolLimits.Default,
+                null,
+                CancellationToken.None));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             RfbSessionInitializer.InitializeAsync(stream, Handshake(RfbVersion.V3_889), ProtocolLimits.Default, cancellation.Token));
 
         Assert.Equal(0, stream.ReadPosition);
         Assert.Empty(stream.WrittenBytes);
+        Assert.Equal([1], compatibilityStream.WrittenBytes);
     }
 
     [Fact]
@@ -131,6 +247,87 @@ public sealed class RfbSessionInitializerTests
         Assert.Equal([1, 66, 4, 8, 20, 32], stream.WriteLengths);
         Assert.Equal(0, stream.FlushCount);
         Assert.False(stream.WasDisposed);
+    }
+
+    [Fact]
+    public async Task Ard_rejects_metadata_expansion_above_encoding_limit_before_io()
+    {
+        var declaration = new RfbSessionDeclaration(
+            PixelFormat.WinArdBgra32,
+            new int[ushort.MaxValue]);
+        await using var stream = new ScriptedDuplexStream([]);
+
+        var exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                stream,
+                Handshake(RfbVersion.V3_889),
+                declaration,
+                ProtocolLimits.Default,
+                CancellationToken.None));
+
+        Assert.Equal("encodings", exception.ParamName);
+        Assert.Empty(stream.WrittenBytes);
+        Assert.Equal(0, stream.ReadPosition);
+    }
+
+    [Fact]
+    public async Task Ard_rejects_encryption_expansion_above_encoding_limit_before_io()
+    {
+        var declaration = new RfbSessionDeclaration(
+            PixelFormat.WinArdBgra32,
+            new int[ushort.MaxValue - 3]);
+        await using var inner = new ScriptedDuplexStream([]);
+        await using var transport = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        await using var encryption = new ArdSessionEncryption(
+            transport,
+            new ArdAuthenticationResult(new byte[16]));
+
+        var exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            RfbSessionInitializer.InitializeAsync(
+                transport,
+                Handshake(RfbVersion.V3_889),
+                ProtocolLimits.Default,
+                declaration,
+                encryption,
+                CancellationToken.None));
+
+        Assert.Equal("encodings", exception.ParamName);
+        Assert.Empty(inner.WrittenBytes);
+        Assert.Equal(0, inner.ReadPosition);
+    }
+
+    [Fact]
+    public async Task Session_declaration_is_preserved_before_ard_metadata_encodings()
+    {
+        var declaration = new RfbSessionDeclaration(
+            PixelFormat.WinArdRgb565,
+            [6, 16, 0, 1, -239, -223]);
+        var nameField = ExtendedNameField(
+            (uint)ArdServerFlags.MayControl,
+            new byte[16],
+            "Studio Mac");
+        await using var stream = new ScriptedDuplexStream(
+            ServerInit(1440, 900, PixelFormat.WinArdBgra32, nameField));
+
+        _ = await RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_889),
+            declaration,
+            ProtocolLimits.Default,
+            CancellationToken.None);
+
+        Assert.Equal(Convert.FromHexString("0000000010100001001F003F001F0B0500000000"), stream.Writes[^2]);
+        Assert.Equal(
+            SetEncodingsMessage(
+                6,
+                16,
+                0,
+                1,
+                -239,
+                -223,
+                (int)RfbEncodingType.ArdDisplayInfo,
+                (int)RfbEncodingType.ArdDisplayInfo2),
+            stream.Writes[^1]);
     }
 
     [Fact]
@@ -360,6 +557,49 @@ public sealed class RfbSessionInitializerTests
 
         Assert.Equal((1920, 1080), (server.Width, server.Height));
         Assert.Equal(ArdSetEncodingsMessage(), stream.Writes[^1]);
+    }
+
+    [Fact]
+    public async Task Session_declaration_is_applied_only_after_ard_bootstrap_metadata()
+    {
+        var declaration = new RfbSessionDeclaration(PixelFormat.WinArdRgb565, [6, 16, 0]);
+        var prefix = ServerInit(
+                0,
+                0,
+                PixelFormat.WinArdBgra32,
+                ExtendedNameField(
+                    (uint)(ArdServerFlags.MayControl | ArdServerFlags.SessionSelect),
+                    new byte[16],
+                    "Studio"))
+            .Concat(SessionInfo(1u << 1, "alice"u8.ToArray()))
+            .Concat(SessionResult(0))
+            .ToArray();
+        await using var stream = new GatedBootstrapDuplexStream(
+            prefix,
+            FramebufferUpdate(DisplayInfoRectangle(1920, 1080)));
+
+        var initialization = RfbSessionInitializer.InitializeAsync(
+            stream,
+            Handshake(RfbVersion.V3_889),
+            declaration,
+            ProtocolLimits.Default,
+            CancellationToken.None);
+        await stream.BootstrapEncodingsWritten.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(BootstrapSetEncodingsMessage(), stream.Writes[^1]);
+
+        stream.ReleaseBootstrapData();
+        _ = await initialization.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(
+            SetEncodingsMessage(
+                6,
+                16,
+                0,
+                (int)RfbEncodingType.ArdDisplayInfo,
+                (int)RfbEncodingType.ArdDisplayInfo2,
+                (int)RfbEncodingType.DesktopSize),
+            stream.Writes[^1]);
     }
 
     [Fact]

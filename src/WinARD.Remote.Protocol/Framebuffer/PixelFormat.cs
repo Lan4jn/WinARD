@@ -33,6 +33,8 @@ public sealed record PixelFormat
 
     public static PixelFormat WinArdBgra32 { get; } = new(32, 24, 0, 1, 255, 255, 255, 16, 8, 0);
 
+    public static PixelFormat WinArdRgb565 { get; } = new(16, 16, 0, 1, 31, 63, 31, 11, 5, 0);
+
     public byte BitsPerPixel { get; }
     public byte Depth { get; }
     public bool BigEndian { get; }

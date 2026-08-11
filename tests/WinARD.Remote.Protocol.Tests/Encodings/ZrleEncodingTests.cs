@@ -136,6 +136,22 @@ public sealed class ZrleEncodingTests
         Assert.Equal(0xFF112233u, framebuffer.GetBgra32(0, 0));
     }
 
+    [Fact]
+    public async Task Raw_tile_decodes_winard_little_endian_rgb565_fixture()
+    {
+        using var framebuffer = new FramebufferModel(4, 1, ProtocolLimits.Default);
+
+        _ = await DecodeAsync(
+            framebuffer,
+            PixelFormat.WinArdRgb565,
+            new FramebufferRect(0, 0, 4, 1),
+            [0, 0, 0xF8, 0xE0, 0x07, 0x1F, 0, 0xFF, 0xFF]);
+
+        Assert.Equal(
+            [0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu],
+            Enumerable.Range(0, 4).Select(x => framebuffer.GetBgra32(x, 0)));
+    }
+
     [Theory]
     [InlineData(17)]
     [InlineData(129)]
