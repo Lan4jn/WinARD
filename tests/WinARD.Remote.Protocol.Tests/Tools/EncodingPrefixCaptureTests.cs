@@ -110,6 +110,23 @@ public sealed class EncodingPrefixCaptureTests
         Assert.Contains("4096", exception.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Reader_accepts_rectangle_count_at_limit_when_first_rectangle_is_candidate()
+    {
+        var payload = new byte[] { 1, 2, 3 };
+        var bytes = CreateUpdate(CandidateEncoding, payload);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2), 4096);
+        await using var stream = new MemoryStream(bytes);
+
+        var capture = await EncodingPrefixReader.ReadAsync(
+            stream,
+            CandidateEncoding,
+            64 * 1024,
+            CancellationToken.None);
+
+        Assert.Equal(payload, capture.PayloadPrefix);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(65537)]
@@ -140,6 +157,74 @@ public sealed class EncodingPrefixCaptureTests
         Assert.Equal(payload[..7], capture.PayloadPrefix);
         Assert.Equal(1, stream.PayloadReadCount);
         Assert.Equal(64, stream.PayloadReadRequestedLength);
+    }
+
+    [Fact]
+    public async Task Reader_bounds_uint_max_payload_declaration_to_one_64_kib_read()
+    {
+        var bytes = CreateUpdate(CandidateEncoding, Enumerable.Range(1, 7).Select(value => (byte)value).ToArray());
+        BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(16), uint.MaxValue);
+        await using var stream = new PayloadReadTrackingStream(bytes, 7);
+
+        var capture = await EncodingPrefixReader.ReadAsync(
+            stream,
+            CandidateEncoding,
+            64 * 1024,
+            CancellationToken.None);
+
+        Assert.Equal(7, capture.PrefixLength);
+        Assert.Equal(1, stream.PayloadReadCount);
+        Assert.Equal(64 * 1024, stream.PayloadReadRequestedLength);
+    }
+
+    [Fact]
+    public async Task Reader_propagates_pre_cancellation()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await using var stream = new MemoryStream(CreateUpdate(CandidateEncoding, [1]));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => EncodingPrefixReader.ReadAsync(
+            stream,
+            CandidateEncoding,
+            64 * 1024,
+            cancellation.Token));
+    }
+
+    [Fact]
+    public async Task Reader_propagates_cancellation_during_payload_read()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await using var stream = new CancelDuringPayloadStream(
+            CreateUpdate(CandidateEncoding, Enumerable.Repeat((byte)1, 64).ToArray()),
+            cancellation);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => EncodingPrefixReader.ReadAsync(
+            stream,
+            CandidateEncoding,
+            64 * 1024,
+            cancellation.Token));
+    }
+
+    [Fact]
+    public async Task Reader_requests_after_only_the_first_seven_of_eight_empty_updates()
+    {
+        var bytes = Enumerable.Repeat(new byte[] { 0, 0, 0, 0 }, 8).SelectMany(value => value).ToArray();
+        await using var stream = new MemoryStream(bytes);
+        var requests = 0;
+
+        await Assert.ThrowsAsync<RfbProtocolException>(() => EncodingPrefixReader.ReadAsync(
+            stream,
+            CandidateEncoding,
+            64 * 1024,
+            _ =>
+            {
+                requests++;
+                return Task.CompletedTask;
+            },
+            CancellationToken.None));
+
+        Assert.Equal(7, requests);
     }
 
     [Fact]
@@ -582,8 +667,26 @@ public sealed class EncodingPrefixCaptureTests
             cancellationToken);
         Assert.Equal(CreateFullRequest(4, 2), secondClientPacket.Payload);
 
+        var emptyUpdatePacket = ArdEncryptedPacketCodec.Encrypt(
+            sessionKey,
+            sessionIv,
+            sequence: 0,
+            new byte[] { 0, 0, 0, 0 });
+        await stream.WriteAsync(emptyUpdatePacket, cancellationToken);
+        var thirdClientPacket = await ReadEncryptedPacketAsync(
+            stream,
+            sessionKey,
+            secondClientPacket.NextIv,
+            sequence: 2,
+            cancellationToken);
+        Assert.Equal(CreateFullRequest(4, 2), thirdClientPacket.Payload);
+
         var update = CreateUpdate(candidateEncodingId, payloadPrefix, width: 4, height: 2);
-        var serverPacket = ArdEncryptedPacketCodec.Encrypt(sessionKey, sessionIv, 0, update);
+        var serverPacket = ArdEncryptedPacketCodec.Encrypt(
+            sessionKey,
+            emptyUpdatePacket.AsSpan(^16),
+            sequence: 1,
+            update);
         await stream.WriteAsync(serverPacket, cancellationToken);
         Assert.Equal(0, await stream.ReadAsync(new byte[1], cancellationToken));
         Assert.InRange(activationRequests, 1, 8);
@@ -693,6 +796,24 @@ public sealed class EncodingPrefixCaptureTests
                 PayloadReadCount++;
                 PayloadReadRequestedLength = buffer.Length;
                 buffer = buffer[..Math.Min(partialPayloadCount, buffer.Length)];
+            }
+
+            return base.ReadAsync(buffer, cancellationToken);
+        }
+    }
+
+    private sealed class CancelDuringPayloadStream(
+        byte[] bytes,
+        CancellationTokenSource cancellation) : MemoryStream(bytes)
+    {
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (buffer.Length >= 64)
+            {
+                cancellation.Cancel();
+                return ValueTask.FromCanceled<int>(cancellationToken);
             }
 
             return base.ReadAsync(buffer, cancellationToken);

@@ -15,10 +15,39 @@ public static class EncodingPrefixReader
     private const string EmptyPayloadMessage =
         "The candidate encoding rectangle contained no observable payload prefix.";
 
-    public static async Task<EncodingPrefixCapture> ReadAsync(
+    public static Task<EncodingPrefixCapture> ReadAsync(
         Stream stream,
         int candidateEncodingId,
         int maximumPrefixLength,
+        CancellationToken cancellationToken) =>
+        ReadCoreAsync(
+            stream,
+            candidateEncodingId,
+            maximumPrefixLength,
+            requestNextUpdate: null,
+            cancellationToken);
+
+    internal static Task<EncodingPrefixCapture> ReadAsync(
+        Stream stream,
+        int candidateEncodingId,
+        int maximumPrefixLength,
+        Func<CancellationToken, Task> requestNextUpdate,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(requestNextUpdate);
+        return ReadCoreAsync(
+            stream,
+            candidateEncodingId,
+            maximumPrefixLength,
+            requestNextUpdate,
+            cancellationToken);
+    }
+
+    private static async Task<EncodingPrefixCapture> ReadCoreAsync(
+        Stream stream,
+        int candidateEncodingId,
+        int maximumPrefixLength,
+        Func<CancellationToken, Task>? requestNextUpdate,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
@@ -56,6 +85,11 @@ public static class EncodingPrefixReader
 
             if (rectangleCount == 0)
             {
+                if (updateIndex + 1 < MaximumEmptyUpdates && requestNextUpdate is not null)
+                {
+                    await requestNextUpdate(cancellationToken).ConfigureAwait(false);
+                }
+
                 continue;
             }
 

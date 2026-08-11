@@ -139,6 +139,7 @@ public sealed class EncodingPrefixCaptureRunner
                 transport,
                 candidateEncodingId,
                 MaximumPrefixLength,
+                token => WriteFullRequestAsync(transport, framebuffer, token),
                 operationCancellation.Token).ConfigureAwait(false);
             await EncodingPrefixCaptureFile.WriteAsync(
                 outputDirectory,
