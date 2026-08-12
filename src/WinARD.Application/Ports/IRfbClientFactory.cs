@@ -15,6 +15,8 @@ public interface IRfbClient : IAsyncDisposable
 
     ArdDisplayCapabilities QualityCapabilities => ArdDisplayCapabilities.Unknown;
 
+    QualityBootstrapState BootstrapState => QualityBootstrapState.LegacyBgra32;
+
     RemoteRuntimePerformanceSnapshot PerformanceSnapshot =>
         RemoteRuntimePerformanceSnapshot.Empty;
 
@@ -35,6 +37,12 @@ public interface IRfbClient : IAsyncDisposable
         CancellationToken cancellationToken);
 
     Task InitializeAsync(CancellationToken cancellationToken);
+
+    ValueTask ConfigureBootstrapAsync(
+        QualityBootstrapSettings settings,
+        QualityBootstrapAttempt attempt,
+        CancellationToken cancellationToken) =>
+        ValueTask.FromException(new NotSupportedException("Bootstrap configuration is not supported."));
 
     ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
         ValueTask.FromException(new NotSupportedException("Runtime framebuffer updates are not supported."));

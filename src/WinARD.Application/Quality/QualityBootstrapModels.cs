@@ -99,3 +99,37 @@ public sealed record QualityBootstrapPlan
 
     public QualityBootstrapSettings Fallback { get; }
 }
+
+public sealed record QualityBootstrapState
+{
+    public QualityBootstrapState(
+        QualityBootstrapAttempt attempt,
+        QualityBootstrapSettings actualQuality)
+        : this((QualityBootstrapAttempt?)attempt, actualQuality)
+    {
+    }
+
+    private QualityBootstrapState(
+        QualityBootstrapAttempt? attempt,
+        QualityBootstrapSettings actualQuality)
+    {
+        if (attempt is { } value && !Enum.IsDefined(value))
+        {
+            throw new ArgumentOutOfRangeException(nameof(attempt));
+        }
+
+        Attempt = attempt;
+        ActualQuality = actualQuality ?? throw new ArgumentNullException(nameof(actualQuality));
+    }
+
+    public static QualityBootstrapState LegacyBgra32 { get; } = new(
+        attempt: null,
+        new QualityBootstrapSettings(
+            RemotePixelFormatKind.Bgra32,
+            [6, 16, 0, 1, -239, -223],
+            QualityBootstrapReason.SafeFallback));
+
+    public QualityBootstrapAttempt? Attempt { get; }
+
+    public QualityBootstrapSettings ActualQuality { get; }
+}

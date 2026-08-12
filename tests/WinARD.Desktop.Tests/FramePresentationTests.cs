@@ -1330,6 +1330,379 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Rfb_client_configures_rgb565_bootstrap_before_the_first_full_request()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var initializationLength = stream.WrittenBytes.Length;
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+
+        await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default);
+        await client.RequestFramebufferUpdateAsync(incremental: false, default);
+
+        Assert.Equal(
+            BootstrapWire(PixelFormat.WinArdRgb565, settings.Encodings, 2, 1),
+            stream.WrittenBytes[initializationLength..]);
+        Assert.Equal(QualityBootstrapAttempt.Preferred, client.BootstrapState.Attempt);
+        Assert.Equal(RemotePixelFormatKind.Rgb565, client.BootstrapState.ActualQuality.PixelFormat);
+        Assert.Equal(settings.Encodings, client.BootstrapState.ActualQuality.Encodings);
+    }
+
+    [Fact]
+    public async Task Legacy_rfb_client_implementations_explicitly_reject_bootstrap_configuration()
+    {
+        await using IRfbClient client = new LegacyRfbClient();
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+
+        await Assert.ThrowsAsync<NotSupportedException>(() =>
+            client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default).AsTask());
+
+        Assert.Same(QualityBootstrapState.LegacyBgra32, client.BootstrapState);
+    }
+
+    [Fact]
+    public async Task Active_bootstrap_rejects_receive_transition_and_request_without_interleaved_wire()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var blockedWrite = stream.BlockNextWrite();
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+        var bootstrap = client.ConfigureBootstrapAsync(
+            settings,
+            QualityBootstrapAttempt.Preferred,
+            default).AsTask();
+        await blockedWrite.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var blockedWireLength = stream.WrittenBytes.Length;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => client.ReceiveAsync(default).AsTask());
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.ApplyQualityTransitionAsync(
+                new RemoteQualitySettings(RemotePixelFormatKind.Bgra32, [6, 16, 0, 1, -239, -223], 1),
+                default).AsTask());
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.RequestFramebufferUpdateAsync(incremental: false, default).AsTask());
+        Assert.Equal(blockedWireLength, stream.WrittenBytes.Length);
+
+        blockedWrite.Release.TrySetResult();
+        await bootstrap.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Bootstrap_publishes_only_complete_states_across_a_blocked_write()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var blockedWrite = stream.BlockNextWrite();
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+
+        var bootstrap = client.ConfigureBootstrapAsync(
+            settings,
+            QualityBootstrapAttempt.Preferred,
+            default).AsTask();
+        await blockedWrite.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Same(QualityBootstrapState.LegacyBgra32, client.BootstrapState);
+
+        blockedWrite.Release.TrySetResult();
+        await bootstrap.WaitAsync(TimeSpan.FromSeconds(5));
+        var published = client.BootstrapState;
+        Assert.Equal(QualityBootstrapAttempt.Preferred, published.Attempt);
+        Assert.Same(settings, published.ActualQuality);
+    }
+
+    [Fact]
+    public async Task Precancelled_bootstrap_creates_no_target_and_preserves_current_session()
+    {
+        var createCount = 0;
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1), .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(
+            stream,
+            framebufferSessionFactory: (framebuffer, pixelFormat) =>
+            {
+                Interlocked.Increment(ref createCount);
+                return FramebufferUpdateReader.CreateSession(
+                    framebuffer,
+                    pixelFormat == RemotePixelFormatKind.Bgra32
+                        ? PixelFormat.WinArdBgra32
+                        : PixelFormat.WinArdRgb565);
+            });
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var wireLength = stream.WrittenBytes.Length;
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, cancellation.Token).AsTask());
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.Equal(1, createCount);
+        Assert.Equal(wireLength, stream.WrittenBytes.Length);
+        using var cursor = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(default));
+    }
+
+    [Fact]
+    public async Task Post_commit_old_session_cleanup_failure_does_not_reverse_bootstrap_success()
+    {
+        var oldDecoder = new CountingDisposeDecoder(throws: true);
+        var targetDecoder = new CountingDisposeDecoder();
+        var createCount = 0;
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1), .. CursorOnlyUpdate()]);
+        var client = new RfbClient(
+            stream,
+            framebufferSessionFactory: (framebuffer, pixelFormat) =>
+            {
+                var decoder = Interlocked.Increment(ref createCount) == 1 ? oldDecoder : targetDecoder;
+                return new FramebufferUpdateSession(
+                    framebuffer,
+                    new Dictionary<int, IRfbEncodingDecoder>
+                    {
+                        [(int)RfbEncodingType.Cursor] = new CursorEncoding(
+                            pixelFormat == RemotePixelFormatKind.Bgra32
+                                ? PixelFormat.WinArdBgra32
+                                : PixelFormat.WinArdRgb565),
+                        [700] = decoder,
+                    });
+            });
+        try
+        {
+            await client.NegotiateAsync(default);
+            await client.InitializeAsync(default);
+            var settings = new QualityBootstrapSettings(
+                RemotePixelFormatKind.Rgb565,
+                [16, 6, 0, 1, -239, -223],
+                QualityBootstrapReason.AutomaticBandwidth);
+
+            await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default);
+            await client.RequestFramebufferUpdateAsync(incremental: false, default);
+            using var cursor = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(default));
+
+            Assert.Equal(1, oldDecoder.DisposeCount);
+            Assert.Equal(0, targetDecoder.DisposeCount);
+            Assert.Same(settings, client.BootstrapState.ActualQuality);
+        }
+        finally
+        {
+            await client.DisposeAsync();
+        }
+
+        Assert.Equal(1, oldDecoder.DisposeCount);
+        Assert.Equal(1, targetDecoder.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Bootstrap_wire_failure_disposes_current_and_target_once()
+    {
+        var decoders = new List<CountingDisposeDecoder>();
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        var client = new RfbClient(
+            stream,
+            framebufferSessionFactory: (framebuffer, _) =>
+            {
+                var decoder = new CountingDisposeDecoder();
+                decoders.Add(decoder);
+                return new FramebufferUpdateSession(
+                    framebuffer,
+                    new Dictionary<int, IRfbEncodingDecoder> { [700] = decoder });
+            });
+        try
+        {
+            await client.NegotiateAsync(default);
+            await client.InitializeAsync(default);
+            stream.FailAfterSuccessfulWrites(1, new IOException("injected bootstrap failure"));
+            var settings = new QualityBootstrapSettings(
+                RemotePixelFormatKind.Rgb565,
+                [16, 6, 0, 1, -239, -223],
+                QualityBootstrapReason.AutomaticBandwidth);
+
+            await Assert.ThrowsAsync<IOException>(() =>
+                client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default).AsTask());
+        }
+        finally
+        {
+            await client.DisposeAsync();
+        }
+
+        Assert.Equal(2, decoders.Count);
+        Assert.All(decoders, decoder => Assert.Equal(1, decoder.DisposeCount));
+    }
+
+    [Fact]
+    public async Task Shutdown_during_active_bootstrap_completes_without_double_disposal()
+    {
+        var decoders = new List<CountingDisposeDecoder>();
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        var client = new RfbClient(
+            stream,
+            framebufferSessionFactory: (framebuffer, _) =>
+            {
+                var decoder = new CountingDisposeDecoder();
+                decoders.Add(decoder);
+                return new FramebufferUpdateSession(
+                    framebuffer,
+                    new Dictionary<int, IRfbEncodingDecoder> { [700] = decoder });
+            });
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var blockedWrite = stream.BlockNextWrite();
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+        var bootstrap = client.ConfigureBootstrapAsync(
+            settings,
+            QualityBootstrapAttempt.Preferred,
+            default).AsTask();
+        await blockedWrite.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        client.BeginShutdown();
+        await blockedWrite.CancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => bootstrap);
+        await client.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, decoders.Count);
+        Assert.All(decoders, decoder => Assert.Equal(1, decoder.DisposeCount));
+    }
+
+    [Fact]
+    public async Task Rfb_client_configures_bgra32_fallback_with_zlib_first()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var initializationLength = stream.WrittenBytes.Length;
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Bgra32,
+            [6, 16, 0, 1, -239, -223],
+            QualityBootstrapReason.SafeFallback);
+
+        await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Fallback, default);
+
+        Assert.Equal(
+            BootstrapWire(PixelFormat.WinArdBgra32, settings.Encodings),
+            stream.WrittenBytes[initializationLength..]);
+        Assert.Equal(QualityBootstrapAttempt.Fallback, client.BootstrapState.Attempt);
+        Assert.Equal(settings, client.BootstrapState.ActualQuality);
+    }
+
+    [Fact]
+    public async Task Rfb_client_rejects_a_second_bootstrap_without_writing()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+        await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default);
+        var configuredLength = stream.WrittenBytes.Length;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default).AsTask());
+
+        Assert.Equal(configuredLength, stream.WrittenBytes.Length);
+    }
+
+    [Fact]
+    public async Task Rfb_client_rejects_bootstrap_after_the_first_request_without_writing()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        await client.RequestFramebufferUpdateAsync(incremental: false, default);
+        var requestedLength = stream.WrittenBytes.Length;
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default).AsTask());
+
+        Assert.Equal(requestedLength, stream.WrittenBytes.Length);
+    }
+
+    [Fact]
+    public async Task Canceled_bootstrap_after_wire_output_faults_the_client_without_publishing_state()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+        stream.CancelAfterNextWrite(cancellation);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, cancellation.Token).AsTask());
+
+        Assert.Same(QualityBootstrapState.LegacyBgra32, client.BootstrapState);
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            client.RequestFramebufferUpdateAsync(incremental: false, default).AsTask());
+    }
+
+    [Fact]
+    public async Task Failed_bootstrap_after_wire_output_faults_the_client_without_publishing_state()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+        stream.FailAfterSuccessfulWrites(1, new IOException("injected bootstrap failure"));
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default).AsTask());
+
+        Assert.Same(QualityBootstrapState.LegacyBgra32, client.BootstrapState);
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            client.RequestFramebufferUpdateAsync(incremental: false, default).AsTask());
+    }
+
+    [Fact]
     public async Task Rfb_client_rejects_duplicate_request_until_a_frame_response_completes()
     {
         await using var stream = new ScriptedDuplexStream(
@@ -2309,6 +2682,38 @@ public sealed class FramePresentationTests
         return -1;
     }
 
+    private static byte[] BootstrapWire(
+        PixelFormat pixelFormat,
+        IReadOnlyList<int> encodings,
+        ushort? requestWidth = null,
+        ushort? requestHeight = null)
+    {
+        var bytes = new List<byte>(24 + (encodings.Count * sizeof(int)) + 10);
+        bytes.AddRange([0, 0, 0, 0]);
+        bytes.AddRange(pixelFormat.ToWireBytes());
+        bytes.AddRange([2, 0]);
+        var count = new byte[2];
+        BinaryPrimitives.WriteUInt16BigEndian(count, checked((ushort)encodings.Count));
+        bytes.AddRange(count);
+        foreach (var encoding in encodings)
+        {
+            var encoded = new byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(encoded, encoding);
+            bytes.AddRange(encoded);
+        }
+
+        if (requestWidth is { } width && requestHeight is { } height)
+        {
+            bytes.AddRange([3, 0, 0, 0, 0, 0]);
+            var dimensions = new byte[4];
+            BinaryPrimitives.WriteUInt16BigEndian(dimensions, width);
+            BinaryPrimitives.WriteUInt16BigEndian(dimensions.AsSpan(2), height);
+            bytes.AddRange(dimensions);
+        }
+
+        return bytes.ToArray();
+    }
+
     private static List<byte> ParseClientMessageTypes(byte[] messages)
     {
         var types = new List<byte>();
@@ -2452,6 +2857,29 @@ public sealed class FramePresentationTests
         public void Dispose() => IsDisposed = true;
     }
 
+    private sealed class CountingDisposeDecoder(bool throws = false) : IRfbEncodingDecoder, IDisposable
+    {
+        public int EncodingId => 700;
+
+        public int DisposeCount { get; private set; }
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            WinARD.Remote.Protocol.Framebuffer.Framebuffer framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(EncodingDecodeResult.Empty);
+
+        public void Dispose()
+        {
+            DisposeCount++;
+            if (throws)
+            {
+                throw new IOException("injected decoder cleanup failure");
+            }
+        }
+    }
+
     private sealed class BlockingDecoder : IRfbEncodingDecoder
     {
         private readonly TaskCompletionSource _started =
@@ -2517,6 +2945,20 @@ public sealed class FramePresentationTests
             client.SendClipboardTextAsync(text, cancellationToken);
 
         public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class LegacyRfbClient : IRfbClient
+    {
+        public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task AuthenticateAsync(
+            string username,
+            ISecret secret,
+            CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class ScriptedDuplexStream(

@@ -59,9 +59,13 @@ internal sealed class RfbClient : IRfbClient
     private bool _framebufferRequestOutstanding;
     private bool _receiveActive;
     private bool _qualityTransitionActive;
+    private bool _bootstrapConfigurationActive;
+    private bool _bootstrapConfigured;
+    private bool _framebufferRequestAttempted;
     private bool _faulted;
     private bool _shutdownStarted;
     private bool _disposed;
+    private QualityBootstrapState _bootstrapState = QualityBootstrapState.LegacyBgra32;
 
     public RfbClient(
         Stream stream,
@@ -209,15 +213,140 @@ internal sealed class RfbClient : IRfbClient
                 throw new InvalidOperationException("A quality transition is active.");
             }
 
+            if (_bootstrapConfigurationActive)
+            {
+                throw new InvalidOperationException("Bootstrap configuration is active.");
+            }
+
             if (_framebufferRequestOutstanding)
             {
                 throw new InvalidOperationException("A framebuffer update request is already outstanding.");
             }
 
             _framebufferRequestOutstanding = true;
+            _framebufferRequestAttempted = true;
         }
 
         return RequestFramebufferUpdateCoreAsync(framebuffer, incremental, cancellationToken);
+    }
+
+    public QualityBootstrapState BootstrapState => Volatile.Read(ref _bootstrapState);
+
+    public async ValueTask ConfigureBootstrapAsync(
+        QualityBootstrapSettings settings,
+        QualityBootstrapAttempt attempt,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(settings);
+        if (!Enum.IsDefined(attempt))
+        {
+            throw new ArgumentOutOfRangeException(nameof(attempt));
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
+        FramebufferUpdateSession currentSession;
+        lock (_lifecycleSync)
+        {
+            ThrowIfProtocolUnavailableNoLock();
+            if (_bootstrapConfigured || _bootstrapConfigurationActive)
+            {
+                throw new InvalidOperationException("RFB bootstrap has already been configured.");
+            }
+
+            if (_framebufferRequestAttempted || _framebufferRequestOutstanding || _receiveActive || _qualityTransitionActive)
+            {
+                throw new InvalidOperationException("RFB bootstrap must be configured before the first framebuffer request.");
+            }
+
+            currentSession = _framebufferUpdates ??
+                throw new InvalidOperationException("RFB initialization has not completed.");
+            _bootstrapConfigurationActive = true;
+        }
+
+        FramebufferUpdateSession? targetSession = null;
+        var wireAttempted = false;
+        var published = false;
+        try
+        {
+            targetSession = CreateFramebufferUpdateSession(framebuffer, settings.PixelFormat);
+            await _messageScheduler.EnqueueBackgroundAsync(async token =>
+            {
+                try
+                {
+                    wireAttempted = true;
+                    await RfbSessionInitializer.WriteSetPixelFormatAsync(
+                        _transport,
+                        ToProtocolPixelFormat(settings.PixelFormat),
+                        token).ConfigureAwait(false);
+                    await RfbSessionInitializer.WriteSetEncodingsAsync(
+                        _transport,
+                        settings.Encodings,
+                        token).ConfigureAwait(false);
+
+                    lock (_lifecycleSync)
+                    {
+                        ThrowIfProtocolUnavailableNoLock();
+                        _framebufferUpdates = targetSession;
+                        _qualitySettings = new RemoteQualitySettings(
+                            settings.PixelFormat,
+                            settings.Encodings,
+                            1);
+                        Volatile.Write(ref _bootstrapState, new QualityBootstrapState(attempt, settings));
+                        _bootstrapConfigured = true;
+                        published = true;
+                    }
+                }
+                catch (OperationCanceledException exception) when (wireAttempted)
+                {
+                    throw new BootstrapConfigurationInterruptedException(exception);
+                }
+            }, cancellationToken).ConfigureAwait(false);
+
+            targetSession = null;
+            try
+            {
+                await currentSession.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                WriteQualityTransitionCleanupDiagnostic("BootstrapReplacedSession", exception);
+            }
+        }
+        catch (BootstrapConfigurationInterruptedException exception)
+        {
+            await FaultAndDisposeDecoderAsync(currentSession).ConfigureAwait(false);
+            throw new OperationCanceledException(
+                "Bootstrap configuration was canceled after protocol output began.",
+                exception.InnerException,
+                cancellationToken);
+        }
+        catch
+        {
+            if (wireAttempted)
+            {
+                await FaultAndDisposeDecoderAsync(currentSession).ConfigureAwait(false);
+            }
+
+            throw;
+        }
+        finally
+        {
+            if (targetSession is not null)
+            {
+                await targetSession.DisposeAsync().ConfigureAwait(false);
+            }
+
+            lock (_lifecycleSync)
+            {
+                _bootstrapConfigurationActive = false;
+                if (!published && wireAttempted)
+                {
+                    _faulted = true;
+                }
+            }
+        }
     }
 
     private async ValueTask RequestFramebufferUpdateCoreAsync(
@@ -264,6 +393,11 @@ internal sealed class RfbClient : IRfbClient
             if (_framebufferRequestOutstanding || _receiveActive || _qualityTransitionActive)
             {
                 return QualityTransitionStatus.CapabilityUnavailable;
+            }
+
+            if (_bootstrapConfigurationActive)
+            {
+                throw new InvalidOperationException("Bootstrap configuration is active.");
             }
 
             var current = _qualitySettings ?? throw new InvalidOperationException("RFB initialization has not completed.");
@@ -451,6 +585,11 @@ internal sealed class RfbClient : IRfbClient
             if (_qualityTransitionActive)
             {
                 throw new InvalidOperationException("A quality transition is active.");
+            }
+
+            if (_bootstrapConfigurationActive)
+            {
+                throw new InvalidOperationException("Bootstrap configuration is active.");
             }
 
             framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
@@ -990,6 +1129,9 @@ internal sealed class RfbClient : IRfbClient
 
     private sealed class QualityTransitionInterruptedException(OperationCanceledException innerException)
         : InvalidOperationException("A quality transition was interrupted after protocol output began.", innerException);
+
+    private sealed class BootstrapConfigurationInterruptedException(OperationCanceledException innerException)
+        : InvalidOperationException("Bootstrap configuration was interrupted after protocol output began.", innerException);
 }
 
 internal sealed class FramebufferSnapshotFactory
