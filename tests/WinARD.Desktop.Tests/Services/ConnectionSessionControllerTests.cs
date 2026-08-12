@@ -1,6 +1,7 @@
 using WinARD.Application.Errors;
 using WinARD.Application.Ports;
 using WinARD.Application.Sessions;
+using WinARD.Application.Quality;
 using WinARD.Desktop.Services;
 using WinARD.Domain.Connections;
 using WinARD.Transport.Ssh;
@@ -1030,6 +1031,9 @@ public sealed class ConnectionSessionControllerTests
         public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public ValueTask ConfigureBootstrapAsync(QualityBootstrapSettings settings, QualityBootstrapAttempt attempt, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) => ValueTask.FromResult<RemoteServerMessage>(Frame());
         public ValueTask DisposeAsync() { Disposed = true; DisposeCount++; return ValueTask.CompletedTask; }
     }
 
@@ -1044,6 +1048,9 @@ public sealed class ConnectionSessionControllerTests
         public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public ValueTask ConfigureBootstrapAsync(QualityBootstrapSettings settings, QualityBootstrapAttempt attempt, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) => ValueTask.FromResult<RemoteServerMessage>(Frame());
 
         public async ValueTask DisposeAsync()
         {
@@ -1052,6 +1059,10 @@ public sealed class ConnectionSessionControllerTests
             await AllowDispose.Task;
         }
     }
+
+    private static RemoteFramebufferMessage Frame() => new(
+        new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+        [new RemoteRectangle(0, 0, 1, 1)]);
 
     private sealed class Secret : ISecret
     {

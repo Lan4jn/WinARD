@@ -1,5 +1,6 @@
 using WinARD.Application.Errors;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
 using WinARD.Domain.Sessions;
@@ -16,29 +17,56 @@ public sealed class ConnectDeviceHandler
     private readonly IConnectionSecretProvider _secretProvider;
     private readonly IRfbClientFactory _clientFactory;
     private readonly IErrorMapper _errorMapper;
+    private readonly QualityDecoderGates _decoderGates;
 
     public ConnectDeviceHandler(
         IRemoteTransportFactory transportFactory,
         IConnectionSecretProvider secretProvider,
         IRfbClientFactory clientFactory,
         IErrorMapper errorMapper)
+        : this(transportFactory, secretProvider, clientFactory, errorMapper, new QualityDecoderGates())
+    {
+    }
+
+    public ConnectDeviceHandler(
+        IRemoteTransportFactory transportFactory,
+        IConnectionSecretProvider secretProvider,
+        IRfbClientFactory clientFactory,
+        IErrorMapper errorMapper,
+        QualityDecoderGates decoderGates)
     {
         _transportFactory = transportFactory ?? throw new ArgumentNullException(nameof(transportFactory));
         _secretProvider = secretProvider ?? throw new ArgumentNullException(nameof(secretProvider));
         _clientFactory = clientFactory ?? throw new ArgumentNullException(nameof(clientFactory));
         _errorMapper = errorMapper ?? throw new ArgumentNullException(nameof(errorMapper));
+        _decoderGates = decoderGates ?? throw new ArgumentNullException(nameof(decoderGates));
     }
 
     public async Task<ConnectResult> HandleAsync(
         ConnectionProfile profile,
         CancellationToken cancellationToken) =>
-        await HandleAsync(profile, stageChanged: null, cancellationToken).ConfigureAwait(false);
+        await HandleAsync(profile, QualityBootstrapAttempt.Preferred, stageChanged: null, cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<ConnectResult> HandleAsync(
+        ConnectionProfile profile,
+        QualityBootstrapAttempt attempt,
+        CancellationToken cancellationToken) =>
+        await HandleAsync(profile, attempt, stageChanged: null, cancellationToken).ConfigureAwait(false);
 
     public async Task<ConnectResult> HandleAsync(
         ConnectionProfile profile,
         Action<ConnectionStage>? stageChanged,
         CancellationToken cancellationToken) =>
-        await HandleCoreAsync(profile, stageChanged, failureObserved: null, cancellationToken)
+        await HandleAsync(profile, QualityBootstrapAttempt.Preferred, stageChanged, cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<ConnectResult> HandleAsync(
+        ConnectionProfile profile,
+        QualityBootstrapAttempt attempt,
+        Action<ConnectionStage>? stageChanged,
+        CancellationToken cancellationToken) =>
+        await HandleCoreAsync(profile, attempt, stageChanged, failureObserved: null, cancellationToken)
             .ConfigureAwait(false);
 
     internal async Task<ConnectResult> HandleWithFailureObservationAsync(
@@ -48,16 +76,23 @@ public sealed class ConnectDeviceHandler
         CancellationToken cancellationToken) =>
         await HandleCoreAsync(
             profile,
+            QualityBootstrapAttempt.Preferred,
             stageChanged,
             failureObserved ?? throw new ArgumentNullException(nameof(failureObserved)),
             cancellationToken).ConfigureAwait(false);
 
     private async Task<ConnectResult> HandleCoreAsync(
         ConnectionProfile profile,
+        QualityBootstrapAttempt attempt,
         Action<ConnectionStage>? stageChanged,
         Func<ConnectionFailureObservation, ValueTask>? failureObserved,
         CancellationToken cancellationToken)
     {
+        if (!Enum.IsDefined(attempt))
+        {
+            throw new ArgumentOutOfRangeException(nameof(attempt));
+        }
+
         ArgumentNullException.ThrowIfNull(profile);
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -66,6 +101,8 @@ public sealed class ConnectDeviceHandler
         TransportConnection? transport = null;
         IRfbClient? client = null;
         var sessionOwnsResources = false;
+        var preloadedMessages = new List<RemoteServerMessage>();
+        using var preloadedOwnership = new PreloadedMessageOwnership(preloadedMessages);
 
         try
         {
@@ -92,11 +129,36 @@ public sealed class ConnectDeviceHandler
             stageChanged?.Invoke(ConnectionStage.Initializing);
             await client.InitializeAsync(cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
+            var plan = QualityBootstrapPlanner.CreatePlan(
+                profile.Quality,
+                client.QualityCapabilities,
+                _decoderGates);
+            var settings = attempt == QualityBootstrapAttempt.Preferred ? plan.Preferred : plan.Fallback;
+            await client.ConfigureBootstrapAsync(settings, attempt, cancellationToken).ConfigureAwait(false);
+            await client.RequestFramebufferUpdateAsync(incremental: false, cancellationToken).ConfigureAwait(false);
+            while (!preloadedMessages.Any(message => message is RemoteFramebufferMessage))
+            {
+                var message = await client.ReceiveBootstrapAsync(cancellationToken).ConfigureAwait(false);
+                if (message is not RemoteCursorMessage and not RemoteFramebufferMessage)
+                {
+                    preloadedMessages.Add(message);
+                    throw new InvalidOperationException("Bootstrap preload received an unsupported message type.");
+                }
+
+                if (preloadedMessages.Count == 8)
+                {
+                    preloadedMessages.Add(message);
+                    throw new InvalidOperationException("The bootstrap preload queue exceeded its limit.");
+                }
+
+                preloadedMessages.Add(message);
+            }
+
             stateMachine.MoveTo(SessionState.Connected);
             stageChanged?.Invoke(ConnectionStage.Connected);
             var result = new ConnectResult(
                 stateMachine.Current,
-                new RemoteSession(stateMachine, transport, client),
+                new RemoteSession(stateMachine, transport, client, preloadedOwnership),
                 null);
             sessionOwnsResources = true;
             return result;
@@ -131,6 +193,7 @@ public sealed class ConnectDeviceHandler
         {
             if (!sessionOwnsResources)
             {
+                preloadedOwnership.Dispose();
                 await CleanupAsync(client, transport, secret).ConfigureAwait(false);
             }
         }

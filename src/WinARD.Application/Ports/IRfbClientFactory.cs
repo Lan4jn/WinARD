@@ -56,6 +56,9 @@ public interface IRfbClient : IAsyncDisposable
         ValueTask.FromException<RemoteServerMessage>(
             new NotSupportedException("Runtime server messages are not supported."));
 
+    ValueTask<RemoteServerMessage> ReceiveBootstrapAsync(CancellationToken cancellationToken) =>
+        ReceiveAsync(cancellationToken);
+
     ValueTask SendPointerAsync(
         byte buttons,
         int x,

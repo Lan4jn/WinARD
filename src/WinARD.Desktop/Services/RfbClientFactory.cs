@@ -751,6 +751,50 @@ internal sealed class RfbClient : IRfbClient
         }
     }
 
+    public async ValueTask<RemoteServerMessage> ReceiveBootstrapAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await ReceiveAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RfbProtocolException exception) when (TryClassifyBootstrapFailure(exception, out var reason))
+        {
+            throw new QualityBootstrapCompatibilityException(reason);
+        }
+    }
+
+    internal static bool TryClassifyBootstrapFailure(
+        RfbProtocolException exception,
+        out QualityBootstrapFailureReason reason)
+    {
+        var failure = exception.Failure;
+        switch (failure?.Kind)
+        {
+            case RfbProtocolFailureKind.DecoderFailure:
+                reason = QualityBootstrapFailureReason.DecoderFailure;
+                return true;
+            case RfbProtocolFailureKind.UnsupportedEncoding:
+                reason = QualityBootstrapFailureReason.UnsupportedEncoding;
+                return true;
+            case RfbProtocolFailureKind.MalformedFramebufferUpdate when failure.ReadStage is
+                RfbProtocolReadStage.FramebufferRectangleHeader or
+                RfbProtocolReadStage.FramebufferRectanglePayload:
+                reason = QualityBootstrapFailureReason.MalformedFramebufferUpdate;
+                return true;
+            case RfbProtocolFailureKind.RemoteSessionClosed:
+                reason = QualityBootstrapFailureReason.RemoteSessionClosed;
+                return true;
+            case RfbProtocolFailureKind.TruncatedRead when failure.ReadStage is
+                RfbProtocolReadStage.FramebufferRectangleHeader or
+                RfbProtocolReadStage.FramebufferRectanglePayload:
+                reason = QualityBootstrapFailureReason.MalformedFramebufferUpdate;
+                return true;
+            default:
+                reason = default;
+                return false;
+        }
+    }
+
     public async ValueTask SendPointerAsync(
         byte buttons,
         int x,

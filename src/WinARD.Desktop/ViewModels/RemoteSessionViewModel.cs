@@ -860,9 +860,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     {
         try
         {
-            await RequestFramebufferUpdateTrackedAsync(
-                incremental: false,
-                cancellationToken).ConfigureAwait(false);
+            if (!_session.HasPreloadedFramebuffer)
+            {
+                await RequestFramebufferUpdateTrackedAsync(
+                    incremental: false,
+                    cancellationToken).ConfigureAwait(false);
+            }
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -949,9 +952,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                                 performanceGeneration,
                                 cancellationToken).ConfigureAwait(false);
                         }
-                        await RequestFramebufferUpdateTrackedAsync(
-                            incremental: true,
-                            cancellationToken).ConfigureAwait(false);
+                        if (!_session.HasPreloadedFramebuffer)
+                        {
+                            await RequestFramebufferUpdateTrackedAsync(
+                                incremental: true,
+                                cancellationToken).ConfigureAwait(false);
+                        }
                         break;
                     case RemoteClipboardMessage clipboard when _clipboardBridge is not null:
                         await _clipboardBridge.SetRemoteTextAsync(clipboard.Text, cancellationToken)

@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Reflection;
 using WinARD.Application.Errors;
 using WinARD.Application.Ports;
 using WinARD.Application.Quality;
@@ -11,6 +13,116 @@ namespace WinARD.Application.Tests;
 
 public sealed class RemoteSessionRuntimeTests
 {
+    [Fact]
+    public void Constructor_rejects_null_preload_collection_with_the_owned_parameter_name()
+    {
+        var exception = Assert.Throws<ArgumentNullException>(() =>
+            CreateSessionWithPreloads(null!));
+
+        Assert.Equal("preloadedMessages", exception.ParamName);
+    }
+
+    [Fact]
+    public void Constructor_disposes_owned_messages_when_a_preload_entry_is_null()
+    {
+        var owner = new CountingMemoryOwner(4);
+        var cursor = CreateCursorMessage(owner);
+
+        var exception = Assert.Throws<ArgumentException>(() =>
+            CreateSessionWithPreloads([cursor, null!]));
+
+        Assert.Equal("preloadedMessages", exception.ParamName);
+        Assert.Equal(1, owner.DisposeCount);
+    }
+
+    [Fact]
+    public void Constructor_disposes_every_owned_message_when_preload_limit_is_exceeded()
+    {
+        var owners = Enumerable.Range(0, 9).Select(_ => new CountingMemoryOwner(4)).ToArray();
+        var messages = owners.Select(CreateCursorMessage).Cast<RemoteServerMessage>().ToArray();
+
+        var exception = Assert.Throws<ArgumentException>(() =>
+            CreateSessionWithPreloads(messages));
+
+        Assert.Equal("preloadedMessages", exception.ParamName);
+        Assert.All(owners, owner => Assert.Equal(1, owner.DisposeCount));
+    }
+
+    [Fact]
+    public void Constructor_disposes_every_owned_message_when_multiple_framebuffers_are_preloaded()
+    {
+        var owners = new[] { new CountingMemoryOwner(4), new CountingMemoryOwner(4) };
+        var messages = owners.Select(CreateFramebufferMessage).Cast<RemoteServerMessage>().ToArray();
+
+        var exception = Assert.Throws<ArgumentException>(() =>
+            CreateSessionWithPreloads(messages));
+
+        Assert.Equal("preloadedMessages", exception.ParamName);
+        Assert.All(owners, owner => Assert.Equal(1, owner.DisposeCount));
+    }
+
+    [Fact]
+    public void Constructor_preserves_validation_failure_and_disposes_all_owners_when_one_dispose_throws()
+    {
+        var first = new CountingMemoryOwner(4)
+        {
+            DisposeException = new InvalidOperationException("sensitive owner cleanup"),
+        };
+        var second = new CountingMemoryOwner(4);
+
+        var exception = Assert.Throws<ArgumentException>(() =>
+            CreateSessionWithPreloads(
+            [
+                CreateFramebufferMessage(first),
+                CreateFramebufferMessage(second),
+            ]));
+
+        Assert.Equal("preloadedMessages", exception.ParamName);
+        Assert.Equal(1, first.DisposeCount);
+        Assert.Equal(1, second.DisposeCount);
+    }
+
+    [Fact]
+    public void Constructor_disposes_owned_messages_when_a_preload_type_is_not_allowed()
+    {
+        var owner = new CountingMemoryOwner(4);
+        var cursor = CreateCursorMessage(owner);
+
+        var exception = Assert.Throws<ArgumentException>(() =>
+            CreateSessionWithPreloads([cursor, new RemoteBellMessage()]));
+
+        Assert.Equal("preloadedMessages", exception.ParamName);
+        Assert.Equal(1, owner.DisposeCount);
+    }
+
+    [Fact]
+    public void Runtime_defaults_to_no_preloaded_framebuffer_and_compatibility_exception_is_sanitized()
+    {
+        IRemoteSessionRuntime runtime = new LegacyRuntime();
+
+        Assert.False(runtime.HasPreloadedFramebuffer);
+        var exception = new QualityBootstrapCompatibilityException(
+            QualityBootstrapFailureReason.DecoderFailure);
+        Assert.Equal(QualityBootstrapFailureReason.DecoderFailure, exception.Reason);
+        Assert.Null(exception.InnerException);
+        Assert.DoesNotContain("secret", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed class LegacyRuntime : IRemoteSessionRuntime
+    {
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromResult<RemoteServerMessage>(new RemoteBellMessage());
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
     [Fact]
     public async Task Controlled_runtime_api_forwards_without_exposing_transport()
     {
@@ -30,6 +142,8 @@ public sealed class RemoteSessionRuntimeTests
                 120),
         };
         await using var session = await ConnectAsync(client);
+        using var preloaded = Assert.IsType<RemoteFramebufferMessage>(
+            await session.ReceiveAsync(CancellationToken.None));
 
         await session.RequestFramebufferUpdateAsync(incremental: true, CancellationToken.None);
         var quality = new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1);
@@ -73,6 +187,8 @@ public sealed class RemoteSessionRuntimeTests
         var stream = new DisposeReleasesReadStream();
         var client = new BlockingReceiveClient(stream);
         var session = await ConnectAsync(client, stream);
+        using var preloaded = Assert.IsType<RemoteFramebufferMessage>(
+            await session.ReceiveAsync(CancellationToken.None));
         var receive = session.ReceiveAsync(CancellationToken.None).AsTask();
         await client.ReceiveStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
@@ -128,8 +244,72 @@ public sealed class RemoteSessionRuntimeTests
         return Assert.IsType<RemoteSession>(result.Session);
     }
 
+    private static RemoteSession CreateSessionWithPreloads(
+        IEnumerable<RemoteServerMessage> preloadedMessages)
+    {
+        var constructor = typeof(RemoteSession).GetConstructor(
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null,
+            [
+                typeof(SessionStateMachine),
+                typeof(TransportConnection),
+                typeof(IRfbClient),
+                typeof(IEnumerable<RemoteServerMessage>),
+            ],
+            modifiers: null);
+        Assert.NotNull(constructor);
+        try
+        {
+            return (RemoteSession)constructor.Invoke(
+                [
+                    new SessionStateMachine(),
+                    new TransportConnection(
+                        new MemoryStream(),
+                        new EndPointDescription("mac.local", 5900)),
+                    new RuntimeClient(),
+                    preloadedMessages,
+                ]);
+        }
+        catch (TargetInvocationException exception) when (exception.InnerException is not null)
+        {
+            throw exception.InnerException;
+        }
+    }
+
+    private static RemoteCursorMessage CreateCursorMessage(CountingMemoryOwner owner) =>
+        new(new RemoteCursorUpdate(0, 0, 1, 1, owner, 4));
+
+    private static RemoteFramebufferMessage CreateFramebufferMessage(CountingMemoryOwner owner) =>
+        new(
+            new RemoteFramebufferSize(1, 1),
+            owner,
+            4,
+            4,
+            [new RemoteRectangle(0, 0, 1, 1)]);
+
+    private sealed class CountingMemoryOwner(int length) : IMemoryOwner<byte>
+    {
+        private byte[]? _memory = new byte[length];
+
+        public int DisposeCount { get; private set; }
+        public Exception? DisposeException { get; init; }
+        public Memory<byte> Memory =>
+            _memory ?? throw new ObjectDisposedException(nameof(CountingMemoryOwner));
+
+        public void Dispose()
+        {
+            DisposeCount++;
+            _memory = null;
+            if (DisposeException is not null)
+            {
+                throw DisposeException;
+            }
+        }
+    }
+
     private sealed class RuntimeClient : IRfbClient
     {
+        private int _receiveCount;
         public RemoteFramebufferSize FramebufferSize => new(640, 480);
         public RemoteDisplayCapabilities DisplayCapabilities { get; init; } =
             RemoteDisplayCapabilities.Unknown;
@@ -155,6 +335,10 @@ public sealed class RemoteSessionRuntimeTests
         public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public ValueTask ConfigureBootstrapAsync(
+            QualityBootstrapSettings settings,
+            QualityBootstrapAttempt attempt,
+            CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
         {
             LastIncremental = incremental;
@@ -168,7 +352,12 @@ public sealed class RemoteSessionRuntimeTests
             return ValueTask.FromResult(QualityTransitionStatus.Applied);
         }
         public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
-            ValueTask.FromResult(NextMessage);
+            ValueTask.FromResult(
+                Interlocked.Increment(ref _receiveCount) == 1
+                    ? new RemoteFramebufferMessage(
+                        new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+                        [new RemoteRectangle(0, 0, 1, 1)])
+                    : NextMessage);
         public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken)
         {
             LastPointer = (buttons, x, y);
@@ -196,6 +385,7 @@ public sealed class RemoteSessionRuntimeTests
     private sealed class BlockingReceiveClient(Stream stream) : IRfbClient
     {
         private readonly SemaphoreSlim _receiveGate = new(1, 1);
+        private int _receives;
 
         public TaskCompletionSource ReceiveStarted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -205,9 +395,22 @@ public sealed class RemoteSessionRuntimeTests
         public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public ValueTask ConfigureBootstrapAsync(
+            QualityBootstrapSettings settings,
+            QualityBootstrapAttempt attempt,
+            CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
 
         public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
         {
+            if (Interlocked.Increment(ref _receives) == 1)
+            {
+                return new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+                    [new RemoteRectangle(0, 0, 1, 1)]);
+            }
+
             await _receiveGate.WaitAsync(cancellationToken);
             try
             {

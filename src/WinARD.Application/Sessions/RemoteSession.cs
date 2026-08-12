@@ -12,16 +12,70 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
     private readonly SessionStateMachine _stateMachine;
     private readonly TransportConnection _transport;
     private readonly SemaphoreSlim _receiveGate = new(1, 1);
+    private readonly object _preloadedSync = new();
+    private readonly Queue<RemoteServerMessage> _preloadedMessages;
     private Task? _disposeTask;
 
     internal RemoteSession(
         SessionStateMachine stateMachine,
         TransportConnection transport,
         IRfbClient client)
+        : this(stateMachine, transport, client, Array.Empty<RemoteServerMessage>())
     {
-        _stateMachine = stateMachine ?? throw new ArgumentNullException(nameof(stateMachine));
-        _transport = transport ?? throw new ArgumentNullException(nameof(transport));
-        _client = client ?? throw new ArgumentNullException(nameof(client));
+    }
+
+    internal RemoteSession(
+        SessionStateMachine stateMachine,
+        TransportConnection transport,
+        IRfbClient client,
+        IEnumerable<RemoteServerMessage> preloadedMessages)
+        : this(
+            stateMachine,
+            transport,
+            client,
+            new PreloadedMessageOwnership(
+                preloadedMessages ?? throw new ArgumentNullException(nameof(preloadedMessages))))
+    {
+    }
+
+    internal RemoteSession(
+        SessionStateMachine stateMachine,
+        TransportConnection transport,
+        IRfbClient client,
+        PreloadedMessageOwnership preloadedMessages)
+    {
+        ArgumentNullException.ThrowIfNull(preloadedMessages);
+        try
+        {
+            var snapshot = preloadedMessages.Snapshot();
+            _stateMachine = stateMachine ?? throw new ArgumentNullException(nameof(stateMachine));
+            _transport = transport ?? throw new ArgumentNullException(nameof(transport));
+            _client = client ?? throw new ArgumentNullException(nameof(client));
+            if (snapshot.Length > 8 || snapshot.Count(message => message is RemoteFramebufferMessage) > 1 ||
+                snapshot.Any(message => message is not RemoteCursorMessage and not RemoteFramebufferMessage))
+            {
+                throw new ArgumentException("The preloaded message snapshot is invalid.", nameof(preloadedMessages));
+            }
+
+            _preloadedMessages = new Queue<RemoteServerMessage>(snapshot);
+            preloadedMessages.Relinquish();
+        }
+        catch
+        {
+            preloadedMessages.Dispose();
+            throw;
+        }
+    }
+
+    public bool HasPreloadedFramebuffer
+    {
+        get
+        {
+            lock (_preloadedSync)
+            {
+                return _preloadedMessages.Any(message => message is RemoteFramebufferMessage);
+            }
+        }
     }
 
     public SessionState State
@@ -95,6 +149,14 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
         try
         {
             EnsureConnected();
+            lock (_preloadedSync)
+            {
+                if (_preloadedMessages.Count > 0)
+                {
+                    return _preloadedMessages.Dequeue();
+                }
+            }
+
             return await _client.ReceiveAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -186,6 +248,28 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
     private async Task DisposeCoreAsync()
     {
         List<Exception>? failures = null;
+        RemoteServerMessage[] preloaded;
+        lock (_preloadedSync)
+        {
+            preloaded = _preloadedMessages.ToArray();
+            _preloadedMessages.Clear();
+        }
+
+        foreach (var message in preloaded)
+        {
+            if (message is IDisposable disposable)
+            {
+                try
+                {
+                    disposable.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    AddFailure(ref failures, exception);
+                }
+            }
+        }
+
         try
         {
             _client.BeginShutdown();

@@ -795,6 +795,45 @@ public sealed class RemoteSessionViewModelTests
     }
 
     [Fact]
+    public async Task Preloaded_framebuffer_skips_startup_full_request_and_requests_incremental_after_presentation()
+    {
+        var runtime = new PreloadedFrameRuntime();
+        var presenter = new TrackingPresenter();
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            presenter,
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.IncrementalRequested.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal([true], runtime.UpdateRequests);
+    }
+
+    [Fact]
+    public async Task Preloaded_cursor_does_not_request_before_preloaded_frame_is_presented()
+    {
+        var runtime = new CursorThenPreloadedFrameRuntime();
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new TrackingLifetime(),
+            new TrackingPresenter(),
+            new InlineDispatcher(),
+            clipboardBridge: null);
+
+        await viewModel.StartAsync(CancellationToken.None);
+        await runtime.FrameReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(runtime.HasPreloadedFramebuffer);
+        Assert.Empty(runtime.UpdateRequests);
+        runtime.AllowFrame.TrySetResult();
+        await runtime.IncrementalRequested.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal([true], runtime.UpdateRequests);
+    }
+
+    [Fact]
     public async Task Dispose_releases_ownership_before_waiting_for_receive_loop()
     {
         var receiveReleased = new TaskCompletionSource(
@@ -2279,6 +2318,101 @@ public sealed class RemoteSessionViewModelTests
         public RemoteDisplayCapabilities DisplayCapabilities { get; } = new(maximum);
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) => ValueTask.FromResult<RemoteServerMessage>(new RemoteBellMessage());
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class PreloadedFrameRuntime : IRemoteSessionRuntime
+    {
+        private int _received;
+        public bool HasPreloadedFramebuffer => Volatile.Read(ref _received) == 0;
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public List<bool> UpdateRequests { get; } = [];
+        public TaskCompletionSource IncrementalRequested { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
+        {
+            UpdateRequests.Add(incremental);
+            if (incremental)
+            {
+                IncrementalRequested.TrySetResult();
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Exchange(ref _received, 1) == 0)
+            {
+                return new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+                    [new RemoteRectangle(0, 0, 1, 1)]);
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException();
+        }
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class CursorThenPreloadedFrameRuntime : IRemoteSessionRuntime
+    {
+        private int _receiveCount;
+        private int _frameDequeued;
+        public bool HasPreloadedFramebuffer => Volatile.Read(ref _frameDequeued) == 0;
+        public RemoteFramebufferSize FramebufferSize => new(1, 1);
+        public List<bool> UpdateRequests { get; } = [];
+        public TaskCompletionSource FrameReceiveEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource AllowFrame { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource IncrementalRequested { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
+        {
+            UpdateRequests.Add(incremental);
+            if (incremental)
+            {
+                IncrementalRequested.TrySetResult();
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+        {
+            var count = Interlocked.Increment(ref _receiveCount);
+            if (count == 1)
+            {
+                return new RemoteCursorMessage(new RemoteCursorUpdate(0, 0, 0, 0, []));
+            }
+
+            if (count == 2)
+            {
+                FrameReceiveEntered.TrySetResult();
+                await AllowFrame.Task.WaitAsync(cancellationToken);
+                Volatile.Write(ref _frameDequeued, 1);
+                return new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+                    [new RemoteRectangle(0, 0, 1, 1)]);
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException();
+        }
+
         public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) => ValueTask.CompletedTask;

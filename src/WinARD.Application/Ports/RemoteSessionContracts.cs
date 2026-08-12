@@ -85,6 +85,30 @@ public enum RemotePointerButtons
 
 public abstract record RemoteServerMessage;
 
+public enum QualityBootstrapFailureReason
+{
+    DecoderFailure,
+    UnsupportedEncoding,
+    MalformedFramebufferUpdate,
+    RemoteSessionClosed,
+}
+
+public sealed class QualityBootstrapCompatibilityException : Exception
+{
+    public QualityBootstrapCompatibilityException(QualityBootstrapFailureReason reason)
+        : base("The remote framebuffer is incompatible with the selected bootstrap quality.")
+    {
+        if (!Enum.IsDefined(reason))
+        {
+            throw new ArgumentOutOfRangeException(nameof(reason));
+        }
+
+        Reason = reason;
+    }
+
+    public QualityBootstrapFailureReason Reason { get; }
+}
+
 public sealed class RemoteFramebufferTransferStatistics
 {
     public RemoteFramebufferTransferStatistics(
@@ -468,6 +492,8 @@ public sealed record RemoteBellMessage : RemoteServerMessage;
 
 public interface IRemoteSessionRuntime
 {
+    bool HasPreloadedFramebuffer => false;
+
     RemoteFramebufferSize FramebufferSize { get; }
 
     RemoteDisplayCapabilities DisplayCapabilities => RemoteDisplayCapabilities.Unknown;

@@ -1355,6 +1355,73 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Bootstrap_receive_maps_only_structural_compatibility_failures()
+    {
+        await using var stream = new ScriptedDuplexStream(
+        [
+            .. Handshake("RFB 003.008\n"),
+            .. ServerInit(1, 1),
+            0, 0, 0, 1,
+            .. Header(0, 0, 1, 1, 999),
+        ]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+
+        var compatibility = await Assert.ThrowsAsync<QualityBootstrapCompatibilityException>(() =>
+            client.ReceiveBootstrapAsync(default).AsTask());
+        Assert.Equal(QualityBootstrapFailureReason.UnsupportedEncoding, compatibility.Reason);
+        Assert.Null(compatibility.InnerException);
+
+        await using var cancellationStream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(1, 1)]);
+        await using var cancellationClient = new RfbClient(cancellationStream);
+        await cancellationClient.NegotiateAsync(default);
+        await cancellationClient.InitializeAsync(default);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            cancellationClient.ReceiveBootstrapAsync(cancellation.Token).AsTask());
+    }
+
+    [Theory]
+    [InlineData(RfbProtocolFailureKind.DecoderFailure, RfbProtocolReadStage.FramebufferRectanglePayload, QualityBootstrapFailureReason.DecoderFailure)]
+    [InlineData(RfbProtocolFailureKind.UnsupportedEncoding, RfbProtocolReadStage.FramebufferRectangleHeader, QualityBootstrapFailureReason.UnsupportedEncoding)]
+    [InlineData(RfbProtocolFailureKind.MalformedFramebufferUpdate, RfbProtocolReadStage.FramebufferRectangleHeader, QualityBootstrapFailureReason.MalformedFramebufferUpdate)]
+    [InlineData(RfbProtocolFailureKind.MalformedFramebufferUpdate, RfbProtocolReadStage.FramebufferRectanglePayload, QualityBootstrapFailureReason.MalformedFramebufferUpdate)]
+    [InlineData(RfbProtocolFailureKind.TruncatedRead, RfbProtocolReadStage.FramebufferRectangleHeader, QualityBootstrapFailureReason.MalformedFramebufferUpdate)]
+    [InlineData(RfbProtocolFailureKind.TruncatedRead, RfbProtocolReadStage.FramebufferRectanglePayload, QualityBootstrapFailureReason.MalformedFramebufferUpdate)]
+    [InlineData(RfbProtocolFailureKind.RemoteSessionClosed, RfbProtocolReadStage.ServerMessageType, QualityBootstrapFailureReason.RemoteSessionClosed)]
+    public void Bootstrap_failure_classifier_accepts_only_the_compatibility_closed_set(
+        RfbProtocolFailureKind kind,
+        RfbProtocolReadStage stage,
+        QualityBootstrapFailureReason expected)
+    {
+        var exception = RfbProtocolException.Create(
+            "secret",
+            new RfbProtocolFailureInfo(kind, stage));
+
+        Assert.True(RfbClient.TryClassifyBootstrapFailure(exception, out var reason));
+        Assert.Equal(expected, reason);
+    }
+
+    [Theory]
+    [InlineData(RfbProtocolFailureKind.MalformedFramebufferUpdate, RfbProtocolReadStage.FramebufferHeader)]
+    [InlineData(RfbProtocolFailureKind.TruncatedRead, RfbProtocolReadStage.FramebufferHeader)]
+    [InlineData(RfbProtocolFailureKind.ArdEncryptionNegotiation, RfbProtocolReadStage.ServerMessageType)]
+    public void Bootstrap_failure_classifier_rejects_non_compatibility_failures(
+        RfbProtocolFailureKind kind,
+        RfbProtocolReadStage stage)
+    {
+        var exception = RfbProtocolException.Create(
+            "secret",
+            new RfbProtocolFailureInfo(kind, stage));
+
+        Assert.False(RfbClient.TryClassifyBootstrapFailure(exception, out var reason));
+        Assert.Equal(default, reason);
+    }
+
+    [Fact]
     public async Task Legacy_rfb_client_implementations_explicitly_reject_bootstrap_configuration()
     {
         await using IRfbClient client = new LegacyRfbClient();
