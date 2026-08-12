@@ -364,6 +364,57 @@ public sealed class RemoteSessionViewModelTests
     }
 
     [Fact]
+    public void Session_frame_performance_merge_retains_and_saturates_transfer_statistics()
+    {
+        var earlier = new SessionFramePerformance(
+            new RemoteUpdateStatistics(
+                long.MaxValue,
+                new Dictionary<int, int> { [6] = int.MaxValue },
+                new RemoteFramebufferTransferStatistics(
+                    long.MaxValue, long.MaxValue, 12, 3, 0,
+                    new Dictionary<int, int> { [6] = int.MaxValue },
+                    new Dictionary<int, long> { [6] = long.MaxValue },
+                    new Dictionary<int, long> { [6] = 12 })),
+            [],
+            new RemoteFramebufferSize(1, 1),
+            TimeSpan.Zero);
+        var later = new SessionFramePerformance(
+            new RemoteUpdateStatistics(
+                1,
+                new Dictionary<int, int> { [6] = 1, [16] = 2 },
+                new RemoteFramebufferTransferStatistics(
+                    2, 7, 8, 2, 0,
+                    new Dictionary<int, int> { [6] = 1, [16] = 2 },
+                    new Dictionary<int, long> { [6] = 3, [16] = 4 },
+                    new Dictionary<int, long> { [6] = 5, [16] = 3 })),
+            [],
+            new RemoteFramebufferSize(1, 1),
+            TimeSpan.Zero);
+
+        var merged = later.MergeFrom(earlier, []);
+        var transfer = merged.Update.TransferStatistics;
+
+        Assert.Equal(long.MaxValue, transfer.RectangleCount);
+        Assert.Equal(long.MaxValue, transfer.WirePayloadBytes);
+        Assert.Equal(20, transfer.PixelWireBytes);
+        Assert.Equal(5, transfer.PixelArea);
+        Assert.Equal(long.MaxValue, transfer.BytesPerPixelMilli);
+        Assert.Equal(int.MaxValue, transfer.RectangleCounts[6]);
+        Assert.Equal(2, transfer.RectangleCounts[16]);
+        Assert.Equal(long.MaxValue, transfer.WirePayloadBytesByEncoding[6]);
+        Assert.Equal(4, transfer.WirePayloadBytesByEncoding[16]);
+        Assert.Equal(17, transfer.PixelWireBytesByEncoding[6]);
+        Assert.Equal(3, transfer.PixelWireBytesByEncoding[16]);
+
+        var zeroArea = new RemoteFramebufferTransferStatistics(
+            1, 5, 0, 0, null,
+            new Dictionary<int, int> { [0] = 1 },
+            new Dictionary<int, long> { [0] = 5 },
+            new Dictionary<int, long> { [0] = 0 });
+        Assert.Null(RemoteFramebufferTransferStatistics.Empty.Merge(zeroArea).BytesPerPixelMilli);
+    }
+
+    [Fact]
     public async Task Quality_capability_only_maximum_disables_higher_options_preserves_saved_value_and_clips_target()
     {
         await using var viewModel = new RemoteSessionViewModel(

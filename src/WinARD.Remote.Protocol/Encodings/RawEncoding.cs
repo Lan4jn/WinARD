@@ -57,7 +57,15 @@ public sealed class RawEncoding : IRfbEncodingDecoder, IReconfigurablePixelForma
                 _pixelFormat,
                 framebuffer.Limits);
             framebuffer.ApplyRaw(rectangle, bgraPixels);
-            return new EncodingDecodeResult([rectangle], [rectangle]);
+            return new EncodingDecodeResult(
+                [rectangle],
+                [rectangle],
+                new RectangleTransferStatistics(
+                    EncodingId,
+                    wireLength,
+                    wireLength,
+                    checked((long)rectangle.Width * rectangle.Height),
+                    true));
         }
         finally
         {

@@ -142,6 +142,45 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public void Remote_update_statistics_preserves_legacy_constructor_and_deconstruct()
+    {
+        Assert.NotNull(typeof(RemoteUpdateStatistics).GetConstructor(
+            [typeof(long), typeof(IReadOnlyDictionary<int, int>)]));
+
+        var statistics = new RemoteUpdateStatistics(42, new Dictionary<int, int>());
+        var (receivedSessionBytes, encodingCounts) = statistics;
+
+        Assert.Equal(42, receivedSessionBytes);
+        Assert.Empty(encodingCounts);
+        Assert.Same(RemoteFramebufferTransferStatistics.Empty, statistics.TransferStatistics);
+    }
+
+    [Fact]
+    public void Remote_transfer_statistics_validate_dictionary_arguments_and_values()
+    {
+        var counts = new Dictionary<int, int> { [0] = 1 };
+        var bytes = new Dictionary<int, long> { [0] = 0 };
+
+        Assert.Equal("rectangleCounts", Assert.Throws<ArgumentNullException>(() =>
+            new RemoteFramebufferTransferStatistics(0, 0, 0, 0, null, null!, bytes, bytes)).ParamName);
+        Assert.Equal("wirePayloadBytesByEncoding", Assert.Throws<ArgumentNullException>(() =>
+            new RemoteFramebufferTransferStatistics(0, 0, 0, 0, null, counts, null!, bytes)).ParamName);
+        Assert.Equal("pixelWireBytesByEncoding", Assert.Throws<ArgumentNullException>(() =>
+            new RemoteFramebufferTransferStatistics(0, 0, 0, 0, null, counts, bytes, null!)).ParamName);
+        Assert.Equal("rectangleCounts", Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new RemoteFramebufferTransferStatistics(
+                0, 0, 0, 0, null, new Dictionary<int, int> { [0] = -1 }, bytes, bytes)).ParamName);
+        Assert.Equal("wirePayloadBytesByEncoding", Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new RemoteFramebufferTransferStatistics(
+                0, 0, 0, 0, null, counts, new Dictionary<int, long> { [0] = -1 }, bytes)).ParamName);
+        Assert.Equal("pixelWireBytesByEncoding", Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new RemoteFramebufferTransferStatistics(
+                0, 0, 0, 0, null, counts, bytes, new Dictionary<int, long> { [0] = -1 })).ParamName);
+        Assert.False(typeof(RemoteUpdateStatistics).GetProperty(
+            nameof(RemoteUpdateStatistics.TransferStatistics))!.CanWrite);
+    }
+
+    [Fact]
     public void Fit_maps_viewport_center_through_letterbox()
     {
         var transform = ViewportTransform.Create(
@@ -591,6 +630,53 @@ public sealed class FramePresentationTests
         Assert.Equal([1, 2, 3, 255], cursor.Bgra32.ToArray());
         Assert.Equal(21, message.Statistics.ReceivedSessionBytes);
         Assert.Equal(1, message.Statistics.EncodingCounts[(int)RfbEncodingType.Cursor]);
+    }
+
+    [Fact]
+    public async Task Rfb_client_maps_raw_and_zlib_transfer_statistics_to_application_snapshot()
+    {
+        var (compressed, _) = CreateSharedZlibChunks([4, 5, 6, 0], [7, 8, 9, 0]);
+        var update = new List<byte> { 0, 0, 0, 2 };
+        update.AddRange(Header(0, 0, 1, 1, (int)RfbEncodingType.Raw));
+        update.AddRange([1, 2, 3, 0]);
+        update.AddRange(Header(1, 0, 1, 1, (int)RfbEncodingType.Zlib));
+        var length = new byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32BigEndian(length, checked((uint)compressed.Length));
+        update.AddRange(length);
+        update.AddRange(compressed);
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1), .. update]);
+        await using var client = new RfbClient(stream);
+
+        await client.NegotiateAsync(CancellationToken.None);
+        await client.InitializeAsync(CancellationToken.None);
+        await client.RequestFramebufferUpdateAsync(incremental: true, CancellationToken.None);
+        using var message = Assert.IsType<RemoteFramebufferMessage>(
+            await client.ReceiveAsync(CancellationToken.None));
+        var statistics = message.Statistics.TransferStatistics;
+
+        Assert.Equal(2, statistics.RectangleCount);
+        Assert.Equal(8 + compressed.Length, statistics.WirePayloadBytes);
+        Assert.Equal(8, statistics.PixelWireBytes);
+        Assert.Equal(2, statistics.PixelArea);
+        Assert.Equal((8L + compressed.Length) * 500, statistics.BytesPerPixelMilli);
+        Assert.Equal(1, statistics.RectangleCounts[(int)RfbEncodingType.Raw]);
+        Assert.Equal(1, statistics.RectangleCounts[(int)RfbEncodingType.Zlib]);
+        Assert.Equal(4, statistics.WirePayloadBytesByEncoding[(int)RfbEncodingType.Raw]);
+        Assert.Equal(4 + compressed.Length, statistics.WirePayloadBytesByEncoding[(int)RfbEncodingType.Zlib]);
+        Assert.Equal(4, statistics.PixelWireBytesByEncoding[(int)RfbEncodingType.Raw]);
+        Assert.Equal(4, statistics.PixelWireBytesByEncoding[(int)RfbEncodingType.Zlib]);
+        var mutableCounts = Assert.IsAssignableFrom<IDictionary<int, int>>(statistics.RectangleCounts);
+        var mutableWire = Assert.IsAssignableFrom<IDictionary<int, long>>(
+            statistics.WirePayloadBytesByEncoding);
+        var mutablePixels = Assert.IsAssignableFrom<IDictionary<int, long>>(
+            statistics.PixelWireBytesByEncoding);
+        Assert.True(mutableCounts.IsReadOnly);
+        Assert.True(mutableWire.IsReadOnly);
+        Assert.True(mutablePixels.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => mutableCounts.Add(16, 1));
+        Assert.Throws<NotSupportedException>(() => mutableWire.Add(16, 1));
+        Assert.Throws<NotSupportedException>(() => mutablePixels.Add(16, 1));
     }
 
     [Fact]

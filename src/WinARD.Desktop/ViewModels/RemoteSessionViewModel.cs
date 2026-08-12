@@ -1835,7 +1835,10 @@ internal sealed record SessionFramePerformance(
             long.MaxValue - later.ReceivedSessionBytes
                 ? long.MaxValue
                 : earlier.ReceivedSessionBytes + later.ReceivedSessionBytes;
-        return new RemoteUpdateStatistics(bytes, counts);
+        return new RemoteUpdateStatistics(
+            bytes,
+            counts,
+            earlier.TransferStatistics.Merge(later.TransferStatistics));
     }
 }
 

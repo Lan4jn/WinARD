@@ -45,6 +45,10 @@ public sealed class ZrleEncodingTests
         Assert.Equal(rectangle, Assert.Single(result.PixelContentRects));
         Assert.Equal(0xFF030201u, framebuffer.GetBgra32(0, 0));
         Assert.Equal(0xFF060504u, framebuffer.GetBgra32(1, 0));
+        var compressed = Compress([0, 1, 2, 3, 4, 5, 6]);
+        Assert.Equal(
+            new RectangleTransferStatistics(16, sizeof(uint) + compressed.Length, 8, 2, true),
+            result.TransferStatistics);
     }
 
     [Fact]
@@ -155,7 +159,7 @@ public sealed class ZrleEncodingTests
     {
         using var framebuffer = new FramebufferModel(4, 1, ProtocolLimits.Default);
 
-        _ = await DecodeAsync(
+        var result = await DecodeAsync(
             framebuffer,
             PixelFormat.WinArdRgb565,
             new FramebufferRect(0, 0, 4, 1),
@@ -164,6 +168,10 @@ public sealed class ZrleEncodingTests
         Assert.Equal(
             [0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu],
             Enumerable.Range(0, 4).Select(x => framebuffer.GetBgra32(x, 0)));
+        var compressed = Compress([0, 0, 0xF8, 0xE0, 0x07, 0x1F, 0, 0xFF, 0xFF]);
+        Assert.Equal(
+            new RectangleTransferStatistics(16, sizeof(uint) + compressed.Length, 8, 4, true),
+            result.TransferStatistics);
     }
 
     [Theory]

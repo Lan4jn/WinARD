@@ -44,6 +44,9 @@ public sealed class ZlibEncodingTests
         Assert.Equal(rectangle, Assert.Single(result.PixelContentRects));
         Assert.Equal(0xFF030201u, framebuffer.GetBgra32(0, 0));
         Assert.Equal(0xFF060504u, framebuffer.GetBgra32(1, 0));
+        Assert.Equal(
+            new RectangleTransferStatistics(6, sizeof(uint) + compressed.Length, 8, 2, true),
+            result.TransferStatistics);
     }
 
     [Fact]
@@ -104,15 +107,19 @@ public sealed class ZlibEncodingTests
         using var framebuffer = new FramebufferModel(4, 1, ProtocolLimits.Default);
         await using var decoder = new ZlibEncoding(PixelFormat.WinArdRgb565);
 
-        _ = await DecodeChunkAsync(
+        var compressed = Compress([0, 0xF8, 0xE0, 0x07, 0x1F, 0, 0xFF, 0xFF]);
+        var result = await DecodeChunkAsync(
             decoder,
             framebuffer,
             new FramebufferRect(0, 0, 4, 1),
-            Compress([0, 0xF8, 0xE0, 0x07, 0x1F, 0, 0xFF, 0xFF]));
+            compressed);
 
         Assert.Equal(
             [0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu],
             Enumerable.Range(0, 4).Select(x => framebuffer.GetBgra32(x, 0)));
+        Assert.Equal(
+            new RectangleTransferStatistics(6, sizeof(uint) + compressed.Length, 8, 4, true),
+            result.TransferStatistics);
     }
 
     [Theory]

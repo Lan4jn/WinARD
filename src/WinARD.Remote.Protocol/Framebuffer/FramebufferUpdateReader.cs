@@ -160,6 +160,7 @@ public static class FramebufferUpdateReader
         var dirtyRects = new List<FramebufferRect>(rectangleCount);
         var pixelContentRects = new List<FramebufferRect>(rectangleCount);
         var encodingCounts = new Dictionary<int, int>();
+        var transferStatistics = new List<RectangleTransferStatistics>(rectangleCount);
         RemoteCursor? cursor = null;
         var desktopResized = false;
         for (var index = 0; index < rectangleCount; index++)
@@ -246,6 +247,10 @@ public static class FramebufferUpdateReader
                     index));
             }
             dirtyRects.AddRange(decodeResult.DirtyRects);
+            if (decodeResult.TransferStatistics is { } rectangleTransferStatistics)
+            {
+                transferStatistics.Add(rectangleTransferStatistics);
+            }
             if (previousWidth != framebuffer.Width || previousHeight != framebuffer.Height)
             {
                 pixelContentRects.Clear();
@@ -268,7 +273,8 @@ public static class FramebufferUpdateReader
             pixelContentRects,
             cursor,
             desktopResized,
-            encodingCounts);
+            encodingCounts,
+            new FramebufferTransferStatistics(transferStatistics));
     }
 
     private static Dictionary<int, IRfbEncodingDecoder> CreateDecoders(PixelFormat pixelFormat) =>

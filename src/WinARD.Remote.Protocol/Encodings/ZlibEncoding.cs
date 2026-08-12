@@ -106,7 +106,15 @@ public sealed class ZlibEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
                         framebuffer.Limits);
                     operationCancellationToken.ThrowIfCancellationRequested();
                     framebuffer.ApplyRaw(rectangle, bgra);
-                    return new EncodingDecodeResult([rectangle], [rectangle]);
+                    return new EncodingDecodeResult(
+                        [rectangle],
+                        [rectangle],
+                        new RectangleTransferStatistics(
+                            EncodingId,
+                            checked(sizeof(uint) + (long)compressedLength),
+                            wireLength,
+                            checked((long)rectangle.Width * rectangle.Height),
+                            true));
                 }
                 finally
                 {

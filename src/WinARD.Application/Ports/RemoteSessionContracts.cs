@@ -85,11 +85,140 @@ public enum RemotePointerButtons
 
 public abstract record RemoteServerMessage;
 
+public sealed class RemoteFramebufferTransferStatistics
+{
+    public RemoteFramebufferTransferStatistics(
+        long rectangleCount,
+        long wirePayloadBytes,
+        long pixelWireBytes,
+        long pixelArea,
+        long? bytesPerPixelMilli,
+        IReadOnlyDictionary<int, int> rectangleCounts,
+        IReadOnlyDictionary<int, long> wirePayloadBytesByEncoding,
+        IReadOnlyDictionary<int, long> pixelWireBytesByEncoding)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(rectangleCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(wirePayloadBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(pixelWireBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(pixelArea);
+        if (bytesPerPixelMilli is < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bytesPerPixelMilli));
+        }
+
+        ArgumentNullException.ThrowIfNull(rectangleCounts);
+        ArgumentNullException.ThrowIfNull(wirePayloadBytesByEncoding);
+        ArgumentNullException.ThrowIfNull(pixelWireBytesByEncoding);
+        if (rectangleCounts.Values.Any(value => value <= 0))
+        {
+            throw new ArgumentOutOfRangeException(nameof(rectangleCounts));
+        }
+
+        if (wirePayloadBytesByEncoding.Values.Any(value => value < 0))
+        {
+            throw new ArgumentOutOfRangeException(nameof(wirePayloadBytesByEncoding));
+        }
+
+        if (pixelWireBytesByEncoding.Values.Any(value => value < 0))
+        {
+            throw new ArgumentOutOfRangeException(nameof(pixelWireBytesByEncoding));
+        }
+
+        RectangleCount = rectangleCount;
+        WirePayloadBytes = wirePayloadBytes;
+        PixelWireBytes = pixelWireBytes;
+        PixelArea = pixelArea;
+        BytesPerPixelMilli = bytesPerPixelMilli;
+        RectangleCounts = Snapshot(rectangleCounts);
+        WirePayloadBytesByEncoding = Snapshot(wirePayloadBytesByEncoding);
+        PixelWireBytesByEncoding = Snapshot(pixelWireBytesByEncoding);
+    }
+
+    public static RemoteFramebufferTransferStatistics Empty { get; } = new(
+        0, 0, 0, 0, null,
+        new Dictionary<int, int>(),
+        new Dictionary<int, long>(),
+        new Dictionary<int, long>());
+
+    public long RectangleCount { get; }
+    public long WirePayloadBytes { get; }
+    public long PixelWireBytes { get; }
+    public long PixelArea { get; }
+    public long? BytesPerPixelMilli { get; }
+    public IReadOnlyDictionary<int, int> RectangleCounts { get; }
+    public IReadOnlyDictionary<int, long> WirePayloadBytesByEncoding { get; }
+    public IReadOnlyDictionary<int, long> PixelWireBytesByEncoding { get; }
+
+    public RemoteFramebufferTransferStatistics Merge(RemoteFramebufferTransferStatistics other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        var rectangleCount = SaturatingAdd(RectangleCount, other.RectangleCount);
+        var wirePayloadBytes = SaturatingAdd(WirePayloadBytes, other.WirePayloadBytes);
+        var pixelWireBytes = SaturatingAdd(PixelWireBytes, other.PixelWireBytes);
+        var pixelArea = SaturatingAdd(PixelArea, other.PixelArea);
+        return new RemoteFramebufferTransferStatistics(
+            rectangleCount,
+            wirePayloadBytes,
+            pixelWireBytes,
+            pixelArea,
+            CalculateBytesPerPixelMilli(wirePayloadBytes, pixelArea),
+            MergeDictionaries(RectangleCounts, other.RectangleCounts, SaturatingAdd),
+            MergeDictionaries(WirePayloadBytesByEncoding, other.WirePayloadBytesByEncoding, SaturatingAdd),
+            MergeDictionaries(PixelWireBytesByEncoding, other.PixelWireBytesByEncoding, SaturatingAdd));
+    }
+
+    private static long? CalculateBytesPerPixelMilli(long wirePayloadBytes, long pixelArea) =>
+        pixelArea == 0
+            ? null
+            : (long)Math.Min(
+                long.MaxValue,
+                decimal.Truncate((decimal)wirePayloadBytes * 1000 / pixelArea));
+
+    private static Dictionary<int, TValue> MergeDictionaries<TValue>(
+        IReadOnlyDictionary<int, TValue> first,
+        IReadOnlyDictionary<int, TValue> second,
+        Func<TValue, TValue, TValue> add)
+    {
+        var result = new Dictionary<int, TValue>(first);
+        foreach (var (key, value) in second)
+        {
+            result.TryGetValue(key, out var previous);
+            result[key] = add(previous!, value);
+        }
+
+        return result;
+    }
+
+    private static int SaturatingAdd(int left, int right) =>
+        left > int.MaxValue - right ? int.MaxValue : left + right;
+
+    private static long SaturatingAdd(long left, long right) =>
+        left > long.MaxValue - right ? long.MaxValue : left + right;
+
+    private static ReadOnlyDictionary<TKey, TValue> Snapshot<TKey, TValue>(
+        IReadOnlyDictionary<TKey, TValue> source)
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        return new ReadOnlyDictionary<TKey, TValue>(new Dictionary<TKey, TValue>(source));
+    }
+}
+
 public sealed record RemoteUpdateStatistics(
     long ReceivedSessionBytes,
     IReadOnlyDictionary<int, int> EncodingCounts)
 {
-    public static RemoteUpdateStatistics Empty { get; } = new(0, new Dictionary<int, int>());
+    public RemoteUpdateStatistics(
+        long receivedSessionBytes,
+        IReadOnlyDictionary<int, int> encodingCounts,
+        RemoteFramebufferTransferStatistics transferStatistics)
+        : this(receivedSessionBytes, encodingCounts)
+    {
+        TransferStatistics = transferStatistics ?? throw new ArgumentNullException(nameof(transferStatistics));
+    }
+
+    public static RemoteUpdateStatistics Empty { get; } =
+        new(0, new Dictionary<int, int>(), RemoteFramebufferTransferStatistics.Empty);
 
     /// <summary>
     /// Gets bytes newly read from the underlying session stream since the previous statistics snapshot was emitted.
@@ -99,6 +228,8 @@ public sealed record RemoteUpdateStatistics(
     /// </summary>
     public long ReceivedSessionBytes { get; } = ValidateReceivedSessionBytes(ReceivedSessionBytes);
     public IReadOnlyDictionary<int, int> EncodingCounts { get; } = SnapshotEncodingCounts(EncodingCounts);
+    public RemoteFramebufferTransferStatistics TransferStatistics { get; } =
+        RemoteFramebufferTransferStatistics.Empty;
 
     private static long ValidateReceivedSessionBytes(long receivedSessionBytes)
     {

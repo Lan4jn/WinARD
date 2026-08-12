@@ -95,6 +95,9 @@ public sealed class FramebufferUpdateTests
         Assert.Equal(rectangle, Assert.Single(decodeResult.DirtyRects));
         Assert.Equal(rectangle, Assert.Single(decodeResult.PixelContentRects));
         Assert.Equal(0xFFFF0000u, framebuffer.GetBgra32(0, 0));
+        Assert.Equal(
+            new RectangleTransferStatistics((int)RfbEncodingType.Raw, 4, 4, 1, true),
+            decodeResult.TransferStatistics);
     }
 
     [Fact]
@@ -138,6 +141,87 @@ public sealed class FramebufferUpdateTests
         Assert.Equal(rectangle, Assert.Single(decodeResult.DirtyRects));
         Assert.Equal(rectangle, Assert.Single(decodeResult.PixelContentRects));
         Assert.Equal(0xFFFF0000u, framebuffer.GetBgra32(0, 0));
+        Assert.Equal(
+            new RectangleTransferStatistics((int)RfbEncodingType.Raw, 2, 2, 1, true),
+            decodeResult.TransferStatistics);
+    }
+
+    [Fact]
+    public async Task Update_aggregates_transfer_counts_and_bytes_without_pseudo_encoding_pixels()
+    {
+        using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);
+
+        var result = await FramebufferUpdateReader.ApplyAsync(
+            new MemoryStream(Update(
+                Raw(0, 0, 1, 1, [1, 2, 3, 0]),
+                CopyRect(1, 0, 1, 1, 0, 0))),
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            CancellationToken.None);
+
+        Assert.Equal(1, result.TransferStatistics.RectangleCount);
+        Assert.Equal(4, result.TransferStatistics.WirePayloadBytes);
+        Assert.Equal(4, result.TransferStatistics.PixelWireBytes);
+        Assert.Equal(1, result.TransferStatistics.PixelArea);
+        Assert.Equal(4000, result.TransferStatistics.BytesPerPixelMilli);
+        Assert.Equal(1, result.TransferStatistics.RectangleCounts[(int)RfbEncodingType.Raw]);
+        Assert.Equal(4, result.TransferStatistics.WirePayloadBytesByEncoding[(int)RfbEncodingType.Raw]);
+        Assert.False(result.TransferStatistics.RectangleCounts.ContainsKey((int)RfbEncodingType.CopyRect));
+        Assert.Equal(1, result.EncodingCounts[(int)RfbEncodingType.CopyRect]);
+    }
+
+    [Fact]
+    public void Transfer_statistics_saturate_totals_and_omit_zero_area_ratio()
+    {
+        var statistics = new FramebufferTransferStatistics(
+        [
+            new RectangleTransferStatistics(700, long.MaxValue, long.MaxValue, 0, true),
+            new RectangleTransferStatistics(700, 1, 1, 0, true),
+        ]);
+
+        Assert.Equal(2, statistics.RectangleCount);
+        Assert.Equal(long.MaxValue, statistics.WirePayloadBytes);
+        Assert.Equal(long.MaxValue, statistics.PixelWireBytes);
+        Assert.Equal(0, statistics.PixelArea);
+        Assert.Null(statistics.BytesPerPixelMilli);
+        Assert.Equal(2, statistics.RectangleCounts[700]);
+        Assert.Equal(long.MaxValue, statistics.WirePayloadBytesByEncoding[700]);
+
+        var mutableCounts = Assert.IsAssignableFrom<IDictionary<int, int>>(statistics.RectangleCounts);
+        Assert.True(mutableCounts.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => mutableCounts.Add(701, 1));
+    }
+
+    [Fact]
+    public void Transfer_statistics_aggregate_only_pixel_content_rectangles()
+    {
+        var statistics = new FramebufferTransferStatistics(
+        [
+            new RectangleTransferStatistics(700, 10, 20, 5, true),
+            new RectangleTransferStatistics(701, 30, 40, 6, false),
+        ]);
+
+        Assert.Equal(1, statistics.RectangleCount);
+        Assert.Equal(10, statistics.WirePayloadBytes);
+        Assert.Equal(20, statistics.PixelWireBytes);
+        Assert.Equal(5, statistics.PixelArea);
+        Assert.Equal(2000, statistics.BytesPerPixelMilli);
+        Assert.Equal(new Dictionary<int, int> { [700] = 1 }, statistics.RectangleCounts);
+        Assert.Equal(new Dictionary<int, long> { [700] = 10 }, statistics.WirePayloadBytesByEncoding);
+        Assert.Equal(new Dictionary<int, long> { [700] = 20 }, statistics.PixelWireBytesByEncoding);
+    }
+
+    [Fact]
+    public void Public_update_result_constructors_remain_available()
+    {
+        Assert.NotNull(typeof(FramebufferUpdateResult).GetConstructor(
+        [
+            typeof(IEnumerable<FramebufferRect>),
+            typeof(IEnumerable<FramebufferRect>),
+            typeof(RemoteCursor),
+            typeof(bool),
+            typeof(IReadOnlyDictionary<int, int>),
+        ]));
     }
 
     [Fact]

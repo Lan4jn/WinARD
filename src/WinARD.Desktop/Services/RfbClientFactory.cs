@@ -497,7 +497,16 @@ internal sealed class RfbClient : IRfbClient
 
                             var statistics = new RemoteUpdateStatistics(
                                 SessionBytesSinceLastFramebufferStatistics(),
-                                update.EncodingCounts);
+                                update.EncodingCounts,
+                                new RemoteFramebufferTransferStatistics(
+                                    update.TransferStatistics.RectangleCount,
+                                    update.TransferStatistics.WirePayloadBytes,
+                                    update.TransferStatistics.PixelWireBytes,
+                                    update.TransferStatistics.PixelArea,
+                                    update.TransferStatistics.BytesPerPixelMilli,
+                                    update.TransferStatistics.RectangleCounts,
+                                    update.TransferStatistics.WirePayloadBytesByEncoding,
+                                    update.TransferStatistics.PixelWireBytesByEncoding));
                             var message = _snapshotFactory.CreateServerMessage(framebuffer, update, statistics);
                             return message;
                         }

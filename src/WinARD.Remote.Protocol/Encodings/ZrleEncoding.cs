@@ -112,7 +112,20 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
                         operationCancellationToken);
                     operationCancellationToken.ThrowIfCancellationRequested();
                     framebuffer.ApplyRaw(rectangle, bgra);
-                    return new EncodingDecodeResult([rectangle], [rectangle]);
+                    var pixelWireLength = PixelConverter.CheckedWireLength(
+                        rectangle.Width,
+                        rectangle.Height,
+                        _pixelFormat,
+                        framebuffer.Limits);
+                    return new EncodingDecodeResult(
+                        [rectangle],
+                        [rectangle],
+                        new RectangleTransferStatistics(
+                            EncodingId,
+                            checked(sizeof(uint) + (long)compressedLength),
+                            pixelWireLength,
+                            checked((long)rectangle.Width * rectangle.Height),
+                            true));
                 }
                 finally
                 {
