@@ -494,6 +494,8 @@ public interface IRemoteSessionRuntime
 {
     bool HasPreloadedFramebuffer => false;
 
+    QualityBootstrapState BootstrapState => QualityBootstrapState.LegacyBgra32;
+
     RemoteFramebufferSize FramebufferSize { get; }
 
     RemoteDisplayCapabilities DisplayCapabilities => RemoteDisplayCapabilities.Unknown;

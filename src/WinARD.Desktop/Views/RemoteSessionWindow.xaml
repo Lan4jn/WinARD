@@ -57,6 +57,17 @@
                                             AutomationProperties.Name="画质状态：状态未知"
                                             AutomationProperties.LiveSetting="Polite"
                                             Text="状态未知" />
+                                        <TextBlock
+                                            x:Name="QualityDesiredText"
+                                            AutomationProperties.AutomationId="RemoteQualityDesiredText"
+                                            AutomationProperties.Name="期望画质"
+                                            Text="期望：—" />
+                                        <TextBlock
+                                            x:Name="QualityAppliedText"
+                                            AutomationProperties.AutomationId="RemoteQualityAppliedText"
+                                            AutomationProperties.Name="实际画质"
+                                            AutomationProperties.LiveSetting="Polite"
+                                            Text="实际：—" />
                                         <TextBlock Text="预设" />
                                         <ComboBox
                                             x:Name="QualityPresetComboBox"

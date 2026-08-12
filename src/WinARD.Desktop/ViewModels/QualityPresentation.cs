@@ -15,6 +15,8 @@ public enum QualityPresentationStatus
     TargetUnsatisfied,
     CapabilityLimited,
     ReconnectRequired,
+    SafeFallback,
+    Unrestricted,
 }
 
 public sealed record QualityChoice<T>(
@@ -36,13 +38,60 @@ public sealed record QualityBandwidthOption(
     long? Value,
     string DisplayName);
 
+public enum QualityActualEncoding
+{
+    Unknown,
+    Raw,
+    Zlib,
+    Zrle,
+    AppleGrayscale,
+    AppleColor,
+}
+
+public sealed record QualityActualState(
+    RemotePixelFormatKind PixelFormat,
+    QualityActualEncoding Encoding,
+    bool FallbackUsed);
+
 public sealed record QualityPresentationSnapshot(
     QualityProfile Profile,
     QualityDecision? Decision,
     QualityTransitionStatus TransitionStatus,
     SessionPerformanceSnapshot Performance,
     long Epoch,
-    long Version);
+    long Version)
+{
+    public QualityPresentationSnapshot(
+        QualityProfile profile,
+        QualityDecision? decision,
+        QualityTransitionStatus transitionStatus,
+        SessionPerformanceSnapshot performance,
+        long epoch,
+        long version,
+        QualityActualState? actual)
+        : this(profile, decision, transitionStatus, performance, epoch, version)
+    {
+        Actual = actual;
+    }
+
+    public QualityPresentationSnapshot(
+        QualityProfile profile,
+        QualityDecision? decision,
+        QualityTransitionStatus transitionStatus,
+        SessionPerformanceSnapshot performance,
+        long epoch,
+        long version,
+        QualityActualState? actual,
+        bool pendingReconnect)
+        : this(profile, decision, transitionStatus, performance, epoch, version, actual)
+    {
+        PendingReconnect = pendingReconnect;
+    }
+
+    public QualityActualState? Actual { get; init; }
+
+    public bool PendingReconnect { get; }
+}
 
 public static class QualityPresentation
 {
@@ -136,6 +185,44 @@ public static class QualityPresentation
             "（待能力确认）";
     }
 
+    public static string DesiredText(QualityProfile profile, QualityDecision? decision)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        var color = decision?.Color ?? profile.Color;
+        var scale = decision?.Scale ?? profile.Scale;
+        var targetFps = decision?.TargetFramesPerSecond ?? profile.Refresh.FixedFramesPerSecond;
+        var bandwidth = profile.TargetBytesPerSecond is { } target
+            ? string.Create(CultureInfo.InvariantCulture, $"{target / (double)MiB:0.#} MiB/s")
+            : "不限制";
+        return $"期望：{ColorName(color)} · {ScaleName(scale)} · " +
+            $"{(targetFps is > 0 ? $"{targetFps} FPS" : "—")} · {bandwidth}";
+    }
+
+    public static string AppliedText(
+        QualityActualState? actual,
+        SessionPerformanceSnapshot performance)
+    {
+        ArgumentNullException.ThrowIfNull(performance);
+        var color = actual?.PixelFormat switch
+        {
+            RemotePixelFormatKind.Bgra32 => "32 位",
+            RemotePixelFormatKind.Rgb565 => "16 位",
+            _ => "Unknown",
+        };
+        var fallback = actual?.FallbackUsed == true ? "（已安全回退）" : string.Empty;
+        var encoding = ActualEncodingName(actual?.Encoding ?? QualityActualEncoding.Unknown);
+        var hasSample = performance.SampleSequence > 0;
+        var actualFps = hasSample && performance.ActualFramesPerSecond > 0
+            ? $"{performance.ActualFramesPerSecond} FPS"
+            : "—";
+        var bandwidth = hasSample && performance.ReceiveBytesPerSecond > 0
+            ? string.Create(
+                CultureInfo.InvariantCulture,
+                $"{performance.ReceiveBytesPerSecond / (double)MiB:0.0} MiB/s")
+            : "—";
+        return $"实际：{color}{fallback} · {encoding} · {actualFps} · {bandwidth}";
+    }
+
     public static string StatusText(QualityPresentationStatus status) => status switch
     {
         QualityPresentationStatus.TargetReached => "已达到目标",
@@ -143,15 +230,41 @@ public static class QualityPresentation
         QualityPresentationStatus.RecoveringClarity => "正在恢复清晰度",
         QualityPresentationStatus.TargetUnsatisfied => "当前链路无法满足目标",
         QualityPresentationStatus.CapabilityLimited => "服务器能力不足，自动范围已限制",
-        QualityPresentationStatus.ReconnectRequired => "重新连接后生效",
+        QualityPresentationStatus.ReconnectRequired => "下次连接生效",
+        QualityPresentationStatus.SafeFallback => "本连接已安全回退",
+        QualityPresentationStatus.Unrestricted => "带宽不限制",
         _ => "状态未知",
     };
 
     public static QualityPresentationStatus StatusFor(
         QualityDecisionReason reason,
         bool targetSatisfied,
-        QualityTransitionStatus transitionStatus)
+        QualityTransitionStatus transitionStatus) =>
+        StatusFor(reason, targetSatisfied, transitionStatus, fallbackUsed: false);
+
+    public static QualityPresentationStatus StatusFor(
+        QualityDecisionReason reason,
+        bool targetSatisfied,
+        QualityTransitionStatus transitionStatus,
+        bool fallbackUsed) =>
+        StatusFor(
+            reason,
+            targetSatisfied,
+            transitionStatus,
+            fallbackUsed,
+            hasNumericBandwidthTarget: true);
+
+    public static QualityPresentationStatus StatusFor(
+        QualityDecisionReason reason,
+        bool targetSatisfied,
+        QualityTransitionStatus transitionStatus,
+        bool fallbackUsed,
+        bool hasNumericBandwidthTarget)
     {
+        if (fallbackUsed)
+        {
+            return QualityPresentationStatus.SafeFallback;
+        }
         if (transitionStatus == QualityTransitionStatus.ReconnectRequired)
         {
             return QualityPresentationStatus.ReconnectRequired;
@@ -159,6 +272,10 @@ public static class QualityPresentation
         if (transitionStatus == QualityTransitionStatus.CapabilityUnavailable)
         {
             return QualityPresentationStatus.CapabilityLimited;
+        }
+        if (!hasNumericBandwidthTarget && targetSatisfied)
+        {
+            return QualityPresentationStatus.Unrestricted;
         }
 
         return reason switch
@@ -174,10 +291,44 @@ public static class QualityPresentation
         };
     }
 
+    public static QualityPresentationStatus StatusFor(QualityPresentationSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        if (snapshot.PendingReconnect)
+        {
+            return QualityPresentationStatus.ReconnectRequired;
+        }
+        if (snapshot.Actual?.FallbackUsed == true)
+        {
+            return QualityPresentationStatus.SafeFallback;
+        }
+        if (snapshot.Decision is null)
+        {
+            return QualityPresentationStatus.Unknown;
+        }
+
+        return StatusFor(
+            snapshot.Decision.Reason,
+            snapshot.Decision.TargetSatisfied,
+            snapshot.TransitionStatus,
+            fallbackUsed: false,
+            snapshot.Profile.TargetBytesPerSecond is not null);
+    }
+
     public static string AutomationName(string summary, QualityPresentationStatus status)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(summary);
         return $"画质：{summary}；状态：{StatusText(status)}";
+    }
+
+    public static string AutomationName(
+        string desired,
+        string applied,
+        QualityPresentationStatus status)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(desired);
+        ArgumentException.ThrowIfNullOrWhiteSpace(applied);
+        return $"画质：{desired}；{applied}；状态：{StatusText(status)}";
     }
 
     public static string EncodingName(int? encoding) => encoding switch
@@ -188,6 +339,16 @@ public static class QualityPresentation
         16 => "ZRLE",
         1001 => "Apple 灰度",
         1002 => "Apple 彩色",
+        _ => "Unknown",
+    };
+
+    public static string ActualEncodingName(QualityActualEncoding encoding) => encoding switch
+    {
+        QualityActualEncoding.Raw => "Raw",
+        QualityActualEncoding.Zlib => "Zlib",
+        QualityActualEncoding.Zrle => "ZRLE",
+        QualityActualEncoding.AppleGrayscale => "Apple 灰度",
+        QualityActualEncoding.AppleColor => "Apple 彩色",
         _ => "Unknown",
     };
 

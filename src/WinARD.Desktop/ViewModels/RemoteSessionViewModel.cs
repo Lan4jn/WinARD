@@ -47,6 +47,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private AdaptiveQualityController _adaptiveQualityController;
     private readonly ArdDisplayCapabilities _adaptiveQualityCapabilities;
     private readonly QualityDecoderGates _qualityDecoderGates;
+    private readonly QualityBootstrapState _bootstrapState;
     private readonly QualityTransitionCoordinator _qualityTransitionCoordinator;
     private readonly SemaphoreSlim _qualityOperationGate = new(1, 1);
     private CancellationTokenSource _qualityProfileOperations = new();
@@ -72,6 +73,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private QualityProfile _qualityProfile;
     private QualityDecision? _latestQualityDecision;
     private QualityTransitionStatus _latestQualityTransitionStatus = QualityTransitionStatus.NoChange;
+    private QualityActualState _actualQualityState;
+    private bool _qualityReconnectRequired;
     private long _qualityPresentationVersion;
     private QualityPresentationSnapshot _qualityPresentationSnapshot = null!;
     private RemoteSessionDiagnosticQualitySnapshot _diagnosticQualitySnapshot = null!;
@@ -171,6 +174,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         var qualityMaximum = ValidateRemoteMaximum(qualityCapabilities.MaximumRefreshRate);
         _remoteMaximum = MinimumKnownMaximum(displayMaximum, qualityMaximum);
         _qualityProfile = qualityProfile ?? throw new ArgumentNullException(nameof(qualityProfile));
+        _bootstrapState = session.BootstrapState;
+        _actualQualityState = CreateActualQualityState(_bootstrapState, RemoteUpdateStatistics.Empty);
         _refreshPolicy = qualityProfile.Refresh;
         _adaptiveQualityCapabilities = WithMaximumRefreshRate(
             qualityCapabilities,
@@ -183,8 +188,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _qualityTransitionCoordinator = qualityTransitionCoordinator ?? new QualityTransitionCoordinator(
             session,
             new RemoteQualitySettings(
-                RemotePixelFormatKind.Bgra32,
-                [6, 16, 0, 1, -239, -223],
+                _bootstrapState.ActualQuality.PixelFormat,
+                _bootstrapState.ActualQuality.Encodings,
                 1),
             _adaptiveQualityCapabilities,
             _qualityDecoderGates);
@@ -207,7 +212,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             QualityTransitionStatus.NoChange,
             _performance,
             _qualityProfileEpoch,
-            _qualityPresentationVersion);
+            _qualityPresentationVersion,
+            _actualQualityState);
         Volatile.Write(
             ref _diagnosticQualitySnapshot,
             CreateDiagnosticQualitySnapshotNoLock(
@@ -327,11 +333,24 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposeTask is not null, this);
+            if (profile == _qualityProfile)
+            {
+                return;
+            }
+
             previousOperations = _qualityProfileOperations;
             _qualityProfileOperations = new CancellationTokenSource();
+            var nextDesiredPixelFormat = DesiredPixelFormat(profile.Color);
+            var colorChanged = _qualityProfile.Color != profile.Color;
             _qualityProfile = profile;
             _latestQualityDecision = null;
-            _latestQualityTransitionStatus = QualityTransitionStatus.NoChange;
+            _qualityReconnectRequired = _receiveTask is not null &&
+                nextDesiredPixelFormat is { } desiredPixelFormat &&
+                desiredPixelFormat != _actualQualityState.PixelFormat &&
+                (_qualityReconnectRequired || colorChanged);
+            _latestQualityTransitionStatus = _qualityReconnectRequired
+                ? QualityTransitionStatus.ReconnectRequired
+                : QualityTransitionStatus.NoChange;
             _refreshPolicy = profile.Refresh;
             _adaptiveQualityController = controller;
             _ = Interlocked.Increment(ref _qualityProfileEpoch);
@@ -345,23 +364,32 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 _refreshPolicy,
                 ResolveTarget(_refreshPolicy, automaticTarget));
             Performance = _performanceTracker.Current;
-            _qualityPresentationSnapshot = new(
+            _ = Interlocked.Increment(ref _qualityPresentationVersion);
+            var presentation = new QualityPresentationSnapshot(
                 _qualityProfile,
                 null,
-                QualityTransitionStatus.NoChange,
+                _latestQualityTransitionStatus,
                 Performance,
                 _qualityProfileEpoch,
-                _qualityPresentationVersion);
+                _qualityPresentationVersion,
+                _actualQualityState,
+                _qualityReconnectRequired);
+            Volatile.Write(ref _qualityPresentationSnapshot, presentation);
             Volatile.Write(
                 ref _diagnosticQualitySnapshot,
                 CreateDiagnosticQualitySnapshotNoLock(
                     _performanceTracker.CreateDiagnosticQualityMeasurements(),
-                    _qualityPresentationSnapshot));
+                    presentation));
             RefreshFrameRefreshOptions();
         }
 
         ObserveDetachedFailure(CancelAndDisposeAsync(previousOperations));
+        PostQualityPresentationChanged();
     }
+
+    private void PostQualityPresentationChanged() =>
+        QueueUiUpdateBestEffort(
+            () => OnPropertyChanged(nameof(QualityPresentationVersion)));
 
     internal static string FormatSessionPerformance(SessionPerformanceSnapshot snapshot)
     {
@@ -1051,6 +1079,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         SessionDiagnosticQualityMeasurements decisionMeasurements;
         QualityDecision decision;
         bool constraintsSatisfied;
+        bool reconnectRequired;
         long profileEpoch;
         CancellationToken profileCancellationToken;
         long performanceGeneration;
@@ -1074,6 +1103,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             decision = WithGlobalGeneration(localDecision);
             constraintsSatisfied = _adaptiveQualityController.ConstraintsSatisfied;
             profileEpoch = _qualityProfileEpoch;
+            reconnectRequired = _qualityReconnectRequired;
             profileCancellationToken = _qualityProfileOperations.Token;
             var target = ResolveTarget(_refreshPolicy, decision.TargetFramesPerSecond);
             targetChanged = snapshot.TargetFramesPerSecond != target;
@@ -1106,6 +1136,10 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             if (profileEpoch != Volatile.Read(ref _qualityProfileEpoch))
             {
                 transitionStatus = QualityTransitionStatus.NoChange;
+            }
+            else if (reconnectRequired)
+            {
+                transitionStatus = QualityTransitionStatus.ReconnectRequired;
             }
             else if (!constraintsSatisfied)
             {
@@ -1147,27 +1181,36 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             }
 
             var previousDecision = _latestQualityDecision;
+            var actualQualityState = CreateActualQualityState(
+                _bootstrapState,
+                pending.Update,
+                _actualQualityState.Encoding);
             presentationChanged = previousDecision is null ||
                 previousDecision.Color != decision.Color ||
                 previousDecision.Scale != decision.Scale ||
                 previousDecision.TargetFramesPerSecond != decision.TargetFramesPerSecond ||
                 previousDecision.Reason != decision.Reason ||
                 previousDecision.TargetSatisfied != decision.TargetSatisfied ||
+                _actualQualityState != actualQualityState ||
                 _latestQualityTransitionStatus != transitionStatus;
             _latestQualityDecision = decision;
             _latestQualityTransitionStatus = transitionStatus;
+            _actualQualityState = actualQualityState;
             if (presentationChanged || performancePublished)
             {
                 _ = Interlocked.Increment(ref _qualityPresentationVersion);
             }
-            _qualityPresentationSnapshot = new(
+            var presentationSnapshot = new QualityPresentationSnapshot(
                 _qualityProfile,
                 decision,
                 transitionStatus,
                 snapshot,
                 _qualityProfileEpoch,
-                _qualityPresentationVersion);
-            var diagnosticPresentation = _qualityPresentationSnapshot with
+                _qualityPresentationVersion,
+                _actualQualityState,
+                _qualityReconnectRequired);
+            Volatile.Write(ref _qualityPresentationSnapshot, presentationSnapshot);
+            var diagnosticPresentation = presentationSnapshot with
             {
                 Performance = decisionMeasurements.Performance.Performance,
             };
@@ -1195,6 +1238,51 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             presentation,
             measurements.Observation,
             _adaptiveQualityCapabilities);
+
+    private static QualityActualState CreateActualQualityState(
+        QualityBootstrapState bootstrapState,
+        RemoteUpdateStatistics update,
+        QualityActualEncoding previousEncoding = QualityActualEncoding.Unknown)
+    {
+        ArgumentNullException.ThrowIfNull(bootstrapState);
+        ArgumentNullException.ThrowIfNull(update);
+        var encoding = update.EncodingCounts
+            .Where(pair => pair.Value > 0)
+            .Where(pair => IsPrimaryEncodingCandidate(pair.Key))
+            .OrderByDescending(pair => pair.Value)
+            .ThenBy(pair => pair.Key)
+            .Select(pair => (int?)pair.Key)
+            .FirstOrDefault();
+        return new QualityActualState(
+            bootstrapState.ActualQuality.PixelFormat,
+            encoding is { } value ? MapActualEncoding(value) : previousEncoding,
+            bootstrapState.FallbackUsed);
+    }
+
+    private static bool IsPrimaryEncodingCandidate(int encoding) => encoding is not
+        (int)RfbEncodingType.CopyRect and not
+        (int)RfbEncodingType.Cursor and not
+        (int)RfbEncodingType.DesktopSize and not
+        (int)RfbEncodingType.ArdDisplayInfo and not
+        (int)RfbEncodingType.ArdSessionEncryption and not
+        (int)RfbEncodingType.ArdDisplayInfo2;
+
+    private static RemotePixelFormatKind? DesiredPixelFormat(QualityColor color) => color switch
+    {
+        QualityColor.Full32 => RemotePixelFormatKind.Bgra32,
+        QualityColor.Color16 => RemotePixelFormatKind.Rgb565,
+        _ => null,
+    };
+
+    private static QualityActualEncoding MapActualEncoding(int encoding) => encoding switch
+    {
+        0 => QualityActualEncoding.Raw,
+        6 => QualityActualEncoding.Zlib,
+        16 => QualityActualEncoding.Zrle,
+        1001 => QualityActualEncoding.AppleGrayscale,
+        1002 => QualityActualEncoding.AppleColor,
+        _ => QualityActualEncoding.Unknown,
+    };
 
     private int? ResolveTarget(FrameRefreshPolicy policy, int automaticTarget) => policy.Mode switch
     {

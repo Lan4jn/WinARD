@@ -781,28 +781,19 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
             var decision = presentation.Decision;
             var performance = presentation.Performance;
-            var summary = decision is null
-                ? QualityPresentation.FormatPendingSummary(
-                    profile,
-                    performance.TargetFramesPerSecond,
-                    performance.SampleSequence > 0 ? performance.ReceiveBytesPerSecond : null)
-                : QualityPresentation.FormatSummary(
-                    profile.Preset,
-                    decision.Color,
-                    decision.Scale,
-                    decision.TargetFramesPerSecond,
-                    performance.SampleSequence > 0 ? performance.ReceiveBytesPerSecond : null);
-            var status = decision is null
-                ? QualityPresentationStatus.Unknown
-                : QualityPresentation.StatusFor(
-                    decision.Reason,
-                    decision.TargetSatisfied,
-                    presentation.TransitionStatus);
-            QualitySummaryButton.Content = $"画质  {summary}";
+            var desired = QualityPresentation.DesiredText(profile, decision);
+            var applied = QualityPresentation.AppliedText(presentation.Actual, performance);
+            var status = QualityPresentation.StatusFor(presentation);
+            QualitySummaryButton.Content = $"画质  {applied}";
+            QualityDesiredText.Text = desired;
+            QualityAppliedText.Text = applied;
             QualityStatusText.Text = QualityPresentation.StatusText(status);
             AutomationProperties.SetName(QualityStatusText, $"画质状态：{QualityPresentation.StatusText(status)}");
-            AutomationProperties.SetName(QualitySummaryButton, QualityPresentation.AutomationName(summary, status));
-            var encoding = QualityPresentation.EncodingName(performance.PrimaryFramebufferEncoding);
+            AutomationProperties.SetName(QualityDesiredText, desired);
+            AutomationProperties.SetName(QualityAppliedText, applied);
+            AutomationProperties.SetName(QualitySummaryButton, QualityPresentation.AutomationName(desired, applied, status));
+            var encoding = QualityPresentation.ActualEncodingName(
+                presentation.Actual?.Encoding ?? QualityActualEncoding.Unknown);
             QualityEncodingText.Text = encoding;
             AutomationProperties.SetName(QualityEncodingText, $"当前编码：{encoding}");
         }
