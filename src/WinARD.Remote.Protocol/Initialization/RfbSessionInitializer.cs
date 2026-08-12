@@ -57,12 +57,29 @@ public static class RfbSessionInitializer
             sessionEncryption,
             cancellationToken);
 
+    public static Task<RfbServerInit> InitializeAsync(
+        Stream stream,
+        RfbHandshakeResult handshake,
+        ProtocolLimits limits,
+        RfbSessionDeclaration declaration,
+        ArdSessionEncryption? sessionEncryption,
+        CancellationToken cancellationToken) =>
+        InitializeAsync(
+            stream,
+            handshake,
+            limits,
+            declaration,
+            sessionEncryption,
+            deferClientDeclarations: false,
+            cancellationToken);
+
     public static async Task<RfbServerInit> InitializeAsync(
         Stream stream,
         RfbHandshakeResult handshake,
         ProtocolLimits limits,
         RfbSessionDeclaration declaration,
         ArdSessionEncryption? sessionEncryption,
+        bool deferClientDeclarations,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
@@ -92,6 +109,7 @@ public static class RfbSessionInitializer
                     declaration,
                     ardEncodings!,
                     sessionEncryption,
+                    deferClientDeclarations,
                     cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -103,7 +121,13 @@ public static class RfbSessionInitializer
                 nameof(sessionEncryption));
         }
 
-        return await InitializeStandardAsync(reader, writer, limits, declaration, cancellationToken)
+        return await InitializeStandardAsync(
+                reader,
+                writer,
+                limits,
+                declaration,
+                deferClientDeclarations,
+                cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -112,6 +136,7 @@ public static class RfbSessionInitializer
         RfbWriter writer,
         ProtocolLimits limits,
         RfbSessionDeclaration declaration,
+        bool deferClientDeclarations,
         CancellationToken cancellationToken)
     {
         await writer.WriteByteAsync(1, cancellationToken).ConfigureAwait(false);
@@ -136,8 +161,12 @@ public static class RfbSessionInitializer
             .ConfigureAwait(false);
         var (name, isTruncated) = CreateDisplayName(nameBytes);
 
-        await WriteSetPixelFormatAsync(writer, declaration.PixelFormat, cancellationToken).ConfigureAwait(false);
-        await WriteSetEncodingsAsync(writer, declaration.Encodings, cancellationToken).ConfigureAwait(false);
+        if (!deferClientDeclarations)
+        {
+            await WriteSetPixelFormatAsync(writer, declaration.PixelFormat, cancellationToken).ConfigureAwait(false);
+            await WriteSetEncodingsAsync(writer, declaration.Encodings, cancellationToken).ConfigureAwait(false);
+        }
+
         return new RfbServerInit(width, height, serverPixelFormat, name, isTruncated);
     }
 
@@ -149,6 +178,7 @@ public static class RfbSessionInitializer
         RfbSessionDeclaration declaration,
         IReadOnlyList<int> ardEncodings,
         ArdSessionEncryption? sessionEncryption,
+        bool deferClientDeclarations,
         CancellationToken cancellationToken)
     {
         await writer.WriteByteAsync((byte)ArdClientInitFlags.Ard, cancellationToken).ConfigureAwait(false);
@@ -188,14 +218,21 @@ public static class RfbSessionInitializer
         await ardWriter.WriteViewerInfoAsync(cancellationToken).ConfigureAwait(false);
         await ardWriter.WriteSetModeAsync(ArdControlMode.Shared, cancellationToken).ConfigureAwait(false);
         await ardWriter.WriteSetDisplayAsync(cancellationToken).ConfigureAwait(false);
-        await WriteSetPixelFormatAsync(writer, declaration.PixelFormat, cancellationToken).ConfigureAwait(false);
-        await WriteSetEncodingsAsync(
-                writer,
-                requiresBootstrap
-                    ? ArdBootstrapRequestedEncodings
-                    : ardEncodings,
-                cancellationToken)
-            .ConfigureAwait(false);
+        if (!deferClientDeclarations || requiresBootstrap)
+        {
+            if (!deferClientDeclarations)
+            {
+                await WriteSetPixelFormatAsync(writer, declaration.PixelFormat, cancellationToken).ConfigureAwait(false);
+            }
+
+            await WriteSetEncodingsAsync(
+                    writer,
+                    requiresBootstrap
+                        ? ArdBootstrapRequestedEncodings
+                        : ardEncodings,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         if (requiresBootstrap)
         {
@@ -203,14 +240,17 @@ public static class RfbSessionInitializer
                 .ConfigureAwait(false);
             width = displaySize.Width;
             height = displaySize.Height;
-            await WriteSetEncodingsAsync(
-                    writer,
-                    ardEncodings,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            if (!deferClientDeclarations)
+            {
+                await WriteSetEncodingsAsync(
+                        writer,
+                        ardEncodings,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
 
-        if (sessionEncryption is not null)
+        if (sessionEncryption is not null && !deferClientDeclarations)
         {
             await sessionEncryption.RequestAsync(cancellationToken).ConfigureAwait(false);
         }

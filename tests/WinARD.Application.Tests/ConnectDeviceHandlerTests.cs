@@ -54,6 +54,39 @@ public sealed class ConnectDeviceHandlerTests
     }
 
     [Fact]
+    public void Framebuffer_message_preserves_legacy_constructors_and_defaults_to_pixel_content()
+    {
+        Assert.NotNull(typeof(RemoteFramebufferMessage).GetConstructor(
+        [
+            typeof(RemoteFramebufferSize),
+            typeof(byte[]),
+            typeof(int),
+            typeof(IReadOnlyList<RemoteRectangle>),
+            typeof(RemoteCursorUpdate),
+            typeof(RemoteUpdateStatistics),
+        ]));
+        Assert.NotNull(typeof(RemoteFramebufferMessage).GetConstructor(
+        [
+            typeof(RemoteFramebufferSize),
+            typeof(IMemoryOwner<byte>),
+            typeof(int),
+            typeof(int),
+            typeof(IReadOnlyList<RemoteRectangle>),
+            typeof(RemoteCursorUpdate),
+            typeof(RemoteUpdateStatistics),
+            typeof(bool),
+        ]));
+
+        using var message = new RemoteFramebufferMessage(
+            new RemoteFramebufferSize(1, 1),
+            [0, 0, 0, 255],
+            4,
+            [new RemoteRectangle(0, 0, 1, 1)]);
+
+        Assert.True(message.HasPixelContent);
+    }
+
+    [Fact]
     public async Task Invalid_bootstrap_attempt_is_rejected_before_any_dependency_is_called()
     {
         var secretProvider = new TestSecretProvider(new TestConnectionSecret());
@@ -119,7 +152,7 @@ public sealed class ConnectDeviceHandlerTests
         var session = Assert.IsType<RemoteSession>(result.Session);
 
         Assert.Equal(
-            ["initialize", "configure-Preferred", "request-False", "receive", "receive"],
+            ["initialize", "configure-Preferred", "request-False", "receive", "request-False", "receive"],
             events.Where(value => value is "initialize" or "receive" ||
                 value.StartsWith("configure", StringComparison.Ordinal) ||
                 value.StartsWith("request", StringComparison.Ordinal)));
@@ -162,6 +195,125 @@ public sealed class ConnectDeviceHandlerTests
     }
 
     [Fact]
+    public async Task Handler_discards_empty_frame_requests_again_and_preloads_the_first_pixel_frame()
+    {
+        var events = new List<string>();
+        var emptyOwner = new CountingOwner(4);
+        var pixelOwner = new CountingOwner(4);
+        var client = new TestRfbClient
+        {
+            Events = events,
+            Messages = new Queue<RemoteServerMessage>(
+            [
+                CreateFramebufferMessage(emptyOwner, hasPixelContent: false),
+                CreateFramebufferMessage(pixelOwner),
+            ]),
+        };
+        var handler = CreateHandler(client);
+
+        var result = await handler.HandleAsync(CreateProfile(), default);
+
+        Assert.Equal(SessionState.Connected, result.State);
+        Assert.Equal(1, emptyOwner.DisposeCount);
+        Assert.Equal(
+            ["request-False", "receive", "request-False", "receive"],
+            events.Where(value => value is "receive" || value.StartsWith("request", StringComparison.Ordinal)));
+        await result.Session!.DisposeAsync();
+        Assert.Equal(1, pixelOwner.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Handler_preserves_cursor_order_across_a_nonpixel_frame_and_reissues_only_for_the_frame()
+    {
+        var events = new List<string>();
+        var firstCursorOwner = new CountingOwner(4);
+        var emptyOwner = new CountingOwner(4);
+        var secondCursorOwner = new CountingOwner(4);
+        var pixelOwner = new CountingOwner(4);
+        var client = new TestRfbClient
+        {
+            Events = events,
+            Messages = new Queue<RemoteServerMessage>(
+            [
+                CreateCursorMessage(firstCursorOwner),
+                CreateFramebufferMessage(emptyOwner, hasPixelContent: false),
+                CreateCursorMessage(secondCursorOwner),
+                CreateFramebufferMessage(pixelOwner),
+            ]),
+        };
+        var handler = CreateHandler(client);
+
+        var result = await handler.HandleAsync(CreateProfile(), default);
+        var session = Assert.IsType<RemoteSession>(result.Session);
+
+        Assert.Equal(
+            [
+                "request-False", "receive", "request-False", "receive",
+                "request-False", "receive", "request-False", "receive",
+            ],
+            events.Where(value => value is "receive" || value.StartsWith("request", StringComparison.Ordinal)));
+        using var firstCursor = Assert.IsType<RemoteCursorMessage>(await session.ReceiveAsync(default));
+        using var secondCursor = Assert.IsType<RemoteCursorMessage>(await session.ReceiveAsync(default));
+        using var pixelFrame = Assert.IsType<RemoteFramebufferMessage>(await session.ReceiveAsync(default));
+        await session.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Handler_preserves_bootstrap_compatibility_failure_after_an_empty_frame()
+    {
+        var emptyOwner = new CountingOwner(4);
+        var compatibility = new QualityBootstrapCompatibilityException(
+            QualityBootstrapFailureReason.UnsupportedEncoding);
+        var client = new TestRfbClient
+        {
+            Messages = new Queue<RemoteServerMessage>(
+            [
+                CreateFramebufferMessage(emptyOwner, hasPixelContent: false),
+            ]),
+            ReceiveException = compatibility,
+        };
+        var mapper = new CapturingErrorMapper();
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            mapper);
+
+        var result = await handler.HandleAsync(CreateProfile(), default);
+
+        Assert.Equal(SessionState.Failed, result.State);
+        Assert.Same(compatibility, mapper.Exception);
+        Assert.Equal(1, emptyOwner.DisposeCount);
+        Assert.Equal(2, client.RequestCount);
+    }
+
+    [Fact]
+    public async Task Handler_bounds_cursor_and_nonpixel_messages_and_releases_every_owner()
+    {
+        var owners = Enumerable.Range(0, 9).Select(_ => new CountingOwner(4)).ToArray();
+        var messages = owners.Select((owner, index) =>
+            index % 2 == 0
+                ? (RemoteServerMessage)CreateFramebufferMessage(owner, hasPixelContent: false)
+                : CreateCursorMessage(owner));
+        var client = new TestRfbClient { Messages = new Queue<RemoteServerMessage>(messages) };
+        var mapper = new CapturingErrorMapper();
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            mapper);
+
+        var result = await handler.HandleAsync(CreateProfile(), default);
+
+        Assert.Equal(SessionState.Failed, result.State);
+        var exception = Assert.IsType<InvalidOperationException>(mapper.Exception);
+        Assert.Equal("The bootstrap preload queue exceeded its limit.", exception.Message);
+        Assert.Equal(8, client.ReceiveCount);
+        Assert.All(owners[..8], owner => Assert.Equal(1, owner.DisposeCount));
+        Assert.Equal(0, owners[8].DisposeCount);
+    }
+
+    [Fact]
     public async Task Preload_failure_preserves_primary_and_best_effort_cleans_all_owned_resources()
     {
         var firstOwner = new CountingOwner(4)
@@ -195,7 +347,7 @@ public sealed class ConnectDeviceHandlerTests
         Assert.Equal("The bootstrap preload queue exceeded its limit.", primary.Message);
         Assert.Equal(1, firstOwner.DisposeCount);
         Assert.Equal(1, secondOwner.DisposeCount);
-        Assert.Equal(1, overflowOwner.DisposeCount);
+        Assert.Equal(0, overflowOwner.DisposeCount);
         Assert.Equal(1, client.DisposeCount);
         Assert.Equal(1, transportLifetime.DisposeCount);
         Assert.Equal(1, secret.DisposeCount);
@@ -822,6 +974,8 @@ public sealed class ConnectDeviceHandlerTests
 
         public Exception? InitializeException { get; init; }
 
+        public Exception? ReceiveException { get; init; }
+
         public Exception? DisposeException { get; init; }
 
         public List<string>? Events { get; init; }
@@ -835,6 +989,7 @@ public sealed class ConnectDeviceHandlerTests
         public int DisposeCount { get; private set; }
 
         public int InitializeCount { get; private set; }
+        public int RequestCount { get; private set; }
         public int ReceiveCount { get; private set; }
         public Queue<RemoteServerMessage>? Messages { get; init; }
         public QualityBootstrapSettings? ConfiguredSettings { get; private set; }
@@ -887,6 +1042,7 @@ public sealed class ConnectDeviceHandlerTests
 
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken)
         {
+            RequestCount++;
             Events?.Add($"request-{incremental}");
             return ValueTask.CompletedTask;
         }
@@ -895,11 +1051,21 @@ public sealed class ConnectDeviceHandlerTests
         {
             ReceiveCount++;
             Events?.Add("receive");
+            if (Messages is null || Messages.Count == 0)
+            {
+                if (ReceiveException is not null)
+                {
+                    return ValueTask.FromException<RemoteServerMessage>(ReceiveException);
+                }
+
+                return ValueTask.FromResult<RemoteServerMessage>(
+                    new RemoteFramebufferMessage(
+                        new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+                        [new RemoteRectangle(0, 0, 1, 1)]));
+            }
+
             return ValueTask.FromResult(
-                Messages?.Dequeue() ??
-                new RemoteFramebufferMessage(
-                    new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
-                    [new RemoteRectangle(0, 0, 1, 1)]));
+                Messages.Dequeue());
         }
 
         public ValueTask DisposeAsync()
@@ -938,13 +1104,25 @@ public sealed class ConnectDeviceHandlerTests
     private static RemoteCursorMessage CreateCursorMessage(CountingOwner owner) =>
         new(new RemoteCursorUpdate(0, 0, 1, 1, owner, 4));
 
-    private static RemoteFramebufferMessage CreateFramebufferMessage(CountingOwner owner) =>
+    private static ConnectDeviceHandler CreateHandler(TestRfbClient client) =>
+        new(
+            new TestTransportFactory(),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            new ErrorMapper(() => "correlation-id"));
+
+    private static RemoteFramebufferMessage CreateFramebufferMessage(
+        CountingOwner owner,
+        bool hasPixelContent = true) =>
         new(
             new RemoteFramebufferSize(1, 1),
             owner,
             4,
             4,
-            [new RemoteRectangle(0, 0, 1, 1)]);
+            [new RemoteRectangle(0, 0, 1, 1)],
+            cursor: null,
+            statistics: null,
+            hasPixelContent);
 
     private sealed class TestAsyncDisposable : IAsyncDisposable
     {

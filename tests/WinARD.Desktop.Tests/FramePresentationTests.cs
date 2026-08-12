@@ -633,6 +633,51 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public void Snapshot_factory_marks_a_nonpixel_framebuffer_update_as_nonpixel()
+    {
+        using var framebuffer = new Framebuffer(1, 1, ProtocolLimits.Default);
+        var snapshotFactory = new FramebufferSnapshotFactory();
+        var update = new FramebufferUpdateResult([], [], cursor: null, desktopResized: true);
+
+        using var message = Assert.IsType<RemoteFramebufferMessage>(
+            snapshotFactory.CreateServerMessage(framebuffer, update));
+
+        Assert.False(message.HasPixelContent);
+    }
+
+    [Fact]
+    public async Task Rfb_client_allows_a_second_full_request_after_cursor_only_then_delivers_pixels()
+    {
+        var rawUpdate = new List<byte> { 0, 0, 0, 1 };
+        rawUpdate.AddRange(Header(0, 0, 1, 1, (int)RfbEncodingType.Raw));
+        rawUpdate.AddRange([1, 2, 3, 0]);
+        await using var stream = new ScriptedDuplexStream(
+        [
+            .. Handshake("RFB 003.008\n"),
+            .. ServerInit(1, 1),
+            .. CursorOnlyUpdate(),
+            .. rawUpdate,
+        ]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        await ConfigureDefaultBootstrapAsync(client);
+        var requestOffset = stream.WrittenBytes.Length;
+
+        await client.RequestFramebufferUpdateAsync(incremental: false, default);
+        using var cursor = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(default));
+        await client.RequestFramebufferUpdateAsync(incremental: false, default);
+        using var pixels = Assert.IsType<RemoteFramebufferMessage>(await client.ReceiveAsync(default));
+
+        Assert.True(pixels.HasPixelContent);
+        Assert.Equal(
+        [
+            3, 0, 0, 0, 0, 0, 0, 1, 0, 1,
+            3, 0, 0, 0, 0, 0, 0, 1, 0, 1,
+        ], stream.WrittenBytes[requestOffset..]);
+    }
+
+    [Fact]
     public async Task Rfb_client_maps_raw_and_zlib_transfer_statistics_to_application_snapshot()
     {
         var (compressed, _) = CreateSharedZlibChunks([4, 5, 6, 0], [7, 8, 9, 0]);
@@ -703,6 +748,7 @@ public sealed class FramePresentationTests
 
         await client.NegotiateAsync(CancellationToken.None);
         await client.InitializeAsync(CancellationToken.None);
+        await ConfigureDefaultBootstrapAsync(client);
         using var activation = Assert.IsType<RemoteFramebufferMessage>(
             await client.ReceiveAsync(CancellationToken.None));
         using var first = Assert.IsType<RemoteCursorMessage>(
@@ -834,6 +880,7 @@ public sealed class FramePresentationTests
 
         await client.NegotiateAsync(CancellationToken.None);
         await client.InitializeAsync(CancellationToken.None);
+        await ConfigureDefaultBootstrapAsync(client);
         using var frame = Assert.IsType<RemoteFramebufferMessage>(
             await client.ReceiveAsync(CancellationToken.None));
         await client.SendPointerAsync(0, 100, 200, CancellationToken.None);
@@ -881,6 +928,7 @@ public sealed class FramePresentationTests
 
         await client.NegotiateAsync(CancellationToken.None);
         await client.InitializeAsync(CancellationToken.None);
+        await ConfigureDefaultBootstrapAsync(client);
         using var firstFrame = Assert.IsType<RemoteFramebufferMessage>(
             await client.ReceiveAsync(CancellationToken.None));
         var plaintextLength = stream.WrittenBytes.Length;
@@ -940,6 +988,7 @@ public sealed class FramePresentationTests
 
         await client.NegotiateAsync(CancellationToken.None);
         await client.InitializeAsync(CancellationToken.None);
+        await ConfigureDefaultBootstrapAsync(client);
         stream.DeliverAfterFramebufferRequest(
             ArdSessionEncryptionUpdate(authenticationKey, sessionKey, sessionIv));
 
@@ -1352,6 +1401,75 @@ public sealed class FramePresentationTests
         Assert.Equal(QualityBootstrapAttempt.Preferred, client.BootstrapState.Attempt);
         Assert.Equal(RemotePixelFormatKind.Rgb565, client.BootstrapState.ActualQuality.PixelFormat);
         Assert.Equal(settings.Encodings, client.BootstrapState.ActualQuality.Encodings);
+    }
+
+    [Theory]
+    [InlineData("RFB 003.008\n", false)]
+    [InlineData("RFB 003.889\n", true)]
+    public async Task Rfb_client_emits_only_the_selected_bootstrap_declaration_before_the_first_request(
+        string banner,
+        bool ard)
+    {
+        await using var stream = new ScriptedDuplexStream(
+        [
+            .. Handshake(banner),
+            .. ard ? ArdServerInit(2, 1) : ServerInit(2, 1),
+        ]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        var initializationOffset = stream.WrittenBytes.Length;
+        await client.InitializeAsync(default);
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+
+        await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default);
+        await client.RequestFramebufferUpdateAsync(incremental: false, default);
+
+        var initializationWire = stream.WrittenBytes[initializationOffset..];
+        var selectedDeclaration = BootstrapWire(PixelFormat.WinArdRgb565, settings.Encodings);
+        var selectedDeclarationAndRequest = BootstrapWire(
+            PixelFormat.WinArdRgb565,
+            settings.Encodings,
+            2,
+            1);
+        var legacyPixelFormat = BootstrapWire(PixelFormat.WinArdBgra32, [])[..20];
+        Assert.Equal(1, CountSequence(initializationWire, selectedDeclaration));
+        Assert.Equal(1, CountSequence(initializationWire, selectedDeclarationAndRequest));
+        Assert.Equal(0, CountSequence(initializationWire, legacyPixelFormat));
+    }
+
+    [Fact]
+    public async Task Authenticated_ard_bootstrap_declares_encryption_before_requesting_it()
+    {
+        var authenticationKey = Enumerable.Range(0, 16).Select(value => (byte)value).ToArray();
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(
+            stream,
+            authenticationResult: new ArdAuthenticationResult(authenticationKey));
+        await client.NegotiateAsync(default);
+        var initializationOffset = stream.WrittenBytes.Length;
+        await client.InitializeAsync(default);
+        var initializationLength = stream.WrittenBytes.Length;
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth);
+
+        await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default);
+
+        var initializationWire = stream.WrittenBytes[initializationOffset..initializationLength];
+        var bootstrapWire = stream.WrittenBytes[initializationLength..];
+        Assert.Equal(0, CountSequence(initializationWire, [0x12, 0, 0, 1]));
+        var declaration = BootstrapWire(
+            PixelFormat.WinArdRgb565,
+            [16, 6, 0, 1, -239, -223, 1101, 1105, 1103]);
+        Assert.Equal(
+            declaration,
+            bootstrapWire[..declaration.Length]);
+        Assert.Equal(0x12, bootstrapWire[declaration.Length]);
     }
 
     [Fact]
@@ -2749,6 +2867,20 @@ public sealed class FramePresentationTests
         return -1;
     }
 
+    private static int CountSequence(byte[] source, byte[] sequence)
+    {
+        var count = 0;
+        for (var offset = 0; offset <= source.Length - sequence.Length; offset++)
+        {
+            if (source.AsSpan(offset, sequence.Length).SequenceEqual(sequence))
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
     private static byte[] BootstrapWire(
         PixelFormat pixelFormat,
         IReadOnlyList<int> encodings,
@@ -2780,6 +2912,15 @@ public sealed class FramePresentationTests
 
         return bytes.ToArray();
     }
+
+    private static ValueTask ConfigureDefaultBootstrapAsync(RfbClient client) =>
+        client.ConfigureBootstrapAsync(
+            new QualityBootstrapSettings(
+                RemotePixelFormatKind.Bgra32,
+                [6, 16, 0, 1, -239, -223],
+                QualityBootstrapReason.SafeFallback),
+            QualityBootstrapAttempt.Fallback,
+            default);
 
     private static List<byte> ParseClientMessageTypes(byte[] messages)
     {

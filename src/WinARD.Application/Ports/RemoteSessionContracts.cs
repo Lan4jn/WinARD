@@ -408,7 +408,8 @@ public sealed record RemoteFramebufferMessage : RemoteServerMessage, IDisposable
             stride,
             dirtyRectangles,
             cursor,
-            statistics)
+            statistics,
+            hasPixelContent: true)
     {
     }
 
@@ -431,6 +432,27 @@ public sealed record RemoteFramebufferMessage : RemoteServerMessage, IDisposable
         IReadOnlyList<RemoteRectangle> dirtyRectangles,
         RemoteCursorUpdate? cursor,
         RemoteUpdateStatistics? statistics)
+        : this(
+            size,
+            pixels,
+            length,
+            stride,
+            dirtyRectangles,
+            cursor,
+            statistics,
+            hasPixelContent: true)
+    {
+    }
+
+    public RemoteFramebufferMessage(
+        RemoteFramebufferSize size,
+        IMemoryOwner<byte> pixels,
+        int length,
+        int stride,
+        IReadOnlyList<RemoteRectangle> dirtyRectangles,
+        RemoteCursorUpdate? cursor,
+        RemoteUpdateStatistics? statistics,
+        bool hasPixelContent)
     {
         ArgumentNullException.ThrowIfNull(pixels);
         ArgumentNullException.ThrowIfNull(dirtyRectangles);
@@ -453,6 +475,7 @@ public sealed record RemoteFramebufferMessage : RemoteServerMessage, IDisposable
         DirtyRectangles = dirtyRectangles;
         _cursor = cursor;
         Statistics = statistics ?? RemoteUpdateStatistics.Empty;
+        HasPixelContent = hasPixelContent;
     }
 
     public RemoteFramebufferSize Size { get; }
@@ -460,6 +483,7 @@ public sealed record RemoteFramebufferMessage : RemoteServerMessage, IDisposable
     public int Stride { get; }
     public IReadOnlyList<RemoteRectangle> DirtyRectangles { get; }
     public RemoteUpdateStatistics Statistics { get; }
+    public bool HasPixelContent { get; }
     public ReadOnlyMemory<byte> Bgra32 => PixelOwner.Memory[..Length];
 
     public IMemoryOwner<byte> TakePixelOwnership() =>

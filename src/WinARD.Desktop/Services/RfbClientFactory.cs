@@ -145,7 +145,9 @@ internal sealed class RfbClient : IRfbClient
                 _transport,
                 handshake,
                 ProtocolLimits.Default,
+                RfbSessionDeclaration.Default,
                 _sessionEncryption,
+                deferClientDeclarations: true,
                 cancellationToken).ConfigureAwait(false);
         }
         else
@@ -154,6 +156,9 @@ internal sealed class RfbClient : IRfbClient
                 _transport,
                 handshake,
                 ProtocolLimits.Default,
+                RfbSessionDeclaration.Default,
+                sessionEncryption: null,
+                deferClientDeclarations: true,
                 cancellationToken).ConfigureAwait(false);
         }
 
@@ -280,10 +285,15 @@ internal sealed class RfbClient : IRfbClient
                         _transport,
                         ToProtocolPixelFormat(settings.PixelFormat),
                         token).ConfigureAwait(false);
+                    var encodings = BuildBootstrapEncodings(settings.Encodings);
                     await RfbSessionInitializer.WriteSetEncodingsAsync(
                         _transport,
-                        settings.Encodings,
+                        encodings,
                         token).ConfigureAwait(false);
+                    if (_sessionEncryption is not null)
+                    {
+                        await _sessionEncryption.RequestAsync(token).ConfigureAwait(false);
+                    }
 
                     lock (_lifecycleSync)
                     {
@@ -347,6 +357,22 @@ internal sealed class RfbClient : IRfbClient
                 }
             }
         }
+    }
+
+    private IReadOnlyList<int> BuildBootstrapEncodings(IReadOnlyList<int> encodings)
+    {
+        if (_sessionEncryption is null)
+        {
+            return encodings;
+        }
+
+        var ardEncodings = encodings.ToList();
+        AddIfMissing(ardEncodings, (int)RfbEncodingType.ArdDisplayInfo);
+        AddIfMissing(ardEncodings, (int)RfbEncodingType.ArdDisplayInfo2);
+        AddIfMissing(ardEncodings, (int)RfbEncodingType.DesktopSize);
+        AddIfMissing(ardEncodings, (int)RfbEncodingType.ArdSessionEncryption);
+
+        return ardEncodings;
     }
 
     private async ValueTask RequestFramebufferUpdateCoreAsync(
@@ -1223,7 +1249,8 @@ internal sealed class FramebufferSnapshotFactory
                         rectangle.Height))
                     .ToArray(),
                 cursor,
-                statistics);
+                statistics,
+                update.PixelContentRects.Count > 0);
         }
         catch
         {

@@ -171,22 +171,44 @@ public sealed class ConnectDeviceHandler
             var settings = attempt == QualityBootstrapAttempt.Preferred ? plan.Preferred : plan.Fallback;
             await client.ConfigureBootstrapAsync(settings, attempt, cancellationToken).ConfigureAwait(false);
             await client.RequestFramebufferUpdateAsync(incremental: false, cancellationToken).ConfigureAwait(false);
-            while (!preloadedMessages.Any(message => message is RemoteFramebufferMessage))
+            const int bootstrapMessageBudget = 8;
+            var bootstrapMessageCount = 0;
+            while (true)
             {
                 var message = await client.ReceiveBootstrapAsync(cancellationToken).ConfigureAwait(false);
+                bootstrapMessageCount++;
                 if (message is not RemoteCursorMessage and not RemoteFramebufferMessage)
                 {
                     preloadedMessages.Add(message);
                     throw new InvalidOperationException("Bootstrap preload received an unsupported message type.");
                 }
 
-                if (preloadedMessages.Count == 8)
+                if (message is RemoteFramebufferMessage { HasPixelContent: false } emptyFrame)
                 {
-                    preloadedMessages.Add(message);
-                    throw new InvalidOperationException("The bootstrap preload queue exceeded its limit.");
+                    emptyFrame.Dispose();
+                    if (bootstrapMessageCount == bootstrapMessageBudget)
+                    {
+                        throw new InvalidOperationException("The bootstrap preload queue exceeded its limit.");
+                    }
+
+                    await client.RequestFramebufferUpdateAsync(incremental: false, cancellationToken)
+                        .ConfigureAwait(false);
+                    continue;
                 }
 
                 preloadedMessages.Add(message);
+                if (message is RemoteFramebufferMessage)
+                {
+                    break;
+                }
+
+                if (bootstrapMessageCount == bootstrapMessageBudget)
+                {
+                    throw new InvalidOperationException("The bootstrap preload queue exceeded its limit.");
+                }
+
+                await client.RequestFramebufferUpdateAsync(incremental: false, cancellationToken)
+                    .ConfigureAwait(false);
             }
 
             stateMachine.MoveTo(SessionState.Connected);
