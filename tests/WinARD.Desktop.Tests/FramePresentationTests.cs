@@ -2,6 +2,8 @@ using WinARD.Application.Ports;
 using WinARD.Application.Quality;
 using WinARD.Desktop.Rendering;
 using WinARD.Desktop.Services;
+using WinARD.Desktop.ViewModels;
+using WinARD.Domain.Connections;
 using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Authentication;
 using WinARD.Remote.Protocol.Clipboard;
@@ -39,11 +41,56 @@ public sealed class FramePresentationTests
 
         Assert.Equal(CapabilitySupport.Observed, capabilities.Zlib);
         Assert.Equal(CapabilitySupport.Observed, capabilities.Rgb565);
-        Assert.True(capabilities.SafeOnlinePixelFormatSwitch);
+        Assert.False(capabilities.SafeOnlinePixelFormatSwitch);
         Assert.Equal(CapabilitySupport.Unknown, capabilities.ServerScaling);
         Assert.Equal(CapabilitySupport.Unknown, capabilities.AppleColor1002);
         Assert.Equal(CapabilitySupport.Unknown, capabilities.AppleGrayscale1001);
         Assert.False(capabilities.SafeOnlineScaleSwitch);
+    }
+
+    [Fact]
+    public async Task Production_coordinator_rejects_q1_without_writing_set_pixel_format()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var transitionOffset = stream.WrittenBytes.Length;
+        var runtime = new RfbClientRuntime(client);
+        using var coordinator = new QualityTransitionCoordinator(
+            runtime,
+            new RemoteQualitySettings(RemotePixelFormatKind.Bgra32, [6, 16, 0, 1, -239, -223], 1),
+            client.QualityCapabilities,
+            new QualityDecoderGates());
+        var decision = new QualityDecision(
+            1,
+            QualityContentState.Idle,
+            QualityLevel.Q1,
+            QualityColor.Color16,
+            QualityScale.Native,
+            60,
+            QualityDecisionReason.Initial,
+            targetSatisfied: true,
+            levelChanged: true,
+            contentStateChanged: false,
+            previousLevel: QualityLevel.Q0,
+            previousContentState: QualityContentState.Idle);
+
+        var result = await coordinator.ApplyAtSafeBoundaryAsync(
+            decision,
+            new QualityTransitionBoundary(
+                FrameResponseCompletedAndPresented: true,
+                HasOutstandingFramebufferRequest: false,
+                HasActiveReceive: false,
+                NextFramebufferRequestProduced: false),
+            default);
+
+        Assert.Equal(QualityTransitionStatus.ReconnectRequired, result);
+        Assert.Equal(transitionOffset, stream.WrittenBytes.Length);
+        var transitionWrites = stream.WrittenBytes[transitionOffset..];
+        Assert.Empty(transitionWrites);
+        Assert.False(ContainsSetPixelFormatMessage(transitionWrites));
     }
     [Fact]
     public void Remote_message_contracts_preserve_pre_statistics_constructor_signatures()
@@ -2342,6 +2389,48 @@ public sealed class FramePresentationTests
         }
 
         public void Release() => _release.TrySetResult();
+    }
+
+    private static bool ContainsSetPixelFormatMessage(ReadOnlySpan<byte> bytes)
+    {
+        for (var offset = 0; offset <= bytes.Length - 20; offset++)
+        {
+            if (bytes[offset] == 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private sealed class RfbClientRuntime(RfbClient client) : IRemoteSessionRuntime
+    {
+        public RemoteFramebufferSize FramebufferSize => client.FramebufferSize;
+
+        public ArdDisplayCapabilities QualityCapabilities => client.QualityCapabilities;
+
+        public ValueTask<QualityTransitionStatus> ApplyQualityTransitionAsync(
+            RemoteQualitySettings settings,
+            CancellationToken cancellationToken) =>
+            client.ApplyQualityTransitionAsync(settings, cancellationToken);
+
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+            client.RequestFramebufferUpdateAsync(incremental, cancellationToken);
+
+        public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) =>
+            client.ReceiveAsync(cancellationToken);
+
+        public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken) =>
+            client.SendPointerAsync(buttons, x, y, cancellationToken);
+
+        public ValueTask SendKeyAsync(uint keysym, bool down, CancellationToken cancellationToken) =>
+            client.SendKeyAsync(keysym, down, cancellationToken);
+
+        public ValueTask SendClipboardTextAsync(string text, CancellationToken cancellationToken) =>
+            client.SendClipboardTextAsync(text, cancellationToken);
+
+        public ValueTask DisconnectAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class ScriptedDuplexStream(

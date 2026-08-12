@@ -34,7 +34,7 @@ internal sealed class RfbClient : IRfbClient
         CapabilitySupport.Unknown,
         CapabilitySupport.Unknown,
         CapabilitySupport.Unknown,
-        SafeOnlinePixelFormatSwitch: true,
+        SafeOnlinePixelFormatSwitch: false,
         SafeOnlineScaleSwitch: false,
         MaximumRefreshRate: null);
 

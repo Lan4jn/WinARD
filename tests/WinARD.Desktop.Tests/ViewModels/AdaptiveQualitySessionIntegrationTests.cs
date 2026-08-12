@@ -55,7 +55,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     }
 
     [Fact]
-    public async Task Production_standard_capabilities_enable_a_q1_transition_without_test_injection()
+    public async Task Production_standard_capabilities_keep_locked_color16_but_fail_closed_without_wire_transition()
     {
         var events = new ConcurrentQueue<string>();
         var runtime = new TransitionRuntime(
@@ -82,7 +82,10 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         await viewModel.StartAsync(default);
         await runtime.SecondRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-        Assert.Equal(RemotePixelFormatKind.Rgb565, runtime.LastAppliedSettings?.PixelFormat);
+        Assert.Same(profile, viewModel.QualityProfile);
+        Assert.Null(runtime.LastAppliedSettings);
+        Assert.DoesNotContain("ApplyTransition", events);
+        Assert.False(runtime.QualityCapabilities.SafeOnlinePixelFormatSwitch);
         Assert.Equal(CapabilitySupport.Unknown, runtime.QualityCapabilities.ServerScaling);
         Assert.Equal(CapabilitySupport.Unknown, runtime.QualityCapabilities.AppleColor1002);
         Assert.Equal(CapabilitySupport.Unknown, runtime.QualityCapabilities.AppleGrayscale1001);

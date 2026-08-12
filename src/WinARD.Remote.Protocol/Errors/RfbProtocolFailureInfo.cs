@@ -16,6 +16,17 @@ public enum RfbProtocolFailureKind
     MalformedHandshake = 11,
 }
 
+public enum RfbDecoderFailureReason
+{
+    Unknown = 0,
+    InvalidCompressedStream = 1,
+    MissingSyncFlushBoundary = 2,
+    DecompressedLengthMismatch = 3,
+    OutputLimitExceeded = 4,
+    CompletedStreamOrTrailingBytes = 5,
+    IncompleteCompressedSegment = 6,
+}
+
 public enum RfbProtocolReadStage
 {
     ServerMessageType = 0,
@@ -67,8 +78,39 @@ public sealed record RfbProtocolFailureInfo(
     int? ArdCiphertextLength = null,
     RfbHandshakeStage? HandshakeStage = null,
     int? ExpectedByteCount = null,
-    int? ActualByteCount = null)
+    int? ActualByteCount = null,
+    RfbDecoderFailureReason? DecoderFailureReason = null)
 {
+    public RfbProtocolFailureInfo(
+        RfbProtocolFailureKind Kind,
+        RfbProtocolReadStage? ReadStage,
+        byte? ServerMessageType,
+        int? EncodingId,
+        int? RectangleIndex,
+        ArdEncryptedPacketFailureStage? ArdEncryptionStage,
+        ArdEncryptedPacketDirection? ArdEncryptionDirection,
+        uint? ArdEncryptionSequence,
+        int? ArdCiphertextLength,
+        RfbHandshakeStage? HandshakeStage,
+        int? ExpectedByteCount,
+        int? ActualByteCount)
+        : this(
+            Kind,
+            ReadStage,
+            ServerMessageType,
+            EncodingId,
+            RectangleIndex,
+            ArdEncryptionStage,
+            ArdEncryptionDirection,
+            ArdEncryptionSequence,
+            ArdCiphertextLength,
+            HandshakeStage,
+            ExpectedByteCount,
+            ActualByteCount,
+            null)
+    {
+    }
+
     public RfbProtocolFailureInfo(
         RfbProtocolFailureKind Kind,
         RfbProtocolReadStage? ReadStage,
@@ -91,6 +133,7 @@ public sealed record RfbProtocolFailureInfo(
             ArdCiphertextLength,
             null,
             null,
+            null,
             null)
     {
     }
@@ -107,6 +150,7 @@ public sealed record RfbProtocolFailureInfo(
             ServerMessageType,
             EncodingId,
             RectangleIndex,
+            null,
             null,
             null,
             null,
@@ -153,6 +197,34 @@ public sealed record RfbProtocolFailureInfo(
         ArdCiphertextLength = this.ArdCiphertextLength;
     }
 
+    public void Deconstruct(
+        out RfbProtocolFailureKind Kind,
+        out RfbProtocolReadStage? ReadStage,
+        out byte? ServerMessageType,
+        out int? EncodingId,
+        out int? RectangleIndex,
+        out ArdEncryptedPacketFailureStage? ArdEncryptionStage,
+        out ArdEncryptedPacketDirection? ArdEncryptionDirection,
+        out uint? ArdEncryptionSequence,
+        out int? ArdCiphertextLength,
+        out RfbHandshakeStage? HandshakeStage,
+        out int? ExpectedByteCount,
+        out int? ActualByteCount)
+    {
+        Kind = this.Kind;
+        ReadStage = this.ReadStage;
+        ServerMessageType = this.ServerMessageType;
+        EncodingId = this.EncodingId;
+        RectangleIndex = this.RectangleIndex;
+        ArdEncryptionStage = this.ArdEncryptionStage;
+        ArdEncryptionDirection = this.ArdEncryptionDirection;
+        ArdEncryptionSequence = this.ArdEncryptionSequence;
+        ArdCiphertextLength = this.ArdCiphertextLength;
+        HandshakeStage = this.HandshakeStage;
+        ExpectedByteCount = this.ExpectedByteCount;
+        ActualByteCount = this.ActualByteCount;
+    }
+
     internal RfbProtocolFailureInfo FillMissingFrom(RfbProtocolFailureInfo outer)
     {
         ArgumentNullException.ThrowIfNull(outer);
@@ -170,6 +242,7 @@ public sealed record RfbProtocolFailureInfo(
             HandshakeStage = HandshakeStage ?? outer.HandshakeStage,
             ExpectedByteCount = ExpectedByteCount ?? outer.ExpectedByteCount,
             ActualByteCount = ActualByteCount ?? outer.ActualByteCount,
+            DecoderFailureReason = DecoderFailureReason ?? outer.DecoderFailureReason,
         };
     }
 }

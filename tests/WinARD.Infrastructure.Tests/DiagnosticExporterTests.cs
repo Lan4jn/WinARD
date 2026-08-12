@@ -621,6 +621,7 @@ public sealed class DiagnosticExporterTests : IDisposable
             new("Status", "65535", DiagnosticFieldCategory.Public),
             new("Flags", "0x00AF", DiagnosticFieldCategory.Public),
             new("ProtocolFailureKind", "ArdEncryptionPacket", DiagnosticFieldCategory.Public),
+            new("DecoderFailureReason", "InvalidCompressedStream", DiagnosticFieldCategory.Public),
             new("RfbHandshakeStage", "SecurityTypes", DiagnosticFieldCategory.Public),
             new("ExpectedByteCount", "1024", DiagnosticFieldCategory.Public),
             new("ActualByteCount", "512", DiagnosticFieldCategory.Public),
@@ -661,6 +662,7 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.Equal("65535", exported.GetProperty("Status").GetString());
         Assert.Equal("0x00AF", exported.GetProperty("Flags").GetString());
         Assert.Equal("DesktopSize", exported.GetProperty("EncodingName").GetString());
+        Assert.Equal("InvalidCompressedStream", exported.GetProperty("DecoderFailureReason").GetString());
         Assert.Equal("safe.example", exported.GetProperty("endpoint").GetString());
         Assert.Equal(fingerprint, exported.GetProperty("fingerprint").GetString());
         Assert.Equal("48", exported.GetProperty("ArdEncryptedPacketLength").GetString());
@@ -696,6 +698,32 @@ public sealed class DiagnosticExporterTests : IDisposable
         using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
         var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
         Assert.Equal("Other", fields.GetProperty("EncodingName").GetString());
+    }
+
+    [Fact]
+    public async Task ArbitraryDecoderFailureReasonIsOmittedFromExport()
+    {
+        const string marker = "arbitrary-decoder-private-marker";
+        var diagnosticEvent = new SafeDiagnosticEvent(
+            DateTimeOffset.UtcNow,
+            "EVENT_DECODER_REASON_SCHEMA_TEST",
+            Guid.NewGuid().ToString("N"),
+            "ignored",
+            [new("DecoderFailureReason", marker, DiagnosticFieldCategory.Public)],
+            null);
+
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "decoder-reason-schema.zip");
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new StaticSnapshotSink([diagnosticEvent]), redactor);
+        await exporter.ExportAsync(destination, DiagnosticExportContext.Empty, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        var archiveContent = await ReadAllAsync(archive);
+        Assert.DoesNotContain(marker, archiveContent, StringComparison.Ordinal);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
+        Assert.False(fields.TryGetProperty("DecoderFailureReason", out _));
     }
 
     [Theory]

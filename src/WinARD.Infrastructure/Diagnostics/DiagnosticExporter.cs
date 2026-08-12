@@ -177,6 +177,12 @@ public sealed class DiagnosticExporter : IDisposable
         "MalformedClipboard", "DecoderFailure", "MalformedArdStateChange", "RemoteSessionClosed",
         "ArdEncryptionNegotiation", "ArdEncryptionPacket", "ArdEncryptionIntegrity", "MalformedHandshake",
     };
+    private static readonly HashSet<string> AllowedDecoderFailureReasons = new(StringComparer.Ordinal)
+    {
+        "Unknown", "InvalidCompressedStream", "MissingSyncFlushBoundary",
+        "DecompressedLengthMismatch", "OutputLimitExceeded", "CompletedStreamOrTrailingBytes",
+        "IncompleteCompressedSegment",
+    };
     private static readonly HashSet<string> AllowedRfbHandshakeStages = new(StringComparer.Ordinal)
     {
         "VersionBanner", "VersionParse", "SecurityType33", "SecurityTypeCount", "SecurityTypes",
@@ -583,7 +589,8 @@ public sealed class DiagnosticExporter : IDisposable
             "Kind" or "Boundary" or "Count" or "Reason" or "Encrypted" or "Sampled" or
             "Category" or "ProtocolVersion" or "ClientInit" or "ServerFlags" or "MayControl" or
             "SessionSelectRequired" or "SessionSelectCompleted" or "RequestedMode" or "FinalState" or
-            "Status" or "Flags" or "Action" or "ProtocolFailureKind" or "RfbHandshakeStage" or
+            "Status" or "Flags" or "Action" or "ProtocolFailureKind" or "DecoderFailureReason" or
+            "RfbHandshakeStage" or
             "ExpectedByteCount" or "ActualByteCount" or "PresentationStage" or "ProtocolReadStage" or
             "ServerMessageType" or "EncodingName" or "RectangleIndex" or "ArdEncryptionStage" or
             "ArdEncryptionDirection" or "securityType" or "endpoint" or "fingerprint" or
@@ -637,6 +644,7 @@ public sealed class DiagnosticExporter : IDisposable
         "Status" => ExportNonNegativeUInt16(value),
         "Flags" => ExportFixedHex(value, 4),
         "ProtocolFailureKind" => ExportAllowedValue(value, AllowedProtocolFailureKinds),
+        "DecoderFailureReason" => ExportAllowedValue(value, AllowedDecoderFailureReasons),
         "RfbHandshakeStage" => ExportAllowedValue(value, AllowedRfbHandshakeStages),
         "ExpectedByteCount" or "ActualByteCount" or "RectangleIndex" or "ArdEncryptedPacketLength" =>
             ExportNonNegativeInt32(value),

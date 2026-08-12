@@ -124,14 +124,31 @@ public sealed class ZlibEncodingTests
         var before = framebuffer.GetPixelsBgra32();
         await using var decoder = new ZlibEncoding();
 
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             DecodeChunkAsync(
                 decoder,
                 framebuffer,
                 new FramebufferRect(0, 0, 2, 1),
                 Compress(raw)));
 
+        Assert.Equal(RfbDecoderFailureReason.DecompressedLengthMismatch, exception.Failure?.DecoderFailureReason);
         Assert.Equal(before, framebuffer.GetPixelsBgra32());
+    }
+
+    [Fact]
+    public async Task Invalid_compressed_stream_reports_stable_decoder_reason()
+    {
+        using var framebuffer = SeededFramebuffer();
+        await using var decoder = new ZlibEncoding();
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            DecodeChunkAsync(
+                decoder,
+                framebuffer,
+                new FramebufferRect(0, 0, 2, 1),
+                [1, 2, 3, 4, 0, 0, 0xFF, 0xFF]));
+
+        Assert.Equal(RfbDecoderFailureReason.InvalidCompressedStream, exception.Failure?.DecoderFailureReason);
     }
 
     [Fact]
@@ -234,8 +251,9 @@ public sealed class ZlibEncodingTests
         await using var decoder = new ZlibEncoding();
         var rectangle = new FramebufferRect(0, 0, 1, 1);
 
-        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
             DecodeChunkAsync(decoder, framebuffer, rectangle, compressed[..^1]));
+        Assert.Equal(RfbDecoderFailureReason.MissingSyncFlushBoundary, exception.Failure?.DecoderFailureReason);
         await Assert.ThrowsAsync<RfbProtocolException>(() =>
             DecodeChunkAsync(decoder, framebuffer, rectangle, compressed));
 

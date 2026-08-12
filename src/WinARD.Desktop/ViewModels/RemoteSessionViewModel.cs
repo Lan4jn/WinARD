@@ -1505,6 +1505,14 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                 failure.Kind.ToString(),
                 DiagnosticFieldCategory.Public),
         };
+        if (failure.DecoderFailureReason is { } decoderFailureReason)
+        {
+            fields.Add(new DiagnosticField(
+                "DecoderFailureReason",
+                decoderFailureReason.ToString(),
+                DiagnosticFieldCategory.Public));
+        }
+
         if (failure.ReadStage is { } readStage)
         {
             fields.Add(new DiagnosticField(

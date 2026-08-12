@@ -271,6 +271,28 @@ public sealed class RfbProtocolFailureInfoTests
     }
 
     [Fact]
+    public void Twelve_parameter_failure_info_constructor_is_preserved_for_binary_compatibility()
+    {
+        var constructor = typeof(RfbProtocolFailureInfo).GetConstructor(
+            [
+                typeof(RfbProtocolFailureKind),
+                typeof(RfbProtocolReadStage?),
+                typeof(byte?),
+                typeof(int?),
+                typeof(int?),
+                typeof(ArdEncryptedPacketFailureStage?),
+                typeof(ArdEncryptedPacketDirection?),
+                typeof(uint?),
+                typeof(int?),
+                typeof(RfbHandshakeStage?),
+                typeof(int?),
+                typeof(int?),
+            ]);
+
+        Assert.NotNull(constructor);
+    }
+
+    [Fact]
     public void Five_element_failure_info_deconstruction_remains_source_compatible()
     {
         var failure = new RfbProtocolFailureInfo(
@@ -323,6 +345,52 @@ public sealed class RfbProtocolFailureInfoTests
         Assert.Equal(ArdEncryptedPacketDirection.Receive, encryptionDirection);
         Assert.Equal((uint)1, encryptionSequence);
         Assert.Equal(48, ciphertextLength);
+    }
+
+    [Fact]
+    public void Twelve_element_failure_info_deconstruction_remains_source_compatible()
+    {
+        var failure = new RfbProtocolFailureInfo(
+            RfbProtocolFailureKind.MalformedHandshake,
+            RfbProtocolReadStage.FramebufferRectanglePayload,
+            0,
+            6,
+            2,
+            ArdEncryptedPacketFailureStage.Integrity,
+            ArdEncryptedPacketDirection.Receive,
+            7,
+            48,
+            RfbHandshakeStage.SecurityTypes,
+            1024,
+            512,
+            RfbDecoderFailureReason.InvalidCompressedStream);
+
+        var (
+            kind,
+            readStage,
+            serverMessageType,
+            encodingId,
+            rectangleIndex,
+            encryptionStage,
+            encryptionDirection,
+            encryptionSequence,
+            ciphertextLength,
+            handshakeStage,
+            expectedByteCount,
+            actualByteCount) = failure;
+
+        Assert.Equal(RfbProtocolFailureKind.MalformedHandshake, kind);
+        Assert.Equal(RfbProtocolReadStage.FramebufferRectanglePayload, readStage);
+        Assert.Equal((byte)0, serverMessageType);
+        Assert.Equal(6, encodingId);
+        Assert.Equal(2, rectangleIndex);
+        Assert.Equal(ArdEncryptedPacketFailureStage.Integrity, encryptionStage);
+        Assert.Equal(ArdEncryptedPacketDirection.Receive, encryptionDirection);
+        Assert.Equal((uint)7, encryptionSequence);
+        Assert.Equal(48, ciphertextLength);
+        Assert.Equal(RfbHandshakeStage.SecurityTypes, handshakeStage);
+        Assert.Equal(1024, expectedByteCount);
+        Assert.Equal(512, actualByteCount);
     }
 
     [Fact]

@@ -890,6 +890,30 @@ public sealed class FramebufferUpdateTests
         Assert.Equal(1, exception.Failure?.RectangleIndex);
     }
 
+    [Fact]
+    public async Task Decoder_protocol_failure_preserves_source_reason_while_adding_rectangle_context()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        const int encoding = 778;
+        var decoders = new Dictionary<int, IRfbEncodingDecoder>
+        {
+            [encoding] = new ReasonedProtocolFailureDecoder(encoding),
+        };
+
+        var exception = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            FramebufferUpdateReader.ApplyAsync(
+                new MemoryStream(Update(Header(0, 0, 1, 1, (RfbEncodingType)encoding))),
+                framebuffer,
+                decoders,
+                CancellationToken.None));
+
+        Assert.Equal(RfbProtocolFailureKind.DecoderFailure, exception.Failure?.Kind);
+        Assert.Equal(RfbDecoderFailureReason.InvalidCompressedStream, exception.Failure?.DecoderFailureReason);
+        Assert.Equal(RfbProtocolReadStage.FramebufferRectanglePayload, exception.Failure?.ReadStage);
+        Assert.Equal(encoding, exception.Failure?.EncodingId);
+        Assert.Equal(0, exception.Failure?.RectangleIndex);
+    }
+
     [Theory]
     [InlineData(new byte[] { 0 }, RfbProtocolReadStage.FramebufferHeader)]
     [InlineData(new byte[] { 0, 0, 0, 1, 0 }, RfbProtocolReadStage.FramebufferRectangleHeader)]
@@ -1385,6 +1409,22 @@ public sealed class FramebufferUpdateTests
             FramebufferRect rectangle,
             CancellationToken cancellationToken) =>
             ValueTask.FromException<EncodingDecodeResult>(new RfbProtocolException("Injected decoder failure."));
+    }
+
+    private sealed class ReasonedProtocolFailureDecoder(int encodingId) : IRfbEncodingDecoder
+    {
+        public int EncodingId { get; } = encodingId;
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            FramebufferModel framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromException<EncodingDecodeResult>(RfbProtocolException.Create(
+                "Injected decoder failure.",
+                new RfbProtocolFailureInfo(
+                    RfbProtocolFailureKind.DecoderFailure,
+                    DecoderFailureReason: RfbDecoderFailureReason.InvalidCompressedStream)));
     }
 
     private static byte[] ArdDisplayInfo2(ushort width, ushort height, byte[] payload)

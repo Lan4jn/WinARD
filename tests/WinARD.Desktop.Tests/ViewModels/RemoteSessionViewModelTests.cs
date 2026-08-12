@@ -924,7 +924,8 @@ public sealed class RemoteSessionViewModelTests
             RfbProtocolReadStage.FramebufferRectanglePayload,
             0xFA,
             -239,
-            7);
+            7,
+            DecoderFailureReason: RfbDecoderFailureReason.InvalidCompressedStream);
         var protocolException = RfbProtocolException.Create(secret, failure);
         using var redactor = new SecretRedactor();
         var safeDiagnosticSink = new InMemorySafeDiagnosticSink(redactor);
@@ -948,6 +949,7 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal(
             [
                 ("ProtocolFailureKind", "DecoderFailure"),
+                ("DecoderFailureReason", "InvalidCompressedStream"),
                 ("ProtocolReadStage", "FramebufferRectanglePayload"),
                 ("ServerMessageType", "0xFA"),
                 ("EncodingName", "Cursor"),

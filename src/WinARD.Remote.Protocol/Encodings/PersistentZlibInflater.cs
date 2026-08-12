@@ -171,6 +171,7 @@ internal sealed class PersistentZlibInflater : IAsyncDisposable
         byte[] compressed,
         int maximumOutputLength,
         int configuredLimit,
+        RfbDecoderFailureReason overflowReason,
         CancellationToken cancellationToken)
     {
         try
@@ -191,9 +192,10 @@ internal sealed class PersistentZlibInflater : IAsyncDisposable
                         CryptographicOperations.ZeroMemory(overflow);
                         if (overflowRead != 0)
                         {
-                            throw new RfbProtocolException(
+                            throw DecoderFailure(
                                 $"{_encodingName} decompressed data exceeds the allowed output length of " +
-                                $"{maximumOutputLength} bytes (configured limit {configuredLimit} bytes).");
+                                $"{maximumOutputLength} bytes (configured limit {configuredLimit} bytes).",
+                                overflowReason);
                         }
 
                         break;
@@ -211,8 +213,9 @@ internal sealed class PersistentZlibInflater : IAsyncDisposable
 
                 if (_compressedInput.Position != compressed.Length)
                 {
-                    throw new RfbProtocolException(
-                        $"{_encodingName} compressed data contains a completed zlib stream or trailing bytes before its Z_SYNC_FLUSH boundary.");
+                    throw DecoderFailure(
+                        $"{_encodingName} compressed data contains a completed zlib stream or trailing bytes before its Z_SYNC_FLUSH boundary.",
+                        RfbDecoderFailureReason.CompletedStreamOrTrailingBytes);
                 }
 
                 _compressedInput.ReleaseSegment();
@@ -226,7 +229,10 @@ internal sealed class PersistentZlibInflater : IAsyncDisposable
         }
         catch (InvalidDataException exception)
         {
-            throw new RfbProtocolException($"{_encodingName} payload is not a valid zlib stream.", exception);
+            throw new RfbProtocolException(
+                $"{_encodingName} payload is not a valid zlib stream.",
+                exception,
+                DecoderFailureInfo(RfbDecoderFailureReason.InvalidCompressedStream));
         }
     }
 
@@ -240,10 +246,17 @@ internal sealed class PersistentZlibInflater : IAsyncDisposable
             compressed[^1] == byte.MaxValue;
         if (!hasSyncFlushBoundary)
         {
-            throw new RfbProtocolException(
-                $"{_encodingName} compressed data must end at a Z_SYNC_FLUSH boundary.");
+            throw DecoderFailure(
+                $"{_encodingName} compressed data must end at a Z_SYNC_FLUSH boundary.",
+                RfbDecoderFailureReason.MissingSyncFlushBoundary);
         }
     }
+
+    private static RfbProtocolFailureInfo DecoderFailureInfo(RfbDecoderFailureReason reason) =>
+        new(RfbProtocolFailureKind.DecoderFailure, DecoderFailureReason: reason);
+
+    private static RfbProtocolException DecoderFailure(string message, RfbDecoderFailureReason reason) =>
+        RfbProtocolException.Create(message, DecoderFailureInfo(reason));
 
     internal sealed class Operation(PersistentZlibInflater owner)
     {
@@ -253,7 +266,8 @@ internal sealed class PersistentZlibInflater : IAsyncDisposable
             byte[] compressed,
             int maximumOutputLength,
             int configuredLimit,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            RfbDecoderFailureReason overflowReason = RfbDecoderFailureReason.OutputLimitExceeded)
         {
             ArgumentNullException.ThrowIfNull(compressed);
             ArgumentOutOfRangeException.ThrowIfNegative(maximumOutputLength);
@@ -263,6 +277,7 @@ internal sealed class PersistentZlibInflater : IAsyncDisposable
                 compressed,
                 maximumOutputLength,
                 configuredLimit,
+                overflowReason,
                 cancellationToken);
         }
     }
@@ -297,8 +312,11 @@ internal sealed class PersistentZlibInflater : IAsyncDisposable
             ArgumentNullException.ThrowIfNull(segment);
             if (_segment is not null && _position != _segment.Length)
             {
-                throw new RfbProtocolException(
-                    $"The previous {encodingName} compressed segment was not fully consumed.");
+                throw RfbProtocolException.Create(
+                    $"The previous {encodingName} compressed segment was not fully consumed.",
+                    new RfbProtocolFailureInfo(
+                        RfbProtocolFailureKind.DecoderFailure,
+                        DecoderFailureReason: RfbDecoderFailureReason.IncompleteCompressedSegment));
             }
 
             _segment = segment;

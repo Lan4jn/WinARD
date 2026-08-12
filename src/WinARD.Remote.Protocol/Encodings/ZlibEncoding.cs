@@ -65,9 +65,12 @@ public sealed class ZlibEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
                     framebuffer.Limits);
                 if (wireLength > framebuffer.Limits.MaxZlibDecompressedBytes)
                 {
-                    throw new RfbProtocolException(
+                    throw RfbProtocolException.Create(
                         $"Zlib decompressed length {wireLength} exceeds the configured limit of " +
-                        $"{framebuffer.Limits.MaxZlibDecompressedBytes} bytes.");
+                        $"{framebuffer.Limits.MaxZlibDecompressedBytes} bytes.",
+                        new RfbProtocolFailureInfo(
+                            RfbProtocolFailureKind.DecoderFailure,
+                            DecoderFailureReason: RfbDecoderFailureReason.OutputLimitExceeded));
                 }
 
                 reader.ReserveFramebufferUpdateBytes(compressedLength);
@@ -84,11 +87,15 @@ public sealed class ZlibEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
                         compressed,
                         wireLength,
                         framebuffer.Limits.MaxZlibDecompressedBytes,
-                        operationCancellationToken).ConfigureAwait(false);
+                        operationCancellationToken,
+                        RfbDecoderFailureReason.DecompressedLengthMismatch).ConfigureAwait(false);
                     if (decompressed.Length != wireLength)
                     {
-                        throw new RfbProtocolException(
-                            $"Zlib rectangle decompressed to {decompressed.Length} bytes; expected exactly {wireLength} bytes.");
+                        throw RfbProtocolException.Create(
+                            $"Zlib rectangle decompressed to {decompressed.Length} bytes; expected exactly {wireLength} bytes.",
+                            new RfbProtocolFailureInfo(
+                                RfbProtocolFailureKind.DecoderFailure,
+                                DecoderFailureReason: RfbDecoderFailureReason.DecompressedLengthMismatch));
                     }
 
                     bgra = PixelConverter.ToBgra32(
