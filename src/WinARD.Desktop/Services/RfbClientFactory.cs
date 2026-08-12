@@ -257,7 +257,7 @@ internal sealed class RfbClient : IRfbClient
         ArgumentNullException.ThrowIfNull(settings);
         var framebuffer = _framebuffer ?? throw new InvalidOperationException("RFB initialization has not completed.");
         var normalized = NormalizeSettings(settings);
-        FramebufferUpdateSession oldSession;
+        FramebufferUpdateSession session;
         lock (_lifecycleSync)
         {
             ThrowIfProtocolUnavailableNoLock();
@@ -283,14 +283,19 @@ internal sealed class RfbClient : IRfbClient
                 return QualityTransitionStatus.CapabilityUnavailable;
             }
 
-            oldSession = _framebufferUpdates ?? throw new InvalidOperationException("RFB initialization has not completed.");
+            session = _framebufferUpdates ?? throw new InvalidOperationException("RFB initialization has not completed.");
             _qualityTransitionActive = true;
         }
 
-        FramebufferUpdateSession newSession;
+        FramebufferPixelFormatReconfiguration? pixelReconfiguration = null;
         try
         {
-            newSession = CreateFramebufferUpdateSession(framebuffer, normalized.PixelFormat);
+            if (_qualitySettings!.PixelFormat != normalized.PixelFormat)
+            {
+                pixelReconfiguration = await session.PreparePixelFormatReconfigurationAsync(
+                    ToProtocolPixelFormat(normalized.PixelFormat),
+                    cancellationToken).ConfigureAwait(false);
+            }
         }
         catch
         {
@@ -302,7 +307,7 @@ internal sealed class RfbClient : IRfbClient
             return QualityTransitionStatus.CapabilityUnavailable;
         }
 
-        var swapped = false;
+        var localCommitted = false;
         var wireAttempted = false;
         try
         {
@@ -331,14 +336,12 @@ internal sealed class RfbClient : IRfbClient
                             token).ConfigureAwait(false);
                     }
 
-                    lock (_lifecycleSync)
+                    if (pixelReconfiguration is not null)
                     {
-                        ThrowIfProtocolUnavailableNoLock();
-                        _framebufferUpdates = newSession;
-                        swapped = true;
+                        pixelReconfiguration.Commit();
+                        localCommitted = true;
                     }
 
-                    await oldSession.DisposeAsync().ConfigureAwait(false);
                     wireAttempted = true;
                     await RfbSessionInitializer.WriteFramebufferUpdateRequestAsync(
                         _transport,
@@ -354,7 +357,7 @@ internal sealed class RfbClient : IRfbClient
                         _framebufferRequestOutstanding = true;
                     }
                 }
-                catch (OperationCanceledException exception) when (wireAttempted || swapped)
+                catch (OperationCanceledException exception) when (wireAttempted || localCommitted)
                 {
                     // A normal scheduler cancellation would allow the next queued writer to run.
                     // Convert it to a scheduler fault before returning cancellation to the caller.
@@ -366,7 +369,13 @@ internal sealed class RfbClient : IRfbClient
         }
         catch (QualityTransitionInterruptedException exception)
         {
-            await FaultAndDisposeDecoderAsync(newSession).ConfigureAwait(false);
+            if (pixelReconfiguration is not null)
+            {
+                await pixelReconfiguration.DisposeAsync().ConfigureAwait(false);
+                pixelReconfiguration = null;
+            }
+
+            await FaultAndDisposeDecoderAsync(session).ConfigureAwait(false);
             throw new OperationCanceledException(
                 "The quality transition was canceled after protocol output began.",
                 exception.InnerException,
@@ -374,34 +383,42 @@ internal sealed class RfbClient : IRfbClient
         }
         catch (OperationCanceledException)
         {
-            if (wireAttempted || swapped)
+            if (wireAttempted || localCommitted)
             {
-                await FaultAndDisposeDecoderAsync(newSession).ConfigureAwait(false);
-            }
-            else
-            {
-                await DisposeUnpublishedSessionBestEffortAsync(
-                    newSession,
-                    "CanceledBeforeWire").ConfigureAwait(false);
+                if (pixelReconfiguration is not null)
+                {
+                    await pixelReconfiguration.DisposeAsync().ConfigureAwait(false);
+                    pixelReconfiguration = null;
+                }
+
+                await FaultAndDisposeDecoderAsync(session).ConfigureAwait(false);
             }
 
             throw;
         }
         catch
         {
-            if (wireAttempted || swapped)
+            if (wireAttempted || localCommitted)
             {
-                await FaultAndDisposeDecoderAsync(newSession).ConfigureAwait(false);
+                if (pixelReconfiguration is not null)
+                {
+                    await pixelReconfiguration.DisposeAsync().ConfigureAwait(false);
+                    pixelReconfiguration = null;
+                }
+
+                await FaultAndDisposeDecoderAsync(session).ConfigureAwait(false);
                 return QualityTransitionStatus.Faulted;
             }
 
-            await DisposeUnpublishedSessionBestEffortAsync(
-                newSession,
-                "FailedBeforeWire").ConfigureAwait(false);
             return QualityTransitionStatus.CapabilityUnavailable;
         }
         finally
         {
+            if (pixelReconfiguration is not null)
+            {
+                await pixelReconfiguration.DisposeAsync().ConfigureAwait(false);
+            }
+
             lock (_lifecycleSync)
             {
                 _qualityTransitionActive = false;
@@ -822,20 +839,6 @@ internal sealed class RfbClient : IRfbClient
         catch (Exception exception)
         {
             WriteQualityTransitionCleanupDiagnostic("FaultedConnection", exception);
-        }
-    }
-
-    private async ValueTask DisposeUnpublishedSessionBestEffortAsync(
-        FramebufferUpdateSession session,
-        string stage)
-    {
-        try
-        {
-            await session.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            WriteQualityTransitionCleanupDiagnostic(stage, exception);
         }
     }
 

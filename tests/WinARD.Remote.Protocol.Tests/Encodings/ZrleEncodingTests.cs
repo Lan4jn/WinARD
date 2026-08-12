@@ -15,6 +15,20 @@ namespace WinARD.Remote.Protocol.Tests.Encodings;
 public sealed class ZrleEncodingTests
 {
     [Fact]
+    public async Task Pending_pixel_layout_is_bound_to_the_validated_format_and_cleared_after_commit()
+    {
+        await using var decoder = new ZrleEncoding(PixelFormat.WinArdBgra32);
+        var reconfigurable = (IReconfigurablePixelFormatDecoder)decoder;
+
+        reconfigurable.ValidatePixelFormat(PixelFormat.WinArdRgb565);
+        Assert.Throws<InvalidOperationException>(() =>
+            reconfigurable.CommitPixelFormat(PixelFormat.WinArdBgra32));
+        reconfigurable.CommitPixelFormat(PixelFormat.WinArdRgb565);
+        Assert.Throws<InvalidOperationException>(() =>
+            reconfigurable.CommitPixelFormat(PixelFormat.WinArdRgb565));
+    }
+
+    [Fact]
     public async Task Raw_tile_decodes_cpixel_and_reports_pixel_content()
     {
         using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);

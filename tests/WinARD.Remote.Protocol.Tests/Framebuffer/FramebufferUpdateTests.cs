@@ -1034,6 +1034,45 @@ public sealed class FramebufferUpdateTests
     }
 
     [Fact]
+    public async Task Prepared_pixel_format_change_keeps_old_format_until_commit()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(
+            framebuffer,
+            PixelFormat.WinArdBgra32);
+
+        await using var prepared = await session.PreparePixelFormatReconfigurationAsync(
+            PixelFormat.WinArdRgb565,
+            CancellationToken.None);
+        prepared.Commit();
+        _ = await session.ApplyAsync(
+            new MemoryStream(Update(Raw(0, 0, 1, 1, [0x1F, 0]))),
+            CancellationToken.None);
+
+        Assert.Equal(0xFF0000FFu, framebuffer.GetBgra32(0, 0));
+    }
+
+    [Fact]
+    public async Task Disposed_pixel_format_preparation_cannot_commit_and_releases_session()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(
+            framebuffer,
+            PixelFormat.WinArdBgra32);
+        var prepared = await session.PreparePixelFormatReconfigurationAsync(
+            PixelFormat.WinArdRgb565,
+            CancellationToken.None);
+
+        await prepared.DisposeAsync();
+        Assert.Throws<InvalidOperationException>(prepared.Commit);
+        _ = await session.ApplyAsync(
+            new MemoryStream(Update(Raw(0, 0, 1, 1, [1, 2, 3, 0]))),
+            CancellationToken.None);
+
+        Assert.Equal(0xFF030201u, framebuffer.GetBgra32(0, 0));
+    }
+
+    [Fact]
     public void Session_rejects_additional_decoder_that_implements_internal_pixel_format_contract()
     {
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);

@@ -112,6 +112,16 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
         PixelFormat pixelFormat,
         CancellationToken cancellationToken)
     {
+        await using var reconfiguration = await PreparePixelFormatReconfigurationAsync(
+            pixelFormat,
+            cancellationToken).ConfigureAwait(false);
+        reconfiguration.Commit();
+    }
+
+    public async Task<FramebufferPixelFormatReconfiguration> PreparePixelFormatReconfigurationAsync(
+        PixelFormat pixelFormat,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(pixelFormat);
         ThrowIfUnavailable();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -127,16 +137,45 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
                 decoder.ValidatePixelFormat(pixelFormat);
             }
 
-            foreach (var decoder in reconfigurableDecoders)
+            return new FramebufferPixelFormatReconfiguration(
+                this,
+                pixelFormat,
+                reconfigurableDecoders);
+        }
+        catch
+        {
+            _gate.Release();
+            throw;
+        }
+    }
+
+    internal void CommitPixelFormatReconfiguration(
+        PixelFormat pixelFormat,
+        IReadOnlyList<IReconfigurablePixelFormatDecoder> decoders)
+    {
+        ThrowIfUnavailable();
+        try
+        {
+            foreach (var decoder in decoders)
             {
                 decoder.CommitPixelFormat(pixelFormat);
             }
         }
-        finally
+        catch
         {
-            _gate.Release();
+            lock (_stateLock)
+            {
+                if (_state == SessionState.Active)
+                {
+                    _state = SessionState.Faulted;
+                }
+            }
+
+            throw;
         }
     }
+
+    internal void ReleasePixelFormatReconfiguration() => _gate.Release();
 
     public ValueTask DisposeAsync()
     {
@@ -224,5 +263,59 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
         Faulted,
         Disposing,
         Disposed,
+    }
+}
+
+public sealed class FramebufferPixelFormatReconfiguration : IAsyncDisposable
+{
+    private readonly FramebufferUpdateSession _session;
+    private readonly PixelFormat _pixelFormat;
+    private readonly IReadOnlyList<IReconfigurablePixelFormatDecoder> _decoders;
+    private readonly object _stateLock = new();
+    private bool _completed;
+
+    internal FramebufferPixelFormatReconfiguration(
+        FramebufferUpdateSession session,
+        PixelFormat pixelFormat,
+        IReadOnlyList<IReconfigurablePixelFormatDecoder> decoders)
+    {
+        _session = session;
+        _pixelFormat = pixelFormat;
+        _decoders = decoders;
+    }
+
+    public void Commit()
+    {
+        lock (_stateLock)
+        {
+            if (_completed)
+            {
+                throw new InvalidOperationException("The pixel format reconfiguration is no longer pending.");
+            }
+
+            try
+            {
+                _session.CommitPixelFormatReconfiguration(_pixelFormat, _decoders);
+            }
+            finally
+            {
+                _completed = true;
+                _session.ReleasePixelFormatReconfiguration();
+            }
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        lock (_stateLock)
+        {
+            if (!_completed)
+            {
+                _completed = true;
+                _session.ReleasePixelFormatReconfiguration();
+            }
+        }
+
+        return ValueTask.CompletedTask;
     }
 }

@@ -18,6 +18,7 @@ using System.Globalization;
 using System.Text.Json;
 using System.Security.Cryptography;
 using System.Buffers;
+using System.IO.Compression;
 
 #pragma warning disable CA1707
 
@@ -1235,6 +1236,115 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Rfb_client_quality_transition_preserves_persistent_zlib_stream()
+    {
+        var firstPixels = Enumerable.Repeat(new byte[] { 1, 2, 3, 0 }, 4096)
+            .SelectMany(pixel => pixel)
+            .ToArray();
+        var secondPixels = Enumerable.Repeat(new byte[] { 0x1F, 0 }, 4096)
+            .SelectMany(pixel => pixel)
+            .ToArray();
+        var (firstChunk, secondChunk) = CreateSharedZlibChunks(firstPixels, secondPixels);
+        var sessionCreateCount = 0;
+        var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
+        await using var stream = new ScriptedDuplexStream(
+        [
+            .. Handshake("RFB 003.008\n"),
+            .. ServerInit(64, 64),
+            .. ZlibUpdate(64, 64, firstChunk),
+            .. ZlibUpdate(64, 64, secondChunk),
+        ]);
+        await using var client = new RfbClient(
+            stream,
+            diagnosticSink: sink,
+            framebufferSessionFactory: (framebuffer, pixelFormat) =>
+            {
+                Interlocked.Increment(ref sessionCreateCount);
+                return FramebufferUpdateReader.CreateSession(
+                    framebuffer,
+                    pixelFormat == RemotePixelFormatKind.Bgra32
+                        ? PixelFormat.WinArdBgra32
+                        : PixelFormat.WinArdRgb565);
+            });
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        using var firstFrame = Assert.IsType<RemoteFramebufferMessage>(await client.ReceiveAsync(default));
+        var transitionOffset = stream.WrittenBytes.Length;
+
+        var result = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [6, 16, 0, 1, -239, -223], 1),
+            default);
+        using var repairedFrame = Assert.IsType<RemoteFramebufferMessage>(await client.ReceiveAsync(default));
+
+        Assert.Equal(QualityTransitionStatus.Applied, result);
+        Assert.Equal(0xFF030201u, BinaryPrimitives.ReadUInt32LittleEndian(firstFrame.Bgra32.Span[..4]));
+        Assert.Equal(0xFF0000FFu, BinaryPrimitives.ReadUInt32LittleEndian(repairedFrame.Bgra32.Span[..4]));
+        Assert.Equal(1, sessionCreateCount);
+        var transitionWrites = stream.WrittenBytes[transitionOffset..];
+        Assert.Equal(30, transitionWrites.Length);
+        Assert.Equal(0, transitionWrites[0]);
+        Assert.Equal(3, transitionWrites[20]);
+        Assert.Equal(0, transitionWrites[21]);
+        Assert.DoesNotContain(
+            sink.Snapshot(),
+            diagnostic => diagnostic.Fields.Any(field => field.Value == "DecoderFailure"));
+    }
+
+    [Fact]
+    public async Task Rfb_client_quality_transition_preserves_persistent_zlib_stream_from_rgb565_to_bgra32()
+    {
+        var firstPixels = Enumerable.Repeat(new byte[] { 0, 0xF8 }, 4096)
+            .SelectMany(pixel => pixel)
+            .ToArray();
+        var secondPixels = Enumerable.Repeat(new byte[] { 4, 5, 6, 0 }, 4096)
+            .SelectMany(pixel => pixel)
+            .ToArray();
+        var (firstChunk, secondChunk) = CreateSharedZlibChunks(firstPixels, secondPixels);
+        var sessionCreateCount = 0;
+        await using var stream = new ScriptedDuplexStream(
+        [
+            .. Handshake("RFB 003.008\n"),
+            .. ServerInit(64, 64),
+            .. ZlibUpdate(64, 64, firstChunk),
+            .. ZlibUpdate(64, 64, secondChunk),
+        ]);
+        await using var client = new RfbClient(
+            stream,
+            framebufferSessionFactory: (framebuffer, pixelFormat) =>
+            {
+                Interlocked.Increment(ref sessionCreateCount);
+                return FramebufferUpdateReader.CreateSession(
+                    framebuffer,
+                    pixelFormat == RemotePixelFormatKind.Bgra32
+                        ? PixelFormat.WinArdBgra32
+                        : PixelFormat.WinArdRgb565);
+            });
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+
+        var firstTransition = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [6, 16, 0, 1, -239, -223], 1),
+            default);
+        using var firstFrame = Assert.IsType<RemoteFramebufferMessage>(await client.ReceiveAsync(default));
+        var secondTransitionOffset = stream.WrittenBytes.Length;
+        var secondTransition = await client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Bgra32, [6, 16, 0, 1, -239, -223], 1),
+            default);
+        using var repairedFrame = Assert.IsType<RemoteFramebufferMessage>(await client.ReceiveAsync(default));
+
+        Assert.Equal(QualityTransitionStatus.Applied, firstTransition);
+        Assert.Equal(QualityTransitionStatus.Applied, secondTransition);
+        Assert.Equal(0xFFFF0000u, BinaryPrimitives.ReadUInt32LittleEndian(firstFrame.Bgra32.Span[..4]));
+        Assert.Equal(0xFF060504u, BinaryPrimitives.ReadUInt32LittleEndian(repairedFrame.Bgra32.Span[..4]));
+        Assert.Equal(1, sessionCreateCount);
+        var secondTransitionWrites = stream.WrittenBytes[secondTransitionOffset..];
+        Assert.Equal(30, secondTransitionWrites.Length);
+        Assert.Equal(0, secondTransitionWrites[0]);
+        Assert.Equal(3, secondTransitionWrites[20]);
+        Assert.Equal(0, secondTransitionWrites[21]);
+    }
+
+    [Fact]
     public async Task Rfb_client_quality_transition_writes_configuration_then_one_full_repair()
     {
         await using var stream = new ScriptedDuplexStream(
@@ -1379,7 +1489,7 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
-    public async Task New_decoder_creation_failure_is_zero_wire_and_old_decoder_remains_usable()
+    public async Task Pixel_format_preflight_failure_is_zero_wire_and_session_remains_usable()
     {
         var createCount = 0;
         await using var stream = new ScriptedDuplexStream(
@@ -1388,16 +1498,14 @@ public sealed class FramePresentationTests
             stream,
             framebufferSessionFactory: (framebuffer, pixelFormat) =>
             {
-                if (Interlocked.Increment(ref createCount) == 2)
-                {
-                    throw new InvalidOperationException("injected decoder creation failure");
-                }
-
-                return FramebufferUpdateReader.CreateSession(
+                Interlocked.Increment(ref createCount);
+                return new FramebufferUpdateSession(
                     framebuffer,
-                    pixelFormat == RemotePixelFormatKind.Bgra32
-                        ? PixelFormat.WinArdBgra32
-                        : PixelFormat.WinArdRgb565);
+                    new Dictionary<int, IRfbEncodingDecoder>
+                    {
+                        [(int)RfbEncodingType.Cursor] = new CursorEncoding(PixelFormat.WinArdBgra32),
+                        [700] = new ThrowingValidatePixelFormatDecoder(),
+                    });
             });
         await client.NegotiateAsync(default);
         await client.InitializeAsync(default);
@@ -1408,30 +1516,29 @@ public sealed class FramePresentationTests
 
         Assert.Equal(QualityTransitionStatus.CapabilityUnavailable, result);
         Assert.Equal(offset, stream.WrittenBytes.Length);
+        Assert.Equal(1, createCount);
         using var frame = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(default));
     }
 
     [Fact]
-    public async Task Old_decoder_dispose_failure_faults_after_configuration_without_repair()
+    public async Task Quality_transition_does_not_dispose_the_reused_decoder_session()
     {
         var createCount = 0;
+        var decoder = new TrackingDisposeDecoder();
         await using var stream = new ScriptedDuplexStream(
             [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1)]);
         await using var client = new RfbClient(
             stream,
-            framebufferSessionFactory: (framebuffer, pixelFormat) =>
-                Interlocked.Increment(ref createCount) == 1
-                    ? new FramebufferUpdateSession(
-                        framebuffer,
-                        new Dictionary<int, IRfbEncodingDecoder>
-                        {
-                            [700] = new ThrowingDisposeDecoder(),
-                        })
-                    : FramebufferUpdateReader.CreateSession(
-                        framebuffer,
-                        pixelFormat == RemotePixelFormatKind.Bgra32
-                            ? PixelFormat.WinArdBgra32
-                            : PixelFormat.WinArdRgb565));
+            framebufferSessionFactory: (framebuffer, _) =>
+            {
+                Interlocked.Increment(ref createCount);
+                return new FramebufferUpdateSession(
+                    framebuffer,
+                    new Dictionary<int, IRfbEncodingDecoder>
+                    {
+                        [700] = decoder,
+                    });
+            });
         await client.NegotiateAsync(default);
         await client.InitializeAsync(default);
         var offset = stream.WrittenBytes.Length;
@@ -1439,9 +1546,10 @@ public sealed class FramePresentationTests
         var result = await client.ApplyQualityTransitionAsync(
             new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0, 1, -239, -223], 1), default);
 
-        Assert.Equal(QualityTransitionStatus.Faulted, result);
-        Assert.Equal(44, stream.WrittenBytes.Length - offset);
-        await Assert.ThrowsAnyAsync<Exception>(() => client.ReceiveAsync(default).AsTask());
+        Assert.Equal(QualityTransitionStatus.Applied, result);
+        Assert.Equal(54, stream.WrittenBytes.Length - offset);
+        Assert.Equal(1, createCount);
+        Assert.False(decoder.IsDisposed);
     }
 
     [Fact]
@@ -1483,9 +1591,8 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
-    public async Task Prewire_cancellation_keeps_primary_cancellation_when_new_decoder_cleanup_fails()
+    public async Task Prewire_cancellation_keeps_primary_cancellation_and_reused_session()
     {
-        const string privateMarker = "PRIVATE-CLEANUP-PATH-MARKER";
         var createCount = 0;
         var sink = new InMemorySafeDiagnosticSink(new SecretRedactor());
         await using var stream = new ScriptedDuplexStream(
@@ -1493,15 +1600,11 @@ public sealed class FramePresentationTests
         await using var client = new RfbClient(
             stream,
             diagnosticSink: sink,
-            framebufferSessionFactory: (framebuffer, pixelFormat) =>
-                Interlocked.Increment(ref createCount) == 1
-                    ? FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32)
-                    : new FramebufferUpdateSession(
-                        framebuffer,
-                        new Dictionary<int, IRfbEncodingDecoder>
-                        {
-                            [700] = new ThrowingDisposeDecoder(privateMarker),
-                        }));
+            framebufferSessionFactory: (framebuffer, _) =>
+            {
+                Interlocked.Increment(ref createCount);
+                return FramebufferUpdateReader.CreateSession(framebuffer, PixelFormat.WinArdBgra32);
+            });
         await client.NegotiateAsync(default);
         await client.InitializeAsync(default);
         var blocked = stream.BlockNextWrite();
@@ -1518,14 +1621,8 @@ public sealed class FramePresentationTests
         var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => transition);
         Assert.Equal(cancellation.Token, exception.CancellationToken);
         await active;
-        var diagnostic = Assert.Single(
-            sink.Snapshot(),
-            item => item.Code == "RFB_QUALITY_TRANSITION_CLEANUP");
-        Assert.Contains(diagnostic.Fields, field =>
-            field.Name == "Stage" && field.Value == "CanceledBeforeWire");
-        Assert.Contains(diagnostic.Fields, field =>
-            field.Name == "FailureKind" && field.Value == "Other");
-        Assert.DoesNotContain(privateMarker, JsonSerializer.Serialize(diagnostic), StringComparison.Ordinal);
+        Assert.Equal(1, createCount);
+        Assert.DoesNotContain(sink.Snapshot(), item => item.Code == "RFB_QUALITY_TRANSITION_CLEANUP");
     }
 
     [Fact]
@@ -2056,6 +2153,31 @@ public sealed class FramePresentationTests
         return bytes;
     }
 
+    private static (byte[] First, byte[] Second) CreateSharedZlibChunks(byte[] first, byte[] second)
+    {
+        using var output = new MemoryStream();
+        using var zlib = new ZLibStream(output, CompressionLevel.SmallestSize, leaveOpen: true);
+        zlib.Write(first);
+        zlib.Flush();
+        var firstLength = checked((int)output.Length);
+        zlib.Write(second);
+        zlib.Flush();
+        var all = output.ToArray();
+        return (all[..firstLength], all[firstLength..]);
+    }
+
+    private static byte[] ZlibUpdate(ushort width, ushort height, byte[] compressed)
+    {
+        var message = new byte[20 + compressed.Length];
+        message[3] = 1;
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(8), width);
+        BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(10), height);
+        BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(12), (int)RfbEncodingType.Zlib);
+        BinaryPrimitives.WriteUInt32BigEndian(message.AsSpan(16), checked((uint)compressed.Length));
+        compressed.CopyTo(message, 20);
+        return message;
+    }
+
     private static byte[] Header(ushort x, ushort y, ushort width, ushort height, int encodingId)
     {
         var bytes = new byte[12];
@@ -2093,8 +2215,9 @@ public sealed class FramePresentationTests
         public void Dispose() => _buffer = null;
     }
 
-    private sealed class ThrowingDisposeDecoder(
-        string message = "injected old decoder disposal failure") : IRfbEncodingDecoder, IDisposable
+    private sealed class ThrowingValidatePixelFormatDecoder :
+        IRfbEncodingDecoder,
+        IReconfigurablePixelFormatDecoder
     {
         public int EncodingId => 700;
 
@@ -2105,7 +2228,27 @@ public sealed class FramePresentationTests
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(EncodingDecodeResult.Empty);
 
-        public void Dispose() => throw new InvalidOperationException(message);
+        public void ValidatePixelFormat(PixelFormat pixelFormat) =>
+            throw new InvalidOperationException("injected pixel format validation failure");
+
+        public void CommitPixelFormat(PixelFormat pixelFormat) =>
+            throw new InvalidOperationException("commit must not run after validation failure");
+    }
+
+    private sealed class TrackingDisposeDecoder : IRfbEncodingDecoder, IDisposable
+    {
+        public int EncodingId => 700;
+
+        public bool IsDisposed { get; private set; }
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            WinARD.Remote.Protocol.Framebuffer.Framebuffer framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(EncodingDecodeResult.Empty);
+
+        public void Dispose() => IsDisposed = true;
     }
 
     private sealed class ScriptedDuplexStream(

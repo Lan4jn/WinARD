@@ -12,8 +12,7 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
     private PixelFormat _pixelFormat;
     private int _encodedPixelLength;
     private int _wirePixelOffset;
-    private int _validatedEncodedPixelLength;
-    private int _validatedWirePixelOffset;
+    private PixelLayout? _validatedLayout;
     private readonly PersistentZlibInflater _inflater;
 
     public ZrleEncoding()
@@ -34,14 +33,21 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
     void IReconfigurablePixelFormatDecoder.ValidatePixelFormat(PixelFormat pixelFormat)
     {
         ArgumentNullException.ThrowIfNull(pixelFormat);
-        (_validatedEncodedPixelLength, _validatedWirePixelOffset) = GetPixelLayout(pixelFormat);
+        var (encodedPixelLength, wirePixelOffset) = GetPixelLayout(pixelFormat);
+        _validatedLayout = new PixelLayout(pixelFormat, encodedPixelLength, wirePixelOffset);
     }
 
     void IReconfigurablePixelFormatDecoder.CommitPixelFormat(PixelFormat pixelFormat)
     {
+        if (_validatedLayout is not { } validated || validated.PixelFormat != pixelFormat)
+        {
+            throw new InvalidOperationException("ZRLE pixel format must match the validated reconfiguration.");
+        }
+
         _pixelFormat = pixelFormat;
-        _encodedPixelLength = _validatedEncodedPixelLength;
-        _wirePixelOffset = _validatedWirePixelOffset;
+        _encodedPixelLength = validated.EncodedPixelLength;
+        _wirePixelOffset = validated.WirePixelOffset;
+        _validatedLayout = null;
     }
 
     public async ValueTask<EncodingDecodeResult> DecodeAsync(
@@ -448,5 +454,10 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
         BinaryPrimitives.WriteUInt32LittleEndian(
             destination.Slice(checked(((y * destinationWidth) + x) * 4), 4),
             pixel);
+
+    private sealed record PixelLayout(
+        PixelFormat PixelFormat,
+        int EncodedPixelLength,
+        int WirePixelOffset);
 
 }
