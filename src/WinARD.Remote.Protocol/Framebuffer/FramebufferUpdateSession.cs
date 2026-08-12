@@ -108,6 +108,36 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
         }
     }
 
+    public async Task ReconfigurePixelFormatAsync(
+        PixelFormat pixelFormat,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(pixelFormat);
+        ThrowIfUnavailable();
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfUnavailable();
+            var reconfigurableDecoders = _decoders.Values
+                .OfType<IReconfigurablePixelFormatDecoder>()
+                .Distinct<IReconfigurablePixelFormatDecoder>(ReferenceEqualityComparer.Instance)
+                .ToArray();
+            foreach (var decoder in reconfigurableDecoders)
+            {
+                decoder.ValidatePixelFormat(pixelFormat);
+            }
+
+            foreach (var decoder in reconfigurableDecoders)
+            {
+                decoder.CommitPixelFormat(pixelFormat);
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public ValueTask DisposeAsync()
     {
         lock (_stateLock)

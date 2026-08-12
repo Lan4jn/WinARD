@@ -6,12 +6,12 @@ using WinARD.Remote.Protocol.IO;
 
 namespace WinARD.Remote.Protocol.Encodings;
 
-public sealed class ZrleEncoding : IRfbEncodingDecoder, IAsyncDisposable
+public sealed class ZrleEncoding : IRfbEncodingDecoder, IReconfigurablePixelFormatDecoder, IAsyncDisposable
 {
     private const int TileSize = 64;
-    private readonly PixelFormat _pixelFormat;
-    private readonly int _encodedPixelLength;
-    private readonly int _wirePixelOffset;
+    private PixelFormat _pixelFormat;
+    private int _encodedPixelLength;
+    private int _wirePixelOffset;
     private readonly PersistentZlibInflater _inflater;
 
     public ZrleEncoding()
@@ -28,6 +28,20 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IAsyncDisposable
     }
 
     public int EncodingId => (int)RfbEncodingType.Zrle;
+
+    void IReconfigurablePixelFormatDecoder.ValidatePixelFormat(PixelFormat pixelFormat)
+    {
+        ArgumentNullException.ThrowIfNull(pixelFormat);
+        _ = GetPixelLayout(pixelFormat);
+    }
+
+    void IReconfigurablePixelFormatDecoder.CommitPixelFormat(PixelFormat pixelFormat)
+    {
+        var (encodedPixelLength, wirePixelOffset) = GetPixelLayout(pixelFormat);
+        _pixelFormat = pixelFormat;
+        _encodedPixelLength = encodedPixelLength;
+        _wirePixelOffset = wirePixelOffset;
+    }
 
     public async ValueTask<EncodingDecodeResult> DecodeAsync(
         RfbReader reader,

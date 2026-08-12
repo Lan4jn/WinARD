@@ -390,6 +390,32 @@ public sealed class ZrleEncodingTests
         Assert.Equal(2u, framebuffer.GetBgra32(0, 0) & 0xFF);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Framebuffer_session_preserves_zrle_stream_across_pixel_format_changes(
+        bool bgraFirst)
+    {
+        var firstFormat = bgraFirst ? PixelFormat.WinArdBgra32 : PixelFormat.WinArdRgb565;
+        var secondFormat = bgraFirst ? PixelFormat.WinArdRgb565 : PixelFormat.WinArdBgra32;
+        var firstTile = RawTile(bgraFirst ? [1, 2, 3] : [0, 0xF8]);
+        var secondTile = RawTile(bgraFirst ? [0x1F, 0] : [4, 5, 6]);
+        var expectedSecondPixel = bgraFirst ? 0xFF0000FFu : 0xFF060504u;
+        var (firstChunk, secondChunk) = CreateSharedZlibChunks(firstTile, secondTile);
+        using var framebuffer = new FramebufferModel(64, 64, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(framebuffer, firstFormat);
+
+        _ = await session.ApplyAsync(
+            new MemoryStream(ZrleUpdate(64, 64, firstChunk)),
+            CancellationToken.None);
+        await session.ReconfigurePixelFormatAsync(secondFormat, CancellationToken.None);
+        _ = await session.ApplyAsync(
+            new MemoryStream(ZrleUpdate(64, 64, secondChunk)),
+            CancellationToken.None);
+
+        Assert.Equal(expectedSecondPixel, framebuffer.GetBgra32(63, 63));
+    }
+
     [Fact]
     public async Task Complete_zlib_stream_is_rejected()
     {
@@ -622,6 +648,17 @@ public sealed class ZrleEncodingTests
         for (var offset = 1; offset < tile.Length; offset += 3)
         {
             tile[offset] = blue;
+        }
+
+        return tile;
+    }
+
+    private static byte[] RawTile(byte[] encodedPixel)
+    {
+        var tile = new byte[checked(1 + (64 * 64 * encodedPixel.Length))];
+        for (var offset = 1; offset < tile.Length; offset += encodedPixel.Length)
+        {
+            encodedPixel.CopyTo(tile, offset);
         }
 
         return tile;

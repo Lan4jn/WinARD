@@ -5,9 +5,9 @@ using WinARD.Remote.Protocol.IO;
 
 namespace WinARD.Remote.Protocol.Encodings;
 
-public sealed class ZlibEncoding : IRfbEncodingDecoder, IAsyncDisposable
+public sealed class ZlibEncoding : IRfbEncodingDecoder, IReconfigurablePixelFormatDecoder, IAsyncDisposable
 {
-    private readonly PixelFormat _pixelFormat;
+    private PixelFormat _pixelFormat;
     private readonly PersistentZlibInflater _inflater;
 
     public ZlibEncoding()
@@ -23,6 +23,12 @@ public sealed class ZlibEncoding : IRfbEncodingDecoder, IAsyncDisposable
     }
 
     public int EncodingId => (int)RfbEncodingType.Zlib;
+
+    void IReconfigurablePixelFormatDecoder.ValidatePixelFormat(PixelFormat pixelFormat) =>
+        ArgumentNullException.ThrowIfNull(pixelFormat);
+
+    void IReconfigurablePixelFormatDecoder.CommitPixelFormat(PixelFormat pixelFormat) =>
+        _pixelFormat = pixelFormat;
 
     public async ValueTask<EncodingDecodeResult> DecodeAsync(
         RfbReader reader,

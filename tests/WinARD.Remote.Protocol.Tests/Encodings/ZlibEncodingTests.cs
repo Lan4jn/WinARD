@@ -283,6 +283,36 @@ public sealed class ZlibEncodingTests
         Assert.Equal(0xFF060504u, framebuffer.GetBgra32(63, 63));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Framebuffer_session_preserves_zlib_stream_across_pixel_format_changes(
+        bool bgraFirst)
+    {
+        var firstFormat = bgraFirst ? PixelFormat.WinArdBgra32 : PixelFormat.WinArdRgb565;
+        var secondFormat = bgraFirst ? PixelFormat.WinArdRgb565 : PixelFormat.WinArdBgra32;
+        var firstPixels = Enumerable.Repeat(
+            bgraFirst ? new byte[] { 1, 2, 3, 0 } : [0, 0xF8],
+            4096).SelectMany(pixel => pixel).ToArray();
+        var secondPixels = Enumerable.Repeat(
+            bgraFirst ? new byte[] { 0x1F, 0 } : [4, 5, 6, 0],
+            4096).SelectMany(pixel => pixel).ToArray();
+        var expectedSecondPixel = bgraFirst ? 0xFF0000FFu : 0xFF060504u;
+        var (firstChunk, secondChunk) = CreateSharedZlibChunks(firstPixels, secondPixels);
+        using var framebuffer = new FramebufferModel(64, 64, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(framebuffer, firstFormat);
+
+        _ = await session.ApplyAsync(
+            new MemoryStream(ZlibUpdate(64, 64, firstChunk)),
+            CancellationToken.None);
+        await session.ReconfigurePixelFormatAsync(secondFormat, CancellationToken.None);
+        _ = await session.ApplyAsync(
+            new MemoryStream(ZlibUpdate(64, 64, secondChunk)),
+            CancellationToken.None);
+
+        Assert.Equal(expectedSecondPixel, framebuffer.GetBgra32(63, 63));
+    }
+
     [Fact]
     public async Task One_shot_reader_rejects_zlib_before_consuming_compressed_length()
     {

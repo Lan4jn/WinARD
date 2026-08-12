@@ -4,9 +4,9 @@ using WinARD.Remote.Protocol.IO;
 
 namespace WinARD.Remote.Protocol.Encodings;
 
-public sealed class RawEncoding : IRfbEncodingDecoder
+public sealed class RawEncoding : IRfbEncodingDecoder, IReconfigurablePixelFormatDecoder
 {
-    private readonly PixelFormat _pixelFormat;
+    private PixelFormat _pixelFormat;
 
     public RawEncoding()
         : this(PixelFormat.WinArdBgra32)
@@ -20,6 +20,12 @@ public sealed class RawEncoding : IRfbEncodingDecoder
     }
 
     public int EncodingId => (int)RfbEncodingType.Raw;
+
+    void IReconfigurablePixelFormatDecoder.ValidatePixelFormat(PixelFormat pixelFormat) =>
+        ArgumentNullException.ThrowIfNull(pixelFormat);
+
+    void IReconfigurablePixelFormatDecoder.CommitPixelFormat(PixelFormat pixelFormat) =>
+        _pixelFormat = pixelFormat;
 
     public async ValueTask<EncodingDecodeResult> DecodeAsync(
         RfbReader reader,

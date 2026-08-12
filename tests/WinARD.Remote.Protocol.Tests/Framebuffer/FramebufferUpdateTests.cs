@@ -1013,6 +1013,117 @@ public sealed class FramebufferUpdateTests
     }
 
     [Fact]
+    public async Task Session_reconfigures_raw_and_cursor_decoders_together()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(
+            framebuffer,
+            PixelFormat.WinArdBgra32);
+
+        await session.ReconfigurePixelFormatAsync(PixelFormat.WinArdRgb565, CancellationToken.None);
+        _ = await session.ApplyAsync(
+            new MemoryStream(Update(
+                Raw(0, 0, 1, 1, [0x1F, 0]),
+                Cursor(0, 0, 1, 1, [0, 0xF8], [0x80]))),
+            CancellationToken.None);
+
+        Assert.Equal(0xFF0000FFu, framebuffer.GetBgra32(0, 0));
+        Assert.Equal(
+            [0, 0, 255, 255],
+            Assert.IsType<RemoteCursor>(framebuffer.Cursor).GetPixelsBgra32());
+    }
+
+    [Fact]
+    public async Task Failed_pixel_format_prevalidation_commits_no_decoder_and_leaves_session_active()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var rejecting = new RejectingPixelFormatDecoder();
+        await using var session = FramebufferUpdateReader.CreateSession(
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            rejecting);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            session.ReconfigurePixelFormatAsync(PixelFormat.WinArdRgb565, CancellationToken.None));
+
+        Assert.Contains("Injected", exception.Message, StringComparison.Ordinal);
+        Assert.True(rejecting.WasValidated);
+        Assert.False(rejecting.WasCommitted);
+        _ = await session.ApplyAsync(
+            new MemoryStream(Update(Raw(0, 0, 1, 1, [1, 2, 3, 0]))),
+            CancellationToken.None);
+        Assert.Equal(0xFF030201u, framebuffer.GetBgra32(0, 0));
+    }
+
+    [Fact]
+    public async Task Pixel_format_reconfiguration_waits_for_in_flight_decode()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var decoder = new BlockingPixelFormatDecoder();
+        await using var session = FramebufferUpdateReader.CreateSession(
+            framebuffer,
+            PixelFormat.WinArdBgra32,
+            decoder);
+        var apply = session.ApplyAsync(
+            new MemoryStream(Update(Header(0, 0, 1, 1, (RfbEncodingType)decoder.EncodingId))),
+            CancellationToken.None);
+        await decoder.Started.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var reconfigure = session.ReconfigurePixelFormatAsync(
+            PixelFormat.WinArdRgb565,
+            CancellationToken.None);
+        Assert.False(reconfigure.IsCompleted);
+
+        decoder.Release();
+        _ = await apply;
+        await reconfigure.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(PixelFormat.WinArdRgb565, decoder.CommittedFormat);
+    }
+
+    [Fact]
+    public async Task Cancelled_pixel_format_reconfiguration_leaves_session_active()
+    {
+        using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        await using var session = FramebufferUpdateReader.CreateSession(
+            framebuffer,
+            PixelFormat.WinArdBgra32);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            session.ReconfigurePixelFormatAsync(PixelFormat.WinArdRgb565, cancellation.Token));
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        _ = await session.ApplyAsync(
+            new MemoryStream(Update(Raw(0, 0, 1, 1, [1, 2, 3, 0]))),
+            CancellationToken.None);
+        Assert.Equal(0xFF030201u, framebuffer.GetBgra32(0, 0));
+    }
+
+    [Fact]
+    public async Task Pixel_format_reconfiguration_rejects_faulted_and_disposed_sessions()
+    {
+        using var faultedFramebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        await using var faulted = FramebufferUpdateReader.CreateSession(
+            faultedFramebuffer,
+            PixelFormat.WinArdBgra32);
+        await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            faulted.ApplyAsync(new MemoryStream([0, 0, 0, 1]), CancellationToken.None));
+
+        var faultedException = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            faulted.ReconfigurePixelFormatAsync(PixelFormat.WinArdRgb565, CancellationToken.None));
+        Assert.Contains("faulted", faultedException.Message, StringComparison.OrdinalIgnoreCase);
+
+        using var disposedFramebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
+        var disposed = FramebufferUpdateReader.CreateSession(
+            disposedFramebuffer,
+            PixelFormat.WinArdBgra32);
+        await disposed.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            disposed.ReconfigurePixelFormatAsync(PixelFormat.WinArdRgb565, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Concurrent_session_disposals_share_completion_while_apply_is_in_flight()
     {
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
@@ -1129,6 +1240,63 @@ public sealed class FramebufferUpdateTests
                 throw new InvalidOperationException($"dispose {EncodingId}");
             }
         }
+    }
+
+    private sealed class RejectingPixelFormatDecoder :
+        IRfbEncodingDecoder,
+        IReconfigurablePixelFormatDecoder
+    {
+        public int EncodingId => 778;
+        public bool WasValidated { get; private set; }
+        public bool WasCommitted { get; private set; }
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            FramebufferModel framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(EncodingDecodeResult.Empty);
+
+        public void ValidatePixelFormat(PixelFormat pixelFormat)
+        {
+            WasValidated = true;
+            throw new InvalidOperationException("Injected pixel format rejection.");
+        }
+
+        public void CommitPixelFormat(PixelFormat pixelFormat) => WasCommitted = true;
+    }
+
+    private sealed class BlockingPixelFormatDecoder :
+        IRfbEncodingDecoder,
+        IReconfigurablePixelFormatDecoder
+    {
+        private readonly TaskCompletionSource _started =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int EncodingId => 779;
+        public Task Started => _started.Task;
+        public PixelFormat? CommittedFormat { get; private set; }
+
+        public async ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            FramebufferModel framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken)
+        {
+            _started.TrySetResult();
+            await _release.Task.WaitAsync(cancellationToken);
+            return EncodingDecodeResult.Empty;
+        }
+
+        public void ValidatePixelFormat(PixelFormat pixelFormat)
+        {
+        }
+
+        public void CommitPixelFormat(PixelFormat pixelFormat) => CommittedFormat = pixelFormat;
+
+        public void Release() => _release.TrySetResult();
     }
 
     private sealed class ThrowingDisposableDecoder : IRfbEncodingDecoder, IAsyncDisposable
