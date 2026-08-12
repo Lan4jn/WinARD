@@ -14,6 +14,7 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
     private readonly SemaphoreSlim _receiveGate = new(1, 1);
     private readonly object _preloadedSync = new();
     private readonly Queue<RemoteServerMessage> _preloadedMessages;
+    private readonly QualityBootstrapState _bootstrapState;
     private Task? _disposeTask;
 
     internal RemoteSession(
@@ -42,7 +43,8 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
         SessionStateMachine stateMachine,
         TransportConnection transport,
         IRfbClient client,
-        PreloadedMessageOwnership preloadedMessages)
+        PreloadedMessageOwnership preloadedMessages,
+        QualityBootstrapFailureReason? preferredFailureReason = null)
     {
         ArgumentNullException.ThrowIfNull(preloadedMessages);
         try
@@ -51,6 +53,13 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
             _stateMachine = stateMachine ?? throw new ArgumentNullException(nameof(stateMachine));
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _client = client ?? throw new ArgumentNullException(nameof(client));
+            var clientBootstrapState = client.BootstrapState;
+            _bootstrapState = clientBootstrapState.Attempt is { } attempt
+                ? new QualityBootstrapState(
+                    attempt,
+                    clientBootstrapState.ActualQuality,
+                    preferredFailureReason)
+                : QualityBootstrapState.LegacyBgra32;
             if (snapshot.Length > 8 || snapshot.Count(message => message is RemoteFramebufferMessage) > 1 ||
                 snapshot.Any(message => message is not RemoteCursorMessage and not RemoteFramebufferMessage))
             {
@@ -77,6 +86,8 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
             }
         }
     }
+
+    public QualityBootstrapState BootstrapState => _bootstrapState;
 
     public SessionState State
     {

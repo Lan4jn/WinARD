@@ -561,6 +561,7 @@ public sealed class DiagnosticExporterTests : IDisposable
             "ServerMessageType", "EncodingName", "RectangleIndex", "ArdEncryptionStage",
             "ArdEncryptionDirection", "securityType", "endpoint", "fingerprint", "oldFingerprint",
             "newFingerprint", "ArdCiphertextLength",
+            "BootstrapAttempt", "BootstrapFallbackReason", "FallbackFailed", "PreferredFailureReason",
         ];
         var markers = fieldNames
             .Select((_, index) => $"ValueMarker{index:D2}")
@@ -638,6 +639,10 @@ public sealed class DiagnosticExporterTests : IDisposable
             new("oldFingerprint", fingerprint, DiagnosticFieldCategory.Public),
             new("newFingerprint", fingerprint, DiagnosticFieldCategory.Public),
             new("ArdCiphertextLength", "48", DiagnosticFieldCategory.Public),
+            new("BootstrapAttempt", "Fallback", DiagnosticFieldCategory.Public),
+            new("BootstrapFallbackReason", "DecoderFailure", DiagnosticFieldCategory.Public),
+            new("FallbackFailed", "True", DiagnosticFieldCategory.Public),
+            new("PreferredFailureReason", "UnsupportedEncoding", DiagnosticFieldCategory.Public),
         ];
         var diagnosticEvent = new SafeDiagnosticEvent(
             DateTimeOffset.UtcNow,
@@ -666,6 +671,70 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.Equal("safe.example", exported.GetProperty("endpoint").GetString());
         Assert.Equal(fingerprint, exported.GetProperty("fingerprint").GetString());
         Assert.Equal("48", exported.GetProperty("ArdEncryptedPacketLength").GetString());
+        Assert.Equal("Fallback", exported.GetProperty("BootstrapAttempt").GetString());
+        Assert.Equal("DecoderFailure", exported.GetProperty("BootstrapFallbackReason").GetString());
+        Assert.Equal("True", exported.GetProperty("FallbackFailed").GetString());
+        Assert.Equal("UnsupportedEncoding", exported.GetProperty("PreferredFailureReason").GetString());
+    }
+
+    [Fact]
+    public async Task BootstrapFieldsExportOnlyClosedValuesAndDropRawMarkers()
+    {
+        const string marker = "raw-bootstrap-host-payload-marker";
+        var diagnosticEvent = new SafeDiagnosticEvent(
+            DateTimeOffset.UtcNow,
+            "QUALITY_BOOTSTRAP_FALLBACK",
+            Guid.NewGuid().ToString("N"),
+            marker,
+            [
+                new("BootstrapAttempt", "Preferred", DiagnosticFieldCategory.Public),
+                new("BootstrapFallbackReason", "RemoteSessionClosed", DiagnosticFieldCategory.Public),
+                new("FallbackFailed", "False", DiagnosticFieldCategory.Public),
+                new("PreferredFailureReason", "MalformedFramebufferUpdate", DiagnosticFieldCategory.Public),
+                new("BootstrapAttemptRaw", marker, DiagnosticFieldCategory.Public),
+                new("BootstrapFallbackReasonRaw", marker, DiagnosticFieldCategory.Public),
+            ],
+            null);
+
+        using var document = await ExportSingleEventAsync(
+            diagnosticEvent,
+            includeHosts: false,
+            "bootstrap-field-schema.zip");
+
+        var json = document.RootElement.GetRawText();
+        Assert.DoesNotContain(marker, json, StringComparison.Ordinal);
+        var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
+        Assert.Equal("Preferred", fields.GetProperty("BootstrapAttempt").GetString());
+        Assert.Equal("RemoteSessionClosed", fields.GetProperty("BootstrapFallbackReason").GetString());
+        Assert.Equal("False", fields.GetProperty("FallbackFailed").GetString());
+        Assert.Equal("MalformedFramebufferUpdate", fields.GetProperty("PreferredFailureReason").GetString());
+    }
+
+    [Fact]
+    public async Task InvalidBootstrapFieldValuesAreOmittedFromExport()
+    {
+        const string marker = "raw-invalid-bootstrap-value-marker";
+        var diagnosticEvent = new SafeDiagnosticEvent(
+            DateTimeOffset.UtcNow,
+            "QUALITY_BOOTSTRAP_FALLBACK",
+            Guid.NewGuid().ToString("N"),
+            "ignored",
+            [
+                new("BootstrapAttempt", marker, DiagnosticFieldCategory.Public),
+                new("BootstrapFallbackReason", marker, DiagnosticFieldCategory.Public),
+                new("FallbackFailed", marker, DiagnosticFieldCategory.Public),
+                new("PreferredFailureReason", marker, DiagnosticFieldCategory.Public),
+            ],
+            null);
+
+        using var document = await ExportSingleEventAsync(
+            diagnosticEvent,
+            includeHosts: false,
+            "bootstrap-invalid-values.zip");
+
+        var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
+        Assert.Empty(fields.EnumerateObject());
+        Assert.DoesNotContain(marker, document.RootElement.GetRawText(), StringComparison.Ordinal);
     }
 
     [Fact]

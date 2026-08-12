@@ -1,14 +1,18 @@
 using System.IO.Compression;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using WinARD.Application.Errors;
 using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Application.Sessions;
 using WinARD.Desktop.Services;
 using WinARD.Domain.Connections;
+using WinARD.Domain.Errors;
 using WinARD.Domain.Sessions;
 using WinARD.Infrastructure.Diagnostics;
 using WinARD.Remote.Protocol.Errors;
+using WinARD.Transport;
 using WinARD.Transport.Ssh;
 using Xunit;
 
@@ -19,6 +23,388 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
     private readonly string _directory = Path.Combine(
         Path.GetTempPath(),
         $"winard-failure-diagnostics-{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task CompatibilityFailureRetriesOnceWithANewFallbackConnectionAfterCleanup()
+    {
+        var events = new List<string>();
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events, QualityBootstrapFailureReason.DecoderFailure),
+            new RetryClient("fallback", events),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            new RetryTransportFactory(events),
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt());
+
+        var outcome = await workflow.AttemptAsync(
+            Profile(), stageChanged: null, acceptedHostKey: null, CancellationToken.None);
+
+        Assert.NotNull(outcome.Result.Session);
+        Assert.Equal(2, events.Count(value => value.StartsWith("client-create", StringComparison.Ordinal)));
+        Assert.True(events.IndexOf("preferred-client-dispose") < events.IndexOf("client-create-fallback"));
+        Assert.True(events.IndexOf("preferred-transport-dispose") < events.IndexOf("client-create-fallback"));
+        Assert.True(events.IndexOf("preferred-secret-dispose") < events.IndexOf("client-create-fallback"));
+        Assert.Contains("preferred-configure-Preferred-Rgb565", events);
+        Assert.Contains("fallback-configure-Fallback-Bgra32", events);
+        Assert.True(outcome.Result.Session!.BootstrapState.FallbackUsed);
+        Assert.Equal(QualityBootstrapAttempt.Fallback, outcome.Result.Session.BootstrapState.Attempt);
+        Assert.Equal(
+            QualityBootstrapFailureReason.DecoderFailure,
+            outcome.Result.Session.BootstrapState.PreferredFailureReason);
+        await outcome.Result.Session.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task FallbackFailureIsReturnedWithoutAThirdConnection()
+    {
+        var events = new List<string>();
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events, QualityBootstrapFailureReason.UnsupportedEncoding),
+            new RetryClient("fallback", events, QualityBootstrapFailureReason.MalformedFramebufferUpdate),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            new RetryTransportFactory(events),
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new BootstrapReasonErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt(), sink);
+
+        var outcome = await workflow.AttemptAsync(
+            Profile(), stageChanged: null, acceptedHostKey: null, CancellationToken.None);
+
+        Assert.Null(outcome.Result.Session);
+        Assert.Equal(2, events.Count(value => value.StartsWith("client-create", StringComparison.Ordinal)));
+        Assert.Empty(clients);
+        Assert.Equal("BOOTSTRAP_MALFORMEDFRAMEBUFFERUPDATE", outcome.Result.Error!.Code);
+        var diagnostics = sink.Snapshot();
+        Assert.Equal(2, diagnostics.Count);
+        Assert.Equal("QUALITY_BOOTSTRAP_FALLBACK", diagnostics[0].Code);
+        Assert.Equal(
+            new[]
+            {
+                ("BootstrapAttempt", "Preferred"),
+                ("BootstrapFallbackReason", "UnsupportedEncoding"),
+            },
+            diagnostics[0].Fields.Select(field => (field.Name, field.Value)));
+        Assert.Equal("QUALITY_BOOTSTRAP_FALLBACK", diagnostics[1].Code);
+        Assert.Null(diagnostics[1].Exception);
+        Assert.Equal(
+            new[]
+            {
+                ("BootstrapAttempt", "Fallback"),
+                ("FallbackFailed", "True"),
+                ("PreferredFailureReason", "UnsupportedEncoding"),
+                ("BootstrapFallbackReason", "MalformedFramebufferUpdate"),
+            },
+            diagnostics[1].Fields.Select(field => (field.Name, field.Value)));
+    }
+
+    [Fact]
+    public async Task NonCompatibilityFailureDoesNotRetryWithFallback()
+    {
+        var events = new List<string>();
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events, bootstrapFailure: new InvalidOperationException("not compatible")),
+            new RetryClient("unused", events),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            new RetryTransportFactory(events),
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt());
+
+        var outcome = await workflow.AttemptAsync(
+            Profile(), stageChanged: null, acceptedHostKey: null, CancellationToken.None);
+
+        Assert.Null(outcome.Result.Session);
+        Assert.Single(events, value => value.StartsWith("client-create", StringComparison.Ordinal));
+        Assert.Single(clients);
+    }
+
+    [Fact]
+    public async Task AuthenticationFailureDoesNotRetryWithFallback()
+    {
+        var events = new List<string>();
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient(
+                "preferred",
+                events,
+                authenticationFailure: new ArdAuthenticationRejectedException(1, null, false)),
+            new RetryClient("unused", events),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            new RetryTransportFactory(events),
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt());
+
+        var outcome = await workflow.AttemptAsync(
+            Profile(), stageChanged: null, acceptedHostKey: null, CancellationToken.None);
+
+        Assert.Null(outcome.Result.Session);
+        Assert.Single(events, value => value.StartsWith("client-create", StringComparison.Ordinal));
+        Assert.Single(clients);
+    }
+
+    [Theory]
+    [MemberData(nameof(NonCompatibilityTransportFailures))]
+    public async Task TransportFailureDoesNotRetryWithFallback(Exception failure, string expectedCode)
+    {
+        var transport = new FailingTransportFactory(failure);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new RetrySecretProvider([]),
+            new RetryClientFactory(new Queue<RetryClient>(), []),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt());
+
+        var outcome = await workflow.AttemptAsync(
+            Profile(), stageChanged: null, acceptedHostKey: null, CancellationToken.None);
+
+        Assert.Null(outcome.Result.Session);
+        Assert.Equal(expectedCode, outcome.Result.Error!.Code);
+        Assert.Equal(1, transport.Attempts);
+    }
+
+    [Fact]
+    public async Task AcceptedHostKeyThenCompatibilityFailureUsesAtMostThreeOrderedAttempts()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
+        var events = new List<string>();
+        var transport = new HostKeyBootstrapTransport(candidate, events);
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events, QualityBootstrapFailureReason.DecoderFailure),
+            new RetryClient("fallback", events),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var prompt = new TrustPrompt();
+        var workflow = new ConnectionAttemptWorkflow(handler, prompt);
+        var profile = Profile().WithSsh(WinARD.Domain.Connections.SshProfile.Create(
+            endpoint.Host,
+            endpoint.Port,
+            "ssh-user",
+            privateKeyPath: null,
+            targetHost: "studio.local",
+            targetPort: 5900,
+            credentialReference: null,
+            pinnedHostKeyAlgorithm: null,
+            pinnedHostKeySha256: null));
+
+        var outcome = await workflow.AttemptAsync(
+            profile, stageChanged: null, acceptedHostKey: (_, _) => Task.CompletedTask,
+            CancellationToken.None);
+
+        Assert.NotNull(outcome.Result.Session);
+        Assert.Equal(3, transport.Attempts);
+        Assert.Equal(1, prompt.Count);
+        Assert.True(events.IndexOf("transport-hostkey") < events.IndexOf("transport-preferred"));
+        Assert.True(events.IndexOf("transport-preferred") < events.IndexOf("client-create-preferred"));
+        Assert.True(events.IndexOf("preferred-client-dispose") < events.IndexOf("transport-fallback"));
+        Assert.True(events.IndexOf("preferred-transport-dispose") < events.IndexOf("transport-fallback"));
+        Assert.Equal(QualityBootstrapAttempt.Fallback, outcome.Result.Session!.BootstrapState.Attempt);
+        await outcome.Result.Session.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task AcceptedFallbackHostKeyRetrySucceedsWithoutFallbackFailedDiagnostic()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        var events = new List<string>();
+        var transport = new FallbackHostKeyTransport(candidate, events);
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events, QualityBootstrapFailureReason.DecoderFailure),
+            new RetryClient("fallback", events),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var prompt = new TrustPrompt();
+        var workflow = new ConnectionAttemptWorkflow(handler, prompt, sink);
+
+        var outcome = await workflow.AttemptAsync(
+            ProfileWithSsh(candidate.Endpoint), stageChanged: null,
+            acceptedHostKey: (_, _) => Task.CompletedTask, CancellationToken.None);
+
+        Assert.NotNull(outcome.Result.Session);
+        Assert.Equal(3, transport.Attempts);
+        Assert.Equal(1, prompt.Count);
+        Assert.Equal(2, events.Count(value => value.StartsWith("client-create", StringComparison.Ordinal)));
+        Assert.DoesNotContain(
+            sink.Snapshot().SelectMany(item => item.Fields),
+            field => field.Name == "FallbackFailed" && field.Value == "True");
+        Assert.Single(sink.Snapshot());
+        await outcome.Result.Session!.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task RejectedFallbackHostKeyWritesOneTerminalFallbackFailureDiagnostic()
+    {
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        var events = new List<string>();
+        var transport = new FallbackHostKeyTransport(candidate, events);
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events, QualityBootstrapFailureReason.DecoderFailure),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            transport,
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt(), sink);
+
+        var outcome = await workflow.AttemptAsync(
+            ProfileWithSsh(candidate.Endpoint), stageChanged: null,
+            acceptedHostKey: null, CancellationToken.None);
+
+        Assert.Null(outcome.Result.Session);
+        Assert.Equal(2, transport.Attempts);
+        var terminal = Assert.Single(
+            sink.Snapshot(),
+            item => item.Fields.Any(field => field.Name == "FallbackFailed" && field.Value == "True"));
+        Assert.Equal("QUALITY_BOOTSTRAP_FALLBACK", terminal.Code);
+        Assert.Null(terminal.Exception);
+        Assert.Contains(terminal.Fields, field =>
+            field.Name == "PreferredFailureReason" && field.Value == "DecoderFailure");
+    }
+
+    public static TheoryData<Exception, string> NonCompatibilityTransportFailures => new()
+    {
+        { new SocketException((int)SocketError.HostNotFound), "DNS_RESOLUTION_FAILED" },
+        { new SocketException((int)SocketError.ConnectionRefused), "TCP_CONNECTION_FAILED" },
+        { new OpenSshTunnelException(255, "raw ssh marker"), "SSH_CONNECTION_FAILED" },
+        { new TransportTimeoutException(TransportTimeoutStage.Connection), "TRANSPORT_TIMEOUT" },
+    };
+
+    private static ConnectionProfile ProfileWithSsh(SshHostKeyEndpoint endpoint) => Profile().WithSsh(
+        WinARD.Domain.Connections.SshProfile.Create(
+            endpoint.Host,
+            endpoint.Port,
+            "ssh-user",
+            privateKeyPath: null,
+            targetHost: "studio.local",
+            targetPort: 5900,
+            credentialReference: null,
+            pinnedHostKeyAlgorithm: null,
+            pinnedHostKeySha256: null));
+
+    [Fact]
+    public async Task UserCancellationPreservesTokenAndDoesNotRetryWithFallback()
+    {
+        var events = new List<string>();
+        using var cancellation = new CancellationTokenSource();
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events, cancelBeforeBootstrap: cancellation),
+            new RetryClient("unused", events),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            new RetryTransportFactory(events),
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt());
+
+        var thrown = await Assert.ThrowsAsync<OperationCanceledException>(() => workflow.AttemptAsync(
+            Profile(), stageChanged: null, acceptedHostKey: null, cancellation.Token));
+
+        Assert.Equal(cancellation.Token, thrown.CancellationToken);
+        Assert.Single(events, value => value.StartsWith("client-create", StringComparison.Ordinal));
+        Assert.Single(clients);
+    }
+
+    [Fact]
+    public async Task PreferredSuccessDoesNotOpenFallbackConnection()
+    {
+        var events = new List<string>();
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events),
+            new RetryClient("unused", events),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            new RetryTransportFactory(events),
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt());
+
+        var outcome = await workflow.AttemptAsync(
+            Profile(), stageChanged: null, acceptedHostKey: null, CancellationToken.None);
+
+        Assert.NotNull(outcome.Result.Session);
+        Assert.Single(events, value => value.StartsWith("client-create", StringComparison.Ordinal));
+        Assert.False(outcome.Result.Session!.BootstrapState.FallbackUsed);
+        Assert.Null(outcome.Result.Session.BootstrapState.PreferredFailureReason);
+        Assert.Single(clients);
+        await outcome.Result.Session.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task BootstrapFallbackDiagnosticContainsOnlyClosedSafeFields()
+    {
+        const string rawMarker = "private-host-payload-marker";
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        var events = new List<string>();
+        var clients = new Queue<RetryClient>(
+        [
+            new RetryClient("preferred", events, QualityBootstrapFailureReason.RemoteSessionClosed),
+            new RetryClient("fallback", events),
+        ]);
+        var handler = new ConnectDeviceHandler(
+            new RetryTransportFactory(events),
+            new RetrySecretProvider(events),
+            new RetryClientFactory(clients, events),
+            new ErrorMapper());
+        var workflow = new ConnectionAttemptWorkflow(handler, new CancelPrompt(), sink);
+
+        var outcome = await workflow.AttemptAsync(
+            ConnectionProfile.Create(
+                Guid.NewGuid(), rawMarker, $"{rawMarker}.invalid", 5900, rawMarker),
+            stageChanged: null,
+            acceptedHostKey: null,
+            CancellationToken.None);
+
+        var diagnostic = Assert.Single(sink.Snapshot());
+        Assert.Equal("QUALITY_BOOTSTRAP_FALLBACK", diagnostic.Code);
+        Assert.Equal(
+            new[]
+            {
+                ("BootstrapAttempt", "Preferred"),
+                ("BootstrapFallbackReason", "RemoteSessionClosed"),
+            },
+            diagnostic.Fields.Select(field => (field.Name, field.Value)));
+        Assert.Null(diagnostic.Exception);
+        Assert.DoesNotContain(rawMarker, JsonSerializer.Serialize(diagnostic), StringComparison.Ordinal);
+        await outcome.Result.Session!.DisposeAsync();
+    }
 
     [Fact]
     public async Task HandshakeFailureExportsOnlySafeStageAndByteCounts()
@@ -284,5 +670,208 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
             throw new InvalidOperationException("diagnostic sink failure");
 
         public IReadOnlyList<SafeDiagnosticEvent> Snapshot() => [];
+    }
+
+    private sealed class BootstrapReasonErrorMapper : IErrorMapper
+    {
+        public WinArdError Map(Exception exception, ConnectionStage stage)
+        {
+            var code = exception is QualityBootstrapCompatibilityException compatibility
+                ? $"BOOTSTRAP_{compatibility.Reason.ToString().ToUpperInvariant()}"
+                : "OTHER";
+            return WinArdError.Create(stage, code, "safe", Guid.NewGuid().ToString("N"));
+        }
+    }
+
+    private sealed class RetryTransportFactory(List<string> events) : IRemoteTransportFactory
+    {
+        private int _count;
+
+        public Task<TransportConnection> ConnectAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken)
+        {
+            var name = Interlocked.Increment(ref _count) == 1 ? "preferred" : "fallback";
+            return Task.FromResult(new TransportConnection(
+                new MemoryStream(),
+                new EndPointDescription(profile.Host, profile.Port),
+                new NamedLifetime(name, events)));
+        }
+    }
+
+    private sealed class FailingTransportFactory(Exception failure) : IRemoteTransportFactory
+    {
+        public int Attempts { get; private set; }
+
+        public Task<TransportConnection> ConnectAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken)
+        {
+            Attempts++;
+            return Task.FromException<TransportConnection>(failure);
+        }
+    }
+
+    private sealed class HostKeyBootstrapTransport(
+        SshHostKeyCandidate candidate,
+        List<string> events) : IRemoteTransportFactory
+    {
+        public int Attempts { get; private set; }
+
+        public Task<TransportConnection> ConnectAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken)
+        {
+            Attempts++;
+            if (Attempts == 1)
+            {
+                events.Add("transport-hostkey");
+                return Task.FromException<TransportConnection>(new SshHostKeyUnknownException(
+                    SshHostKeyVerifier.Verify(candidate, null)));
+            }
+
+            var name = Attempts == 2 ? "preferred" : "fallback";
+            events.Add($"transport-{name}");
+            return Task.FromResult(new TransportConnection(
+                new MemoryStream(),
+                new EndPointDescription(profile.Host, profile.Port),
+                new NamedLifetime(name, events)));
+        }
+    }
+
+    private sealed class FallbackHostKeyTransport(
+        SshHostKeyCandidate candidate,
+        List<string> events) : IRemoteTransportFactory
+    {
+        public int Attempts { get; private set; }
+
+        public Task<TransportConnection> ConnectAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken)
+        {
+            Attempts++;
+            if (Attempts == 2)
+            {
+                events.Add("transport-fallback-hostkey");
+                return Task.FromException<TransportConnection>(new SshHostKeyUnknownException(
+                    SshHostKeyVerifier.Verify(candidate, null)));
+            }
+
+            var name = Attempts == 1 ? "preferred" : "fallback";
+            events.Add($"transport-{name}");
+            return Task.FromResult(new TransportConnection(
+                new MemoryStream(),
+                new EndPointDescription(profile.Host, profile.Port),
+                new NamedLifetime(name, events)));
+        }
+    }
+
+    private sealed class RetrySecretProvider(List<string> events) : IConnectionSecretProvider
+    {
+        private int _count;
+
+        public ValueTask<ISecret> GetSecretAsync(
+            ConnectionProfile profile,
+            CancellationToken cancellationToken)
+        {
+            var name = Interlocked.Increment(ref _count) == 1 ? "preferred" : "fallback";
+            return ValueTask.FromResult<ISecret>(new NamedSecret(name, events));
+        }
+    }
+
+    private sealed class RetryClientFactory(Queue<RetryClient> clients, List<string> events) : IRfbClientFactory
+    {
+        public IRfbClient Create(Stream stream)
+        {
+            var client = clients.Dequeue();
+            events.Add($"client-create-{client.Name}");
+            return client;
+        }
+    }
+
+    private sealed class RetryClient(
+        string name,
+        List<string> events,
+        QualityBootstrapFailureReason? failure = null,
+        Exception? bootstrapFailure = null,
+        Exception? authenticationFailure = null,
+        CancellationTokenSource? cancelBeforeBootstrap = null) : IRfbClient
+    {
+        private QualityBootstrapState _state = QualityBootstrapState.LegacyBgra32;
+        public string Name => name;
+        public QualityBootstrapState BootstrapState => _state;
+        public ArdDisplayCapabilities QualityCapabilities => new(
+            CapabilitySupport.Observed, CapabilitySupport.Observed,
+            CapabilitySupport.Unknown, CapabilitySupport.Unknown, CapabilitySupport.Unknown,
+            false, false, null);
+        public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) =>
+            authenticationFailure is null
+                ? Task.CompletedTask
+                : Task.FromException(authenticationFailure);
+        public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public ValueTask ConfigureBootstrapAsync(
+            QualityBootstrapSettings settings,
+            QualityBootstrapAttempt attempt,
+            CancellationToken cancellationToken)
+        {
+            events.Add($"{name}-configure-{attempt}-{settings.PixelFormat}");
+            _state = new QualityBootstrapState(attempt, settings);
+            return ValueTask.CompletedTask;
+        }
+        public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+            ValueTask.CompletedTask;
+        public ValueTask<RemoteServerMessage> ReceiveBootstrapAsync(CancellationToken cancellationToken)
+        {
+            if (cancelBeforeBootstrap is not null)
+            {
+                cancelBeforeBootstrap.Cancel();
+                return ValueTask.FromException<RemoteServerMessage>(
+                    new OperationCanceledException(cancelBeforeBootstrap.Token));
+            }
+
+            return bootstrapFailure is not null
+                ? ValueTask.FromException<RemoteServerMessage>(bootstrapFailure)
+                : failure is { } reason
+                ? ValueTask.FromException<RemoteServerMessage>(new QualityBootstrapCompatibilityException(reason))
+                : ValueTask.FromResult<RemoteServerMessage>(new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+                    [new RemoteRectangle(0, 0, 1, 1)]));
+        }
+        public ValueTask DisposeAsync()
+        {
+            events.Add($"{name}-client-dispose");
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class NamedSecret(string name, List<string> events) : ISecret
+    {
+        public int Length => 1;
+        public void CopyTo(Span<byte> destination) => destination[0] = 1;
+        public ISecret Clone() => new NamedSecret(name, events);
+        public void Dispose() => events.Add($"{name}-secret-dispose");
+    }
+
+    private sealed class NamedLifetime(string name, List<string> events) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync()
+        {
+            events.Add($"{name}-transport-dispose");
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class TrustPrompt : ISshHostKeyPrompt
+    {
+        public int Count { get; private set; }
+
+        public ValueTask<SshHostKeyPromptDecision> PromptAsync(
+            SshHostKeyPromptRequest request,
+            CancellationToken cancellationToken)
+        {
+            Count++;
+            return ValueTask.FromResult(SshHostKeyPromptDecision.Trust);
+        }
     }
 }

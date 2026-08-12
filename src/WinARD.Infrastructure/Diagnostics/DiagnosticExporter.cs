@@ -183,6 +183,14 @@ public sealed class DiagnosticExporter : IDisposable
         "DecompressedLengthMismatch", "OutputLimitExceeded", "CompletedStreamOrTrailingBytes",
         "IncompleteCompressedSegment",
     };
+    private static readonly HashSet<string> AllowedBootstrapAttempts = new(StringComparer.Ordinal)
+    {
+        "Preferred", "Fallback",
+    };
+    private static readonly HashSet<string> AllowedBootstrapFailureReasons = new(StringComparer.Ordinal)
+    {
+        "DecoderFailure", "UnsupportedEncoding", "MalformedFramebufferUpdate", "RemoteSessionClosed",
+    };
     private static readonly HashSet<string> AllowedRfbHandshakeStages = new(StringComparer.Ordinal)
     {
         "VersionBanner", "VersionParse", "SecurityType33", "SecurityTypeCount", "SecurityTypes",
@@ -595,6 +603,8 @@ public sealed class DiagnosticExporter : IDisposable
             "ServerMessageType" or "EncodingName" or "RectangleIndex" or "ArdEncryptionStage" or
             "ArdEncryptionDirection" or "securityType" or "endpoint" or "fingerprint" or
             "oldFingerprint" or "newFingerprint" => field.Name,
+            "BootstrapAttempt" or "BootstrapFallbackReason" or "FallbackFailed" or
+            "PreferredFailureReason" => field.Name,
             "ArdCiphertextLength" => "ArdEncryptedPacketLength",
             _ => null,
         };
@@ -645,6 +655,10 @@ public sealed class DiagnosticExporter : IDisposable
         "Flags" => ExportFixedHex(value, 4),
         "ProtocolFailureKind" => ExportAllowedValue(value, AllowedProtocolFailureKinds),
         "DecoderFailureReason" => ExportAllowedValue(value, AllowedDecoderFailureReasons),
+        "BootstrapAttempt" => ExportAllowedValue(value, AllowedBootstrapAttempts),
+        "BootstrapFallbackReason" or "PreferredFailureReason" =>
+            ExportAllowedValue(value, AllowedBootstrapFailureReasons),
+        "FallbackFailed" => ExportBoolean(value),
         "RfbHandshakeStage" => ExportAllowedValue(value, AllowedRfbHandshakeStages),
         "ExpectedByteCount" or "ActualByteCount" or "RectangleIndex" or "ArdEncryptedPacketLength" =>
             ExportNonNegativeInt32(value),

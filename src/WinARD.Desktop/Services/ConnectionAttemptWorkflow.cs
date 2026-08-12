@@ -1,4 +1,6 @@
 using System.Globalization;
+using WinARD.Application.Ports;
+using WinARD.Application.Quality;
 using WinARD.Application.Sessions;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
@@ -45,28 +47,64 @@ public sealed class ConnectionAttemptWorkflow(
     {
         ArgumentNullException.ThrowIfNull(profile);
         var hostKeyRetried = false;
+        var bootstrapAttempt = QualityBootstrapAttempt.Preferred;
+        QualityBootstrapFailureReason? preferredFailureReason = null;
         while (true)
         {
             HostKeyFailure? hostKeyFailure = null;
+            QualityBootstrapCompatibilityException? compatibilityFailure = null;
             var result = await _handler.HandleWithFailureObservationAsync(
                 profile,
+                bootstrapAttempt,
+                preferredFailureReason,
                 stageChanged,
                 observation =>
                 {
                     hostKeyFailure = GetHostKeyFailure(observation.Exception, profile);
-                    _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
-                        observation.Error.Code,
-                        observation.Error.CorrelationId,
-                        "Connection attempt stage failed.",
-                        CreateFailureFields(observation.Error.Stage, observation.Exception),
-                        observation.Exception));
+                    compatibilityFailure = observation.Exception as QualityBootstrapCompatibilityException;
+                    if (bootstrapAttempt != QualityBootstrapAttempt.Fallback &&
+                        compatibilityFailure is null)
+                    {
+                        _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
+                            observation.Error.Code,
+                            observation.Error.CorrelationId,
+                            "Connection attempt stage failed.",
+                            CreateFailureFields(
+                                observation.Error.Stage,
+                                observation.Exception,
+                                bootstrapAttempt,
+                                preferredFailureReason),
+                            observation.Exception));
+                    }
+
                     return ValueTask.CompletedTask;
                 },
                 cancellationToken).ConfigureAwait(false);
 
-            if (result.Session is not null || hostKeyRetried ||
-                hostKeyFailure is not { } failure)
+            if (result.Session is not null)
             {
+                return new ConnectionAttemptOutcome(profile, result);
+            }
+
+            if (bootstrapAttempt == QualityBootstrapAttempt.Preferred &&
+                compatibilityFailure is { } preferredFailure)
+            {
+                preferredFailureReason = preferredFailure.Reason;
+                _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
+                    "QUALITY_BOOTSTRAP_FALLBACK",
+                    result.Error?.CorrelationId ?? string.Empty,
+                    "Preferred bootstrap quality was incompatible; retrying with safe quality.",
+                    [
+                        new DiagnosticField("BootstrapAttempt", QualityBootstrapAttempt.Preferred.ToString()),
+                        new DiagnosticField("BootstrapFallbackReason", preferredFailure.Reason.ToString()),
+                    ]));
+                bootstrapAttempt = QualityBootstrapAttempt.Fallback;
+                continue;
+            }
+
+            if (hostKeyRetried || hostKeyFailure is not { } failure)
+            {
+                WriteTerminalFallbackFailure(result, bootstrapAttempt, preferredFailureReason, compatibilityFailure);
                 return new ConnectionAttemptOutcome(profile, result, hostKeyFailure?.Request);
             }
 
@@ -78,6 +116,7 @@ public sealed class ConnectionAttemptWorkflow(
                 : decision == SshHostKeyPromptDecision.Trust;
             if (!accepted)
             {
+                WriteTerminalFallbackFailure(result, bootstrapAttempt, preferredFailureReason, compatibilityFailure);
                 return new ConnectionAttemptOutcome(profile, result, failure.Request);
             }
 
@@ -120,12 +159,24 @@ public sealed class ConnectionAttemptWorkflow(
 
     private static List<DiagnosticField> CreateFailureFields(
         ConnectionStage stage,
-        Exception exception)
+        Exception exception,
+        QualityBootstrapAttempt bootstrapAttempt,
+        QualityBootstrapFailureReason? preferredFailureReason)
     {
-        var fields = new List<DiagnosticField>(5)
+        var fields = new List<DiagnosticField>(7)
         {
             new("stage", stage.ToString()),
         };
+        if (bootstrapAttempt == QualityBootstrapAttempt.Fallback)
+        {
+            fields.Add(new DiagnosticField("BootstrapAttempt", bootstrapAttempt.ToString()));
+            fields.Add(new DiagnosticField("FallbackFailed", bool.TrueString));
+            if (preferredFailureReason is { } reason)
+            {
+                fields.Add(new DiagnosticField("PreferredFailureReason", reason.ToString()));
+            }
+        }
+
         if (exception is not RfbProtocolException { Failure: { } failure })
         {
             return fields;
@@ -152,6 +203,43 @@ public sealed class ConnectionAttemptWorkflow(
         }
 
         return fields;
+    }
+
+    private static List<DiagnosticField> CreateFallbackFailureFields(
+        QualityBootstrapFailureReason preferredFailureReason,
+        QualityBootstrapFailureReason? fallbackFailureReason)
+    {
+        var fields = new List<DiagnosticField>(4)
+        {
+            new("BootstrapAttempt", QualityBootstrapAttempt.Fallback.ToString()),
+            new("FallbackFailed", bool.TrueString),
+            new("PreferredFailureReason", preferredFailureReason.ToString()),
+        };
+        if (fallbackFailureReason is { } reason)
+        {
+            fields.Add(new DiagnosticField("BootstrapFallbackReason", reason.ToString()));
+        }
+
+        return fields;
+    }
+
+    private void WriteTerminalFallbackFailure(
+        ConnectResult result,
+        QualityBootstrapAttempt bootstrapAttempt,
+        QualityBootstrapFailureReason? preferredFailureReason,
+        QualityBootstrapCompatibilityException? compatibilityFailure)
+    {
+        if (bootstrapAttempt != QualityBootstrapAttempt.Fallback ||
+            preferredFailureReason is not { } preferredReason)
+        {
+            return;
+        }
+
+        _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
+            "QUALITY_BOOTSTRAP_FALLBACK",
+            result.Error?.CorrelationId ?? string.Empty,
+            "Safe bootstrap fallback failed.",
+            CreateFallbackFailureFields(preferredReason, compatibilityFailure?.Reason)));
     }
 
     private sealed record HostKeyFailure(

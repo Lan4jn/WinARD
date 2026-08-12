@@ -268,6 +268,16 @@ public sealed class QualityBootstrapPlannerTests
     }
 
     [Fact]
+    public void BootstrapStateRetainsTheExactPublicTwoParameterConstructor()
+    {
+        var constructor = typeof(QualityBootstrapState).GetConstructor(
+            [typeof(QualityBootstrapAttempt), typeof(QualityBootstrapSettings)]);
+
+        Assert.NotNull(constructor);
+        Assert.Equal(2, constructor!.GetParameters().Length);
+    }
+
+    [Fact]
     public void Planner_rejects_null_inputs()
     {
         Assert.Throws<ArgumentNullException>(() => QualityBootstrapPlanner.CreatePlan(

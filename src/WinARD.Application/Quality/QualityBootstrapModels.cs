@@ -105,21 +105,43 @@ public sealed record QualityBootstrapState
     public QualityBootstrapState(
         QualityBootstrapAttempt attempt,
         QualityBootstrapSettings actualQuality)
-        : this((QualityBootstrapAttempt?)attempt, actualQuality)
+        : this(attempt, actualQuality, preferredFailureReason: null)
+    {
+    }
+
+    public QualityBootstrapState(
+        QualityBootstrapAttempt attempt,
+        QualityBootstrapSettings actualQuality,
+        QualityBootstrapFailureReason? preferredFailureReason)
+        : this((QualityBootstrapAttempt?)attempt, actualQuality, preferredFailureReason)
     {
     }
 
     private QualityBootstrapState(
         QualityBootstrapAttempt? attempt,
-        QualityBootstrapSettings actualQuality)
+        QualityBootstrapSettings actualQuality,
+        QualityBootstrapFailureReason? preferredFailureReason = null)
     {
         if (attempt is { } value && !Enum.IsDefined(value))
         {
             throw new ArgumentOutOfRangeException(nameof(attempt));
         }
 
+        if (preferredFailureReason is { } failureReason && !Enum.IsDefined(failureReason))
+        {
+            throw new ArgumentOutOfRangeException(nameof(preferredFailureReason));
+        }
+
+        if (preferredFailureReason is not null && attempt != QualityBootstrapAttempt.Fallback)
+        {
+            throw new ArgumentException(
+                "A preferred failure reason is only valid for a fallback attempt.",
+                nameof(preferredFailureReason));
+        }
+
         Attempt = attempt;
         ActualQuality = actualQuality ?? throw new ArgumentNullException(nameof(actualQuality));
+        PreferredFailureReason = preferredFailureReason;
     }
 
     public static QualityBootstrapState LegacyBgra32 { get; } = new(
@@ -132,4 +154,8 @@ public sealed record QualityBootstrapState
     public QualityBootstrapAttempt? Attempt { get; }
 
     public QualityBootstrapSettings ActualQuality { get; }
+
+    public bool FallbackUsed => Attempt == QualityBootstrapAttempt.Fallback;
+
+    public QualityBootstrapFailureReason? PreferredFailureReason { get; }
 }

@@ -66,7 +66,13 @@ public sealed class ConnectDeviceHandler
         QualityBootstrapAttempt attempt,
         Action<ConnectionStage>? stageChanged,
         CancellationToken cancellationToken) =>
-        await HandleCoreAsync(profile, attempt, stageChanged, failureObserved: null, cancellationToken)
+        await HandleCoreAsync(
+            profile,
+            attempt,
+            preferredFailureReason: null,
+            stageChanged,
+            failureObserved: null,
+            cancellationToken)
             .ConfigureAwait(false);
 
     internal async Task<ConnectResult> HandleWithFailureObservationAsync(
@@ -74,9 +80,25 @@ public sealed class ConnectDeviceHandler
         Action<ConnectionStage>? stageChanged,
         Func<ConnectionFailureObservation, ValueTask> failureObserved,
         CancellationToken cancellationToken) =>
-        await HandleCoreAsync(
+        await HandleWithFailureObservationAsync(
             profile,
             QualityBootstrapAttempt.Preferred,
+            preferredFailureReason: null,
+            stageChanged,
+            failureObserved,
+            cancellationToken).ConfigureAwait(false);
+
+    internal async Task<ConnectResult> HandleWithFailureObservationAsync(
+        ConnectionProfile profile,
+        QualityBootstrapAttempt attempt,
+        QualityBootstrapFailureReason? preferredFailureReason,
+        Action<ConnectionStage>? stageChanged,
+        Func<ConnectionFailureObservation, ValueTask> failureObserved,
+        CancellationToken cancellationToken) =>
+        await HandleCoreAsync(
+            profile,
+            attempt,
+            preferredFailureReason,
             stageChanged,
             failureObserved ?? throw new ArgumentNullException(nameof(failureObserved)),
             cancellationToken).ConfigureAwait(false);
@@ -84,6 +106,7 @@ public sealed class ConnectDeviceHandler
     private async Task<ConnectResult> HandleCoreAsync(
         ConnectionProfile profile,
         QualityBootstrapAttempt attempt,
+        QualityBootstrapFailureReason? preferredFailureReason,
         Action<ConnectionStage>? stageChanged,
         Func<ConnectionFailureObservation, ValueTask>? failureObserved,
         CancellationToken cancellationToken)
@@ -91,6 +114,18 @@ public sealed class ConnectDeviceHandler
         if (!Enum.IsDefined(attempt))
         {
             throw new ArgumentOutOfRangeException(nameof(attempt));
+        }
+
+        if (preferredFailureReason is { } failureReason && !Enum.IsDefined(failureReason))
+        {
+            throw new ArgumentOutOfRangeException(nameof(preferredFailureReason));
+        }
+
+        if (preferredFailureReason is not null && attempt != QualityBootstrapAttempt.Fallback)
+        {
+            throw new ArgumentException(
+                "A preferred failure reason is only valid for a fallback attempt.",
+                nameof(preferredFailureReason));
         }
 
         ArgumentNullException.ThrowIfNull(profile);
@@ -158,7 +193,12 @@ public sealed class ConnectDeviceHandler
             stageChanged?.Invoke(ConnectionStage.Connected);
             var result = new ConnectResult(
                 stateMachine.Current,
-                new RemoteSession(stateMachine, transport, client, preloadedOwnership),
+                new RemoteSession(
+                    stateMachine,
+                    transport,
+                    client,
+                    preloadedOwnership,
+                    preferredFailureReason),
                 null);
             sessionOwnsResources = true;
             return result;
