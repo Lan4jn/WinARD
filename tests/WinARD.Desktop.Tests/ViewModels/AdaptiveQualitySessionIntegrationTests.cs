@@ -910,7 +910,8 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         await runtime.NextReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         var committed = viewModel.CreateDiagnosticQualitySnapshot();
 
-        Assert.Same(initial, whileTransitionPending);
+        Assert.Same(initial.QualityPresentation, whileTransitionPending.QualityPresentation);
+        Assert.Equal(initial.BootstrapState, whileTransitionPending.BootstrapState);
         Assert.NotSame(initial, committed);
         Assert.NotNull(committed.QualityPresentation.Decision);
         Assert.Equal(
@@ -918,6 +919,62 @@ public sealed class AdaptiveQualitySessionIntegrationTests
             committed.Performance.Performance);
         Assert.True(committed.Performance.Performance.SampleSequence > 0);
         Assert.Equal(capabilities, committed.QualityCapabilities);
+    }
+
+    [Fact]
+    public async Task Diagnostic_transfer_expires_while_quality_transition_is_blocked_without_mixing_quality()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = new SessionPerformanceTracker(time, FrameRefreshPolicy.Automatic, 60);
+        var runtime = new StaleCompletingTransitionRuntime();
+        var profile = Profile(QualityColor.Color16);
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime, new AsyncLifetime(), new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(), null, null, profile, timeProvider: time,
+            performanceTracker: tracker, adaptiveQualityCapabilities: FullCapabilities());
+        tracker.ObserveFrame(new RemoteUpdateStatistics(1, new Dictionary<int, int>(),
+                new RemoteFramebufferTransferStatistics(1, 1, 1, 1, null,
+                    new Dictionary<int, int>(), new Dictionary<int, long>(),
+                    new Dictionary<int, long>())), [], new RemoteFramebufferSize(1, 1),
+            TimeSpan.Zero, TimeSpan.Zero, RemoteRuntimePerformanceSnapshot.Empty, default);
+        var old = viewModel.CreateDiagnosticQualitySnapshot();
+
+        await viewModel.StartAsync(default);
+        await runtime.TransitionEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        time.Advance(TimeSpan.FromSeconds(5));
+        var blocked = viewModel.CreateDiagnosticQualitySnapshot();
+
+        Assert.Equal(SessionTransferDiagnosticSnapshot.Empty, blocked.Performance.Transfer);
+        Assert.Same(old.QualityPresentation, blocked.QualityPresentation);
+        Assert.Equal(old.BootstrapState, blocked.BootstrapState);
+        Assert.Equal(old.PreferredBootstrap, blocked.PreferredBootstrap);
+        runtime.ReleaseTransition.TrySetResult();
+        await runtime.NextReceiveEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.NotSame(blocked.QualityPresentation,
+            viewModel.CreateDiagnosticQualitySnapshot().QualityPresentation);
+    }
+
+    [Fact]
+    public async Task Diagnostic_transfer_cache_does_not_treat_clock_rollback_as_fresh()
+    {
+        var time = new ManualTimeProvider();
+        time.Advance(TimeSpan.FromSeconds(5));
+        var tracker = new SessionPerformanceTracker(time, FrameRefreshPolicy.Automatic, 60);
+        var runtime = new TransitionRuntime(new ConcurrentQueue<string>(), frameCount: 0);
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime, new AsyncLifetime(), new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(), null, null, qualityProfile: QualityProfile.Automatic,
+            timeProvider: time, performanceTracker: tracker);
+        tracker.ObserveFrame(new RemoteUpdateStatistics(1, new Dictionary<int, int>(),
+                new RemoteFramebufferTransferStatistics(1, 1, 1, 1, null,
+                    new Dictionary<int, int>(), new Dictionary<int, long>(),
+                    new Dictionary<int, long>())), [], new RemoteFramebufferSize(1, 1),
+            TimeSpan.Zero, TimeSpan.Zero, RemoteRuntimePerformanceSnapshot.Empty, default);
+        Assert.Equal(1, viewModel.CreateDiagnosticQualitySnapshot().Performance.Transfer.RectangleCount);
+
+        time.Advance(TimeSpan.FromSeconds(-5));
+        Assert.Equal(SessionTransferDiagnosticSnapshot.Empty,
+            viewModel.CreateDiagnosticQualitySnapshot().Performance.Transfer);
     }
 
     [Fact]
@@ -990,6 +1047,112 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         Assert.NotNull(old.QualityPresentation.Decision);
         Assert.Same(QualityProfile.Original, current.QualityPresentation.Profile);
         Assert.Null(current.QualityPresentation.Decision);
+    }
+
+    [Fact]
+    public async Task Diagnostic_snapshot_keeps_the_connection_preferred_bootstrap_after_profile_change()
+    {
+        var preferredProfile = QualityProfile.CreateCustom(
+            null, QualityColor.Color16, QualityScale.Native, FrameRefreshPolicy.Automatic,
+            allowAutomaticGrayscale: false, colorLocked: true, scaleLocked: true);
+        var preferred = QualityBootstrapPlanner.CreatePlan(
+            preferredProfile, FullCapabilities(), new QualityDecoderGates()).Preferred;
+        var fallback = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Bgra32, [6, 16, 0, 1, -239, -223], QualityBootstrapReason.SafeFallback);
+        var runtime = new TransitionRuntime(new ConcurrentQueue<string>(), frameCount: 0,
+            bootstrapState: new QualityBootstrapState(
+            QualityBootstrapAttempt.Fallback,
+            fallback,
+            QualityBootstrapFailureReason.DecoderFailure));
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime, new AsyncLifetime(), new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(), clipboardBridge: null, diagnosticSink: null, preferredProfile,
+            adaptiveQualityCapabilities: FullCapabilities());
+
+        Assert.Equal(preferred, viewModel.CreateDiagnosticQualitySnapshot().PreferredBootstrap);
+        viewModel.SetQualityProfile(QualityProfile.Original);
+        var snapshot = viewModel.CreateDiagnosticQualitySnapshot();
+
+        Assert.Equal(preferred, snapshot.PreferredBootstrap);
+        Assert.Same(QualityProfile.Original, snapshot.QualityPresentation.Profile);
+        Assert.Equal(RemotePixelFormatKind.Bgra32, snapshot.BootstrapState.ActualQuality.PixelFormat);
+    }
+
+    [Fact]
+    public async Task Diagnostic_snapshot_refreshes_transfer_expiry_without_a_ui_publication()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = new SessionPerformanceTracker(
+            time, FrameRefreshPolicy.Automatic, targetFramesPerSecond: 60);
+        var runtime = new TransitionRuntime(new ConcurrentQueue<string>(), frameCount: 0);
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime, new AsyncLifetime(), new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(), clipboardBridge: null, diagnosticSink: null,
+            qualityProfile: QualityProfile.Automatic, timeProvider: time,
+            performanceTracker: tracker);
+        tracker.ObserveFrame(
+            new RemoteUpdateStatistics(10, new Dictionary<int, int>(),
+                new RemoteFramebufferTransferStatistics(1, 10, 10, 10, null,
+                    new Dictionary<int, int>(), new Dictionary<int, long>(),
+                    new Dictionary<int, long>())),
+            [], new RemoteFramebufferSize(10, 10), TimeSpan.Zero, TimeSpan.Zero,
+            RemoteRuntimePerformanceSnapshot.Empty, default);
+
+        Assert.Equal(1, viewModel.CreateDiagnosticQualitySnapshot().Performance.Transfer.RectangleCount);
+        time.Advance(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(SessionTransferDiagnosticSnapshot.Empty,
+            viewModel.CreateDiagnosticQualitySnapshot().Performance.Transfer);
+    }
+
+    [Fact]
+    public async Task Repeated_diagnostic_export_without_new_transfer_reuses_the_snapshot_instance()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = new SessionPerformanceTracker(time, FrameRefreshPolicy.Automatic, 60);
+        var runtime = new TransitionRuntime(new ConcurrentQueue<string>(), frameCount: 0);
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime, new AsyncLifetime(), new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(), null, null, qualityProfile: QualityProfile.Automatic,
+            timeProvider: time, performanceTracker: tracker);
+        tracker.ObserveFrame(new RemoteUpdateStatistics(0, new Dictionary<int, int>(),
+                RemoteFramebufferTransferStatistics.Empty),
+            [new RemoteRectangle(0, 0, 5, 10)], new RemoteFramebufferSize(10, 10),
+            TimeSpan.Zero, TimeSpan.Zero, RemoteRuntimePerformanceSnapshot.Empty, default);
+
+        var first = viewModel.CreateDiagnosticQualitySnapshot();
+        var second = viewModel.CreateDiagnosticQualitySnapshot();
+
+        Assert.Same(first, second);
+        Assert.Equal(500, first.Performance.Transfer.DirtyCoveragePermille);
+    }
+
+    [Fact]
+    public async Task Same_transfer_values_with_a_new_version_advance_the_export_cache_once()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = new SessionPerformanceTracker(time, FrameRefreshPolicy.Automatic, 60);
+        var runtime = new TransitionRuntime(new ConcurrentQueue<string>(), frameCount: 0);
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime, new AsyncLifetime(), new EventPresenter(new ConcurrentQueue<string>()),
+            new InlineDispatcher(), null, null, qualityProfile: QualityProfile.Automatic,
+            timeProvider: time, performanceTracker: tracker);
+        static void ObserveSame(SessionPerformanceTracker tracker) => tracker.ObserveFrame(
+            new RemoteUpdateStatistics(1, new Dictionary<int, int>(),
+                new RemoteFramebufferTransferStatistics(1, 1, 1, 1, null,
+                    new Dictionary<int, int>(), new Dictionary<int, long>(),
+                    new Dictionary<int, long>())), [], new RemoteFramebufferSize(1, 1),
+            TimeSpan.Zero, TimeSpan.Zero, RemoteRuntimePerformanceSnapshot.Empty, default);
+
+        ObserveSame(tracker);
+        var first = viewModel.CreateDiagnosticQualitySnapshot();
+        time.Advance(TimeSpan.FromTicks(-1));
+        ObserveSame(tracker);
+        var afterVersionChange = viewModel.CreateDiagnosticQualitySnapshot();
+        var repeated = viewModel.CreateDiagnosticQualitySnapshot();
+
+        Assert.Same(first, afterVersionChange);
+        Assert.Same(afterVersionChange, repeated);
     }
 
     [Fact]
@@ -1159,6 +1322,17 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         QualityScale.Native,
         FrameRefreshPolicy.Automatic,
         allowAutomaticGrayscale: color is QualityColor.Automatic or QualityColor.Grayscale);
+
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private long _timestamp;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => Interlocked.Read(ref _timestamp);
+        public override DateTimeOffset GetUtcNow() =>
+            DateTimeOffset.UnixEpoch + TimeSpan.FromTicks(GetTimestamp());
+        public void Advance(TimeSpan duration) =>
+            Interlocked.Add(ref _timestamp, duration.Ticks);
+    }
 
     private sealed class TransitionRuntime(
         ConcurrentQueue<string> events,

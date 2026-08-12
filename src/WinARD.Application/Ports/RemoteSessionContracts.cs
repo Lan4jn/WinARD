@@ -196,7 +196,10 @@ public sealed class RemoteFramebufferTransferStatistics
             ? null
             : (long)Math.Min(
                 long.MaxValue,
-                decimal.Truncate((decimal)wirePayloadBytes * 1000 / pixelArea));
+                decimal.Round(
+                    (decimal)wirePayloadBytes * 1000 / pixelArea,
+                    0,
+                    MidpointRounding.AwayFromZero));
 
     private static Dictionary<int, TValue> MergeDictionaries<TValue>(
         IReadOnlyDictionary<int, TValue> first,

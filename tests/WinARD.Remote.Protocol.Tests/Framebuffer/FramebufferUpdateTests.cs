@@ -14,6 +14,14 @@ namespace WinARD.Remote.Protocol.Tests.Framebuffer;
 public sealed class FramebufferUpdateTests
 {
     [Fact]
+    public void Transfer_statistics_round_bytes_per_pixel_milli_away_from_zero()
+    {
+        var statistics = new FramebufferTransferStatistics(
+            [new RectangleTransferStatistics(0, 1, 1, 16, true)]);
+
+        Assert.Equal(63, statistics.BytesPerPixelMilli);
+    }
+    [Fact]
     public async Task Update_reports_each_rectangle_encoding_count()
     {
         using var framebuffer = new FramebufferModel(2, 1, ProtocolLimits.Default);

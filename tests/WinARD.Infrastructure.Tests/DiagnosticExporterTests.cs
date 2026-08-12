@@ -260,6 +260,99 @@ public sealed class DiagnosticExporterTests : IDisposable
     }
 
     [Fact]
+    public async Task TransferEfficiencyExportsOnlyAggregateClosedSchemaValues()
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "transfer-allowlist.zip");
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
+        var context = DiagnosticExportContext.Empty with
+        {
+            Transfer = new DiagnosticTransferSummary(
+                "Rgb565", "Bgra32", "Fallback", "DecoderFailure", "ZrleFirst",
+                3, 2_000, 800, 400, 200, "Color16", "Full32",
+                new Dictionary<string, long>
+                {
+                    ["Zlib"] = 700,
+                    ["CopyRect"] = 100,
+                    ["Other"] = 9,
+                }),
+        };
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var transfer = document.RootElement.GetProperty("transfer");
+        Assert.Equal("Rgb565", transfer.GetProperty("PreferredPixelFormat").GetString());
+        Assert.Equal("Bgra32", transfer.GetProperty("AppliedPixelFormat").GetString());
+        Assert.Equal("Fallback", transfer.GetProperty("BootstrapAttempt").GetString());
+        Assert.Equal("DecoderFailure", transfer.GetProperty("BootstrapFallbackReason").GetString());
+        Assert.Equal("ZrleFirst", transfer.GetProperty("PreferredEncodingOrder").GetString());
+        Assert.Equal(3, transfer.GetProperty("RectangleCount").GetInt64());
+        Assert.Equal(2_000, transfer.GetProperty("PixelArea").GetInt64());
+        Assert.Equal(800, transfer.GetProperty("WirePayloadBytes").GetInt64());
+        Assert.Equal(400, transfer.GetProperty("BytesPerPixelMilli").GetInt64());
+        Assert.Equal(200, transfer.GetProperty("DirtyCoveragePermille").GetInt32());
+        Assert.Equal(700, transfer.GetProperty("EncodingZlibWireBytes").GetInt64());
+        Assert.Equal(9, transfer.GetProperty("EncodingOtherWireBytes").GetInt64());
+        Assert.DoesNotContain(transfer.EnumerateObject(), property =>
+            property.Name.Contains("Coordinates", StringComparison.OrdinalIgnoreCase) ||
+            property.Name.Contains("Rectangles", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task TransferEfficiencyDropsEveryInvalidValueAndLeaksNoArbitraryMarkers()
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "transfer-private.zip");
+        string[] markers =
+        [
+            "host-transfer-marker", "username-transfer-marker", "coordinate-transfer-marker",
+            "payload-transfer-marker", "pixel-transfer-marker", "exception-transfer-marker",
+            "encoding-314159-transfer-marker",
+        ];
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        sink.Write(new SafeDiagnosticEventInput(
+            "EVENT", Guid.NewGuid().ToString("N"), string.Join('|', markers), [],
+            new InvalidOperationException(markers[5])));
+        using var exporter = new DiagnosticExporter(sink, redactor);
+        var context = DiagnosticExportContext.Empty with
+        {
+            Profiles =
+            [
+                new DiagnosticProfileSummary(
+                    "Remote session", markers[0], 5900, markers[1], "RFB 3.x", "ARD-30"),
+            ],
+            Transfer = new DiagnosticTransferSummary(
+                markers[4], markers[4], markers[0], markers[5], markers[6],
+                -1, -2, -3, -4, 1001, markers[1], markers[2],
+                new Dictionary<string, long>
+                {
+                    [markers[6]] = 314_159,
+                    ["Zlib"] = -7,
+                }),
+        };
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        var allEntries = await ReadAllAsync(archive);
+        foreach (var marker in markers)
+        {
+            Assert.DoesNotContain(marker, allEntries, StringComparison.OrdinalIgnoreCase);
+        }
+
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var transfer = document.RootElement.GetProperty("transfer");
+        foreach (var property in transfer.EnumerateObject())
+        {
+            Assert.Equal(JsonValueKind.Null, property.Value.ValueKind);
+        }
+    }
+
+    [Fact]
     public async Task AdaptiveQualityRejectsUnlistedStringValuesAndLeaksNoSensitiveMarkers()
     {
         Directory.CreateDirectory(_directory);

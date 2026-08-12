@@ -13,6 +13,226 @@ namespace WinARD.Desktop.Tests.ViewModels;
 public sealed class SessionPerformanceTrackerTests
 {
     [Fact]
+    public void Transfer_coverage_uses_frame_dirty_rectangles_instead_of_pixel_transfer_area()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+
+        ObserveTransferFrame(tracker, new(100, 100), 1, 10, 1,
+            new Dictionary<int, long>(), [new RemoteRectangle(0, 0, 50, 100)]);
+
+        var transfer = tracker.CurrentDiagnostics.Transfer;
+        Assert.Equal(1, transfer.PixelArea);
+        Assert.Equal(500, transfer.DirtyCoveragePermille);
+    }
+
+    [Fact]
+    public void Transfer_coverage_preserves_dirty_coverage_for_copy_rect_and_overlapping_rectangles()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+
+        ObserveTransferFrame(tracker, new(100, 100), 1, 0, 0,
+            new Dictionary<int, long> { [(int)RfbEncodingType.CopyRect] = 0 },
+            [new RemoteRectangle(0, 0, 50, 100), new RemoteRectangle(0, 0, 50, 100)]);
+
+        Assert.Equal(500, tracker.CurrentDiagnostics.Transfer.DirtyCoveragePermille);
+    }
+
+    [Fact]
+    public void Transfer_buckets_do_not_merge_boundary_or_long_gap_samples_and_expire_when_idle()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        ObserveTransferFrame(tracker, new(10, 10), 1, 10, 10, new Dictionary<int, long>(),
+            [new RemoteRectangle(0, 0, 5, 10)]);
+        Assert.Equal(1, tracker.CurrentDiagnostics.Transfer.RectangleCount);
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveTransferFrame(tracker, new(10, 10), 2, 20, 20, new Dictionary<int, long>(), []);
+        Assert.Equal(2, tracker.CurrentDiagnostics.Transfer.RectangleCount);
+
+        time.Advance(TimeSpan.FromSeconds(10));
+        ObserveTransferFrame(tracker, new(10, 10), 3, 30, 30, new Dictionary<int, long>(), []);
+        Assert.Equal(3, tracker.CurrentDiagnostics.Transfer.RectangleCount);
+
+        time.Advance(TimeSpan.FromSeconds(5));
+        Assert.Equal(SessionTransferDiagnosticSnapshot.Empty, tracker.CurrentDiagnostics.Transfer);
+    }
+
+    [Fact]
+    public void Transfer_bucket_resets_safely_when_monotonic_clock_moves_backwards()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        ObserveTransferFrame(tracker, new(10, 10), 1, 10, 10, new Dictionary<int, long>(), []);
+        time.Advance(TimeSpan.FromMilliseconds(-1));
+        ObserveTransferFrame(tracker, new(10, 10), 2, 20, 20, new Dictionary<int, long>(), []);
+
+        Assert.Equal(2, tracker.CurrentDiagnostics.Transfer.RectangleCount);
+    }
+
+    [Fact]
+    public void Late_read_does_not_extend_the_transfer_time_to_live()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        ObserveTransferFrame(tracker, new(10, 10), 1, 10, 10, new Dictionary<int, long>(), []);
+
+        time.Advance(TimeSpan.FromSeconds(4.9));
+        Assert.Equal(1, tracker.CurrentDiagnostics.Transfer.RectangleCount);
+        time.Advance(TimeSpan.FromMilliseconds(100));
+
+        Assert.Equal(SessionTransferDiagnosticSnapshot.Empty, tracker.CurrentDiagnostics.Transfer);
+    }
+
+    [Fact]
+    public void Dirty_coverage_bounds_pathological_rectangle_lists()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        var dirty = Enumerable.Range(0, 4096)
+            .Select(index => new RemoteRectangle(index % 100, index / 100, 1, 1))
+            .ToArray();
+
+        ObserveTransferFrame(tracker, new(100, 100), 1, 1, 1,
+            new Dictionary<int, long>(), dirty);
+
+        Assert.InRange(tracker.CurrentDiagnostics.Transfer.DirtyCoveragePermille, 0, 1000);
+    }
+
+    [Fact]
+    public void Dirty_coverage_is_exact_for_large_fragmented_and_overlapping_input()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        var dirty = Enumerable.Range(0, 4096)
+            .Select(index => index < 8
+                ? new RemoteRectangle(index * 10, 0, 20, 10)
+                : new RemoteRectangle(2000 + index, 2000, 1, 1))
+            .ToArray();
+
+        ObserveTransferFrame(tracker, new(100, 100), 1, 1, 1,
+            new Dictionary<int, long>(), dirty);
+
+        Assert.Equal(90, tracker.CurrentDiagnostics.Transfer.DirtyCoveragePermille);
+    }
+
+    [Fact]
+    public void Newer_partial_window_wins_over_completed_window_and_uses_its_own_sample_ttl()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        ObserveTransferFrame(tracker, new(10, 10), 1, 10, 10, new Dictionary<int, long>(), []);
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveTransferFrame(tracker, new(10, 10), 2, 20, 20, new Dictionary<int, long>(), []);
+        Assert.Equal(2, tracker.CurrentDiagnostics.Transfer.RectangleCount);
+
+        time.Advance(TimeSpan.FromSeconds(4.8));
+        Assert.Equal(2, tracker.CurrentDiagnostics.Transfer.RectangleCount);
+        time.Advance(TimeSpan.FromMilliseconds(200));
+        Assert.Equal(SessionTransferDiagnosticSnapshot.Empty, tracker.CurrentDiagnostics.Transfer);
+    }
+
+    [Fact]
+    public void Copy_rect_only_coverage_is_published_and_expires()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        ObserveTransferFrame(tracker, new(10, 10), 0, 0, 0, new Dictionary<int, long>(),
+            [new RemoteRectangle(0, 0, 5, 10)]);
+        Assert.Equal(500, tracker.CurrentDiagnostics.Transfer.DirtyCoveragePermille);
+        time.Advance(TimeSpan.FromSeconds(5));
+        Assert.Equal(SessionTransferDiagnosticSnapshot.Empty, tracker.CurrentDiagnostics.Transfer);
+    }
+
+    [Fact]
+    public void Numeric_dirty_summaries_are_weighted_by_their_original_capacity()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+
+        tracker.ObserveFrame(RemoteUpdateStatistics.Empty, 50_000, 100_000,
+            new RemoteFramebufferSize(100, 100), TimeSpan.Zero, TimeSpan.Zero,
+            RemoteRuntimePerformanceSnapshot.Empty, default);
+        tracker.ObserveFrame(RemoteUpdateStatistics.Empty, 10_000, 10_000,
+            new RemoteFramebufferSize(100, 100), TimeSpan.Zero, TimeSpan.Zero,
+            RemoteRuntimePerformanceSnapshot.Empty, default);
+
+        Assert.Equal(545, tracker.CurrentDiagnostics.Transfer.DirtyCoveragePermille);
+    }
+
+    [Fact]
+    public void Transfer_diagnostics_publish_only_the_last_completed_bucket_and_aggregate_without_geometry()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+
+        ObserveTransferFrame(tracker, new(100, 100), rectangleCount: 2, wireBytes: 500,
+            pixelArea: 5_000, new Dictionary<int, long> { [(int)RfbEncodingType.Zlib] = 500 });
+
+        Assert.Equal(2, tracker.CurrentDiagnostics.Transfer.RectangleCount);
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveTransferFrame(tracker, new(100, 100), rectangleCount: 3, wireBytes: 600,
+            pixelArea: 2_000, new Dictionary<int, long> { [314_159] = 600 });
+
+        var transfer = tracker.CurrentDiagnostics.Transfer;
+        Assert.Equal(3, transfer.RectangleCount);
+        Assert.Equal(2_000, transfer.PixelArea);
+        Assert.Equal(600, transfer.WirePayloadBytes);
+        Assert.Equal(300, transfer.BytesPerPixelMilli);
+        Assert.Equal(0, transfer.DirtyCoveragePermille);
+        Assert.Empty(transfer.WirePayloadBytesByEncoding);
+        Assert.Equal(600, transfer.OtherEncodingWirePayloadBytes);
+        Assert.DoesNotContain(transfer.GetType().GetProperties(), property =>
+            property.Name.Contains("Rectangle", StringComparison.OrdinalIgnoreCase) &&
+            property.PropertyType != typeof(long));
+        Assert.DoesNotContain(transfer.GetType().GetProperties(), property =>
+            property.Name.Contains("Coordinate", StringComparison.OrdinalIgnoreCase) ||
+            property.Name.Contains("Payload", StringComparison.OrdinalIgnoreCase) &&
+            property.PropertyType != typeof(long) &&
+            property.PropertyType != typeof(IReadOnlyDictionary<int, long>));
+    }
+
+    [Fact]
+    public void Transfer_diagnostics_use_null_ratio_for_zero_area_and_clamp_per_frame_coverage()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        ObserveTransferFrame(tracker, new(10, 10), 1, 10, 1_000, new Dictionary<int, long>(),
+            [new RemoteRectangle(0, 0, 10, 10)]);
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveTransferFrame(tracker, new(10, 10), 0, 0, 0, new Dictionary<int, long>());
+
+        Assert.Equal(0, tracker.CurrentDiagnostics.Transfer.DirtyCoveragePermille);
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        ObserveTransferFrame(tracker, new(10, 10), 0, 20, 0, new Dictionary<int, long>());
+
+        Assert.Null(tracker.CurrentDiagnostics.Transfer.BytesPerPixelMilli);
+    }
+
+    [Fact]
+    public void Transfer_diagnostics_saturate_counters_and_merge_unknown_encodings_into_other()
+    {
+        var time = new ManualTimeProvider();
+        var tracker = CreateTracker(time);
+        ObserveTransferFrame(tracker, new(int.MaxValue, int.MaxValue), long.MaxValue, long.MaxValue,
+            long.MaxValue, new Dictionary<int, long> { [700] = long.MaxValue });
+        ObserveTransferFrame(tracker, new(int.MaxValue, int.MaxValue), 1, 1,
+            1, new Dictionary<int, long> { [701] = 1 });
+
+        var transfer = tracker.CurrentDiagnostics.Transfer;
+        Assert.Equal(long.MaxValue, transfer.RectangleCount);
+        Assert.Equal(long.MaxValue, transfer.PixelArea);
+        Assert.Equal(long.MaxValue, transfer.WirePayloadBytes);
+        Assert.Equal(long.MaxValue, transfer.OtherEncodingWirePayloadBytes);
+        Assert.Equal(1000, transfer.BytesPerPixelMilli);
+        Assert.InRange(transfer.DirtyCoveragePermille, 0, 1000);
+        Assert.Empty(transfer.WirePayloadBytesByEncoding);
+    }
+    [Fact]
     public void One_second_window_reports_frames_bytes_and_primary_pixel_encoding()
     {
         var time = new ManualTimeProvider();
@@ -370,7 +590,7 @@ public sealed class SessionPerformanceTrackerTests
     }
 
     [Fact]
-    public void Dirty_coverage_clips_rectangles_sums_overlap_conservatively_and_clamps()
+    public void Dirty_coverage_clips_rectangles_and_uses_their_union()
     {
         var time = new ManualTimeProvider();
         var tracker = CreateTracker(time);
@@ -389,7 +609,7 @@ public sealed class SessionPerformanceTrackerTests
             ],
             size: new(100, 100));
 
-        Assert.Equal(1, tracker.CreateQualityObservation().DirtyCoverage);
+        Assert.Equal(0.75, tracker.CreateQualityObservation().DirtyCoverage);
     }
 
     [Fact]
@@ -638,6 +858,34 @@ public sealed class SessionPerformanceTrackerTests
         tracker.ObserveFrame(
             new RemoteUpdateStatistics(bytes, new Dictionary<int, int>()),
             dirty,
+            size,
+            TimeSpan.Zero,
+            TimeSpan.Zero,
+            RemoteRuntimePerformanceSnapshot.Empty,
+            default);
+
+    private static SessionPerformanceSnapshot ObserveTransferFrame(
+        SessionPerformanceTracker tracker,
+        RemoteFramebufferSize size,
+        long rectangleCount,
+        long wireBytes,
+        long pixelArea,
+        IReadOnlyDictionary<int, long> wireBytesByEncoding,
+        IReadOnlyList<RemoteRectangle>? dirty = null) =>
+        tracker.ObserveFrame(
+            new RemoteUpdateStatistics(
+                wireBytes,
+                new Dictionary<int, int>(),
+                new RemoteFramebufferTransferStatistics(
+                    rectangleCount,
+                    wireBytes,
+                    wireBytes,
+                    pixelArea,
+                    null,
+                    new Dictionary<int, int>(),
+                    wireBytesByEncoding,
+                    wireBytesByEncoding)),
+            dirty ?? [],
             size,
             TimeSpan.Zero,
             TimeSpan.Zero,

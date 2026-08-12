@@ -19,7 +19,14 @@ internal sealed record RemoteSessionDiagnosticQualitySnapshot(
     SessionPerformanceDiagnosticSnapshot Performance,
     QualityPresentationSnapshot QualityPresentation,
     QualityObservation QualityObservation,
-    ArdDisplayCapabilities QualityCapabilities);
+    ArdDisplayCapabilities QualityCapabilities)
+{
+    public QualityBootstrapState BootstrapState { get; init; } =
+        QualityBootstrapState.LegacyBgra32;
+
+    public QualityBootstrapSettings PreferredBootstrap { get; init; } =
+        QualityBootstrapState.LegacyBgra32.ActualQuality;
+}
 
 public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 {
@@ -48,6 +55,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private readonly ArdDisplayCapabilities _adaptiveQualityCapabilities;
     private readonly QualityDecoderGates _qualityDecoderGates;
     private readonly QualityBootstrapState _bootstrapState;
+    private readonly QualityBootstrapSettings _preferredBootstrap;
     private readonly QualityTransitionCoordinator _qualityTransitionCoordinator;
     private readonly SemaphoreSlim _qualityOperationGate = new(1, 1);
     private CancellationTokenSource _qualityProfileOperations = new();
@@ -78,6 +86,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     private long _qualityPresentationVersion;
     private QualityPresentationSnapshot _qualityPresentationSnapshot = null!;
     private RemoteSessionDiagnosticQualitySnapshot _diagnosticQualitySnapshot = null!;
+    private long _lastDiagnosticTransferRefresh;
+    private long _lastDiagnosticTransferVersion;
     private long _qualityDecisionGeneration;
     private long _qualityProfileEpoch;
     private int _pendingScrollInput;
@@ -175,12 +185,16 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _remoteMaximum = MinimumKnownMaximum(displayMaximum, qualityMaximum);
         _qualityProfile = qualityProfile ?? throw new ArgumentNullException(nameof(qualityProfile));
         _bootstrapState = session.BootstrapState;
-        _actualQualityState = CreateActualQualityState(_bootstrapState, RemoteUpdateStatistics.Empty);
         _refreshPolicy = qualityProfile.Refresh;
         _adaptiveQualityCapabilities = WithMaximumRefreshRate(
             qualityCapabilities,
             _remoteMaximum);
         _qualityDecoderGates = qualityDecoderGates ?? new QualityDecoderGates();
+        _preferredBootstrap = QualityBootstrapPlanner.CreatePlan(
+            qualityProfile,
+            _adaptiveQualityCapabilities,
+            _qualityDecoderGates).Preferred;
+        _actualQualityState = CreateActualQualityState(_bootstrapState, RemoteUpdateStatistics.Empty);
         _adaptiveQualityController = adaptiveQualityController ?? new AdaptiveQualityController(
             _qualityProfile,
             _adaptiveQualityCapabilities,
@@ -219,6 +233,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
             CreateDiagnosticQualitySnapshotNoLock(
                 _performanceTracker.CreateDiagnosticQualityMeasurements(),
                 _qualityPresentationSnapshot));
+        _lastDiagnosticTransferRefresh = _timeProvider.GetTimestamp();
+        _lastDiagnosticTransferVersion = _performanceTracker.TransferVersion;
         RefreshFrameRefreshOptions();
         _inputMapper = new WindowsInputMapper(_session.SendKeyAsync);
         _pointerWrites = new RemotePointerWriteCoalescer(
@@ -292,8 +308,83 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         _adaptiveQualityCapabilities.AppleGrayscale1001.IsObserved() &&
         _qualityDecoderGates.AppleGrayscale1001Approved;
 
-    internal RemoteSessionDiagnosticQualitySnapshot CreateDiagnosticQualitySnapshot() =>
-        Volatile.Read(ref _diagnosticQualitySnapshot);
+    internal RemoteSessionDiagnosticQualitySnapshot CreateDiagnosticQualitySnapshot()
+    {
+        var published = Volatile.Read(ref _diagnosticQualitySnapshot);
+        var now = _timeProvider.GetTimestamp();
+        var lastRefresh = Volatile.Read(ref _lastDiagnosticTransferRefresh);
+        var lastVersion = Volatile.Read(ref _lastDiagnosticTransferVersion);
+        var clockMovedBackwards = now < lastRefresh;
+        if (!clockMovedBackwards &&
+            _qualityOperationGate.CurrentCount == 0 &&
+            _timeProvider.GetElapsedTime(lastRefresh, now) <
+            TimeSpan.FromSeconds(5))
+        {
+            return published;
+        }
+
+        if (!clockMovedBackwards &&
+            lastVersion == _performanceTracker.TransferVersion &&
+            _timeProvider.GetElapsedTime(lastRefresh, now) <
+            TimeSpan.FromSeconds(5))
+        {
+            return published;
+        }
+
+        lock (_sync)
+        {
+            var current = Volatile.Read(ref _diagnosticQualitySnapshot);
+            var measurements = _performanceTracker.CreateDiagnosticQualityMeasurements();
+            if (TransferEquals(
+                    measurements.Performance.Transfer,
+                    current.Performance.Transfer))
+            {
+                Volatile.Write(ref _lastDiagnosticTransferRefresh, now);
+                Volatile.Write(
+                    ref _lastDiagnosticTransferVersion,
+                    _performanceTracker.TransferVersion);
+                return current;
+            }
+
+            var refreshedPerformance = new SessionPerformanceDiagnosticSnapshot(
+                current.Performance.Performance,
+                current.Performance.PresentationMilliseconds,
+                current.Performance.AutomaticTargetChanges,
+                current.Performance.EncodingCounts,
+                current.Performance.OtherEncodingCount)
+            {
+                Transfer = measurements.Performance.Transfer,
+            };
+            var refreshed = current with { Performance = refreshedPerformance };
+            Volatile.Write(ref _diagnosticQualitySnapshot, refreshed);
+            Volatile.Write(ref _lastDiagnosticTransferRefresh, now);
+            Volatile.Write(
+                ref _lastDiagnosticTransferVersion,
+                _performanceTracker.TransferVersion);
+            return refreshed;
+        }
+    }
+
+    private static bool HasTransferDiagnostics(SessionTransferDiagnosticSnapshot transfer) =>
+        transfer.RectangleCount != 0 ||
+        transfer.PixelArea != 0 ||
+        transfer.WirePayloadBytes != 0 ||
+        transfer.WirePayloadBytesByEncoding.Count != 0 ||
+        transfer.OtherEncodingWirePayloadBytes != 0;
+
+    private static bool TransferEquals(
+        SessionTransferDiagnosticSnapshot left,
+        SessionTransferDiagnosticSnapshot right) =>
+        left.RectangleCount == right.RectangleCount &&
+        left.PixelArea == right.PixelArea &&
+        left.WirePayloadBytes == right.WirePayloadBytes &&
+        left.BytesPerPixelMilli == right.BytesPerPixelMilli &&
+        left.DirtyCoveragePermille == right.DirtyCoveragePermille &&
+        left.OtherEncodingWirePayloadBytes == right.OtherEncodingWirePayloadBytes &&
+        left.WirePayloadBytesByEncoding.Count == right.WirePayloadBytesByEncoding.Count &&
+        left.WirePayloadBytesByEncoding.All(pair =>
+            right.WirePayloadBytesByEncoding.TryGetValue(pair.Key, out var value) &&
+            value == pair.Value);
 
     internal bool HasPendingPerformancePublication =>
         Volatile.Read(ref _activePerformancePublicationCount) != 0;
@@ -1087,7 +1178,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         {
             snapshot = _performanceTracker.ObserveFrame(
                 pending.Update,
-                pending.Dirty,
+                pending.DirtyArea,
+                pending.DirtyCapacity,
                 pending.Size,
                 pending.Response,
                 presentation,
@@ -1233,11 +1325,18 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
     private RemoteSessionDiagnosticQualitySnapshot CreateDiagnosticQualitySnapshotNoLock(
         SessionDiagnosticQualityMeasurements measurements,
-        QualityPresentationSnapshot presentation) => new(
+        QualityPresentationSnapshot presentation)
+    {
+        return new RemoteSessionDiagnosticQualitySnapshot(
             measurements.Performance,
             presentation,
             measurements.Observation,
-            _adaptiveQualityCapabilities);
+            _adaptiveQualityCapabilities)
+        {
+            BootstrapState = _bootstrapState,
+            PreferredBootstrap = _preferredBootstrap,
+        };
+    }
 
     private static QualityActualState CreateActualQualityState(
         QualityBootstrapState bootstrapState,
@@ -1886,24 +1985,58 @@ internal sealed class SessionPerformancePublicationGate
     }
 }
 
-internal sealed record SessionFramePerformance(
-    RemoteUpdateStatistics Update,
-    IReadOnlyList<RemoteRectangle> Dirty,
-    RemoteFramebufferSize Size,
-    TimeSpan Response)
+internal sealed record SessionFramePerformance
 {
+    public SessionFramePerformance(
+        RemoteUpdateStatistics update,
+        IReadOnlyList<RemoteRectangle> dirty,
+        RemoteFramebufferSize size,
+        TimeSpan response)
+    {
+        Update = update ?? throw new ArgumentNullException(nameof(update));
+        ArgumentNullException.ThrowIfNull(dirty);
+        Size = size;
+        Response = response;
+        DirtyCapacity = checked((long)size.Width * size.Height);
+        DirtyArea = SessionPerformanceTracker.CalculateDirtyArea(dirty, size);
+    }
+
+    private SessionFramePerformance(
+        RemoteUpdateStatistics update,
+        RemoteFramebufferSize size,
+        TimeSpan response,
+        long dirtyArea,
+        long dirtyCapacity)
+    {
+        Update = update;
+        Size = size;
+        Response = response;
+        DirtyArea = dirtyArea;
+        DirtyCapacity = dirtyCapacity;
+    }
+
+    public RemoteUpdateStatistics Update { get; }
+    public RemoteFramebufferSize Size { get; }
+    public TimeSpan Response { get; }
+    public long DirtyArea { get; }
+    public long DirtyCapacity { get; }
+
     public SessionFramePerformance MergeFrom(
         SessionFramePerformance earlier,
         IReadOnlyList<RemoteRectangle> mergedDirty)
     {
         ArgumentNullException.ThrowIfNull(earlier);
         ArgumentNullException.ThrowIfNull(mergedDirty);
-        return this with
-        {
-            Update = MergeStatistics(earlier.Update, Update),
-            Dirty = [.. mergedDirty],
-        };
+        return new SessionFramePerformance(
+            MergeStatistics(earlier.Update, Update),
+            Size,
+            Response,
+            SaturatingAdd(earlier.DirtyArea, DirtyArea),
+            SaturatingAdd(earlier.DirtyCapacity, DirtyCapacity));
     }
+
+    private static long SaturatingAdd(long left, long right) =>
+        left > long.MaxValue - right ? long.MaxValue : left + right;
 
     private static RemoteUpdateStatistics MergeStatistics(
         RemoteUpdateStatistics earlier,

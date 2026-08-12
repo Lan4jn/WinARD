@@ -64,7 +64,9 @@ internal static class DesktopDiagnosticContextFactory
                     qualityPresentation.Performance,
                     decision,
                     qualityObservation,
-                    qualityCapabilities),
+                    qualityCapabilities,
+                    qualityPresentation.Actual),
+            Transfer = BuildTransferSummary(snapshot),
         };
     }
 
@@ -118,14 +120,15 @@ internal static class DesktopDiagnosticContextFactory
         SessionPerformanceSnapshot performance,
         QualityDecision decision,
         QualityObservation observation,
-        ArdDisplayCapabilities capabilities)
+        ArdDisplayCapabilities capabilities,
+        QualityActualState? actual)
     {
         return new DiagnosticQualitySummary(
             profile.Preset.ToString(),
             profile.TargetBytesPerSecond,
             decision.Level.ToString(),
             decision.ContentState.ToString(),
-            decision.Color.ToString(),
+            AppliedColor(actual, decision.Color),
             ScalePercent(decision.Scale),
             performance.PrimaryFramebufferEncoding is { } encoding
                 ? KnownEncodingName(encoding) ?? "Other"
@@ -145,6 +148,79 @@ internal static class DesktopDiagnosticContextFactory
             decision.Reason.ToString(),
             decision.TargetSatisfied);
     }
+
+    private static DiagnosticTransferSummary BuildTransferSummary(
+        RemoteSessionDiagnosticQualitySnapshot snapshot)
+    {
+        var transfer = snapshot.Performance.Transfer;
+        var encodingBytes = new Dictionary<string, long>(StringComparer.Ordinal);
+        var other = transfer.OtherEncodingWirePayloadBytes;
+        foreach (var (encoding, byteCount) in transfer.WirePayloadBytesByEncoding)
+        {
+            var name = KnownEncodingName(encoding);
+            if (name is null)
+            {
+                other = SaturatingAdd(other, byteCount);
+            }
+            else
+            {
+                encodingBytes[name] = byteCount;
+            }
+        }
+
+        if (other > 0)
+        {
+            encodingBytes["Other"] = other;
+        }
+
+        var actualPixelFormat = snapshot.QualityPresentation.Actual?.PixelFormat ??
+            snapshot.BootstrapState.ActualQuality.PixelFormat;
+        return new DiagnosticTransferSummary(
+            snapshot.PreferredBootstrap.PixelFormat.ToString(),
+            actualPixelFormat.ToString(),
+            snapshot.BootstrapState.Attempt?.ToString(),
+            snapshot.BootstrapState.PreferredFailureReason?.ToString(),
+            PreferredEncodingOrder(snapshot.PreferredBootstrap.Encodings),
+            transfer.RectangleCount,
+            transfer.PixelArea,
+            transfer.WirePayloadBytes,
+            transfer.BytesPerPixelMilli,
+            transfer.DirtyCoveragePermille,
+            snapshot.QualityPresentation.Profile.Color.ToString(),
+            AppliedColor(snapshot.QualityPresentation.Actual, PixelFormatColorValue(actualPixelFormat)),
+            encodingBytes);
+    }
+
+    private static string? PreferredEncodingOrder(IReadOnlyList<int> encodings) =>
+        encodings.Count > 0 ? encodings[0] switch
+        {
+            (int)RfbEncodingType.Zrle => "ZrleFirst",
+            (int)RfbEncodingType.Zlib => "ZlibFirst",
+            _ => null,
+        } : null;
+
+    private static string PixelFormatColor(WinARD.Application.Ports.RemotePixelFormatKind format) =>
+        format switch
+        {
+            WinARD.Application.Ports.RemotePixelFormatKind.Bgra32 => "Full32",
+            WinARD.Application.Ports.RemotePixelFormatKind.Rgb565 => "Color16",
+            _ => throw new ArgumentOutOfRangeException(nameof(format)),
+        };
+
+    private static QualityColor PixelFormatColorValue(
+        WinARD.Application.Ports.RemotePixelFormatKind format) => format switch
+        {
+            WinARD.Application.Ports.RemotePixelFormatKind.Bgra32 => QualityColor.Full32,
+            WinARD.Application.Ports.RemotePixelFormatKind.Rgb565 => QualityColor.Color16,
+            _ => throw new ArgumentOutOfRangeException(nameof(format)),
+        };
+
+    private static string AppliedColor(QualityActualState? actual, QualityColor fallback) =>
+        actual?.Encoding == QualityActualEncoding.AppleGrayscale
+            ? QualityColor.Grayscale.ToString()
+            : actual is { } state
+                ? PixelFormatColor(state.PixelFormat)
+                : fallback.ToString();
 
     private static int ScalePercent(QualityScale scale) => scale switch
     {

@@ -47,6 +47,21 @@ public sealed record DiagnosticQualitySummary(
     string Reason,
     bool TargetSatisfied);
 
+public sealed record DiagnosticTransferSummary(
+    string? PreferredPixelFormat,
+    string? AppliedPixelFormat,
+    string? BootstrapAttempt,
+    string? BootstrapFallbackReason,
+    string? PreferredEncodingOrder,
+    long RectangleCount,
+    long PixelArea,
+    long WirePayloadBytes,
+    long? BytesPerPixelMilli,
+    int DirtyCoveragePermille,
+    string? DesiredColor,
+    string? AppliedColor,
+    IReadOnlyDictionary<string, long> EncodingWireBytes);
+
 public sealed record DiagnosticExportContext(
     DiagnosticApplicationInfo Application,
     IReadOnlyList<DiagnosticProfileSummary> Profiles,
@@ -54,6 +69,8 @@ public sealed record DiagnosticExportContext(
     bool IncludeHosts,
     DiagnosticQualitySummary? Quality = null)
 {
+    public DiagnosticTransferSummary? Transfer { get; init; }
+
     public static DiagnosticExportContext Empty { get; } = new(
         new DiagnosticApplicationInfo(
             "WinARD",
@@ -371,6 +388,7 @@ public sealed class DiagnosticExporter : IDisposable
                 context.PerformanceCounters,
                 _limits.MaxPerformanceCounters),
             quality = context.Quality is null ? null : ExportQuality(context.Quality),
+            transfer = context.Transfer is null ? null : ExportTransfer(context.Transfer),
             events,
         };
         var manifest = new
@@ -561,6 +579,61 @@ public sealed class DiagnosticExporter : IDisposable
         reason = ExportAllowedValue(quality.Reason, AllowedQualityDecisionReasons),
         targetSatisfied = quality.TargetSatisfied,
     };
+
+    private static readonly HashSet<string> AllowedPixelFormats = new(StringComparer.Ordinal)
+    {
+        "Bgra32", "Rgb565",
+    };
+    private static readonly HashSet<string> AllowedEncodingOrders = new(StringComparer.Ordinal)
+    {
+        "ZrleFirst", "ZlibFirst",
+    };
+
+    private static object ExportTransfer(DiagnosticTransferSummary transfer) => new
+    {
+        PreferredPixelFormat = ExportNullableAllowedValue(transfer.PreferredPixelFormat, AllowedPixelFormats),
+        AppliedPixelFormat = ExportNullableAllowedValue(transfer.AppliedPixelFormat, AllowedPixelFormats),
+        BootstrapAttempt = ExportNullableAllowedValue(transfer.BootstrapAttempt, AllowedBootstrapAttempts),
+        BootstrapFallbackReason = ExportNullableAllowedValue(
+            transfer.BootstrapFallbackReason,
+            AllowedBootstrapFailureReasons),
+        PreferredEncodingOrder = ExportNullableAllowedValue(
+            transfer.PreferredEncodingOrder,
+            AllowedEncodingOrders),
+        RectangleCount = NonNegativeOrNull(transfer.RectangleCount),
+        PixelArea = NonNegativeOrNull(transfer.PixelArea),
+        WirePayloadBytes = NonNegativeOrNull(transfer.WirePayloadBytes),
+        BytesPerPixelMilli = NonNegativeOrNull(transfer.BytesPerPixelMilli),
+        DirtyCoveragePermille = transfer.DirtyCoveragePermille is >= 0 and <= 1000
+            ? transfer.DirtyCoveragePermille
+            : (int?)null,
+        DesiredColor = ExportNullableAllowedValue(transfer.DesiredColor, AllowedQualityColors),
+        AppliedColor = ExportNullableAllowedValue(transfer.AppliedColor, AllowedQualityColors),
+        EncodingRawWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Raw"),
+        EncodingCopyRectWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "CopyRect"),
+        EncodingZlibWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Zlib"),
+        EncodingZrleWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "ZRLE"),
+        EncodingDesktopSizeWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "DesktopSize"),
+        EncodingCursorWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Cursor"),
+        EncodingArdDisplayInfoWireBytes = ExportEncodingWireBytes(
+            transfer.EncodingWireBytes,
+            "ARD.DisplayInfo"),
+        EncodingArdSessionEncryptionWireBytes = ExportEncodingWireBytes(
+            transfer.EncodingWireBytes,
+            "ARD.SessionEncryption"),
+        EncodingArdDisplayInfo2WireBytes = ExportEncodingWireBytes(
+            transfer.EncodingWireBytes,
+            "ARD.DisplayInfo2"),
+        EncodingOtherWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Other"),
+    };
+
+    private static string? ExportNullableAllowedValue(string? value, HashSet<string> allowed) =>
+        value is not null && allowed.Contains(value) ? value : null;
+
+    private static long? ExportEncodingWireBytes(
+        IReadOnlyDictionary<string, long> values,
+        string key) =>
+        values.TryGetValue(key, out var value) && value >= 0 ? value : null;
 
     private static long? NonNegativeOrNull(long? value) => value >= 0 ? value : null;
 

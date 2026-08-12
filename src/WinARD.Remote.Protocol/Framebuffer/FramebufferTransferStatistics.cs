@@ -41,7 +41,12 @@ public sealed class FramebufferTransferStatistics
         PixelWireBytesByEncoding = Snapshot(pixelWireBytesByEncoding);
         BytesPerPixelMilli = PixelArea == 0
             ? null
-            : (long)Math.Min(long.MaxValue, decimal.Truncate((decimal)WirePayloadBytes * 1000 / PixelArea));
+            : (long)Math.Min(
+                long.MaxValue,
+                decimal.Round(
+                    (decimal)WirePayloadBytes * 1000 / PixelArea,
+                    0,
+                    MidpointRounding.AwayFromZero));
     }
 
     public static FramebufferTransferStatistics Empty { get; } = new([]);

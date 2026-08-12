@@ -47,9 +47,8 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal(
             new Dictionary<int, int> { [0] = 1, [16] = 1 },
             latest.Performance.Update.EncodingCounts);
-        Assert.Equal(
-            [new RemoteRectangle(0, 0, 1, 1), new RemoteRectangle(1, 0, 1, 1)],
-            latest.Performance.Dirty.OrderBy(rectangle => rectangle.X));
+        Assert.Equal(2, latest.Performance.DirtyArea);
+        Assert.Equal(4, latest.Performance.DirtyCapacity);
     }
 
     [Fact]
@@ -412,6 +411,39 @@ public sealed class RemoteSessionViewModelTests
             new Dictionary<int, long> { [0] = 5 },
             new Dictionary<int, long> { [0] = 0 });
         Assert.Null(RemoteFramebufferTransferStatistics.Empty.Merge(zeroArea).BytesPerPixelMilli);
+    }
+
+    [Fact]
+    public void Application_transfer_merge_rounds_bytes_per_pixel_milli_away_from_zero()
+    {
+        var statistics = new RemoteFramebufferTransferStatistics(
+            1, 1, 1, 16, null, new Dictionary<int, int> { [0] = 1 },
+            new Dictionary<int, long> { [0] = 1 }, new Dictionary<int, long> { [0] = 1 });
+
+        Assert.Equal(63,
+            RemoteFramebufferTransferStatistics.Empty.Merge(statistics).BytesPerPixelMilli);
+    }
+
+    [Fact]
+    public void Session_frame_performance_merge_keeps_only_bounded_numeric_dirty_summaries()
+    {
+        var earlier = new SessionFramePerformance(
+            RemoteUpdateStatistics.Empty,
+            [new RemoteRectangle(0, 0, 50, 100), new RemoteRectangle(0, 0, 50, 100)],
+            new RemoteFramebufferSize(100, 100), TimeSpan.Zero);
+        var later = new SessionFramePerformance(
+            RemoteUpdateStatistics.Empty,
+            Enumerable.Range(0, 4096)
+                .Select(index => new RemoteRectangle(index % 100, index / 100, 1, 1))
+                .ToArray(),
+            new RemoteFramebufferSize(100, 100), TimeSpan.Zero);
+
+        var merged = later.MergeFrom(earlier, []);
+
+        Assert.Equal(9_096, merged.DirtyArea);
+        Assert.Equal(20_000, merged.DirtyCapacity);
+        Assert.DoesNotContain(merged.GetType().GetProperties(), property =>
+            typeof(IReadOnlyList<RemoteRectangle>).IsAssignableFrom(property.PropertyType));
     }
 
     [Fact]

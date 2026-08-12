@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Reflection;
 using System.Text.Json;
 using WinARD.Application.Ports;
 using WinARD.Application.Quality;
@@ -16,6 +17,107 @@ namespace WinARD.Desktop.Tests.Views;
 
 public sealed class RemoteSessionDiagnosticExportStateTests
 {
+    [Fact]
+    public void Session_context_maps_atomic_bootstrap_quality_and_transfer_evidence()
+    {
+        var profile = ConnectionProfile.Create(
+            Guid.NewGuid(), "Mac", "private.internal", 5900, "private-user")
+            .WithQualityProfile(QualityProfile.CreateCustom(
+                2 * 1024 * 1024,
+                QualityColor.Color16,
+                QualityScale.Percent75,
+                FrameRefreshPolicy.Automatic));
+        var performance = new SessionPerformanceSnapshot(
+            FrameRefreshMode.Automatic, 60, 30, 1024, (int)RfbEncodingType.Zlib,
+            10, 2, 0, 0, 1);
+        var session = new SessionPerformanceDiagnosticSnapshot(
+            performance, 2, 0, new Dictionary<int, long>())
+        {
+            Transfer = new SessionTransferDiagnosticSnapshot(
+                3, 2_000, 800, 400, 200,
+                new Dictionary<int, long>
+                {
+                    [(int)RfbEncodingType.Zlib] = 700,
+                    [(int)RfbEncodingType.CopyRect] = 100,
+                },
+                9),
+        };
+        var decision = new QualityDecision(
+            1, QualityContentState.Motion, QualityLevel.Q2, QualityColor.Color16,
+            QualityScale.Percent75, 60, QualityDecisionReason.MotionDetected,
+            true, false, false, QualityLevel.Q2, QualityContentState.Motion);
+        var presentation = new QualityPresentationSnapshot(
+            profile.Quality, decision, QualityTransitionStatus.Applied, performance, 1, 1,
+            new QualityActualState(RemotePixelFormatKind.Bgra32, QualityActualEncoding.Zlib, true));
+        var snapshot = new RemoteSessionDiagnosticQualitySnapshot(
+            session,
+            presentation,
+            CreateDiagnosticSnapshot(profile, session).QualityObservation,
+            ArdDisplayCapabilities.Unknown)
+        {
+            BootstrapState = new QualityBootstrapState(
+                QualityBootstrapAttempt.Fallback,
+                new QualityBootstrapSettings(
+                    RemotePixelFormatKind.Bgra32,
+                    [6, 16, 0, 1, -239, -223],
+                    QualityBootstrapReason.SafeFallback),
+                QualityBootstrapFailureReason.DecoderFailure),
+            PreferredBootstrap = new QualityBootstrapSettings(
+                RemotePixelFormatKind.Rgb565,
+                [16, 6, 0, 1, -239, -223],
+                QualityBootstrapReason.UserColor16),
+        };
+
+        var context = DesktopDiagnosticContextFactory.CreateSession(profile, snapshot);
+
+        Assert.Equal("Full32", context.Quality!.Color);
+        var transfer = Assert.IsType<DiagnosticTransferSummary>(context.Transfer);
+        Assert.Equal("Rgb565", transfer.PreferredPixelFormat);
+        Assert.Equal("Bgra32", transfer.AppliedPixelFormat);
+        Assert.Equal("Fallback", transfer.BootstrapAttempt);
+        Assert.Equal("DecoderFailure", transfer.BootstrapFallbackReason);
+        Assert.Equal("ZrleFirst", transfer.PreferredEncodingOrder);
+        Assert.Equal("Color16", transfer.DesiredColor);
+        Assert.Equal("Full32", transfer.AppliedColor);
+        Assert.Equal(3, transfer.RectangleCount);
+        Assert.Equal(9, transfer.EncodingWireBytes["Other"]);
+        Assert.Equal(700, transfer.EncodingWireBytes["Zlib"]);
+    }
+
+    [Fact]
+    public void Diagnostic_quality_summary_keeps_the_public_21_parameter_constructor_and_deconstruct()
+    {
+        var constructor = typeof(DiagnosticQualitySummary).GetConstructors()
+            .Single(candidate => candidate.IsPublic);
+        var deconstruct = typeof(DiagnosticQualitySummary).GetMethod(
+            "Deconstruct", BindingFlags.Public | BindingFlags.Instance);
+
+        Type[] expectedTypes =
+        [
+            typeof(string), typeof(long?), typeof(string), typeof(string), typeof(string),
+            typeof(int), typeof(string), typeof(int?), typeof(int), typeof(long), typeof(long),
+            typeof(int), typeof(string), typeof(string), typeof(string), typeof(string),
+            typeof(string), typeof(bool), typeof(bool), typeof(string), typeof(bool),
+        ];
+        string[] expectedNames =
+        [
+            "Preset", "TargetBytesPerSecond", "QualityLevel", "ContentState", "Color",
+            "ScalePercent", "EncodingName", "TargetFramesPerSecond", "ActualFramesPerSecond",
+            "AverageBytesPerSecond", "PeakBytesPerSecond", "ResponseMilliseconds",
+            "ZlibCapability", "Rgb565Capability", "ServerScalingCapability",
+            "AppleColor1002Capability", "AppleGrayscale1001Capability",
+            "SafeOnlinePixelFormatSwitch", "SafeOnlineScaleSwitch", "Reason", "TargetSatisfied",
+        ];
+
+        Assert.Equal(expectedTypes, constructor.GetParameters().Select(parameter => parameter.ParameterType));
+        Assert.Equal(expectedNames, constructor.GetParameters().Select(parameter => parameter.Name));
+        Assert.NotNull(deconstruct);
+        var deconstructParameters = deconstruct!.GetParameters();
+        Assert.Equal(expectedTypes.Select(type => type.MakeByRefType()),
+            deconstructParameters.Select(parameter => parameter.ParameterType));
+        Assert.All(deconstructParameters, parameter => Assert.True(parameter.IsOut));
+        Assert.Equal(expectedNames, deconstructParameters.Select(parameter => parameter.Name));
+    }
     [Fact]
     public void Completing_export_after_closing_does_not_reenable_export()
     {
@@ -240,7 +342,7 @@ public sealed class RemoteSessionDiagnosticExportStateTests
             var json = root.GetRawText();
             foreach (var forbidden in new[]
             {
-                "Coordinate", "PointerX", "PointerY", "Keysym", "Pixel", "Ciphertext", "Sequence",
+                "Coordinate", "PointerX", "PointerY", "Keysym", "Ciphertext", "Sequence",
                 "Private device name", hostMarker, userMarker, passwordMarker, exceptionMarker, keyMarker,
                 clipboardMarker,
             })
