@@ -1416,6 +1416,74 @@ public sealed class FramePresentationTests
     }
 
     [Fact]
+    public async Task Precancelled_quality_transition_preserves_cancellation_before_wire()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1), .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.ApplyQualityTransitionAsync(
+                new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1),
+                cancellation.Token).AsTask());
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.Equal(offset, stream.WrittenBytes.Length);
+        using var frame = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(default));
+    }
+
+    [Fact]
+    public async Task Quality_transition_cancelled_while_waiting_for_session_gate_preserves_cancellation()
+    {
+        var decoder = new BlockingDecoder();
+        FramebufferUpdateSession? session = null;
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.008\n"), .. ServerInit(2, 1), .. CursorOnlyUpdate()]);
+        await using var client = new RfbClient(
+            stream,
+            framebufferSessionFactory: (framebuffer, _) =>
+                session = FramebufferUpdateReader.CreateSession(
+                    framebuffer,
+                    PixelFormat.WinArdBgra32,
+                    decoder));
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var offset = stream.WrittenBytes.Length;
+        var activeSession = Assert.IsType<FramebufferUpdateSession>(session);
+        byte[] blockingUpdate =
+        [
+            0, 0, 0, 1,
+            .. Header(0, 0, 1, 1, decoder.EncodingId),
+        ];
+        var decode = activeSession.ApplyAsync(new MemoryStream(blockingUpdate), default);
+        await decoder.Started.WaitAsync(TimeSpan.FromSeconds(5));
+        using var cancellation = new CancellationTokenSource();
+        var transition = client.ApplyQualityTransitionAsync(
+            new RemoteQualitySettings(RemotePixelFormatKind.Rgb565, [16, 0], 1),
+            cancellation.Token).AsTask();
+        cancellation.Cancel();
+
+        try
+        {
+            var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => transition);
+            Assert.Equal(cancellation.Token, exception.CancellationToken);
+            Assert.Equal(offset, stream.WrittenBytes.Length);
+        }
+        finally
+        {
+            decoder.Release();
+        }
+
+        _ = await decode.WaitAsync(TimeSpan.FromSeconds(5));
+        using var frame = Assert.IsType<RemoteCursorMessage>(await client.ReceiveAsync(default));
+    }
+
+    [Fact]
     public async Task Rfb_client_configuration_write_failure_faults_connection()
     {
         await using var stream = new ScriptedDuplexStream(
@@ -2249,6 +2317,31 @@ public sealed class FramePresentationTests
             ValueTask.FromResult(EncodingDecodeResult.Empty);
 
         public void Dispose() => IsDisposed = true;
+    }
+
+    private sealed class BlockingDecoder : IRfbEncodingDecoder
+    {
+        private readonly TaskCompletionSource _started =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int EncodingId => 701;
+
+        public Task Started => _started.Task;
+
+        public async ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            WinARD.Remote.Protocol.Framebuffer.Framebuffer framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken)
+        {
+            _started.TrySetResult();
+            await _release.Task.WaitAsync(cancellationToken);
+            return EncodingDecodeResult.Empty;
+        }
+
+        public void Release() => _release.TrySetResult();
     }
 
     private sealed class ScriptedDuplexStream(

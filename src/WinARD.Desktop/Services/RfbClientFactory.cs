@@ -297,6 +297,15 @@ internal sealed class RfbClient : IRfbClient
                     cancellationToken).ConfigureAwait(false);
             }
         }
+        catch (OperationCanceledException)
+        {
+            lock (_lifecycleSync)
+            {
+                _qualityTransitionActive = false;
+            }
+
+            throw;
+        }
         catch
         {
             lock (_lifecycleSync)
