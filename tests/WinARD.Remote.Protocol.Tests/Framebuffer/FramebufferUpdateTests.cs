@@ -1034,25 +1034,19 @@ public sealed class FramebufferUpdateTests
     }
 
     [Fact]
-    public async Task Failed_pixel_format_prevalidation_commits_no_decoder_and_leaves_session_active()
+    public void Session_rejects_additional_decoder_that_implements_internal_pixel_format_contract()
     {
         using var framebuffer = new FramebufferModel(1, 1, ProtocolLimits.Default);
-        var rejecting = new RejectingPixelFormatDecoder();
-        await using var session = FramebufferUpdateReader.CreateSession(
-            framebuffer,
-            PixelFormat.WinArdBgra32,
-            rejecting);
+        var decoder = new ThrowingCommitPixelFormatDecoder();
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            session.ReconfigurePixelFormatAsync(PixelFormat.WinArdRgb565, CancellationToken.None));
+        var exception = Assert.Throws<ArgumentException>(() =>
+            FramebufferUpdateReader.CreateSession(
+                framebuffer,
+                PixelFormat.WinArdBgra32,
+                decoder));
 
-        Assert.Contains("Injected", exception.Message, StringComparison.Ordinal);
-        Assert.True(rejecting.WasValidated);
-        Assert.False(rejecting.WasCommitted);
-        _ = await session.ApplyAsync(
-            new MemoryStream(Update(Raw(0, 0, 1, 1, [1, 2, 3, 0]))),
-            CancellationToken.None);
-        Assert.Equal(0xFF030201u, framebuffer.GetBgra32(0, 0));
+        Assert.Equal("additionalDecoders", exception.ParamName);
+        Assert.Contains("pixel format", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1077,7 +1071,10 @@ public sealed class FramebufferUpdateTests
         decoder.Release();
         _ = await apply;
         await reconfigure.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.Equal(PixelFormat.WinArdRgb565, decoder.CommittedFormat);
+        _ = await session.ApplyAsync(
+            new MemoryStream(Update(Raw(0, 0, 1, 1, [0x1F, 0]))),
+            CancellationToken.None);
+        Assert.Equal(0xFF0000FFu, framebuffer.GetBgra32(0, 0));
     }
 
     [Fact]
@@ -1242,33 +1239,7 @@ public sealed class FramebufferUpdateTests
         }
     }
 
-    private sealed class RejectingPixelFormatDecoder :
-        IRfbEncodingDecoder,
-        IReconfigurablePixelFormatDecoder
-    {
-        public int EncodingId => 778;
-        public bool WasValidated { get; private set; }
-        public bool WasCommitted { get; private set; }
-
-        public ValueTask<EncodingDecodeResult> DecodeAsync(
-            RfbReader reader,
-            FramebufferModel framebuffer,
-            FramebufferRect rectangle,
-            CancellationToken cancellationToken) =>
-            ValueTask.FromResult(EncodingDecodeResult.Empty);
-
-        public void ValidatePixelFormat(PixelFormat pixelFormat)
-        {
-            WasValidated = true;
-            throw new InvalidOperationException("Injected pixel format rejection.");
-        }
-
-        public void CommitPixelFormat(PixelFormat pixelFormat) => WasCommitted = true;
-    }
-
-    private sealed class BlockingPixelFormatDecoder :
-        IRfbEncodingDecoder,
-        IReconfigurablePixelFormatDecoder
+    private sealed class BlockingPixelFormatDecoder : IRfbEncodingDecoder
     {
         private readonly TaskCompletionSource _started =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1277,7 +1248,6 @@ public sealed class FramebufferUpdateTests
 
         public int EncodingId => 779;
         public Task Started => _started.Task;
-        public PixelFormat? CommittedFormat { get; private set; }
 
         public async ValueTask<EncodingDecodeResult> DecodeAsync(
             RfbReader reader,
@@ -1290,13 +1260,28 @@ public sealed class FramebufferUpdateTests
             return EncodingDecodeResult.Empty;
         }
 
+        public void Release() => _release.TrySetResult();
+    }
+
+    private sealed class ThrowingCommitPixelFormatDecoder :
+        IRfbEncodingDecoder,
+        IReconfigurablePixelFormatDecoder
+    {
+        public int EncodingId => 780;
+
+        public ValueTask<EncodingDecodeResult> DecodeAsync(
+            RfbReader reader,
+            FramebufferModel framebuffer,
+            FramebufferRect rectangle,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(EncodingDecodeResult.Empty);
+
         public void ValidatePixelFormat(PixelFormat pixelFormat)
         {
         }
 
-        public void CommitPixelFormat(PixelFormat pixelFormat) => CommittedFormat = pixelFormat;
-
-        public void Release() => _release.TrySetResult();
+        public void CommitPixelFormat(PixelFormat pixelFormat) =>
+            throw new InvalidOperationException("Injected commit failure.");
     }
 
     private sealed class ThrowingDisposableDecoder : IRfbEncodingDecoder, IAsyncDisposable

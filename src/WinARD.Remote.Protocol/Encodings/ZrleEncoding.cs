@@ -12,6 +12,8 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
     private PixelFormat _pixelFormat;
     private int _encodedPixelLength;
     private int _wirePixelOffset;
+    private int _validatedEncodedPixelLength;
+    private int _validatedWirePixelOffset;
     private readonly PersistentZlibInflater _inflater;
 
     public ZrleEncoding()
@@ -32,15 +34,14 @@ public sealed class ZrleEncoding : IRfbEncodingDecoder, IReconfigurablePixelForm
     void IReconfigurablePixelFormatDecoder.ValidatePixelFormat(PixelFormat pixelFormat)
     {
         ArgumentNullException.ThrowIfNull(pixelFormat);
-        _ = GetPixelLayout(pixelFormat);
+        (_validatedEncodedPixelLength, _validatedWirePixelOffset) = GetPixelLayout(pixelFormat);
     }
 
     void IReconfigurablePixelFormatDecoder.CommitPixelFormat(PixelFormat pixelFormat)
     {
-        var (encodedPixelLength, wirePixelOffset) = GetPixelLayout(pixelFormat);
         _pixelFormat = pixelFormat;
-        _encodedPixelLength = encodedPixelLength;
-        _wirePixelOffset = wirePixelOffset;
+        _encodedPixelLength = _validatedEncodedPixelLength;
+        _wirePixelOffset = _validatedWirePixelOffset;
     }
 
     public async ValueTask<EncodingDecodeResult> DecodeAsync(

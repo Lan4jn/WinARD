@@ -51,6 +51,13 @@ public static class FramebufferUpdateReader
         foreach (var decoder in additionalDecoders)
         {
             ArgumentNullException.ThrowIfNull(decoder);
+            if (decoder is IReconfigurablePixelFormatDecoder)
+            {
+                throw new ArgumentException(
+                    "Additional RFB decoders cannot participate in the internal pixel format transaction.",
+                    nameof(additionalDecoders));
+            }
+
             var encodingId = decoder.EncodingId;
             if (!registeredEncodingIds.Add(encodingId))
             {
