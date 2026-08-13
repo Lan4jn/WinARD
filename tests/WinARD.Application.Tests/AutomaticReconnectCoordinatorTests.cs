@@ -273,6 +273,28 @@ public sealed class AutomaticReconnectCoordinatorTests
         Assert.Same(failure, coordinator.LastFailure);
     }
 
+    [Fact]
+    public async Task Dispose_releases_resources_even_when_connect_ignores_cancellation_and_faults()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var coordinator = Create(_ => true, async _ =>
+        {
+            entered.TrySetResult();
+            await release.Task;
+            throw new InvalidOperationException("fault");
+        });
+        var reconnect = coordinator.ReconnectNowAsync(default);
+        await entered.Task;
+        var dispose = coordinator.DisposeAsync().AsTask();
+        release.TrySetResult();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => dispose);
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => coordinator.ReconnectNowAsync(default));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => reconnect);
+    }
+
     private static AutomaticReconnectCoordinator Create(
         Func<Exception, bool> transient,
         Func<CancellationToken, Task> connect,

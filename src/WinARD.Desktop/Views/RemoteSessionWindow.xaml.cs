@@ -48,6 +48,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly QualityOverlayOpenCoordinator _qualityOverlayOpenCoordinator;
     private readonly IReconnectProfileCapture? _reconnectProfileCapture;
     private readonly ReconnectSessionReservation? _reconnectReservation;
+    private readonly Func<CancellationToken, Task>? _retryWithoutReservation;
     private readonly Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>?
         _updateFrameRefreshPolicy;
     private readonly Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>?
@@ -83,6 +84,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         DiagnosticExportService? diagnosticExportService = null,
         ConnectionErrorViewModel? initialError = null,
         Func<CancellationToken, Task>? retryRequested = null,
+        Func<CancellationToken, Task>? retryWithoutReservation = null,
         ConnectionProfile? profile = null,
         Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>?
             updateFrameRefreshPolicy = null,
@@ -91,7 +93,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         : this(
             session, ownership, dispatcher, presenter, diagnosticSink, diagnosticExportService,
             initialError, retryRequested, profile, updateFrameRefreshPolicy, updateQualityProfile,
-            reconnectProfileCapture: null)
+            reconnectProfileCapture: null,
+            reconnectReservation: null,
+            retryWithoutReservation)
     {
     }
 
@@ -111,7 +115,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         : this(session, ownership, dispatcher, presenter, diagnosticSink,
             diagnosticExportService, initialError, retryRequested, profile,
             updateFrameRefreshPolicy, updateQualityProfile, reconnectProfileCapture,
-            reconnectReservation: null)
+            reconnectReservation: null,
+            retryWithoutReservation: null)
     {
     }
 
@@ -128,7 +133,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>? updateFrameRefreshPolicy,
         Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>? updateQualityProfile,
         IReconnectProfileCapture? reconnectProfileCapture,
-        ReconnectSessionReservation? reconnectReservation)
+        ReconnectSessionReservation? reconnectReservation,
+        Func<CancellationToken, Task>? retryWithoutReservation = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(ownership);
@@ -140,6 +146,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _profile = profile;
         _reconnectProfileCapture = reconnectProfileCapture;
         _reconnectReservation = reconnectReservation;
+        _retryWithoutReservation = retryWithoutReservation;
         _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _diagnosticExportState = new RemoteSessionDiagnosticExportState(
             serviceAvailable: diagnosticExportService is not null);
@@ -167,7 +174,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             () => ViewModel.Error is not null,
             StopSessionCoreAsync,
             CloseWindowCoreAsync,
-            _automaticReconnect is null ? null : ReconnectNowAndDisposeAsync,
+            retryWithoutReservation is null
+                ? (_automaticReconnect is null ? null : ReconnectNowAndDisposeAsync)
+                : ReconnectWithoutReservationAsync,
             BeginClosingDiagnostics);
         var handlers = new Dictionary<ConnectionErrorActionKind, Func<CancellationToken, Task>>
         {
@@ -699,6 +708,10 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
         else
         {
+            if (_reconnectReservation is not null)
+            {
+                await _reconnectReservation.DisposeAsync();
+            }
             await _dispatcher.InvokeAsync(
                 () =>
                 {
@@ -707,6 +720,16 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                 },
                 CancellationToken.None);
         }
+    }
+
+    private async Task ReconnectWithoutReservationAsync(CancellationToken token)
+    {
+        await CloseWindowCoreAsync();
+        if (_reconnectReservation is not null)
+        {
+            await _reconnectReservation.DisposeAsync();
+        }
+        await _retryWithoutReservation!(token);
     }
 
     private void ShowAutomaticReconnectFailure(Exception? failure)

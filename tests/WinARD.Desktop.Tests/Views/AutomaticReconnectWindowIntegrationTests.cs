@@ -24,7 +24,8 @@ public sealed class AutomaticReconnectWindowIntegrationTests
         Assert.Contains("SuppressAndCancelAutomaticReconnect();", window, StringComparison.Ordinal);
         Assert.Contains("await _automaticReconnect.DisposeAsync()", window, StringComparison.Ordinal);
         Assert.Contains("ShowAutomaticReconnectFailure", window, StringComparison.Ordinal);
-        Assert.DoesNotContain("await _reconnectReservation.DisposeAsync();\r\n        }\r\n    }\r\n\r\n    private void ShowAutomaticReconnectProgress", window, StringComparison.Ordinal);
+        Assert.Contains("await _reconnectReservation.DisposeAsync();", window, StringComparison.Ordinal);
+        Assert.Contains("ReconnectWithoutReservationAsync", window, StringComparison.Ordinal);
     }
 
     [Fact]

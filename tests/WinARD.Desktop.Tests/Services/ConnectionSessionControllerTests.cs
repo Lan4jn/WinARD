@@ -166,6 +166,23 @@ public sealed class ConnectionSessionControllerTests
     }
 
     [Fact]
+    public async Task Terminal_reconnect_failure_releases_reservation_for_a_fresh_manual_acquire()
+    {
+        var coordinator = new ActiveSessionCoordinator();
+        await using var first = Controller(new TrackingClient(), coordinator);
+        await first.ConnectAsync(Profile(), default);
+        var ownership = first.TransferConnectedSession();
+        var reservation = ownership.ReserveForReconnect();
+        await ownership.DisposeAsync();
+
+        await reservation.DisposeAsync();
+
+        await using var manual = Controller(new TrackingClient(), coordinator);
+        await manual.ConnectAsync(Profile(), default);
+        await using var replacement = manual.TransferConnectedSession();
+    }
+
+    [Fact]
     public async Task Reservation_transfer_and_cancel_have_exactly_one_lease_winner()
     {
         var coordinator = new ActiveSessionCoordinator();

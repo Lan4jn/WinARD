@@ -554,7 +554,9 @@ public sealed partial class MainWindow : Window, IDisposable
                 var reconnectRequest = new RemoteSessionReconnectRequest(
                     ownership.Profile,
                     (latestProfile, retryToken) => InvokeReconnectAsync(
-                        latestProfile, nextReconnectReservation, retryToken));
+                        latestProfile, nextReconnectReservation, retryToken),
+                    (latestProfile, retryToken) => InvokeReconnectAsync(
+                        latestProfile, reservation: null, retryToken));
                 operationToken.ThrowIfCancellationRequested();
                 remoteWindow = new RemoteSessionWindow(
                     ownership.Session,
@@ -565,6 +567,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     diagnosticExportService: _diagnosticExportService,
                     initialError: null,
                     retryRequested: reconnectRequest.InvokeAsync,
+                    retryWithoutReservation: reconnectRequest.InvokeWithoutReservationAsync,
                     profile: ownership.Profile,
                     updateFrameRefreshPolicy:
                         _sessionController.UpdateConnectedFrameRefreshPolicyAsync,
@@ -660,7 +663,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private Task InvokeReconnectAsync(
         ConnectionProfile profile,
-        ReconnectSessionReservation reservation,
+        ReconnectSessionReservation? reservation,
         CancellationToken cancellationToken)
     {
         if (DispatcherQueue.HasThreadAccess)

@@ -216,20 +216,32 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
 
     private async Task DisposeCoreAsync(Task<bool>? loop, Task[] connections)
     {
-        if (loop is not null) await loop.ConfigureAwait(false);
+        Exception? failure = null;
         try
         {
+            if (loop is not null) await loop.ConfigureAwait(false);
             await Task.WhenAll(connections).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
         }
-        lock (_sync)
+        catch (Exception exception)
         {
-            _loopCancellation?.Dispose();
-            _loopCancellation = null;
+            failure = exception;
         }
-        _connectGate.Dispose();
-        _shutdown.Dispose();
+        finally
+        {
+            lock (_sync)
+            {
+                _loopCancellation?.Dispose();
+                _loopCancellation = null;
+            }
+            _connectGate.Dispose();
+            _shutdown.Dispose();
+        }
+        if (failure is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
     }
 }
