@@ -49,6 +49,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly QualityOverlayOpenCoordinator _qualityOverlayOpenCoordinator;
     private readonly FullscreenToolbarController _fullscreenToolbarController = new();
     private readonly FullscreenToolbarHideScheduler _fullscreenToolbarHideScheduler;
+    private readonly RemoteSessionWindowCloseCoordinator _windowCloseCoordinator;
     private readonly IReconnectProfileCapture? _reconnectProfileCapture;
     private readonly ReconnectSessionReservation? _reconnectReservation;
     private readonly Func<CancellationToken, Task>? _retryWithoutReservation;
@@ -79,6 +80,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private int _qualitySynchronizationDepth;
     private long _suppressedReconnectGeneration;
     private int _automaticReconnectCancellationStarted;
+    private int _closedCleanupStarted;
 
     public RemoteSessionWindow(
         IRemoteSessionRuntime session,
@@ -159,6 +161,11 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _fullscreenToolbarHideScheduler = new FullscreenToolbarHideScheduler(
             token => Task.Delay(TimeSpan.FromSeconds(2), token),
             action => _dispatcher.InvokeAsync(action, _lifetime.Token));
+        _windowCloseCoordinator = new RemoteSessionWindowCloseCoordinator(
+            _fullscreenToolbarHideScheduler.Cancel,
+            () => _fullscreenToolbarHideScheduler.DisposeAsync().AsTask(),
+            _lifetime.Cancel,
+            CloseWindowOnDispatcherAsync);
         RefreshDiagnosticExportState();
         _remoteSize = session.FramebufferSize;
         presenter ??= new D3DFramePresenter(FramePanel);
@@ -1961,11 +1968,10 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
     }
 
-    private async Task CloseWindowCoreAsync()
+    private Task CloseWindowCoreAsync() => _windowCloseCoordinator.CloseAsync();
+
+    private async Task CloseWindowOnDispatcherAsync()
     {
-        _fullscreenToolbarHideScheduler.Cancel();
-        await _fullscreenToolbarHideScheduler.WhenIdleAsync().ConfigureAwait(false);
-        _lifetime.Cancel();
         try
         {
             await _dispatcher.InvokeAsync(() =>
@@ -2026,7 +2032,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnClosed(object sender, WindowEventArgs args)
     {
-        _fullscreenToolbarHideScheduler.Cancel();
+        if (Interlocked.Exchange(ref _closedCleanupStarted, 1) != 0)
+        {
+            return;
+        }
+
+        _ = DisposeWindowResourcesAfterCloseAsync(_windowCloseCoordinator.CloseAsync());
         _appWindow.Closing -= OnClosing;
         InputSurface.RemoveHandler(UIElement.KeyDownEvent, _keyDownHandler);
         InputSurface.RemoveHandler(UIElement.KeyUpEvent, _keyUpHandler);
@@ -2043,6 +2054,11 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _windowLifecycle.Dispose();
         _cursorVisibility.Reset();
         InputSurface.Dispose();
+    }
+
+    private async Task DisposeWindowResourcesAfterCloseAsync(Task close)
+    {
+        await ObserveFailureAsync(close).ConfigureAwait(false);
         _saveCancellation.Dispose();
         _lifetime.Dispose();
     }

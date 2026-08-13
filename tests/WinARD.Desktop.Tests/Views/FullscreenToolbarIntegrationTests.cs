@@ -49,6 +49,17 @@ public sealed class FullscreenToolbarIntegrationTests
         Assert.Contains("FullscreenEscapeAction.ExitFullscreen", source, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void WindowCloseUsesIdempotentBestEffortSchedulerCleanup()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Contains("RemoteSessionWindowCloseCoordinator", source, StringComparison.Ordinal);
+        Assert.Contains("_fullscreenToolbarHideScheduler.DisposeAsync", source, StringComparison.Ordinal);
+        Assert.Contains("Interlocked.Exchange(ref _closedCleanupStarted, 1)", source, StringComparison.Ordinal);
+    }
+
     private static string RepositoryFile(params string[] parts)
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
