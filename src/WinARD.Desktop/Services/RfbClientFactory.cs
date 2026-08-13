@@ -61,6 +61,7 @@ internal sealed class RfbClient : IRfbClient
     private bool _qualityTransitionActive;
     private bool _bootstrapConfigurationActive;
     private bool _bootstrapConfigured;
+    private bool _bootstrapScalingWritten;
     private bool _framebufferRequestAttempted;
     private bool _faulted;
     private bool _shutdownStarted;
@@ -288,6 +289,7 @@ internal sealed class RfbClient : IRfbClient
                         await new ArdClientMessageWriter(new RfbWriter(_transport))
                             .WriteScalingFactorAsync(settings.ScaleFactor, token)
                             .ConfigureAwait(false);
+                        _bootstrapScalingWritten = true;
                     }
 
                     wireAttempted = true;
@@ -793,14 +795,12 @@ internal sealed class RfbClient : IRfbClient
         {
             return await ReceiveAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (RfbProtocolException exception) when (TryClassifyBootstrapFailure(exception, out var reason))
+        catch (RfbProtocolException exception) when (TryClassifyBootstrapFailure(
+            exception,
+            _bootstrapScalingWritten,
+            BootstrapState.IsFirstPixelConfirmed,
+            out var reason))
         {
-            if (reason == QualityBootstrapFailureReason.RemoteSessionClosed &&
-                BootstrapState.ActualQuality.ScaleFactor < 1d)
-            {
-                reason = QualityBootstrapFailureReason.ScaleRejected;
-            }
-
             throw new QualityBootstrapCompatibilityException(reason);
         }
     }
@@ -821,8 +821,14 @@ internal sealed class RfbClient : IRfbClient
 
             var desiredScale = _bootstrapState.ActualQuality.ScaleFactor;
             if (desiredScale < 1d &&
-                (framebufferSize.Width > Math.Max(1, (int)Math.Ceiling(_bootstrapOriginalSize.Width * desiredScale)) ||
-                 framebufferSize.Height > Math.Max(1, (int)Math.Ceiling(_bootstrapOriginalSize.Height * desiredScale))))
+                (!IsWithinScaleRoundingBounds(
+                    _bootstrapOriginalSize.Width,
+                    framebufferSize.Width,
+                    desiredScale) ||
+                 !IsWithinScaleRoundingBounds(
+                    _bootstrapOriginalSize.Height,
+                    framebufferSize.Height,
+                    desiredScale)))
             {
                 throw new QualityBootstrapCompatibilityException(
                     QualityBootstrapFailureReason.FramebufferSizeMismatch);
@@ -834,6 +840,17 @@ internal sealed class RfbClient : IRfbClient
 
     internal static bool TryClassifyBootstrapFailure(
         RfbProtocolException exception,
+        out QualityBootstrapFailureReason reason)
+        => TryClassifyBootstrapFailure(
+            exception,
+            scalingWritten: false,
+            firstPixelConfirmed: false,
+            out reason);
+
+    internal static bool TryClassifyBootstrapFailure(
+        RfbProtocolException exception,
+        bool scalingWritten,
+        bool firstPixelConfirmed,
         out QualityBootstrapFailureReason reason)
     {
         var failure = exception.Failure;
@@ -851,8 +868,14 @@ internal sealed class RfbClient : IRfbClient
                 reason = QualityBootstrapFailureReason.MalformedFramebufferUpdate;
                 return true;
             case RfbProtocolFailureKind.RemoteSessionClosed:
-                reason = QualityBootstrapFailureReason.RemoteSessionClosed;
-                return true;
+                if (scalingWritten && !firstPixelConfirmed)
+                {
+                    reason = QualityBootstrapFailureReason.ScaleRejected;
+                    return true;
+                }
+
+                reason = default;
+                return false;
             case RfbProtocolFailureKind.TruncatedRead when failure.ReadStage is
                 RfbProtocolReadStage.FramebufferRectangleHeader or
                 RfbProtocolReadStage.FramebufferRectanglePayload:
@@ -862,6 +885,17 @@ internal sealed class RfbClient : IRfbClient
                 reason = default;
                 return false;
         }
+    }
+
+    private static bool IsWithinScaleRoundingBounds(
+        int originalDimension,
+        int actualDimension,
+        double scaleFactor)
+    {
+        var scaled = originalDimension * scaleFactor;
+        var minimum = Math.Max(1, (int)Math.Floor(scaled));
+        var maximum = Math.Max(1, (int)Math.Ceiling(scaled));
+        return actualDimension >= minimum && actualDimension <= maximum;
     }
 
     public async ValueTask SendPointerAsync(

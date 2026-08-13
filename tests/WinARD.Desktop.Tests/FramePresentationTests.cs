@@ -1561,7 +1561,6 @@ public sealed class FramePresentationTests
     [InlineData(RfbProtocolFailureKind.MalformedFramebufferUpdate, RfbProtocolReadStage.FramebufferRectanglePayload, QualityBootstrapFailureReason.MalformedFramebufferUpdate)]
     [InlineData(RfbProtocolFailureKind.TruncatedRead, RfbProtocolReadStage.FramebufferRectangleHeader, QualityBootstrapFailureReason.MalformedFramebufferUpdate)]
     [InlineData(RfbProtocolFailureKind.TruncatedRead, RfbProtocolReadStage.FramebufferRectanglePayload, QualityBootstrapFailureReason.MalformedFramebufferUpdate)]
-    [InlineData(RfbProtocolFailureKind.RemoteSessionClosed, RfbProtocolReadStage.ServerMessageType, QualityBootstrapFailureReason.RemoteSessionClosed)]
     public void Bootstrap_failure_classifier_accepts_only_the_compatibility_closed_set(
         RfbProtocolFailureKind kind,
         RfbProtocolReadStage stage,
@@ -1589,6 +1588,118 @@ public sealed class FramePresentationTests
 
         Assert.False(RfbClient.TryClassifyBootstrapFailure(exception, out var reason));
         Assert.Equal(default, reason);
+    }
+
+    [Fact]
+    public void Remote_close_is_scale_rejection_only_after_written_scaling_and_before_first_pixel()
+    {
+        var exception = RfbProtocolException.Create(
+            "closed",
+            new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.RemoteSessionClosed,
+                RfbProtocolReadStage.ArdStateChangePayload));
+
+        Assert.True(RfbClient.TryClassifyBootstrapFailure(
+            exception,
+            scalingWritten: true,
+            firstPixelConfirmed: false,
+            out var reason));
+        Assert.Equal(QualityBootstrapFailureReason.ScaleRejected, reason);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void Remote_close_is_not_bootstrap_compatibility_without_pending_written_scaling(
+        bool scalingWritten,
+        bool firstPixelConfirmed)
+    {
+        var exception = RfbProtocolException.Create(
+            "closed",
+            new RfbProtocolFailureInfo(
+                RfbProtocolFailureKind.RemoteSessionClosed,
+                RfbProtocolReadStage.ArdStateChangePayload));
+
+        Assert.False(RfbClient.TryClassifyBootstrapFailure(
+            exception,
+            scalingWritten,
+            firstPixelConfirmed,
+            out var reason));
+        Assert.Equal(default, reason);
+    }
+
+    [Theory]
+    [InlineData(3, 3, 0.75d, 2, 2)]
+    [InlineData(3, 3, 0.75d, 3, 3)]
+    [InlineData(100, 80, 0.75d, 75, 60)]
+    public async Task Bootstrap_scale_confirmation_accepts_server_integer_rounding(
+        ushort originalWidth,
+        ushort originalHeight,
+        double scaleFactor,
+        ushort actualWidth,
+        ushort actualHeight)
+    {
+        await using var stream = new ScriptedDuplexStream(
+        [
+            .. Handshake("RFB 003.889\n"),
+            .. ArdServerInit(originalWidth, originalHeight),
+            .. DesktopSizeUpdate(actualWidth, actualHeight),
+        ]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        await client.ConfigureBootstrapAsync(
+            new QualityBootstrapSettings(
+                RemotePixelFormatKind.Rgb565,
+                [16, 6, 0, 1, -239, -223],
+                QualityBootstrapReason.AutomaticBandwidth,
+                scaleFactor),
+            QualityBootstrapAttempt.Preferred,
+            default);
+
+        using var resize = Assert.IsType<RemoteFramebufferMessage>(await client.ReceiveBootstrapAsync(default));
+        client.ConfirmBootstrap(resize.Size);
+
+        Assert.True(client.BootstrapState.IsFirstPixelConfirmed);
+        Assert.Equal(scaleFactor, client.BootstrapState.AppliedScaleFactor);
+    }
+
+    [Theory]
+    [InlineData(100, 80, 0.75d, 1, 1)]
+    [InlineData(100, 80, 0.75d, 74, 60)]
+    [InlineData(100, 80, 0.75d, 75, 61)]
+    public async Task Bootstrap_scale_confirmation_rejects_dimensions_outside_rounding_bounds(
+        ushort originalWidth,
+        ushort originalHeight,
+        double scaleFactor,
+        ushort actualWidth,
+        ushort actualHeight)
+    {
+        await using var stream = new ScriptedDuplexStream(
+        [
+            .. Handshake("RFB 003.889\n"),
+            .. ArdServerInit(originalWidth, originalHeight),
+            .. DesktopSizeUpdate(actualWidth, actualHeight),
+        ]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        await client.ConfigureBootstrapAsync(
+            new QualityBootstrapSettings(
+                RemotePixelFormatKind.Rgb565,
+                [16, 6, 0, 1, -239, -223],
+                QualityBootstrapReason.AutomaticBandwidth,
+                scaleFactor),
+            QualityBootstrapAttempt.Preferred,
+            default);
+
+        using var resize = Assert.IsType<RemoteFramebufferMessage>(await client.ReceiveBootstrapAsync(default));
+        var compatibility = Assert.Throws<QualityBootstrapCompatibilityException>(() =>
+            client.ConfirmBootstrap(resize.Size));
+
+        Assert.Equal(QualityBootstrapFailureReason.FramebufferSizeMismatch, compatibility.Reason);
+        Assert.False(client.BootstrapState.IsFirstPixelConfirmed);
     }
 
     [Fact]
