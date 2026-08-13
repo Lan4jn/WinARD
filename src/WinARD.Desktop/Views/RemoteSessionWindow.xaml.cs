@@ -72,6 +72,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private bool _allowClose;
     private int _qualitySynchronizationDepth;
     private long _suppressedReconnectGeneration;
+    private int _automaticReconnectCancellationStarted;
 
     public RemoteSessionWindow(
         IRemoteSessionRuntime session,
@@ -274,6 +275,10 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     public async Task CloseSessionAsync()
     {
         SuppressAndCancelAutomaticReconnect();
+        if (_automaticReconnect is not null)
+        {
+            await _automaticReconnect.StopAsync();
+        }
         await _windowLifecycle.DisconnectAsync();
         if (_automaticReconnect is not null)
         {
@@ -717,12 +722,41 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         AutomaticReconnectPanel.Visibility = Visibility.Visible;
     }
 
-    private void OnCancelAutomaticReconnectClicked(object sender, RoutedEventArgs args)
+    private async void OnCancelAutomaticReconnectClicked(object sender, RoutedEventArgs args)
     {
+        if (Interlocked.Exchange(ref _automaticReconnectCancellationStarted, 1) != 0)
+        {
+            return;
+        }
+
+        CancelAutomaticReconnectButton.IsEnabled = false;
         SuppressAndCancelAutomaticReconnect();
-        AutomaticReconnectPanel.Visibility = Visibility.Collapsed;
-        StatusText.Text = "已取消自动重连。";
-        _ = ObserveFailureAsync(_reconnectReservation?.DisposeAsync().AsTask() ?? Task.CompletedTask);
+        try
+        {
+            if (_automaticReconnect is not null)
+            {
+                await _automaticReconnect.StopAsync();
+            }
+            if (_reconnectReservation is not null)
+            {
+                await _reconnectReservation.DisposeAsync();
+            }
+            if (!_lifetime.IsCancellationRequested)
+            {
+                AutomaticReconnectPanel.Visibility = Visibility.Collapsed;
+                StatusText.Text = "已取消自动重连。";
+            }
+        }
+        catch (Exception) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            if (!_lifetime.IsCancellationRequested)
+            {
+                StatusText.Text = "取消自动重连失败。";
+            }
+        }
     }
 
     private void SuppressAndCancelAutomaticReconnect()

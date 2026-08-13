@@ -188,6 +188,41 @@ public sealed class AutomaticReconnectCoordinatorTests
         Assert.Equal(2, progress.Select(item => item.Generation).Distinct().Count());
     }
 
+    [Fact]
+    public async Task Stop_waits_for_a_cancellation_observing_connect_attempt_to_exit()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var exited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var coordinator = Create(_ => true, async token =>
+        {
+            entered.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { exited.TrySetResult(); }
+        });
+        var reconnect = coordinator.StartAsync(new IOException(), default);
+        await entered.Task;
+
+        await coordinator.StopAsync();
+
+        Assert.True(exited.Task.IsCompleted);
+        Assert.False(await reconnect);
+        Assert.False(coordinator.IsRunning);
+    }
+
+    [Fact]
+    public async Task Stop_after_connect_success_reports_success_without_racing_a_new_attempt()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var coordinator = Create(_ => true, _ => release.Task);
+        var reconnect = coordinator.StartAsync(new IOException(), default);
+        release.TrySetResult();
+        Assert.True(await reconnect);
+
+        await coordinator.StopAsync();
+
+        Assert.False(coordinator.IsRunning);
+    }
+
     private static AutomaticReconnectCoordinator Create(
         Func<Exception, bool> transient,
         Func<CancellationToken, Task> connect,

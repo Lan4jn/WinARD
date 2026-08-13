@@ -64,6 +64,21 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
         lock (_sync) _loopCancellation?.Cancel();
     }
 
+    public async Task StopAsync()
+    {
+        Task<bool>? loop;
+        lock (_sync)
+        {
+            _loopCancellation?.Cancel();
+            loop = _loop;
+        }
+
+        if (loop is not null)
+        {
+            await loop.ConfigureAwait(false);
+        }
+    }
+
     public async Task ReconnectNowAsync(CancellationToken token)
     {
         Task<bool>? automatic;

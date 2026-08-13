@@ -234,7 +234,7 @@
                     Visibility="Collapsed" />
                 <StackPanel x:Name="AutomaticReconnectPanel" Orientation="Horizontal" Spacing="8" Visibility="Collapsed">
                     <TextBlock x:Name="AutomaticReconnectStatusText" AutomationProperties.AutomationId="RemoteAutomaticReconnectStatus" AutomationProperties.LiveSetting="Polite" VerticalAlignment="Center" />
-                    <Button AutomationProperties.AutomationId="RemoteCancelAutomaticReconnect" AutomationProperties.Name="取消自动重连" Click="OnCancelAutomaticReconnectClicked" Content="取消" />
+                    <Button x:Name="CancelAutomaticReconnectButton" AutomationProperties.AutomationId="RemoteCancelAutomaticReconnect" AutomationProperties.Name="取消自动重连" Click="OnCancelAutomaticReconnectClicked" Content="取消" />
                 </StackPanel>
             </StackPanel>
             <StackPanel

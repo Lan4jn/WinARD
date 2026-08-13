@@ -166,6 +166,32 @@ public sealed class ConnectionSessionControllerTests
     }
 
     [Fact]
+    public async Task Reservation_transfer_and_cancel_have_exactly_one_lease_winner()
+    {
+        var coordinator = new ActiveSessionCoordinator();
+        await using var first = Controller(new TrackingClient(), coordinator);
+        await first.ConnectAsync(Profile(), default);
+        var ownership = first.TransferConnectedSession();
+        var reservation = ownership.ReserveForReconnect();
+        await ownership.DisposeAsync();
+
+        ActiveSessionCoordinator.ActiveSessionLease? transferred = null;
+        var dispose = Task.Run(async () => await reservation.DisposeAsync());
+        var transfer = Task.Run(() =>
+        {
+            try { transferred = reservation.TransferLease(); }
+            catch (ObjectDisposedException) { }
+        });
+        await Task.WhenAll(dispose, transfer);
+        if (transferred is not null)
+        {
+            await transferred.DisposeAsync();
+        }
+
+        await using var released = await coordinator.AcquireAsync();
+    }
+
+    [Fact]
     public async Task Connected_quality_profile_update_persists_updates_ownership_and_publishes()
     {
         var repository = new RecordingRepository();

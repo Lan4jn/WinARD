@@ -540,6 +540,11 @@ public sealed partial class MainWindow : Window, IDisposable
                 await _sessionController.ReconnectAsync(
                     profile, reconnectReservation, hostKeyPrompt, operationToken);
             }
+            if (operationToken.IsCancellationRequested)
+            {
+                await _sessionController.DisconnectAsync(CancellationToken.None);
+                operationToken.ThrowIfCancellationRequested();
+            }
             var ownership = _sessionController.TransferConnectedSession();
             ReconnectSessionReservation? nextReconnectReservation = null;
             try
@@ -566,6 +571,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     reconnectProfileCapture: reconnectRequest,
                     reconnectReservation: nextReconnectReservation);
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
+                operationToken.ThrowIfCancellationRequested();
                 _remoteSessionWindow = remoteWindow;
                 remoteWindow.Activate();
             }
