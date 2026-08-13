@@ -116,7 +116,14 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
     {
         if (SshAuthenticationModeBox.SelectedIndex >= 0)
         {
-            ViewModel.SshAuthenticationMode = (SshAuthenticationMode)SshAuthenticationModeBox.SelectedIndex;
+            var selected = (SshAuthenticationMode)SshAuthenticationModeBox.SelectedIndex;
+            if (selected != ViewModel.SshAuthenticationMode)
+            {
+                SshPasswordBox.Password = string.Empty;
+                ViewModel.HasSshAuthenticationSecret = false;
+                Interlocked.Exchange(ref _pendingHostKeyRetrySecret, null)?.Dispose();
+                ViewModel.SshAuthenticationMode = selected;
+            }
         }
 
         UpdateState();

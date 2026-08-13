@@ -301,7 +301,7 @@ public sealed partial class MainWindow : Window, IDisposable
             SelectionMode = ListViewSelectionMode.Single,
         };
         list.ItemClick += OnDeviceItemClick;
-        list.DoubleTapped += (_, _) => ViewModel.ActivateSelectedCommand.Execute(null);
+        list.DoubleTapped += OnDeviceDoubleTapped;
         return list;
     }
 
@@ -344,6 +344,22 @@ public sealed partial class MainWindow : Window, IDisposable
         }
 
         ViewModel.SelectedDevice = item;
+    }
+
+    private void OnDeviceDoubleTapped(object sender, Microsoft.UI.Xaml.Input.DoubleTappedRoutedEventArgs args)
+    {
+        var current = args.OriginalSource as DependencyObject;
+        while (current is not null && current is not ListViewItem)
+        {
+            current = VisualTreeHelper.GetParent(current);
+        }
+
+        if (current is ListViewItem { DataContext: var dataContext } &&
+            DeviceActivationTargetResolver.Resolve(dataContext) is { } item)
+        {
+            ViewModel.ActivateDeviceCommand.Execute(item);
+            args.Handled = true;
+        }
     }
 
     private void OnAddDeviceRequested(ConnectionEditorDraft? draft) =>

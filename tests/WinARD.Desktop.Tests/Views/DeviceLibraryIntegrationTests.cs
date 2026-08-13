@@ -10,7 +10,9 @@ public sealed class DeviceLibraryIntegrationTests
         var source = File.ReadAllText(RepositoryFile("src", "WinARD.Desktop", "MainWindow.xaml.cs"));
 
         Assert.Contains("list.DoubleTapped", source, StringComparison.Ordinal);
-        Assert.Contains("ViewModel.ActivateSelectedCommand.Execute(null)", source, StringComparison.Ordinal);
+        Assert.Contains("ListViewItem", source, StringComparison.Ordinal);
+        Assert.Contains("DeviceActivationTargetResolver.Resolve(dataContext)", source, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.ActivateDeviceCommand.Execute(item)", source, StringComparison.Ordinal);
         Assert.Contains("无预览", source, StringComparison.Ordinal);
         Assert.DoesNotContain("Screenshot", source, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Framebuffer", source, StringComparison.OrdinalIgnoreCase);

@@ -33,6 +33,44 @@ public sealed class ConnectionEditorServiceTests
         Assert.Null(saved.SshProfile!.PasswordCredentialReference);
         Assert.NotNull(saved.SshProfile.PrivateKeyPassphraseCredentialReference);
     }
+
+    [Fact]
+    public async Task PasswordClearedBySwitchToPrivateKeyDoesNotCreatePassphraseReference()
+    {
+        var repository = new FakeRepository();
+        using var credentialStore = new VersionedCredentialStore();
+        var service = CreateService(repository, credentialStore, credentialStore);
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Key Mac", "mac.local", 5900, "operator")
+            .WithSsh(SshProfile.Create("jump.local", 22, "ssh-user", "C:\\Keys\\id_ed25519",
+                "target.local", 5900, null, null, null));
+        using var mac = Secret("mac-secret");
+        using var package = new ConnectionEditorSecretPackage(mac, null);
+
+        var saved = (await service.SaveWithResultAsync(
+            profile, CredentialSaveMode.WindowsCredentialManager, package, CancellationToken.None)).Profile;
+
+        Assert.Null(saved.SshProfile!.PasswordCredentialReference);
+        Assert.Null(saved.SshProfile.PrivateKeyPassphraseCredentialReference);
+    }
+
+    [Fact]
+    public async Task PassphraseClearedBySwitchToPasswordDoesNotCreatePasswordReference()
+    {
+        var repository = new FakeRepository();
+        using var credentialStore = new VersionedCredentialStore();
+        var service = CreateService(repository, credentialStore, credentialStore);
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Password Mac", "mac.local", 5900, "operator")
+            .WithSsh(SshProfile.Create("jump.local", 22, "ssh-user", null,
+                "target.local", 5900, null, null, null));
+        using var mac = Secret("mac-secret");
+        using var package = new ConnectionEditorSecretPackage(mac, null);
+
+        var saved = (await service.SaveWithResultAsync(
+            profile, CredentialSaveMode.WindowsCredentialManager, package, CancellationToken.None)).Profile;
+
+        Assert.Null(saved.SshProfile!.PasswordCredentialReference);
+        Assert.Null(saved.SshProfile.PrivateKeyPassphraseCredentialReference);
+    }
     [Fact]
     public async Task AskEveryTimeSavesReferenceWithoutPersistingSecret()
     {

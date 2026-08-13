@@ -61,6 +61,28 @@ public sealed class ConnectionEditorViewModelTests
     }
 
     [Fact]
+    public void UserAuthenticationModeChangeClearsCurrentSecretState()
+    {
+        var sut = CreateValidViewModel();
+        sut.HasSshAuthenticationSecret = true;
+
+        sut.SshAuthenticationMode = SshAuthenticationMode.PrivateKey;
+
+        Assert.False(sut.HasSshAuthenticationSecret);
+    }
+
+    [Fact]
+    public void AssigningSameAuthenticationModeDoesNotClearLoadedSecretState()
+    {
+        var sut = CreateValidViewModel();
+        sut.HasSshAuthenticationSecret = true;
+
+        sut.SshAuthenticationMode = SshAuthenticationMode.Password;
+
+        Assert.True(sut.HasSshAuthenticationSecret);
+    }
+
+    [Fact]
     public void PrivateKeyModePreservesOnlyPassphraseReference()
     {
         var password = CredentialReference.Create("windows", "ssh/password");

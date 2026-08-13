@@ -247,7 +247,14 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public SshAuthenticationMode SshAuthenticationMode
     {
         get => _sshAuthenticationMode;
-        set => SetValidated(ref _sshAuthenticationMode, value);
+        set
+        {
+            if (_sshAuthenticationMode != value)
+            {
+                SetValidated(ref _sshAuthenticationMode, value);
+                HasSshAuthenticationSecret = false;
+            }
+        }
     }
 
     public IReadOnlyList<SshAuthenticationMode> SshAuthenticationModes { get; } =

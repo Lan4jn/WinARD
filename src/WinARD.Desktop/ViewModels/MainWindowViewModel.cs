@@ -40,6 +40,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         _discovery.Changed += OnDiscoveryChanged;
         AddDeviceCommand = new RelayCommand(() => AddDeviceRequested?.Invoke(null));
         ActivateSelectedCommand = new RelayCommand(ActivateSelected, () => SelectedDevice is not null);
+        ActivateDeviceCommand = new RelayCommand<DeviceItemViewModel>(ActivateDevice, item => item is not null);
         EditDeviceCommand = new RelayCommand(
             () => EditDeviceRequested?.Invoke(SelectedDevice!.Profile!),
             () => SelectedDevice?.Profile is not null);
@@ -50,6 +51,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public IRelayCommand AddDeviceCommand { get; }
     public IRelayCommand EditDeviceCommand { get; }
     public IRelayCommand ActivateSelectedCommand { get; }
+    public IRelayCommand<DeviceItemViewModel> ActivateDeviceCommand { get; }
 
     public event Action<ConnectionEditorDraft?>? AddDeviceRequested;
 
@@ -84,11 +86,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void ActivateSelected()
     {
-        if (SelectedDevice is not { } item)
+        if (SelectedDevice is { } item)
+        {
+            ActivateDevice(item);
+        }
+    }
+
+    private void ActivateDevice(DeviceItemViewModel? item)
+    {
+        if (item is null)
         {
             return;
         }
 
+        SelectedDevice = item;
         if (item.Profile is { } profile)
         {
             ConnectRequested?.Invoke(profile);

@@ -51,6 +51,24 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task Activating_hit_item_selects_and_activates_it_instead_of_stale_selection()
+    {
+        var studio = Profile(StudioId, "Studio Mac", "studio.local");
+        var office = Profile(OfficeId, "Office Mini", "office.local");
+        await using var viewModel = Create(new FakeRepository(studio, office));
+        await viewModel.InitializeAsync(CancellationToken.None);
+        viewModel.SelectedDevice = viewModel.SavedDevices.Single(item => item.Profile == studio);
+        ConnectionProfile? requested = null;
+        viewModel.ConnectRequested += candidate => requested = candidate;
+        var hit = viewModel.SavedDevices.Single(item => item.Profile == office);
+
+        viewModel.ActivateDeviceCommand.Execute(hit);
+
+        Assert.Same(hit, viewModel.SelectedDevice);
+        Assert.Equal(office, requested);
+    }
+
+    [Fact]
     public async Task Explicit_add_requests_blank_draft()
     {
         await using var viewModel = Create(new FakeRepository());

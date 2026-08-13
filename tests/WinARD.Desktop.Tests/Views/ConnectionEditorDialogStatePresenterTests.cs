@@ -10,6 +10,18 @@ namespace WinARD.Desktop.Tests.Views;
 public sealed class ConnectionEditorDialogStatePresenterTests
 {
     [Fact]
+    public void AuthenticationModeHandlerClearsVisibleAndPendingSecretsOnlyWhenModeChanges()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "ConnectionEditorDialog.xaml.cs"));
+
+        Assert.Contains("selected != ViewModel.SshAuthenticationMode", source, StringComparison.Ordinal);
+        Assert.Contains("SshPasswordBox.Password = string.Empty", source, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.HasSshAuthenticationSecret = false", source, StringComparison.Ordinal);
+        Assert.Contains("Interlocked.Exchange(ref _pendingHostKeyRetrySecret, null)?.Dispose()", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void AuthenticationModeControlsVisibleInput()
     {
         var viewModel = new ConnectionEditorViewModel(
@@ -51,5 +63,16 @@ public sealed class ConnectionEditorDialogStatePresenterTests
         Assert.True(updated.SaveEnabled);
         Assert.True(updated.TestEnabled);
         Assert.Equal(string.Empty, updated.StatusMessage);
+    }
+
+    private static string RepositoryFile(params string[] parts)
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "WinARD.sln")))
+        {
+            directory = directory.Parent;
+        }
+
+        return Path.Combine(directory!.FullName, Path.Combine(parts));
     }
 }
