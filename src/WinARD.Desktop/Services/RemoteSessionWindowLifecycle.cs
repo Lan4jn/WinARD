@@ -9,6 +9,7 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
     private readonly Func<Task> _closeWindow;
     private readonly Func<CancellationToken, Task>? _retryRequested;
     private readonly Action? _closingStarted;
+    private readonly bool _retryOwnsWindowClose;
     private readonly CancellationTokenSource _retryCancellation = new();
     private Task? _stopTask;
     private Task? _closeWindowTask;
@@ -25,7 +26,8 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
         Func<Task> stopSession,
         Func<Task> closeWindow,
         Func<CancellationToken, Task>? retryRequested,
-        Action? closingStarted = null)
+        Action? closingStarted = null,
+        bool retryOwnsWindowClose = false)
     {
         _sessionCompletion = sessionCompletion ??
             throw new ArgumentNullException(nameof(sessionCompletion));
@@ -37,6 +39,7 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
             throw new ArgumentNullException(nameof(closeWindow));
         _retryRequested = retryRequested;
         _closingStarted = closingStarted;
+        _retryOwnsWindowClose = retryOwnsWindowClose;
     }
 
     public bool IsSessionStopped
@@ -219,9 +222,16 @@ public sealed class RemoteSessionWindowLifecycle : IDisposable
         try
         {
             await StopSessionAsync().ConfigureAwait(false);
-            await CloseWindowOnceAsync().ConfigureAwait(false);
             _retryCancellation.Token.ThrowIfCancellationRequested();
-            await _retryRequested!(_retryCancellation.Token).ConfigureAwait(false);
+            if (_retryOwnsWindowClose)
+            {
+                await _retryRequested!(_retryCancellation.Token).ConfigureAwait(false);
+            }
+            else
+            {
+                await CloseWindowOnceAsync().ConfigureAwait(false);
+                await _retryRequested!(_retryCancellation.Token).ConfigureAwait(false);
+            }
             completion.TrySetResult();
         }
         catch (OperationCanceledException exception)

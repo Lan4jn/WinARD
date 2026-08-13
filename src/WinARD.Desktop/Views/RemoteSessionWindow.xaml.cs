@@ -40,6 +40,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly ConnectionErrorActionHandler _errorActionHandler;
     private readonly RemoteSessionWindowLifecycle _windowLifecycle;
     private readonly AutomaticReconnectCoordinator? _automaticReconnect;
+    private readonly ReconnectTransitionCoordinator? _manualReconnectTransition;
     private readonly FrameRateSelectionCoordinator _frameRateSelection = new();
     private readonly FrameRateSaveStatus _frameRateSaveStatus = new();
     private readonly PerformanceTextPresentationState _performanceTextPresentation = new();
@@ -177,7 +178,17 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             retryWithoutReservation is null
                 ? (_automaticReconnect is null ? null : ReconnectNowAndDisposeAsync)
                 : ReconnectWithoutReservationAsync,
-            BeginClosingDiagnostics);
+            BeginClosingDiagnostics,
+            retryOwnsWindowClose: retryWithoutReservation is not null);
+        if (_automaticReconnect is not null && _reconnectReservation is not null &&
+            retryWithoutReservation is not null)
+        {
+            _manualReconnectTransition = new ReconnectTransitionCoordinator(
+                _automaticReconnect,
+                _reconnectReservation,
+                CloseWindowCoreAsync,
+                retryWithoutReservation);
+        }
         var handlers = new Dictionary<ConnectionErrorActionKind, Func<CancellationToken, Task>>
         {
             [ConnectionErrorActionKind.CopyCorrelationId] = CopyCorrelationIdAsync,
@@ -724,12 +735,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private async Task ReconnectWithoutReservationAsync(CancellationToken token)
     {
-        await CloseWindowCoreAsync();
-        if (_reconnectReservation is not null)
+        if (Interlocked.Exchange(ref _automaticReconnectCancellationStarted, 1) == 0)
         {
-            await _reconnectReservation.DisposeAsync();
+            SuppressAndCancelAutomaticReconnect();
+            RefreshErrorActionState();
         }
-        await _retryWithoutReservation!(token);
+        await _manualReconnectTransition!.RunAsync(token);
     }
 
     private void ShowAutomaticReconnectFailure(Exception? failure)
@@ -1737,7 +1748,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private bool IsErrorActionEnabled(ConnectionErrorActionKind action) => action switch
     {
         ConnectionErrorActionKind.Retry =>
-            _errorActionHandler.CanHandle(action) && _windowLifecycle.CanRetry,
+            _errorActionHandler.CanHandle(action) && _windowLifecycle.CanRetry &&
+            Volatile.Read(ref _automaticReconnectCancellationStarted) == 0,
         ConnectionErrorActionKind.Disconnect or ConnectionErrorActionKind.Cancel =>
             _errorActionHandler.CanHandle(action) && _windowLifecycle.CanDisconnect,
         ConnectionErrorActionKind.ExportDiagnostics =>
