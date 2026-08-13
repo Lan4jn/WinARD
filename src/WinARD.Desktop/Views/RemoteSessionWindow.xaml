@@ -163,17 +163,23 @@
                 Padding="12"
                 PointerPressed="OnQualityOverlayPointerPressed"
                 Visibility="Collapsed">
-                <ScrollViewer
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition x:Name="QualityOverlayHeaderRow" Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <Grid>
+                        <TextBlock x:Name="QualityOverlayTitle" FontSize="18" Text="画质" />
+                        <Button x:Name="QualityCloseButton" HorizontalAlignment="Right" AutomationProperties.AutomationId="RemoteQualityCloseButton" AutomationProperties.Name="关闭画质面板" Click="OnQualityCloseClicked" Content="关闭" />
+                    </Grid>
+                    <ScrollViewer
                     x:Name="QualityOverlayScrollViewer"
+                    Grid.Row="1"
                     HorizontalScrollBarVisibility="Auto"
                     HorizontalScrollMode="Enabled"
                     VerticalScrollBarVisibility="Auto"
                     VerticalScrollMode="Enabled">
                     <StackPanel MinWidth="120" Spacing="8">
-                        <Grid>
-                            <TextBlock FontSize="18" Text="画质" />
-                            <Button x:Name="QualityCloseButton" HorizontalAlignment="Right" AutomationProperties.AutomationId="RemoteQualityCloseButton" AutomationProperties.Name="关闭画质面板" Click="OnQualityCloseClicked" Content="关闭" />
-                        </Grid>
                         <TextBlock x:Name="QualityStatusText" AutomationProperties.AutomationId="RemoteQualityStatus" AutomationProperties.Name="画质状态" AutomationProperties.LiveSetting="Polite" Text="状态未知" />
                         <TextBlock x:Name="QualityDesiredText" AutomationProperties.AutomationId="RemoteQualityDesiredText" AutomationProperties.Name="期望画质" Text="期望：—" />
                         <TextBlock x:Name="QualityAppliedText" AutomationProperties.AutomationId="RemoteQualityAppliedText" AutomationProperties.Name="实际画质" AutomationProperties.LiveSetting="Polite" Text="实际：—" />
@@ -204,7 +210,8 @@
                             <Button x:Name="QualityLaterButton" AutomationProperties.AutomationId="RemoteQualityLaterButton" AutomationProperties.Name="稍后重新连接" Click="OnQualityLaterClicked" Content="稍后" />
                         </StackPanel>
                     </StackPanel>
-                </ScrollViewer>
+                    </ScrollViewer>
+                </Grid>
             </Border>
         </Canvas>
 

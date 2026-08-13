@@ -33,6 +33,10 @@ public sealed class RemoteSessionQualityPanelTests
         var scroller = Assert.Single(overlay.Descendants(presentation + "ScrollViewer"));
         Assert.Equal("Auto", (string?)scroller.Attribute("HorizontalScrollBarVisibility"));
         Assert.Equal("Auto", (string?)scroller.Attribute("VerticalScrollBarVisibility"));
+        Assert.DoesNotContain(scroller.Descendants(), item =>
+            (string?)item.Attribute(x + "Name") == "QualityCloseButton");
+        Assert.NotNull(overlay.Descendants().SingleOrDefault(item =>
+            (string?)item.Attribute(x + "Name") == "QualityCloseButton"));
     }
 
     [Fact]

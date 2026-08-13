@@ -43,7 +43,14 @@ internal sealed class QualityOverlayState
     }
 }
 
-internal readonly record struct QualityOverlayPlacement(double Left, double Top, double Width, double Height)
+internal readonly record struct QualityOverlayPlacement(
+    double Left,
+    double Top,
+    double Width,
+    double Height,
+    double Padding,
+    double HeaderHeight,
+    double ViewportHeight)
 {
     public static QualityOverlayPlacement Calculate(
         double windowWidth,
@@ -64,7 +71,11 @@ internal readonly record struct QualityOverlayPlacement(double Left, double Top,
             ? Math.Max(margin, anchorBottom - maxHeight)
             : Math.Max(margin, Math.Min(anchorBottom, windowHeight - margin));
         var height = Math.Max(0, Math.Min(maxHeight, windowHeight - top - margin));
-        return new(left, top, width, height);
+        var padding = height >= 80 ? 12d : height >= 48 ? 4d : 0d;
+        var headerHeight = Math.Min(height >= 80 ? 32d : 12d, Math.Max(0, height - 3));
+        const double borderChrome = 2d;
+        var viewportHeight = Math.Max(1, height - headerHeight - borderChrome - (2 * padding));
+        return new(left, top, width, height, padding, headerHeight, viewportHeight);
     }
 }
 

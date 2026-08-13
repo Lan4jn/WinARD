@@ -32,5 +32,7 @@ public sealed class QualityOverlayPlacementTests
         Assert.Equal(84, placement.Width);
         Assert.True(placement.Left + placement.Width <= 92);
         Assert.True(placement.Top + placement.Height <= 32);
+        Assert.True(placement.ViewportHeight > 0);
+        Assert.True(placement.Padding >= 0);
     }
 }

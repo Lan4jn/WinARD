@@ -1038,6 +1038,17 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         Canvas.SetTop(QualityOverlay, placement.Top);
         QualityOverlay.Width = placement.Width;
         QualityOverlay.Height = placement.Height;
+        QualityOverlay.Padding = new Thickness(placement.Padding);
+        QualityOverlayHeaderRow.Height = new GridLength(placement.HeaderHeight);
+        QualityOverlayTitle.Visibility = placement.HeaderHeight >= 24
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        QualityCloseButton.Padding = placement.HeaderHeight >= 24
+            ? new Thickness(8, 4, 8, 4)
+            : new Thickness(1, 0, 1, 0);
+        QualityCloseButton.MinHeight = 0;
+        QualityCloseButton.MaxHeight = placement.HeaderHeight;
+        QualityOverlayScrollViewer.MaxHeight = placement.ViewportHeight;
     }
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs args)
