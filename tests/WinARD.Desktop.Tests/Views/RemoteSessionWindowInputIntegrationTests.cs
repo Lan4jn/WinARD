@@ -549,16 +549,10 @@ public sealed class RemoteSessionWindowInputIntegrationTests
             "                        _sessionController.UpdateConnectedFrameRefreshPolicyAsync",
             source,
             StringComparison.Ordinal);
-        Assert.Contains(
-            "ConnectProfileWithHandlingAsync(\n                            ownership.Profile,",
-            source,
-            StringComparison.Ordinal);
+        Assert.Contains("new RemoteSessionReconnectRequest(", source, StringComparison.Ordinal);
+        Assert.Contains("retryRequested: reconnectRequest.InvokeAsync", source, StringComparison.Ordinal);
         Assert.DoesNotContain(
             "ConnectProfileWithHandlingAsync(\n                            effectiveProfile,",
-            source,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain(
-            "var effectiveProfile = ownership.Profile",
             source,
             StringComparison.Ordinal);
     }
@@ -590,6 +584,19 @@ public sealed class RemoteSessionWindowInputIntegrationTests
             "InputSurface.RemoveHandler(UIElement.KeyUpEvent",
             source,
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Every_keyboard_entry_point_consumes_local_quality_ui_before_remote_dispatch()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Equal(4, source.Split("ConsumeLocalQualityKeyboardInput()", StringSplitOptions.None).Length - 1);
+        Assert.Contains("_textInput.Reset();", source, StringComparison.Ordinal);
+        Assert.Contains("InputSurface.CharacterReceived -= OnCharacterReceived", source, StringComparison.Ordinal);
+        Assert.Contains("FrameScrollViewer.SizeChanged -= _frameScrollViewerSizeChangedHandler", source, StringComparison.Ordinal);
+        Assert.Contains("RootGrid.SizeChanged -= _rootGridSizeChangedHandler", source, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -27,7 +27,7 @@ public sealed class QualityOverlayPlacementTests
         var placement = QualityOverlayPlacement.Calculate(100, 40, 90, 35, 360, 620, 8);
 
         Assert.Equal(8, placement.Left);
-        Assert.Equal(32, placement.Top);
-        Assert.Equal(0, placement.MaxHeight);
+        Assert.Equal(8, placement.Top);
+        Assert.Equal(27, placement.MaxHeight);
     }
 }

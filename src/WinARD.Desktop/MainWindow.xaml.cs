@@ -525,6 +525,13 @@ public sealed partial class MainWindow : Window, IDisposable
             var ownership = _sessionController.TransferConnectedSession();
             try
             {
+                var reconnectRequest = new RemoteSessionReconnectRequest(
+                    ownership.Profile,
+                    (latestProfile, retryToken) => _uiOperation.RunAsync(
+                        () => ConnectProfileWithHandlingAsync(
+                            latestProfile,
+                            cancellationToken: retryToken),
+                        retryToken));
                 var remoteWindow = new RemoteSessionWindow(
                     ownership.Session,
                     ownership,
@@ -532,11 +539,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     presenter: null,
                     diagnosticSink: _diagnosticSink,
                     diagnosticExportService: _diagnosticExportService,
-                    retryRequested: retryToken => _uiOperation.RunAsync(
-                        () => ConnectProfileWithHandlingAsync(
-                            ownership.Profile,
-                            cancellationToken: retryToken),
-                        retryToken),
+                    retryRequested: reconnectRequest.InvokeAsync,
                     profile: ownership.Profile,
                     updateFrameRefreshPolicy:
                         _sessionController.UpdateConnectedFrameRefreshPolicyAsync,

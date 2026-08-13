@@ -42,6 +42,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly PerformanceTextPresentationState _performanceTextPresentation = new();
     private readonly QualityProfileSelectionCoordinator _qualityProfileSelection = new();
     private readonly QualityOverlayState _qualityOverlayState = new();
+    private readonly IReconnectProfileCapture? _reconnectProfileCapture;
     private readonly Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>?
         _updateFrameRefreshPolicy;
     private readonly Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>?
@@ -54,6 +55,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly PointerEventHandler _pointerReleasedHandler;
     private readonly PointerEventHandler _pointerCanceledHandler;
     private readonly PointerEventHandler _pointerWheelChangedHandler;
+    private readonly SizeChangedEventHandler _frameScrollViewerSizeChangedHandler;
+    private readonly SizeChangedEventHandler _rootGridSizeChangedHandler;
+    private ConnectionProfile? _capturedReconnectProfile;
     private RemoteFramebufferSize _remoteSize;
     private ViewportScaleMode _scaleMode = ViewportScaleMode.Fit;
     private byte _pointerMask;
@@ -86,6 +90,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _updateFrameRefreshPolicy = updateFrameRefreshPolicy;
         _updateQualityProfile = updateQualityProfile;
         _profile = profile;
+        _reconnectProfileCapture = retryRequested?.Target as IReconnectProfileCapture;
         _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _diagnosticExportState = new RemoteSessionDiagnosticExportState(
             serviceAvailable: diagnosticExportService is not null);
@@ -169,6 +174,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _pointerReleasedHandler = OnPointerReleased;
         _pointerCanceledHandler = OnPointerCanceled;
         _pointerWheelChangedHandler = OnPointerWheelChanged;
+        _frameScrollViewerSizeChangedHandler = (_, _) => UpdateFrameSizing();
+        _rootGridSizeChangedHandler = (_, _) => UpdateQualityOverlayPlacement();
         InputSurface.AddHandler(
             UIElement.KeyDownEvent,
             _keyDownHandler,
@@ -200,8 +207,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             handledEventsToo: true);
         FramePanel.Loaded += OnFramePanelLoaded;
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
-        FrameScrollViewer.SizeChanged += (_, _) => UpdateFrameSizing();
-        RootGrid.SizeChanged += (_, _) => UpdateQualityOverlayPlacement();
+        FrameScrollViewer.SizeChanged += _frameScrollViewerSizeChangedHandler;
+        RootGrid.SizeChanged += _rootGridSizeChangedHandler;
         UpdateFrameSizing();
     }
 
@@ -447,6 +454,13 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     {
         if (args.Key == Windows.System.VirtualKey.Escape && HandleQualityOverlayEscape())
         {
+            _textInput.Reset();
+            args.Handled = true;
+            return;
+        }
+
+        if (ConsumeLocalQualityKeyboardInput())
+        {
             args.Handled = true;
             return;
         }
@@ -480,6 +494,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnKeyUp(object sender, KeyRoutedEventArgs args)
     {
+        if (ConsumeLocalQualityKeyboardInput())
+        {
+            args.Handled = true;
+            return;
+        }
+
         if (IsInputClosing())
         {
             RecordKeyboardDropped(RemoteInputDropReason.SessionClosing);
@@ -503,6 +523,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnCharacterReceived(object sender, CharacterReceivedRoutedEventArgs args)
     {
+        if (ConsumeLocalQualityKeyboardInput())
+        {
+            args.Handled = true;
+            return;
+        }
+
         if (IsInputClosing())
         {
             RecordKeyboardDropped(RemoteInputDropReason.SessionClosing);
@@ -849,6 +875,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         QualityReconnectNowButton.IsEnabled = false;
         try
         {
+            CaptureReconnectProfile();
             await _windowLifecycle.RetryAsync(_lifetime.Token);
         }
         catch (OperationCanceledException)
@@ -859,6 +886,26 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             QualityReconnectNowButton.IsEnabled = true;
             ShowFrameRateSaveStatus("重新连接失败；设置已保留");
         }
+    }
+
+    private void CaptureReconnectProfile()
+    {
+        var current = Volatile.Read(ref _profile) ??
+            throw new InvalidOperationException("A connection profile is required for reconnect.");
+        var captured = current.WithQualityProfile(ViewModel.QualityProfile);
+        Volatile.Write(ref _capturedReconnectProfile, captured);
+        _reconnectProfileCapture?.Capture(captured);
+    }
+
+    private bool ConsumeLocalQualityKeyboardInput()
+    {
+        if (!_qualityOverlayState.IsOpen && !_qualityOverlayState.IsDropDownOpen)
+        {
+            return false;
+        }
+
+        _textInput.Reset();
+        return true;
     }
 
     private void OnQualityOverlayPointerPressed(object sender, PointerRoutedEventArgs args) =>
@@ -1589,6 +1636,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _appWindow.Closing -= OnClosing;
         InputSurface.RemoveHandler(UIElement.KeyDownEvent, _keyDownHandler);
         InputSurface.RemoveHandler(UIElement.KeyUpEvent, _keyUpHandler);
+        InputSurface.CharacterReceived -= OnCharacterReceived;
+        FrameScrollViewer.SizeChanged -= _frameScrollViewerSizeChangedHandler;
+        RootGrid.SizeChanged -= _rootGridSizeChangedHandler;
         FrameSurface.RemoveHandler(UIElement.PointerPressedEvent, _pointerPressedHandler);
         FrameSurface.RemoveHandler(UIElement.PointerMovedEvent, _pointerMovedHandler);
         FrameSurface.RemoveHandler(UIElement.PointerReleasedEvent, _pointerReleasedHandler);

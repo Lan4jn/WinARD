@@ -52,6 +52,12 @@ internal sealed class RemoteTextInputBuffer
         return character.ToString();
     }
 
+    public void Reset()
+    {
+        _pendingPhysicalCharacter = null;
+        _pendingHighSurrogate = null;
+    }
+
     private static bool UsesPhysicalTextPath(VirtualKey key)
     {
         var value = (int)key;

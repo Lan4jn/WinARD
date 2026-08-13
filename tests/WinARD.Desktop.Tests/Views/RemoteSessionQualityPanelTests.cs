@@ -87,8 +87,21 @@ public sealed class RemoteSessionQualityPanelTests
         var main = File.ReadAllText(RepositoryFile(
             "src", "WinARD.Desktop", "MainWindow.xaml.cs"));
 
-        Assert.Contains("ownership.Profile", main, StringComparison.Ordinal);
+        Assert.Contains("new RemoteSessionReconnectRequest", main, StringComparison.Ordinal);
         Assert.Contains("UpdateConnectedQualityProfileAsync", main, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Explicit_reconnect_captures_session_desired_quality_before_lifecycle_stop()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Contains("CaptureReconnectProfile()", source, StringComparison.Ordinal);
+        Assert.Contains("WithQualityProfile(ViewModel.QualityProfile)", source, StringComparison.Ordinal);
+        Assert.Contains("await _windowLifecycle.RetryAsync", source, StringComparison.Ordinal);
+        Assert.True(source.IndexOf("CaptureReconnectProfile()", StringComparison.Ordinal) <
+            source.IndexOf("await _windowLifecycle.RetryAsync", StringComparison.Ordinal));
     }
 
     private static void AssertQualityTextBlock(

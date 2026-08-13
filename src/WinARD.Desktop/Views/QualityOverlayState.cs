@@ -55,8 +55,13 @@ internal readonly record struct QualityOverlayPlacement(double Left, double Top,
         double margin)
     {
         var left = Math.Max(margin, Math.Min(anchorLeft, windowWidth - panelWidth - margin));
-        var top = Math.Max(margin, Math.Min(anchorBottom, windowHeight - margin));
-        var maxHeight = Math.Max(0, Math.Min(desiredHeight, windowHeight - top - margin));
+        var availableBelow = Math.Max(0, windowHeight - anchorBottom - margin);
+        var availableAbove = Math.Max(0, anchorBottom - margin);
+        var useAbove = availableBelow < Math.Min(desiredHeight, 160) && availableAbove > availableBelow;
+        var maxHeight = Math.Max(0, Math.Min(desiredHeight, useAbove ? availableAbove : availableBelow));
+        var top = useAbove
+            ? Math.Max(margin, anchorBottom - maxHeight)
+            : Math.Max(margin, Math.Min(anchorBottom, windowHeight - margin));
         return new(left, top, maxHeight);
     }
 }

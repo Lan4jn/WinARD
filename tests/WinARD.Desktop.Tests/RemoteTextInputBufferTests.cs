@@ -26,4 +26,17 @@ public sealed class RemoteTextInputBufferTests
         Assert.Null(buffer.AcceptCharacter('\ud83d'));
         Assert.Equal("😀", buffer.AcceptCharacter('\ude00'));
     }
+
+    [Fact]
+    public void Reset_discards_pending_physical_and_surrogate_state()
+    {
+        var buffer = new RemoteTextInputBuffer();
+        buffer.OnPhysicalKeyDown(VirtualKey.Number1, 0x02, isExtended: false);
+        Assert.Null(buffer.AcceptCharacter('\ud83d'));
+
+        buffer.Reset();
+
+        Assert.Equal("!", buffer.AcceptCharacter('!'));
+        Assert.Null(buffer.AcceptCharacter('\ude00'));
+    }
 }
