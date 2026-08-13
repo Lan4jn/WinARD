@@ -600,6 +600,18 @@ public sealed class RemoteSessionWindowInputIntegrationTests
     }
 
     [Fact]
+    public void Opening_quality_overlay_releases_remote_input_before_visibility_and_local_key_up_is_consumed()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Contains("token => ReleaseInputAsync(token, releasePointer: true)", source, StringComparison.Ordinal);
+        Assert.Contains("await _qualityOverlayOpenCoordinator.ToggleAsync", source, StringComparison.Ordinal);
+        Assert.Contains("private void OnKeyUp", source, StringComparison.Ordinal);
+        Assert.Contains("if (ConsumeLocalQualityKeyboardInput())", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Remote_window_routes_pointer_events_through_frame_surface()
     {
         var source = File.ReadAllText(RepositoryFile(

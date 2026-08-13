@@ -539,12 +539,14 @@ public sealed partial class MainWindow : Window, IDisposable
                     presenter: null,
                     diagnosticSink: _diagnosticSink,
                     diagnosticExportService: _diagnosticExportService,
+                    initialError: null,
                     retryRequested: reconnectRequest.InvokeAsync,
                     profile: ownership.Profile,
                     updateFrameRefreshPolicy:
                         _sessionController.UpdateConnectedFrameRefreshPolicyAsync,
                     updateQualityProfile:
-                        _sessionController.UpdateConnectedQualityProfileAsync);
+                        _sessionController.UpdateConnectedQualityProfileAsync,
+                    reconnectProfileCapture: reconnectRequest);
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
                 _remoteSessionWindow = remoteWindow;
                 remoteWindow.Activate();

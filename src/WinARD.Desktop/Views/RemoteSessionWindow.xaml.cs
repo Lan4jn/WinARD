@@ -42,6 +42,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly PerformanceTextPresentationState _performanceTextPresentation = new();
     private readonly QualityProfileSelectionCoordinator _qualityProfileSelection = new();
     private readonly QualityOverlayState _qualityOverlayState = new();
+    private readonly QualityOverlayOpenCoordinator _qualityOverlayOpenCoordinator;
     private readonly IReconnectProfileCapture? _reconnectProfileCapture;
     private readonly Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>?
         _updateFrameRefreshPolicy;
@@ -81,6 +82,26 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             updateFrameRefreshPolicy = null,
         Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>?
             updateQualityProfile = null)
+        : this(
+            session, ownership, dispatcher, presenter, diagnosticSink, diagnosticExportService,
+            initialError, retryRequested, profile, updateFrameRefreshPolicy, updateQualityProfile,
+            reconnectProfileCapture: null)
+    {
+    }
+
+    internal RemoteSessionWindow(
+        IRemoteSessionRuntime session,
+        IAsyncDisposable ownership,
+        IUiDispatcher dispatcher,
+        IFramePresenter? presenter,
+        ISafeDiagnosticSink? diagnosticSink,
+        DiagnosticExportService? diagnosticExportService,
+        ConnectionErrorViewModel? initialError,
+        Func<CancellationToken, Task>? retryRequested,
+        ConnectionProfile? profile,
+        Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>? updateFrameRefreshPolicy,
+        Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>? updateQualityProfile,
+        IReconnectProfileCapture? reconnectProfileCapture)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(ownership);
@@ -90,7 +111,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _updateFrameRefreshPolicy = updateFrameRefreshPolicy;
         _updateQualityProfile = updateQualityProfile;
         _profile = profile;
-        _reconnectProfileCapture = retryRequested?.Target as IReconnectProfileCapture;
+        _reconnectProfileCapture = reconnectProfileCapture;
         _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _diagnosticExportState = new RemoteSessionDiagnosticExportState(
             serviceAvailable: diagnosticExportService is not null);
@@ -139,6 +160,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             _windowLifecycle.StopSessionAsync,
             IsInputClosing,
             ViewModel.ObserveInputFailure);
+        _qualityOverlayOpenCoordinator = new QualityOverlayOpenCoordinator(
+            token => ReleaseInputAsync(token, releasePointer: true),
+            SetQualityOverlayVisible);
         _cursorVisibility = new RemoteCursorVisibilityController(
             InputSurface.SetHostCursorHidden,
             visible => RemoteCursorOverlay.Visibility = visible
@@ -861,9 +885,24 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
     }
 
-    private void OnQualitySummaryClicked(object sender, RoutedEventArgs args)
+    private async void OnQualitySummaryClicked(object sender, RoutedEventArgs args)
     {
-        SetQualityOverlayVisible(_qualityOverlayState.Toggle());
+        try
+        {
+            if (_qualityOverlayState.IsOpen)
+            {
+                CloseQualityOverlay();
+                return;
+            }
+            await _qualityOverlayOpenCoordinator.ToggleAsync(_lifetime.Token);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            ShowFrameRateSaveStatus("无法安全打开画质设置");
+        }
     }
 
     private void OnQualityCloseClicked(object sender, RoutedEventArgs args) => CloseQualityOverlay();
@@ -923,11 +962,15 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private void CloseQualityOverlay()
     {
         _qualityOverlayState.Close();
-        SetQualityOverlayVisible(false);
+        _qualityOverlayOpenCoordinator.Close();
     }
 
     private void SetQualityOverlayVisible(bool visible)
     {
+        if (visible)
+        {
+            _qualityOverlayState.Open();
+        }
         QualityOverlay.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
         QualityOverlayLayer.IsHitTestVisible = visible;
         if (visible)
@@ -992,6 +1035,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         Canvas.SetLeft(QualityOverlay, placement.Left);
         Canvas.SetTop(QualityOverlay, placement.Top);
         QualityOverlayScrollViewer.MaxHeight = placement.MaxHeight;
+        QualityOverlay.Width = placement.Width;
     }
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs args) =>

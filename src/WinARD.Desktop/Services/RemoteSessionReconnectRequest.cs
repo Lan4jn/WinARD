@@ -2,7 +2,7 @@ using WinARD.Domain.Connections;
 
 namespace WinARD.Desktop.Services;
 
-internal interface IReconnectProfileCapture
+public interface IReconnectProfileCapture
 {
     void Capture(ConnectionProfile profile);
 }

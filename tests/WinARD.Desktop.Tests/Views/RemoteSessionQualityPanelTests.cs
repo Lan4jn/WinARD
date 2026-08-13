@@ -99,6 +99,9 @@ public sealed class RemoteSessionQualityPanelTests
 
         Assert.Contains("CaptureReconnectProfile()", source, StringComparison.Ordinal);
         Assert.Contains("WithQualityProfile(ViewModel.QualityProfile)", source, StringComparison.Ordinal);
+        Assert.Contains("reconnectProfileCapture:", File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "MainWindow.xaml.cs")), StringComparison.Ordinal);
+        Assert.DoesNotContain("retryRequested?.Target", source, StringComparison.Ordinal);
         Assert.Contains("await _windowLifecycle.RetryAsync", source, StringComparison.Ordinal);
         Assert.True(source.IndexOf("CaptureReconnectProfile()", StringComparison.Ordinal) <
             source.IndexOf("await _windowLifecycle.RetryAsync", StringComparison.Ordinal));

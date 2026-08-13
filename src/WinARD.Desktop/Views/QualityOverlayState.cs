@@ -43,7 +43,7 @@ internal sealed class QualityOverlayState
     }
 }
 
-internal readonly record struct QualityOverlayPlacement(double Left, double Top, double MaxHeight)
+internal readonly record struct QualityOverlayPlacement(double Left, double Top, double Width, double MaxHeight)
 {
     public static QualityOverlayPlacement Calculate(
         double windowWidth,
@@ -54,7 +54,8 @@ internal readonly record struct QualityOverlayPlacement(double Left, double Top,
         double desiredHeight,
         double margin)
     {
-        var left = Math.Max(margin, Math.Min(anchorLeft, windowWidth - panelWidth - margin));
+        var width = Math.Max(0, Math.Min(panelWidth, windowWidth - (2 * margin)));
+        var left = Math.Max(margin, Math.Min(anchorLeft, windowWidth - width - margin));
         var availableBelow = Math.Max(0, windowHeight - anchorBottom - margin);
         var availableAbove = Math.Max(0, anchorBottom - margin);
         var useAbove = availableBelow < Math.Min(desiredHeight, 160) && availableAbove > availableBelow;
@@ -62,6 +63,67 @@ internal readonly record struct QualityOverlayPlacement(double Left, double Top,
         var top = useAbove
             ? Math.Max(margin, anchorBottom - maxHeight)
             : Math.Max(margin, Math.Min(anchorBottom, windowHeight - margin));
-        return new(left, top, maxHeight);
+        return new(left, top, width, maxHeight);
+    }
+}
+
+internal sealed class QualityOverlayOpenCoordinator(
+    Func<CancellationToken, Task> releaseInput,
+    Action<bool> setVisible)
+{
+    private readonly object _sync = new();
+    private Task? _openTask;
+    private long _version;
+    private bool _visible;
+
+    public Task ToggleAsync(CancellationToken token)
+    {
+        lock (_sync)
+        {
+            if (_visible)
+            {
+                CloseNoLock();
+                return Task.CompletedTask;
+            }
+            return _openTask ??= OpenAsync(++_version, token);
+        }
+    }
+
+    public void Close()
+    {
+        lock (_sync)
+        {
+            CloseNoLock();
+        }
+    }
+
+    private void CloseNoLock()
+    {
+        _version++;
+        _visible = false;
+        setVisible(false);
+    }
+
+    private async Task OpenAsync(long version, CancellationToken token)
+    {
+        try
+        {
+            await releaseInput(token);
+            lock (_sync)
+            {
+                if (version == _version)
+                {
+                    _visible = true;
+                    setVisible(true);
+                }
+            }
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                _openTask = null;
+            }
+        }
     }
 }
