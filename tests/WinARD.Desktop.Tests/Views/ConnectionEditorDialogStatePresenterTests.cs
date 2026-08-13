@@ -19,6 +19,7 @@ public sealed class ConnectionEditorDialogStatePresenterTests
         Assert.Contains("SshPasswordBox.Password = string.Empty", source, StringComparison.Ordinal);
         Assert.Contains("ViewModel.HasSshAuthenticationSecret = false", source, StringComparison.Ordinal);
         Assert.Contains("Interlocked.Exchange(ref _pendingHostKeyRetrySecret, null)?.Dispose()", source, StringComparison.Ordinal);
+        Assert.Contains("SshAuthenticationConfigurationChanged", source, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -60,6 +60,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
             ? -1
             : (int)viewModel.CredentialSaveMode;
         WireFieldChanges();
+        ViewModel.SshAuthenticationConfigurationChanged += OnSshAuthenticationConfigurationChanged;
         ErrorCard.IsActionEnabled = CanHandleErrorAction;
         ErrorCard.ActionRequested += OnErrorActionRequested;
         PrimaryButtonClick += OnSaveClicked;
@@ -134,6 +135,9 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         ViewModel.HasSshAuthenticationSecret = SshPasswordBox.Password.Length > 0;
         UpdateState();
     }
+
+    private void OnSshAuthenticationConfigurationChanged(object? sender, EventArgs args) =>
+        Interlocked.Exchange(ref _pendingHostKeyRetrySecret, null)?.Dispose();
 
     private void OnSaveClicked(ContentDialog sender, ContentDialogButtonClickEventArgs args)
     {
@@ -484,6 +488,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         }
 
         _lifetime.Cancel();
+        ViewModel.SshAuthenticationConfigurationChanged -= OnSshAuthenticationConfigurationChanged;
         ErrorCard.ActionRequested -= OnErrorActionRequested;
         ClearPasswords();
         _lifetime.Dispose();

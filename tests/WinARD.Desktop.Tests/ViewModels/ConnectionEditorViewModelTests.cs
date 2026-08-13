@@ -1,5 +1,6 @@
 using WinARD.Application.Ports;
 using WinARD.Desktop.ViewModels;
+using WinARD.Desktop.Services;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
 using WinARD.Domain.Security;
@@ -80,6 +81,74 @@ public sealed class ConnectionEditorViewModelTests
         sut.SshAuthenticationMode = SshAuthenticationMode.Password;
 
         Assert.True(sut.HasSshAuthenticationSecret);
+    }
+
+    [Fact]
+    public void AuthenticationFieldChangesIncrementGeneration()
+    {
+        var sut = CreateValidViewModel();
+        var initial = sut.SshAuthenticationGeneration;
+
+        sut.SshUsername = "ssh-user";
+        var afterUsername = sut.SshAuthenticationGeneration;
+        sut.PrivateKeyPath = "C:\\Keys\\id_ed25519";
+
+        Assert.True(afterUsername > initial);
+        Assert.True(sut.SshAuthenticationGeneration > afterUsername);
+    }
+
+    [Fact]
+    public async Task StaleHostKeyFailureAfterModeChangeIsDiscarded()
+    {
+        var release = new TaskCompletionSource<ConnectionProfileTestResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var profile = ExistingSshProfile(privateKeyPath: null)
+            .WithCredential(CredentialReference.Create("windows", "mac"));
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (saved, _, _, _) => Task.FromResult(new ConnectionProfileSaveResult(saved)),
+            (_, _, _, _) => release.Task);
+        sut.CredentialSaveMode = CredentialSaveMode.AskEveryTime;
+        var test = sut.TestConnectionAsync(null, CancellationToken.None);
+        sut.SshAuthenticationMode = SshAuthenticationMode.PrivateKey;
+        var failure = new SshHostKeyPromptRequest(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "SHA256:new",
+            PreviousFingerprint: null,
+            IsChanged: false);
+
+        release.SetResult(new ConnectionProfileTestResult(profile, [], HostKeyFailure: failure));
+        await test;
+
+        Assert.Null(sut.LastTestHostKeyFailure);
+        Assert.Contains("配置已变", sut.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StaleHostKeyFailureAfterAuthenticationFieldChangeIsDiscarded()
+    {
+        var release = new TaskCompletionSource<ConnectionProfileTestResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var profile = ExistingSshProfile(privateKeyPath: null)
+            .WithCredential(CredentialReference.Create("windows", "mac"));
+        var sut = new ConnectionEditorViewModel(
+            profile,
+            (saved, _, _, _) => Task.FromResult(new ConnectionProfileSaveResult(saved)),
+            (_, _, _, _) => release.Task);
+        sut.CredentialSaveMode = CredentialSaveMode.AskEveryTime;
+        var test = sut.TestConnectionAsync(null, CancellationToken.None);
+        sut.SshUsername = "changed-user";
+        var failure = new SshHostKeyPromptRequest(
+            new SshHostKeyEndpoint("jump.local", 22),
+            "ssh-ed25519",
+            "SHA256:new",
+            PreviousFingerprint: null,
+            IsChanged: false);
+
+        release.SetResult(new ConnectionProfileTestResult(profile, [], HostKeyFailure: failure));
+        await test;
+
+        Assert.Null(sut.LastTestHostKeyFailure);
+        Assert.Contains("配置已变", sut.StatusMessage, StringComparison.Ordinal);
     }
 
     [Fact]

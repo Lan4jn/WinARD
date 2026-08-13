@@ -65,6 +65,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     private string _sshTargetHost = string.Empty;
     private int _sshTargetPort = 5900;
     private SshAuthenticationMode _sshAuthenticationMode;
+    private long _sshAuthenticationGeneration;
     private bool _hasSshAuthenticationSecret;
     private bool _hasUnsupportedCredentialReference;
     private bool _credentialModeChanged;
@@ -211,25 +212,25 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public string SshHost
     {
         get => _sshHost;
-        set => SetValidated(ref _sshHost, value ?? string.Empty);
+        set => SetSshAuthenticationField(ref _sshHost, value ?? string.Empty);
     }
 
     public int SshPort
     {
         get => _sshPort;
-        set => SetValidated(ref _sshPort, value);
+        set => SetSshAuthenticationField(ref _sshPort, value);
     }
 
     public string SshUsername
     {
         get => _sshUsername;
-        set => SetValidated(ref _sshUsername, value ?? string.Empty);
+        set => SetSshAuthenticationField(ref _sshUsername, value ?? string.Empty);
     }
 
     public string PrivateKeyPath
     {
         get => _privateKeyPath;
-        set => SetValidated(ref _privateKeyPath, value ?? string.Empty);
+        set => SetSshAuthenticationField(ref _privateKeyPath, value ?? string.Empty);
     }
 
     public string SshTargetHost
@@ -252,7 +253,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             if (_sshAuthenticationMode != value)
             {
                 SetValidated(ref _sshAuthenticationMode, value);
-                HasSshAuthenticationSecret = false;
+                InvalidateSshAuthentication();
             }
         }
     }
@@ -260,10 +261,21 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public IReadOnlyList<SshAuthenticationMode> SshAuthenticationModes { get; } =
         Enum.GetValues<SshAuthenticationMode>();
 
+    public long SshAuthenticationGeneration => Interlocked.Read(ref _sshAuthenticationGeneration);
+
+    public event EventHandler? SshAuthenticationConfigurationChanged;
+
     public bool HasSshAuthenticationSecret
     {
         get => _hasSshAuthenticationSecret;
-        set => SetValidated(ref _hasSshAuthenticationSecret, value);
+        set
+        {
+            if (_hasSshAuthenticationSecret != value)
+            {
+                SetValidated(ref _hasSshAuthenticationSecret, value);
+                AuthenticationGenerationChanged();
+            }
+        }
     }
 
     public CredentialSaveMode CredentialSaveMode
@@ -351,6 +363,8 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public async Task TestConnectionAsync(ISecret? secret, CancellationToken cancellationToken)
     {
         EnterBusy();
+        var authenticationGeneration = SshAuthenticationGeneration;
+        var authenticationMode = SshAuthenticationMode;
         try
         {
             if (_hasUnsupportedCredentialReference && !_credentialModeChanged)
@@ -363,6 +377,15 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             LastTestHostKeyFailure = null;
             var result = await _test(BuildProfile(), CredentialSaveMode, secret, cancellationToken)
                 .ConfigureAwait(false);
+            if (authenticationGeneration != SshAuthenticationGeneration ||
+                authenticationMode != SshAuthenticationMode)
+            {
+                TestResults = [];
+                LastTestError = null;
+                LastTestHostKeyFailure = null;
+                StatusMessage = "SSH 认证配置已变，请重新测试连接。";
+                return;
+            }
             _hostKeyPin = result.Profile.SshProfile?.HostKeyPin;
             var results = result.Stages;
             TestResults = results;
@@ -382,6 +405,31 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             secret?.Dispose();
             ExitBusy();
         }
+    }
+
+    private void SetSshAuthenticationField<T>(ref T field, T value)
+    {
+        if (!EqualityComparer<T>.Default.Equals(field, value))
+        {
+            SetValidated(ref field, value);
+            InvalidateSshAuthentication();
+        }
+    }
+
+    private void InvalidateSshAuthentication()
+    {
+        if (_hasSshAuthenticationSecret)
+        {
+            SetValidated(ref _hasSshAuthenticationSecret, false);
+        }
+        LastTestHostKeyFailure = null;
+        AuthenticationGenerationChanged();
+    }
+
+    private void AuthenticationGenerationChanged()
+    {
+        _ = Interlocked.Increment(ref _sshAuthenticationGeneration);
+        SshAuthenticationConfigurationChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public ConnectionProfile BuildProfile()
