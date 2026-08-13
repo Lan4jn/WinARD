@@ -12,10 +12,38 @@ public sealed class QualityProfileTests
     {
         Assert.Equal(0, (int)QualityScale.Automatic);
         Assert.Equal(1, (int)QualityScale.Percent100);
-        Assert.Equal(QualityScale.Percent100, QualityScale.Native);
+        Assert.Equal(
+            QualityScale.Percent100,
+            (QualityScale)(typeof(QualityScale).GetField("Native")!.GetRawConstantValue() ?? -1));
         Assert.Equal(2, (int)QualityScale.Percent75);
         Assert.Equal(3, (int)QualityScale.Percent50);
         Assert.Equal(4, (int)QualityScale.Percent25);
+    }
+
+    [Fact]
+    public void Quality_scales_expose_five_canonical_values_and_stable_names()
+    {
+        Assert.Equal(
+            [
+                QualityScale.Automatic,
+                QualityScale.Percent100,
+                QualityScale.Percent75,
+                QualityScale.Percent50,
+                QualityScale.Percent25,
+            ],
+            QualityScales.CanonicalValues);
+        Assert.Equal(
+            ["Automatic", "Percent100", "Percent75", "Percent50", "Percent25"],
+            QualityScales.CanonicalValues.Select(QualityScales.GetStableName));
+    }
+
+    [Fact]
+    public void Native_alias_is_obsolete_for_source_compatibility()
+    {
+        var field = typeof(QualityScale).GetField("Native");
+
+        Assert.NotNull(field);
+        Assert.NotNull(field!.GetCustomAttributes(typeof(ObsoleteAttribute), inherit: false).SingleOrDefault());
     }
 
     [Fact]
@@ -43,7 +71,7 @@ public sealed class QualityProfileTests
     public void Named_presets_express_expected_intent()
     {
         Assert.Equal(
-            (QualityPreset.Original, (long?)null, QualityColor.Full32, QualityScale.Native, FrameRefreshPolicy.Unlimited, false),
+            (QualityPreset.Original, (long?)null, QualityColor.Full32, QualityScale.Percent100, FrameRefreshPolicy.Unlimited, false),
             Intent(QualityProfile.Original));
         Assert.Equal(
             (QualityPreset.Balanced, (long?)(4L * 1024 * 1024), QualityColor.Color16, QualityScale.Percent75, FrameRefreshPolicy.Automatic, true),
@@ -109,7 +137,7 @@ public sealed class QualityProfileTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Full32,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Fixed(60),
             allowAutomaticGrayscale: false,
             bandwidthLocked: true,
@@ -139,7 +167,7 @@ public sealed class QualityProfileTests
         Assert.Throws<ArgumentException>(() => QualityProfile.CreateCustom(
             1024,
             QualityColor.Full32,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: true,
             colorLocked: true));

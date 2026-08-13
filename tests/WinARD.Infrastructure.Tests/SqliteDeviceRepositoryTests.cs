@@ -67,7 +67,7 @@ public sealed class SqliteDeviceRepositoryTests
         var quality = QualityProfile.CreateCustom(
             null,
             QualityColor.Full32,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Unlimited,
             allowAutomaticGrayscale: false,
             bandwidthLocked: true,

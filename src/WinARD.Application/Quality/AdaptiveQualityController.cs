@@ -20,8 +20,8 @@ public sealed class AdaptiveQualityController
     private static readonly (QualityLevel Level, QualityColor Color, QualityScale Scale, int FramesPerSecond)[]
         FixedQualityTable =
         [
-            (QualityLevel.Q0, QualityColor.Full32, QualityScale.Native, 60),
-            (QualityLevel.Q1, QualityColor.Color16, QualityScale.Native, 60),
+            (QualityLevel.Q0, QualityColor.Full32, QualityScale.Percent100, 60),
+            (QualityLevel.Q1, QualityColor.Color16, QualityScale.Percent100, 60),
             (QualityLevel.Q2, QualityColor.Color16, QualityScale.Percent75, 60),
             (QualityLevel.Q3, QualityColor.Color16, QualityScale.Percent50, 45),
             (QualityLevel.Q4, QualityColor.Grayscale, QualityScale.Percent50, 30),

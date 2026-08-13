@@ -117,7 +117,7 @@ public sealed class ConnectDeviceHandlerTests
             QualityProfile.CreateCustom(
                 1024,
                 QualityColor.Full32,
-                QualityScale.Native,
+                QualityScale.Percent100,
                 FrameRefreshPolicy.Automatic,
                 allowAutomaticGrayscale: false,
                 colorLocked: true),

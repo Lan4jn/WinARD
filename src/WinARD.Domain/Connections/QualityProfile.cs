@@ -17,14 +17,40 @@ public enum QualityColor
     Grayscale = 3,
 }
 
+#pragma warning disable CA1069 // Native intentionally aliases Percent100 for public API compatibility.
 public enum QualityScale
 {
     Automatic = 0,
+    Percent100 = 1,
+    [Obsolete("Use Percent100. Native remains only for source compatibility.")]
     Native = 1,
-    Percent100 = Native,
     Percent75 = 2,
     Percent50 = 3,
     Percent25 = 4,
+}
+#pragma warning restore CA1069
+
+public static class QualityScales
+{
+    public static IReadOnlyList<QualityScale> CanonicalValues { get; } = Array.AsReadOnly(
+        new[]
+        {
+            QualityScale.Automatic,
+            QualityScale.Percent100,
+            QualityScale.Percent75,
+            QualityScale.Percent50,
+            QualityScale.Percent25,
+        });
+
+    public static string GetStableName(QualityScale scale) => scale switch
+    {
+        QualityScale.Automatic => "Automatic",
+        QualityScale.Percent100 => "Percent100",
+        QualityScale.Percent75 => "Percent75",
+        QualityScale.Percent50 => "Percent50",
+        QualityScale.Percent25 => "Percent25",
+        _ => throw new ArgumentOutOfRangeException(nameof(scale)),
+    };
 }
 
 public sealed record QualityProfile
@@ -118,7 +144,7 @@ public sealed record QualityProfile
         QualityPreset.Original,
         null,
         QualityColor.Full32,
-        QualityScale.Native,
+        QualityScale.Percent100,
         FrameRefreshPolicy.Unlimited,
         false,
         true,

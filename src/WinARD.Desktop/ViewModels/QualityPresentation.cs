@@ -128,9 +128,10 @@ public static class QualityPresentation
     public static IReadOnlyList<QualityChoice<QualityScale>> ScaleOptions { get; } =
         ReadOnly<QualityScale>([
             new(QualityScale.Automatic, "自动"),
-            new(QualityScale.Native, "100%"),
+            new(QualityScale.Percent100, "100%"),
             new(QualityScale.Percent75, "75%"),
             new(QualityScale.Percent50, "50%"),
+            new(QualityScale.Percent25, "25%"),
         ]);
 
     public static IReadOnlyList<QualityChoice<QualityColor>> ColorOptionsFor(
@@ -157,7 +158,7 @@ public static class QualityPresentation
         ArgumentNullException.ThrowIfNull(capabilities);
         var scalingAvailable = capabilities.ServerScaling.IsObserved() && scaleSwitchApproved;
         return ScaleOptions
-            .Select(option => option.Value is QualityScale.Percent75 or QualityScale.Percent50 && !scalingAvailable
+            .Select(option => option.Value is QualityScale.Percent75 or QualityScale.Percent50 or QualityScale.Percent25 && !scalingAvailable
                 ? Unavailable(option, option.Value == selected)
                 : option)
             .ToArray();

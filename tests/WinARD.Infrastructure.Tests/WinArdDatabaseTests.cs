@@ -13,6 +13,18 @@ namespace WinARD.Infrastructure.Tests;
 public sealed class WinArdDatabaseTests
 {
     [Fact]
+    public void Quality_scale_migration_uses_a_regular_table_rebuild()
+    {
+        var source = File.ReadAllText(
+            Path.Combine(GetRepositoryRoot(), "src", "WinARD.Infrastructure", "Database", "Migrations", "Migration004QualityScalePercent.cs"));
+
+        Assert.DoesNotContain("writable_schema", source, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("sqlite_schema", source, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("CREATE TABLE devices_v4", source, StringComparison.Ordinal);
+        Assert.Contains("INSERT INTO devices_v4", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Fresh_database_quality_scale_constraint_accepts_percent25_and_rejects_out_of_range()
     {
         using var fixture = new TempDatabase();
@@ -37,6 +49,63 @@ public sealed class WinArdDatabaseTests
         Assert.Equal(new long[] { 0, 1, 2, 3 }, await fixture.ReadQualityScalesAsync());
         await fixture.InsertDeviceWithQualityScaleAsync(4);
         Assert.Equal(new long[] { 0, 1, 2, 3, 4 }, await fixture.ReadQualityScalesAsync());
+    }
+
+    [Fact]
+    public async Task Quality_scale_migration_preserves_foreign_keys_indexes_and_data_after_reopen()
+    {
+        await using var fixture = await DatabaseFixture.CreateAtVersionThreeAsync(includeSshProfile: true);
+        await fixture.Database.InitializeAsync(CancellationToken.None);
+        await fixture.Database.DisposeAsync();
+
+        await using var reopened = new WinArdDatabase(fixture.DatabasePath);
+        await reopened.InitializeAsync(CancellationToken.None);
+        await using var connection = reopened.CreateConnection();
+        await connection.OpenAsync();
+        var integrity = connection.CreateCommand();
+        integrity.CommandText = "PRAGMA foreign_key_check;";
+        Assert.Null(await integrity.ExecuteScalarAsync());
+        var index = connection.CreateCommand();
+        index.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='ux_devices_host_port';";
+        Assert.Equal(1L, await index.ExecuteScalarAsync());
+        var data = connection.CreateCommand();
+        data.CommandText = "SELECT COUNT(*) FROM devices;";
+        Assert.Equal(4L, await data.ExecuteScalarAsync());
+    }
+
+    [Fact]
+    public async Task Cancelled_quality_scale_migration_rolls_back_and_can_resume()
+    {
+        await using var fixture = await DatabaseFixture.CreateAtVersionThreeAsync();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            fixture.Database.InitializeAsync(cancellation.Token));
+        Assert.Equal(3, await fixture.ReadSchemaVersionAsync());
+
+        await fixture.Database.InitializeAsync(CancellationToken.None);
+        Assert.Equal(4, await fixture.ReadSchemaVersionAsync());
+    }
+
+    [Fact]
+    public async Task Failed_quality_scale_migration_rolls_back_schema_and_data()
+    {
+        await using var fixture = await DatabaseFixture.CreateAtVersionThreeAsync();
+        await fixture.InsertOrphanSshProfileAsync();
+
+        await Assert.ThrowsAsync<SqliteException>(() =>
+            fixture.Database.InitializeAsync(CancellationToken.None));
+
+        Assert.Equal(3, await fixture.ReadSchemaVersionAsync());
+        await using var connection = fixture.Database.CreateConnection();
+        await connection.OpenAsync();
+        var devices = connection.CreateCommand();
+        devices.CommandText = "SELECT COUNT(*) FROM devices;";
+        Assert.Equal(4L, await devices.ExecuteScalarAsync());
+        var orphan = connection.CreateCommand();
+        orphan.CommandText = "SELECT COUNT(*) FROM ssh_profiles WHERE device_id = 'orphan';";
+        Assert.Equal(1L, await orphan.ExecuteScalarAsync());
     }
 
     [Fact]
@@ -265,6 +334,9 @@ public sealed class WinArdDatabaseTests
         await command.ExecuteNonQueryAsync();
     }
 
+    private static string GetRepositoryRoot() =>
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", ".."));
+
     private static async Task SeedVersionTableAsync(string path, string rowsSql)
     {
         var builder = new SqliteConnectionStringBuilder { DataSource = path, Pooling = false };
@@ -353,6 +425,8 @@ public sealed class WinArdDatabaseTests
 
         public WinArdDatabase Database { get; }
 
+        public string DatabasePath => Path.Combine(Directory, "winard.db");
+
         public static async Task<DatabaseFixture> CreateAtVersionTwoAsync()
         {
             var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "WinARD.Tests", Guid.NewGuid().ToString("N"));
@@ -412,7 +486,7 @@ public sealed class WinArdDatabaseTests
             return new DatabaseFixture(directory, database);
         }
 
-        public static async Task<DatabaseFixture> CreateAtVersionThreeAsync()
+        public static async Task<DatabaseFixture> CreateAtVersionThreeAsync(bool includeSshProfile = false)
         {
             var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "WinARD.Tests", Guid.NewGuid().ToString("N"));
             var path = System.IO.Path.Combine(directory, "winard.db");
@@ -449,6 +523,20 @@ public sealed class WinArdDatabaseTests
                 await command.ExecuteNonQueryAsync();
             }
 
+            if (includeSshProfile)
+            {
+                var device = connection.CreateCommand();
+                device.CommandText = "SELECT id FROM devices WHERE quality_scale = 3;";
+                var deviceId = (string)(await device.ExecuteScalarAsync() ?? throw new InvalidOperationException());
+                var ssh = connection.CreateCommand();
+                ssh.CommandText = """
+                    INSERT INTO ssh_profiles(device_id, ssh_host, ssh_port, ssh_username, target_host, target_port)
+                    VALUES($device_id, 'jump.local', 22, 'alex', 'target.local', 5900);
+                    """;
+                ssh.Parameters.AddWithValue("$device_id", deviceId);
+                await ssh.ExecuteNonQueryAsync();
+            }
+
             return new DatabaseFixture(directory, database);
         }
 
@@ -466,6 +554,22 @@ public sealed class WinArdDatabaseTests
             command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("D"));
             command.Parameters.AddWithValue("$scale", scale);
             command.Parameters.AddWithValue("$now", "2026-08-13T00:00:00.0000000+00:00");
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task InsertOrphanSshProfileAsync()
+        {
+            var builder = new SqliteConnectionStringBuilder(Database.ConnectionString);
+            await using var connection = new SqliteConnection(builder.ToString());
+            await connection.OpenAsync();
+            var disableForeignKeys = connection.CreateCommand();
+            disableForeignKeys.CommandText = "PRAGMA foreign_keys=OFF;";
+            await disableForeignKeys.ExecuteNonQueryAsync();
+            var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO ssh_profiles(device_id, ssh_host, ssh_port, ssh_username, target_host, target_port)
+                VALUES('orphan', 'jump.local', 22, 'alex', 'target.local', 5900);
+                """;
             await command.ExecuteNonQueryAsync();
         }
 

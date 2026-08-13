@@ -62,7 +62,7 @@ public sealed record QualityBootstrapSettings
             throw new ArgumentOutOfRangeException(nameof(reason));
         }
 
-        if (!double.IsFinite(scaleFactor) || scaleFactor is <= 0d or > 1d)
+        if (scaleFactor is not (0.25d or 0.5d or 0.75d or 1d))
         {
             throw new ArgumentOutOfRangeException(nameof(scaleFactor));
         }

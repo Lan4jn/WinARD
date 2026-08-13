@@ -133,7 +133,7 @@ public sealed class QualityTransitionCoordinator : IDisposable
 
         var scale = decision.Scale switch
         {
-            QualityScale.Native => 1d,
+            QualityScale.Percent100 => 1d,
             QualityScale.Percent75 => 0.75d,
             QualityScale.Percent50 => 0.5d,
             _ => throw new ArgumentOutOfRangeException(nameof(decision)),

@@ -248,9 +248,9 @@ public sealed record QualityDecision
         var approved = level switch
         {
             QualityLevel.Q0 => (WinARD.Domain.Connections.QualityColor.Full32,
-                WinARD.Domain.Connections.QualityScale.Native, 60),
+                WinARD.Domain.Connections.QualityScale.Percent100, 60),
             QualityLevel.Q1 => (WinARD.Domain.Connections.QualityColor.Color16,
-                WinARD.Domain.Connections.QualityScale.Native, 60),
+                WinARD.Domain.Connections.QualityScale.Percent100, 60),
             QualityLevel.Q2 => (WinARD.Domain.Connections.QualityColor.Color16,
                 WinARD.Domain.Connections.QualityScale.Percent75, 60),
             QualityLevel.Q3 => (WinARD.Domain.Connections.QualityColor.Color16,

@@ -41,7 +41,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Fixed(30),
             allowAutomaticGrayscale: false,
             colorLocked: true);
@@ -423,7 +423,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var color16 = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -512,7 +512,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             targetBytesPerSecond: null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -554,7 +554,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -639,7 +639,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var color16 = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -721,7 +721,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var color16 = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -762,7 +762,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -799,7 +799,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -839,7 +839,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -879,7 +879,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -985,7 +985,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var oldProfile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -1053,7 +1053,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     public async Task Diagnostic_snapshot_keeps_the_connection_preferred_bootstrap_after_profile_change()
     {
         var preferredProfile = QualityProfile.CreateCustom(
-            null, QualityColor.Color16, QualityScale.Native, FrameRefreshPolicy.Automatic,
+            null, QualityColor.Color16, QualityScale.Percent100, FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false, colorLocked: true, scaleLocked: true);
         var preferred = QualityBootstrapPlanner.CreatePlan(
             preferredProfile, FullCapabilities(), new QualityDecoderGates()).Preferred;
@@ -1163,7 +1163,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -1236,7 +1236,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -1277,7 +1277,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true,
@@ -1319,7 +1319,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     private static QualityProfile Profile(QualityColor color) => QualityProfile.CreateCustom(
         2L << 20,
         color,
-        QualityScale.Native,
+        QualityScale.Percent100,
         FrameRefreshPolicy.Automatic,
         allowAutomaticGrayscale: color is QualityColor.Automatic or QualityColor.Grayscale);
 

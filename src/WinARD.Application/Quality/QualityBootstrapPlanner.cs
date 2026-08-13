@@ -37,7 +37,7 @@ public static class QualityBootstrapPlanner
             <= 4L * 1024 * 1024 => 0.75d,
             _ => 1d,
         },
-        QualityScale.Native => 1d,
+        QualityScale.Percent100 => 1d,
         QualityScale.Percent75 => 0.75d,
         QualityScale.Percent50 => 0.5d,
         QualityScale.Percent25 => 0.25d,

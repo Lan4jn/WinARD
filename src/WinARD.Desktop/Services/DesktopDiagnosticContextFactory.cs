@@ -224,7 +224,7 @@ internal static class DesktopDiagnosticContextFactory
 
     private static int ScalePercent(QualityScale scale) => scale switch
     {
-        QualityScale.Native => 100,
+        QualityScale.Percent100 => 100,
         QualityScale.Percent75 => 75,
         QualityScale.Percent50 => 50,
         _ => throw new ArgumentOutOfRangeException(nameof(scale)),

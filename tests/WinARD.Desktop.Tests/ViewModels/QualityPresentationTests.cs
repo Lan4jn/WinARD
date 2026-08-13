@@ -107,7 +107,7 @@ public sealed class QualityPresentationTests
         var profile = QualityProfile.CreateCustom(
             null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Fixed(30));
         var actual = new QualityActualState(
             RemotePixelFormatKind.Rgb565,
@@ -217,7 +217,7 @@ public sealed class QualityPresentationTests
             QualityContentState.Idle,
             QualityLevel.Q0,
             QualityColor.Full32,
-            QualityScale.Native,
+            QualityScale.Percent100,
             targetFramesPerSecond: 60,
             QualityDecisionReason.Initial,
             targetSatisfied: true,
@@ -344,7 +344,10 @@ public sealed class QualityPresentationTests
         Assert.Equal(new long?[] { 1L << 20, 2L << 20, 4L << 20, 8L << 20, 16L << 20, null },
             QualityPresentation.BandwidthOptions.Take(6).Select(option => option.Value));
         Assert.Equal(4, QualityPresentation.ColorOptions.Count);
-        Assert.Equal(4, QualityPresentation.ScaleOptions.Count);
+        Assert.Equal(5, QualityPresentation.ScaleOptions.Count);
+        Assert.Equal(
+            QualityScales.CanonicalValues,
+            QualityPresentation.ScaleOptions.Select(option => option.Value));
     }
 
     [Fact]
@@ -370,12 +373,12 @@ public sealed class QualityPresentationTests
         Assert.False(savedGray.IsEnabled);
         Assert.Equal("已保存，当前连接不可用", savedGray.ConstraintText);
         Assert.All(
-            scales.Where(option => option.Value is QualityScale.Percent75 or QualityScale.Percent50),
+            scales.Where(option => option.Value is QualityScale.Percent75 or QualityScale.Percent50 or QualityScale.Percent25),
             option => Assert.False(option.IsEnabled));
         var savedScale = Assert.Single(scales, option => option.Value == QualityScale.Percent50);
         Assert.Equal("已保存，当前连接不可用", savedScale.ConstraintText);
         Assert.Equal(4, colors.Count);
-        Assert.Equal(4, scales.Count);
+        Assert.Equal(5, scales.Count);
     }
 
     [Fact]
@@ -392,7 +395,7 @@ public sealed class QualityPresentationTests
             null);
 
         Assert.True(QualityPresentation.ScaleOptionsFor(
-                QualityScale.Native,
+                QualityScale.Percent100,
                 capabilities,
                 scaleSwitchApproved: true)
             .Single(option => option.Value == QualityScale.Percent75).IsEnabled);
@@ -416,7 +419,7 @@ public sealed class QualityPresentationTests
             true,
             null);
 
-        var scale = QualityPresentation.ScaleOptionsFor(QualityScale.Native, capabilities)
+        var scale = QualityPresentation.ScaleOptionsFor(QualityScale.Percent100, capabilities)
             .Single(option => option.Value == QualityScale.Percent75);
 
         Assert.False(scale.IsEnabled);

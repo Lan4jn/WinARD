@@ -68,7 +68,7 @@ public sealed class FramePresentationTests
             QualityContentState.Idle,
             QualityLevel.Q1,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             60,
             QualityDecisionReason.Initial,
             targetSatisfied: true,

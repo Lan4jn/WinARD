@@ -27,8 +27,8 @@ public sealed class AdaptiveQualityControllerTests
     {
         Assert.Collection(
             AdaptiveQualityController.QualityTable,
-            value => Assert.Equal((QualityLevel.Q0, QualityColor.Full32, QualityScale.Native, 60), value),
-            value => Assert.Equal((QualityLevel.Q1, QualityColor.Color16, QualityScale.Native, 60), value),
+            value => Assert.Equal((QualityLevel.Q0, QualityColor.Full32, QualityScale.Percent100, 60), value),
+            value => Assert.Equal((QualityLevel.Q1, QualityColor.Color16, QualityScale.Percent100, 60), value),
             value => Assert.Equal((QualityLevel.Q2, QualityColor.Color16, QualityScale.Percent75, 60), value),
             value => Assert.Equal((QualityLevel.Q3, QualityColor.Color16, QualityScale.Percent50, 45), value),
             value => Assert.Equal((QualityLevel.Q4, QualityColor.Grayscale, QualityScale.Percent50, 30), value));

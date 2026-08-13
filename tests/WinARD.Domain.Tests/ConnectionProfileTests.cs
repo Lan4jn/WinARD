@@ -104,7 +104,7 @@ public sealed class ConnectionProfileTests
         var quality = QualityProfile.CreateCustom(
             null,
             QualityColor.Full32,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Fixed(60),
             allowAutomaticGrayscale: false,
             bandwidthLocked: true,

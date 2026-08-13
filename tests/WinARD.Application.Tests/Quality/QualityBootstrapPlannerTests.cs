@@ -80,7 +80,7 @@ public sealed class QualityBootstrapPlannerTests
         var profile = QualityProfile.CreateCustom(
             targetBytesPerSecond: null,
             QualityColor.Color16,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Automatic,
             allowAutomaticGrayscale: false,
             colorLocked: true);
@@ -211,6 +211,9 @@ public sealed class QualityBootstrapPlannerTests
     [InlineData(1.01)]
     [InlineData(double.NaN)]
     [InlineData(double.PositiveInfinity)]
+    [InlineData(0.1)]
+    [InlineData(0.333)]
+    [InlineData(0.8)]
     public void Settings_reject_invalid_scale_factors(double scaleFactor)
     {
         var exception = Assert.Throws<ArgumentOutOfRangeException>(() => new QualityBootstrapSettings(
@@ -384,7 +387,7 @@ public sealed class QualityBootstrapPlannerTests
         QualityProfile.CreateCustom(
             targetBytesPerSecond: null,
             QualityColor.Full32,
-            QualityScale.Native,
+            QualityScale.Percent100,
             FrameRefreshPolicy.Unlimited,
             allowAutomaticGrayscale: false,
             colorLocked: true),
