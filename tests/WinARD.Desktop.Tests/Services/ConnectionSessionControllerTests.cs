@@ -116,6 +116,56 @@ public sealed class ConnectionSessionControllerTests
     }
 
     [Fact]
+    public async Task Reconnect_reservation_holds_one_lease_between_sessions_and_transfers_it_on_success()
+    {
+        var coordinator = new ActiveSessionCoordinator();
+        await using var first = Controller(new TrackingClient(), coordinator);
+        await first.ConnectAsync(Profile(), CancellationToken.None);
+        var ownership = first.TransferConnectedSession();
+        await using var reservation = ownership.ReserveForReconnect();
+
+        await ownership.DisposeAsync();
+        await Assert.ThrowsAsync<SessionAlreadyActiveException>(async () =>
+        {
+            await using var competing = await coordinator.AcquireAsync();
+        });
+
+        await using var retry = Controller(new TrackingClient(), coordinator);
+        await retry.ReconnectAsync(Profile(), reservation, cancellationToken: default);
+        await using var replacement = retry.TransferConnectedSession();
+        await reservation.DisposeAsync();
+        await Assert.ThrowsAsync<SessionAlreadyActiveException>(async () =>
+        {
+            await using var competing = await coordinator.AcquireAsync();
+        });
+
+        await replacement.DisposeAsync();
+        await using var released = await coordinator.AcquireAsync();
+    }
+
+    [Fact]
+    public async Task Failed_reconnect_keeps_reservation_until_terminal_cancel_releases_it()
+    {
+        var coordinator = new ActiveSessionCoordinator();
+        await using var first = Controller(new TrackingClient(), coordinator);
+        await first.ConnectAsync(Profile(), CancellationToken.None);
+        var ownership = first.TransferConnectedSession();
+        await using var reservation = ownership.ReserveForReconnect();
+        await ownership.DisposeAsync();
+
+        await using var retry = Controller(new FailingClient(), coordinator);
+        await Assert.ThrowsAsync<ConnectionFailedException>(
+            () => retry.ReconnectAsync(Profile(), reservation, cancellationToken: default));
+        await Assert.ThrowsAsync<SessionAlreadyActiveException>(async () =>
+        {
+            await using var competing = await coordinator.AcquireAsync();
+        });
+
+        await reservation.DisposeAsync();
+        await using var released = await coordinator.AcquireAsync();
+    }
+
+    [Fact]
     public async Task Connected_quality_profile_update_persists_updates_ownership_and_publishes()
     {
         var repository = new RecordingRepository();
@@ -1034,6 +1084,7 @@ public sealed class ConnectionSessionControllerTests
         public ValueTask ConfigureBootstrapAsync(QualityBootstrapSettings settings, QualityBootstrapAttempt attempt, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) => ValueTask.FromResult<RemoteServerMessage>(Frame());
+        public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize) { }
         public ValueTask DisposeAsync() { Disposed = true; DisposeCount++; return ValueTask.CompletedTask; }
     }
 
@@ -1051,6 +1102,7 @@ public sealed class ConnectionSessionControllerTests
         public ValueTask ConfigureBootstrapAsync(QualityBootstrapSettings settings, QualityBootstrapAttempt attempt, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken) => ValueTask.FromResult<RemoteServerMessage>(Frame());
+        public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize) { }
 
         public async ValueTask DisposeAsync()
         {
@@ -1058,6 +1110,16 @@ public sealed class ConnectionSessionControllerTests
             DisposeStarted.TrySetResult();
             await AllowDispose.Task;
         }
+    }
+
+    private sealed class FailingClient : IRfbClient
+    {
+        public Task NegotiateAsync(CancellationToken cancellationToken) =>
+            Task.FromException(new IOException());
+        public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+        public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private static RemoteFramebufferMessage Frame() => new(

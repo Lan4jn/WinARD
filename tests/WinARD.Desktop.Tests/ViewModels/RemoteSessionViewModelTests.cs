@@ -1118,6 +1118,7 @@ public sealed class RemoteSessionViewModelTests
         Assert.Equal("远程主机已结束会话。", viewModel.StatusMessage);
         Assert.Equal("远程主机已结束共享会话。", viewModel.Error?.UserMessage);
         Assert.Equal("REMOTE_SESSION_INTERRUPTED", viewModel.Error?.Code);
+        Assert.Same(protocolException, viewModel.TerminalFailure);
         var diagnostic = Assert.Single(
             diagnosticSink.Events,
             item => item.Code == "REMOTE_SESSION_INTERRUPTED");

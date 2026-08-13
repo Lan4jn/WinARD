@@ -1,6 +1,6 @@
 namespace WinARD.Application.Sessions;
 
-public sealed record AutomaticReconnectProgress(int Attempt, TimeSpan Remaining);
+public sealed record AutomaticReconnectProgress(long Generation, int Attempt, TimeSpan Remaining);
 
 public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
 {
@@ -16,6 +16,7 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
     private Task<bool>? _loop;
     private Task? _disposeTask;
     private bool _disposed;
+    private long _generation;
 
     public AutomaticReconnectCoordinator(
         Func<Exception, bool> isTransient,
@@ -39,6 +40,11 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
         get { lock (_sync) return _loop is { IsCompleted: false }; }
     }
 
+    public long Generation
+    {
+        get { lock (_sync) return _generation; }
+    }
+
     public Task<bool> StartAsync(Exception failure, CancellationToken token)
     {
         ArgumentNullException.ThrowIfNull(failure);
@@ -49,7 +55,7 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
             if (_loop is { IsCompleted: false }) return _loop;
             _loopCancellation?.Dispose();
             _loopCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-            return _loop = RunAsync(failure, _loopCancellation.Token);
+            return _loop = RunAsync(failure, ++_generation, _loopCancellation.Token);
         }
     }
 
@@ -76,7 +82,7 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
         await ConnectOnceAsync(token).ConfigureAwait(false);
     }
 
-    private async Task<bool> RunAsync(Exception failure, CancellationToken token)
+    private async Task<bool> RunAsync(Exception failure, long generation, CancellationToken token)
     {
         var current = failure;
         for (var index = 0; ; index++)
@@ -87,12 +93,12 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
                 var remaining = _policy.DelayForAttempt(index);
                 while (remaining > TimeSpan.Zero)
                 {
-                    _progress?.Invoke(new(index + 1, remaining));
+                    _progress?.Invoke(new(generation, index + 1, remaining));
                     var slice = remaining < _countdownInterval ? remaining : _countdownInterval;
                     await _delay(slice, token).ConfigureAwait(false);
                     remaining -= slice;
                 }
-                _progress?.Invoke(new(index + 1, TimeSpan.Zero));
+                _progress?.Invoke(new(generation, index + 1, TimeSpan.Zero));
                 await ConnectOnceAsync(token).ConfigureAwait(false);
                 return true;
             }

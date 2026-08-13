@@ -48,6 +48,23 @@ public sealed class ConnectionSessionController : IAsyncDisposable
     public async Task ConnectAsync(
         ConnectionProfile profile,
         ISshHostKeyPrompt? hostKeyPrompt,
+        CancellationToken cancellationToken) =>
+        await ConnectCoreAsync(profile, hostKeyPrompt, reconnectReservation: null, cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task ReconnectAsync(
+        ConnectionProfile profile,
+        ReconnectSessionReservation reconnectReservation,
+        ISshHostKeyPrompt? hostKeyPrompt = null,
+        CancellationToken cancellationToken = default) =>
+        await ConnectCoreAsync(profile, hostKeyPrompt,
+            reconnectReservation ?? throw new ArgumentNullException(nameof(reconnectReservation)),
+            cancellationToken).ConfigureAwait(false);
+
+    private async Task ConnectCoreAsync(
+        ConnectionProfile profile,
+        ISshHostKeyPrompt? hostKeyPrompt,
+        ReconnectSessionReservation? reconnectReservation,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -61,7 +78,9 @@ public sealed class ConnectionSessionController : IAsyncDisposable
                 throw new SessionAlreadyActiveException();
             }
 
-            var lease = await _coordinator.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            var lease = reconnectReservation is null
+                ? await _coordinator.AcquireAsync(cancellationToken).ConfigureAwait(false)
+                : null;
             var completed = new List<ConnectionTestStageResult>();
             var timer = Stopwatch.StartNew();
             ConnectionStage? active = null;
@@ -107,7 +126,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
 
                 completed.Add(new ConnectionTestStageResult(
                     ConnectionStage.Connected, true, timer.Elapsed, "已连接。"));
-                _lease = lease;
+                _lease = reconnectReservation?.TransferLease() ?? lease;
                 lease = null;
                 _session = result.Session;
                 _connectedProfile = profile;
@@ -298,7 +317,7 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
     private readonly object _sync = new();
     private readonly SemaphoreSlim _profileOperationGate = new(1, 1);
     private readonly RemoteSession _session;
-    private readonly ActiveSessionCoordinator.ActiveSessionLease _lease;
+    private ActiveSessionCoordinator.ActiveSessionLease? _lease;
     private readonly Action<ConnectedSessionOwnership> _disposedCallback;
     private ConnectionProfile _profile;
     private OwnershipState _state;
@@ -317,6 +336,19 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
     }
 
     public RemoteSession Session => _session;
+
+    public ReconnectSessionReservation ReserveForReconnect()
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(
+                _state != OwnershipState.Active, nameof(ConnectedSessionOwnership));
+
+            var lease = Interlocked.Exchange(ref _lease, null) ??
+                throw new InvalidOperationException("Reconnect ownership has already been reserved.");
+            return new ReconnectSessionReservation(lease);
+        }
+    }
 
     public ConnectionProfile Profile
     {
@@ -389,7 +421,11 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
 
         try
         {
-            await _lease.DisposeAsync().ConfigureAwait(false);
+            var lease = Interlocked.Exchange(ref _lease, null);
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+            }
         }
         catch (Exception leaseFailure) when (sessionFailure is not null)
         {
@@ -416,6 +452,24 @@ public sealed class ConnectedSessionOwnership : IAsyncDisposable
         Active,
         Disposing,
         Disposed,
+    }
+}
+
+public sealed class ReconnectSessionReservation : IAsyncDisposable
+{
+    private ActiveSessionCoordinator.ActiveSessionLease? _lease;
+
+    internal ReconnectSessionReservation(ActiveSessionCoordinator.ActiveSessionLease lease) =>
+        _lease = lease;
+
+    internal ActiveSessionCoordinator.ActiveSessionLease TransferLease() =>
+        Interlocked.Exchange(ref _lease, null) ??
+        throw new ObjectDisposedException(nameof(ReconnectSessionReservation));
+
+    public ValueTask DisposeAsync()
+    {
+        var lease = Interlocked.Exchange(ref _lease, null);
+        return lease is null ? ValueTask.CompletedTask : lease.DisposeAsync();
     }
 }
 

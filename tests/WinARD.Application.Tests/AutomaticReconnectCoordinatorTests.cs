@@ -12,6 +12,8 @@ public sealed class AutomaticReconnectCoordinatorTests
     [InlineData("REMOTE_SESSION_INTERRUPTED", true)]
     [InlineData("TCP_CONNECTION_FAILED", true)]
     [InlineData("TRANSPORT_TIMEOUT", true)]
+    [InlineData("REMOTE_SESSION_CLOSED", true)]
+    [InlineData("UNEXPECTED_CONNECTION_ERROR", false)]
     [InlineData("ARD_AUTH_REJECTED", false)]
     [InlineData("ARD_CONTROL_NOT_ALLOWED", false)]
     [InlineData("RFB_PROTOCOL_ERROR", false)]
@@ -172,6 +174,18 @@ public sealed class AutomaticReconnectCoordinatorTests
         Assert.False(coordinator.IsRunning);
         await Assert.ThrowsAsync<ObjectDisposedException>(
             () => coordinator.StartAsync(new IOException(), default));
+    }
+
+    [Fact]
+    public async Task Progress_generation_changes_between_loops()
+    {
+        var progress = new List<AutomaticReconnectProgress>();
+        var coordinator = Create(_ => true, _ => Task.CompletedTask, progress.Add);
+
+        Assert.True(await coordinator.StartAsync(new IOException(), default));
+        Assert.True(await coordinator.StartAsync(new IOException(), default));
+
+        Assert.Equal(2, progress.Select(item => item.Generation).Distinct().Count());
     }
 
     private static AutomaticReconnectCoordinator Create(

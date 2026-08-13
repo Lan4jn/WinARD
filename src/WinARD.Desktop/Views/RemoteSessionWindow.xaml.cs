@@ -47,6 +47,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly QualityOverlayState _qualityOverlayState = new();
     private readonly QualityOverlayOpenCoordinator _qualityOverlayOpenCoordinator;
     private readonly IReconnectProfileCapture? _reconnectProfileCapture;
+    private readonly ReconnectSessionReservation? _reconnectReservation;
     private readonly Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>?
         _updateFrameRefreshPolicy;
     private readonly Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>?
@@ -70,6 +71,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private bool _fullscreen;
     private bool _allowClose;
     private int _qualitySynchronizationDepth;
+    private long _suppressedReconnectGeneration;
 
     public RemoteSessionWindow(
         IRemoteSessionRuntime session,
@@ -105,6 +107,27 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>? updateFrameRefreshPolicy,
         Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>? updateQualityProfile,
         IReconnectProfileCapture? reconnectProfileCapture)
+        : this(session, ownership, dispatcher, presenter, diagnosticSink,
+            diagnosticExportService, initialError, retryRequested, profile,
+            updateFrameRefreshPolicy, updateQualityProfile, reconnectProfileCapture,
+            reconnectReservation: null)
+    {
+    }
+
+    internal RemoteSessionWindow(
+        IRemoteSessionRuntime session,
+        IAsyncDisposable ownership,
+        IUiDispatcher dispatcher,
+        IFramePresenter? presenter,
+        ISafeDiagnosticSink? diagnosticSink,
+        DiagnosticExportService? diagnosticExportService,
+        ConnectionErrorViewModel? initialError,
+        Func<CancellationToken, Task>? retryRequested,
+        ConnectionProfile? profile,
+        Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>? updateFrameRefreshPolicy,
+        Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>? updateQualityProfile,
+        IReconnectProfileCapture? reconnectProfileCapture,
+        ReconnectSessionReservation? reconnectReservation)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(ownership);
@@ -115,6 +138,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _updateQualityProfile = updateQualityProfile;
         _profile = profile;
         _reconnectProfileCapture = reconnectProfileCapture;
+        _reconnectReservation = reconnectReservation;
         _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _diagnosticExportState = new RemoteSessionDiagnosticExportState(
             serviceAvailable: diagnosticExportService is not null);
@@ -132,11 +156,11 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             diagnosticSink,
             profile?.Quality ?? QualityProfile.Automatic);
         _automaticReconnect = retryRequested is null ? null : new AutomaticReconnectCoordinator(
-            IsTransientRuntimeFailure,
+            RuntimeReconnectFailureClassifier.IsTransient,
             new ReconnectPolicy(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30), Random.Shared),
             retryRequested,
-            progress => _ = _dispatcher.InvokeAsync(
-                () => ShowAutomaticReconnectProgress(progress), CancellationToken.None));
+            progress => _ = ObserveFailureAsync(_dispatcher.InvokeAsync(
+                () => ShowAutomaticReconnectProgress(progress), _lifetime.Token)));
         _windowLifecycle = new RemoteSessionWindowLifecycle(
             ViewModel.Completion,
             () => ViewModel.Error is not null,
@@ -249,11 +273,15 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     public async Task CloseSessionAsync()
     {
-        _automaticReconnect?.Cancel();
+        SuppressAndCancelAutomaticReconnect();
         await _windowLifecycle.DisconnectAsync();
         if (_automaticReconnect is not null)
         {
             await _automaticReconnect.DisposeAsync();
+        }
+        if (_reconnectReservation is not null)
+        {
+            await _reconnectReservation.DisposeAsync();
         }
     }
 
@@ -669,11 +697,20 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             await _dispatcher.InvokeAsync(
                 () => AutomaticReconnectPanel.Visibility = Visibility.Collapsed,
                 CancellationToken.None);
+            if (_reconnectReservation is not null)
+            {
+                await _reconnectReservation.DisposeAsync();
+            }
         }
     }
 
     private void ShowAutomaticReconnectProgress(AutomaticReconnectProgress progress)
     {
+        if (_lifetime.IsCancellationRequested ||
+            progress.Generation <= Volatile.Read(ref _suppressedReconnectGeneration))
+        {
+            return;
+        }
         AutomaticReconnectStatusText.Text = progress.Remaining > TimeSpan.Zero
             ? $"第 {progress.Attempt} 次重连将在 {Math.Ceiling(progress.Remaining.TotalSeconds)} 秒后开始"
             : $"正在进行第 {progress.Attempt} 次重连…";
@@ -682,18 +719,22 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnCancelAutomaticReconnectClicked(object sender, RoutedEventArgs args)
     {
-        _automaticReconnect?.Cancel();
+        SuppressAndCancelAutomaticReconnect();
         AutomaticReconnectPanel.Visibility = Visibility.Collapsed;
         StatusText.Text = "已取消自动重连。";
+        _ = ObserveFailureAsync(_reconnectReservation?.DisposeAsync().AsTask() ?? Task.CompletedTask);
     }
 
-    private static bool IsTransientRuntimeFailure(Exception failure) =>
-        ReconnectFailureClassifier.IsTransient(failure) ||
-        failure is RfbProtocolException
+    private void SuppressAndCancelAutomaticReconnect()
+    {
+        if (_automaticReconnect is not { } coordinator)
         {
-            Failure.Kind: RfbProtocolFailureKind.TruncatedRead,
-            InnerException: IOException
-        };
+            return;
+        }
+
+        Volatile.Write(ref _suppressedReconnectGeneration, coordinator.Generation);
+        coordinator.Cancel();
+    }
 
     private async Task ReconnectNowAndDisposeAsync(CancellationToken token)
     {

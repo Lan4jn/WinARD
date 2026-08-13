@@ -16,7 +16,7 @@ public static class ReconnectFailureClassifier
         "TRANSPORT_TIMEOUT",
         "DNS_RESOLUTION_FAILED",
         "SSH_CONNECTION_FAILED",
-        "UNEXPECTED_CONNECTION_ERROR",
+        "REMOTE_SESSION_CLOSED",
     };
 
     public static bool IsTransient(Exception exception)

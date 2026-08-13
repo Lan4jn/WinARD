@@ -500,6 +500,7 @@ public sealed partial class MainWindow : Window, IDisposable
         ConnectionProfile profile,
         ISshHostKeyPrompt? hostKeyPrompt = null,
         bool throwOnFailure = false,
+        ReconnectSessionReservation? reconnectReservation = null,
         CancellationToken cancellationToken = default)
     {
         using var operationLifetime = CancellationTokenSource.CreateLinkedTokenSource(
@@ -509,6 +510,14 @@ public sealed partial class MainWindow : Window, IDisposable
         operationToken.ThrowIfCancellationRequested();
         if (_sessionBusy || _sessionController.IsConnected)
         {
+            if (throwOnFailure)
+            {
+                throw new ReconnectFailureException(WinArdError.Create(
+                    ConnectionStage.Connecting,
+                    "SESSION_ALREADY_ACTIVE",
+                    "已有活动连接。",
+                    Guid.NewGuid().ToString("N")));
+            }
             return;
         }
 
@@ -522,18 +531,24 @@ public sealed partial class MainWindow : Window, IDisposable
         _connectionStatus.Text = "正在连接…";
         try
         {
-            await _sessionController.ConnectAsync(profile, hostKeyPrompt, operationToken);
+            if (reconnectReservation is null)
+            {
+                await _sessionController.ConnectAsync(profile, hostKeyPrompt, operationToken);
+            }
+            else
+            {
+                await _sessionController.ReconnectAsync(
+                    profile, reconnectReservation, hostKeyPrompt, operationToken);
+            }
             var ownership = _sessionController.TransferConnectedSession();
+            ReconnectSessionReservation? nextReconnectReservation = null;
             try
             {
+                nextReconnectReservation = ownership.ReserveForReconnect();
                 var reconnectRequest = new RemoteSessionReconnectRequest(
                     ownership.Profile,
-                    (latestProfile, retryToken) => _uiOperation.RunAsync(
-                        () => ConnectProfileWithHandlingAsync(
-                            latestProfile,
-                            cancellationToken: retryToken,
-                            throwOnFailure: true),
-                        retryToken));
+                    (latestProfile, retryToken) => InvokeReconnectAsync(
+                        latestProfile, nextReconnectReservation, retryToken));
                 var remoteWindow = new RemoteSessionWindow(
                     ownership.Session,
                     ownership,
@@ -548,7 +563,8 @@ public sealed partial class MainWindow : Window, IDisposable
                         _sessionController.UpdateConnectedFrameRefreshPolicyAsync,
                     updateQualityProfile:
                         _sessionController.UpdateConnectedQualityProfileAsync,
-                    reconnectProfileCapture: reconnectRequest);
+                    reconnectProfileCapture: reconnectRequest,
+                    reconnectReservation: nextReconnectReservation);
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
                 _remoteSessionWindow = remoteWindow;
                 remoteWindow.Activate();
@@ -556,11 +572,19 @@ public sealed partial class MainWindow : Window, IDisposable
             catch
             {
                 await ownership.DisposeAsync();
+                if (nextReconnectReservation is not null)
+                {
+                    await nextReconnectReservation.DisposeAsync();
+                }
                 throw;
             }
         }
         catch (OperationCanceledException) when (operationToken.IsCancellationRequested)
         {
+            if (throwOnFailure)
+            {
+                throw;
+            }
         }
         catch (ConnectionFailedException exception)
         {
@@ -584,6 +608,14 @@ public sealed partial class MainWindow : Window, IDisposable
         catch (SessionAlreadyActiveException)
         {
             _connectionStatus.Text = "已有活动连接。";
+            if (throwOnFailure)
+            {
+                throw new ReconnectFailureException(WinArdError.Create(
+                    ConnectionStage.Connecting,
+                    "SESSION_ALREADY_ACTIVE",
+                    "已有活动连接。",
+                    Guid.NewGuid().ToString("N")));
+            }
         }
         catch (Exception exception)
         {
@@ -608,6 +640,50 @@ public sealed partial class MainWindow : Window, IDisposable
             SetSessionBusy(false);
             RefreshConnectionPresentation();
         }
+    }
+
+    private Task InvokeReconnectAsync(
+        ConnectionProfile profile,
+        ReconnectSessionReservation reservation,
+        CancellationToken cancellationToken)
+    {
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            return ConnectProfileWithHandlingAsync(
+                profile,
+                throwOnFailure: true,
+                reconnectReservation: reservation,
+                cancellationToken: cancellationToken);
+        }
+
+        var completion = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!DispatcherQueue.TryEnqueue(async () =>
+        {
+            try
+            {
+                await ConnectProfileWithHandlingAsync(
+                    profile,
+                    throwOnFailure: true,
+                    reconnectReservation: reservation,
+                    cancellationToken: cancellationToken);
+                completion.TrySetResult();
+            }
+            catch (OperationCanceledException exception)
+            {
+                completion.TrySetCanceled(exception.CancellationToken);
+            }
+            catch (Exception exception)
+            {
+                completion.TrySetException(exception);
+            }
+        }))
+        {
+            completion.TrySetException(new InvalidOperationException(
+                "The reconnect operation could not be dispatched."));
+        }
+
+        return completion.Task;
     }
 
     private async Task DisconnectWithHandlingAsync()
