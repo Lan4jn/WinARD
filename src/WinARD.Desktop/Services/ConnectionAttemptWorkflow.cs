@@ -47,10 +47,12 @@ public sealed class ConnectionAttemptWorkflow(
     {
         ArgumentNullException.ThrowIfNull(profile);
         var hostKeyRetried = false;
+        var transportAttempts = 0;
         var bootstrapAttempt = QualityBootstrapAttempt.Preferred;
         QualityBootstrapFailureReason? preferredFailureReason = null;
         while (true)
         {
+            transportAttempts++;
             HostKeyFailure? hostKeyFailure = null;
             QualityBootstrapCompatibilityException? compatibilityFailure = null;
             var result = await _handler.HandleWithFailureObservationAsync(
@@ -87,7 +89,8 @@ public sealed class ConnectionAttemptWorkflow(
             }
 
             if (bootstrapAttempt == QualityBootstrapAttempt.Preferred &&
-                compatibilityFailure is { } preferredFailure)
+                compatibilityFailure is { } preferredFailure &&
+                transportAttempts < 2)
             {
                 preferredFailureReason = preferredFailure.Reason;
                 _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
@@ -102,7 +105,7 @@ public sealed class ConnectionAttemptWorkflow(
                 continue;
             }
 
-            if (hostKeyRetried || hostKeyFailure is not { } failure)
+            if (hostKeyRetried || transportAttempts >= 2 || hostKeyFailure is not { } failure)
             {
                 WriteTerminalFallbackFailure(result, bootstrapAttempt, preferredFailureReason, compatibilityFailure);
                 return new ConnectionAttemptOutcome(profile, result, hostKeyFailure?.Request);

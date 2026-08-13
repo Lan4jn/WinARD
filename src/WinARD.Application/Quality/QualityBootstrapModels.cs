@@ -124,7 +124,7 @@ public sealed record QualityBootstrapState
     public QualityBootstrapState(
         QualityBootstrapAttempt attempt,
         QualityBootstrapSettings actualQuality)
-        : this(attempt, actualQuality, preferredFailureReason: null)
+        : this(attempt, actualQuality, preferredFailureReason: null, appliedScaleFactor: null)
     {
     }
 
@@ -132,14 +132,15 @@ public sealed record QualityBootstrapState
         QualityBootstrapAttempt attempt,
         QualityBootstrapSettings actualQuality,
         QualityBootstrapFailureReason? preferredFailureReason)
-        : this((QualityBootstrapAttempt?)attempt, actualQuality, preferredFailureReason)
+        : this((QualityBootstrapAttempt?)attempt, actualQuality, preferredFailureReason, appliedScaleFactor: null)
     {
     }
 
     private QualityBootstrapState(
         QualityBootstrapAttempt? attempt,
         QualityBootstrapSettings actualQuality,
-        QualityBootstrapFailureReason? preferredFailureReason = null)
+        QualityBootstrapFailureReason? preferredFailureReason = null,
+        double? appliedScaleFactor = null)
     {
         if (attempt is { } value && !Enum.IsDefined(value))
         {
@@ -158,9 +159,16 @@ public sealed record QualityBootstrapState
                 nameof(preferredFailureReason));
         }
 
+        if (appliedScaleFactor is { } scaleFactor &&
+            (!double.IsFinite(scaleFactor) || scaleFactor <= 0 || scaleFactor > 1))
+        {
+            throw new ArgumentOutOfRangeException(nameof(appliedScaleFactor));
+        }
+
         Attempt = attempt;
         ActualQuality = actualQuality ?? throw new ArgumentNullException(nameof(actualQuality));
         PreferredFailureReason = preferredFailureReason;
+        AppliedScaleFactor = appliedScaleFactor;
     }
 
     public static QualityBootstrapState LegacyBgra32 { get; } = new(
@@ -177,4 +185,14 @@ public sealed record QualityBootstrapState
     public bool FallbackUsed => Attempt == QualityBootstrapAttempt.Fallback;
 
     public QualityBootstrapFailureReason? PreferredFailureReason { get; }
+
+    public double? AppliedScaleFactor { get; }
+
+    public bool IsFirstPixelConfirmed => AppliedScaleFactor is not null;
+
+    public QualityBootstrapState ConfirmApplied() => new(
+        Attempt,
+        ActualQuality,
+        PreferredFailureReason,
+        ActualQuality.ScaleFactor);
 }

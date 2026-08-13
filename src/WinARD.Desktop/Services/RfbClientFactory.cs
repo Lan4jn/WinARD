@@ -66,6 +66,7 @@ internal sealed class RfbClient : IRfbClient
     private bool _shutdownStarted;
     private bool _disposed;
     private QualityBootstrapState _bootstrapState = QualityBootstrapState.LegacyBgra32;
+    private RemoteFramebufferSize _bootstrapOriginalSize;
 
     public RfbClient(
         Stream stream,
@@ -185,6 +186,7 @@ internal sealed class RfbClient : IRfbClient
             if (!_shutdownStarted)
             {
                 _serverInit = serverInit;
+                _bootstrapOriginalSize = new RemoteFramebufferSize(serverInit.Width, serverInit.Height);
                 _framebuffer = framebuffer;
                 _framebufferUpdates = framebufferUpdates;
                 _qualitySettings = NormalizeSettings(new RemoteQualitySettings(
@@ -280,6 +282,14 @@ internal sealed class RfbClient : IRfbClient
             {
                 try
                 {
+                    if (_handshake?.Version == RfbVersion.V3_889 && settings.ScaleFactor < 1d)
+                    {
+                        wireAttempted = true;
+                        await new ArdClientMessageWriter(new RfbWriter(_transport))
+                            .WriteScalingFactorAsync(settings.ScaleFactor, token)
+                            .ConfigureAwait(false);
+                    }
+
                     wireAttempted = true;
                     await RfbSessionInitializer.WriteSetPixelFormatAsync(
                         _transport,
@@ -302,7 +312,7 @@ internal sealed class RfbClient : IRfbClient
                         _qualitySettings = new RemoteQualitySettings(
                             settings.PixelFormat,
                             settings.Encodings,
-                            1);
+                            settings.ScaleFactor);
                         Volatile.Write(ref _bootstrapState, new QualityBootstrapState(attempt, settings));
                         _bootstrapConfigured = true;
                         published = true;
@@ -785,7 +795,40 @@ internal sealed class RfbClient : IRfbClient
         }
         catch (RfbProtocolException exception) when (TryClassifyBootstrapFailure(exception, out var reason))
         {
+            if (reason == QualityBootstrapFailureReason.RemoteSessionClosed &&
+                BootstrapState.ActualQuality.ScaleFactor < 1d)
+            {
+                reason = QualityBootstrapFailureReason.ScaleRejected;
+            }
+
             throw new QualityBootstrapCompatibilityException(reason);
+        }
+    }
+
+    public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize)
+    {
+        ThrowIfDisposed();
+        lock (_lifecycleSync)
+        {
+            ThrowIfProtocolUnavailableNoLock();
+            var framebuffer = _framebuffer ??
+                throw new InvalidOperationException("RFB initialization has not completed.");
+            if (framebuffer.Width != framebufferSize.Width || framebuffer.Height != framebufferSize.Height)
+            {
+                throw new QualityBootstrapCompatibilityException(
+                    QualityBootstrapFailureReason.FramebufferSizeMismatch);
+            }
+
+            var desiredScale = _bootstrapState.ActualQuality.ScaleFactor;
+            if (desiredScale < 1d &&
+                (framebufferSize.Width > Math.Max(1, (int)Math.Ceiling(_bootstrapOriginalSize.Width * desiredScale)) ||
+                 framebufferSize.Height > Math.Max(1, (int)Math.Ceiling(_bootstrapOriginalSize.Height * desiredScale))))
+            {
+                throw new QualityBootstrapCompatibilityException(
+                    QualityBootstrapFailureReason.FramebufferSizeMismatch);
+            }
+
+            Volatile.Write(ref _bootstrapState, _bootstrapState.ConfirmApplied());
         }
     }
 

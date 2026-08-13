@@ -1404,6 +1404,56 @@ public sealed class FramePresentationTests
     }
 
     [Theory]
+    [InlineData(0.75d)]
+    [InlineData(0.5d)]
+    [InlineData(0.25d)]
+    public async Task Ard_bootstrap_writes_scaling_before_pixel_format_and_first_request(double scaleFactor)
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(4, 2)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var initializationLength = stream.WrittenBytes.Length;
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Rgb565,
+            [16, 6, 0, 1, -239, -223],
+            QualityBootstrapReason.AutomaticBandwidth,
+            scaleFactor);
+
+        await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default);
+        await client.RequestFramebufferUpdateAsync(incremental: false, default);
+
+        Assert.Equal(
+            BootstrapWire(PixelFormat.WinArdRgb565, settings.Encodings, 4, 2, scaleFactor),
+            stream.WrittenBytes[initializationLength..]);
+        Assert.False(client.BootstrapState.IsFirstPixelConfirmed);
+        Assert.Null(client.BootstrapState.AppliedScaleFactor);
+    }
+
+    [Fact]
+    public async Task Ard_bootstrap_at_one_hundred_percent_omits_scaling_message()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(2, 1)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        var initializationLength = stream.WrittenBytes.Length;
+        var settings = new QualityBootstrapSettings(
+            RemotePixelFormatKind.Bgra32,
+            [6, 16, 0, 1, -239, -223],
+            QualityBootstrapReason.SafeFallback,
+            1d);
+
+        await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Fallback, default);
+
+        Assert.Equal(
+            BootstrapWire(PixelFormat.WinArdBgra32, settings.Encodings),
+            stream.WrittenBytes[initializationLength..]);
+    }
+
+    [Theory]
     [InlineData("RFB 003.008\n", false)]
     [InlineData("RFB 003.889\n", true)]
     public async Task Rfb_client_emits_only_the_selected_bootstrap_declaration_before_the_first_request(
@@ -1456,7 +1506,8 @@ public sealed class FramePresentationTests
         var settings = new QualityBootstrapSettings(
             RemotePixelFormatKind.Rgb565,
             [16, 6, 0, 1, -239, -223],
-            QualityBootstrapReason.AutomaticBandwidth);
+            QualityBootstrapReason.AutomaticBandwidth,
+            0.5d);
 
         await client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default);
 
@@ -1465,7 +1516,8 @@ public sealed class FramePresentationTests
         Assert.Equal(0, CountSequence(initializationWire, [0x12, 0, 0, 1]));
         var declaration = BootstrapWire(
             PixelFormat.WinArdRgb565,
-            [16, 6, 0, 1, -239, -223, 1101, 1105, 1103]);
+            [16, 6, 0, 1, -239, -223, 1101, 1105, 1103],
+            scaleFactor: 0.5d);
         Assert.Equal(
             declaration,
             bootstrapWire[..declaration.Length]);
@@ -2885,9 +2937,18 @@ public sealed class FramePresentationTests
         PixelFormat pixelFormat,
         IReadOnlyList<int> encodings,
         ushort? requestWidth = null,
-        ushort? requestHeight = null)
+        ushort? requestHeight = null,
+        double scaleFactor = 1d)
     {
         var bytes = new List<byte>(24 + (encodings.Count * sizeof(int)) + 10);
+        if (scaleFactor < 1d)
+        {
+            bytes.AddRange([8, 0]);
+            var scale = new byte[sizeof(double)];
+            BinaryPrimitives.WriteInt64BigEndian(scale, BitConverter.DoubleToInt64Bits(scaleFactor));
+            bytes.AddRange(scale);
+        }
+
         bytes.AddRange([0, 0, 0, 0]);
         bytes.AddRange(pixelFormat.ToWireBytes());
         bytes.AddRange([2, 0]);

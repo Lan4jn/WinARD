@@ -59,6 +59,10 @@ public interface IRfbClient : IAsyncDisposable
     ValueTask<RemoteServerMessage> ReceiveBootstrapAsync(CancellationToken cancellationToken) =>
         ReceiveAsync(cancellationToken);
 
+    void ConfirmBootstrap(RemoteFramebufferSize framebufferSize)
+    {
+    }
+
     ValueTask SendPointerAsync(
         byte buttons,
         int x,

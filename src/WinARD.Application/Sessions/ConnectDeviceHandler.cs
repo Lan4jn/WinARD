@@ -196,11 +196,15 @@ public sealed class ConnectDeviceHandler
                     continue;
                 }
 
-                preloadedMessages.Add(message);
-                if (message is RemoteFramebufferMessage)
+                if (message is RemoteFramebufferMessage pixelFrame)
                 {
+                    ValidateFirstPixelFrame(client, pixelFrame);
+                    client.ConfirmBootstrap(pixelFrame.Size);
+                    preloadedMessages.Add(pixelFrame);
                     break;
                 }
+
+                preloadedMessages.Add(message);
 
                 if (bootstrapMessageCount == bootstrapMessageBudget)
                 {
@@ -257,6 +261,34 @@ public sealed class ConnectDeviceHandler
             {
                 preloadedOwnership.Dispose();
                 await CleanupAsync(client, transport, secret).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static void ValidateFirstPixelFrame(IRfbClient client, RemoteFramebufferMessage frame)
+    {
+        var actualSize = client.FramebufferSize;
+        if (!actualSize.IsValid)
+        {
+            actualSize = frame.Size;
+        }
+
+        if (frame.Size != actualSize)
+        {
+            frame.Dispose();
+            throw new QualityBootstrapCompatibilityException(
+                QualityBootstrapFailureReason.FramebufferSizeMismatch);
+        }
+
+        foreach (var rectangle in frame.DirtyRectangles)
+        {
+            if (rectangle.X < 0 || rectangle.Y < 0 || rectangle.Width <= 0 || rectangle.Height <= 0 ||
+                (long)rectangle.X + rectangle.Width > actualSize.Width ||
+                (long)rectangle.Y + rectangle.Height > actualSize.Height)
+            {
+                frame.Dispose();
+                throw new QualityBootstrapCompatibilityException(
+                    QualityBootstrapFailureReason.RectangleOutOfBounds);
             }
         }
     }

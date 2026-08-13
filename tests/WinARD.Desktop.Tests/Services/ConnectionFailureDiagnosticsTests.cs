@@ -178,7 +178,7 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
     }
 
     [Fact]
-    public async Task AcceptedHostKeyThenCompatibilityFailureUsesAtMostThreeOrderedAttempts()
+    public async Task AcceptedHostKeyThenCompatibilityFailureStopsAfterTwoTransportsWithoutFallback()
     {
         var endpoint = new SshHostKeyEndpoint("jump.local", 22);
         var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
@@ -211,19 +211,16 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
             profile, stageChanged: null, acceptedHostKey: (_, _) => Task.CompletedTask,
             CancellationToken.None);
 
-        Assert.NotNull(outcome.Result.Session);
-        Assert.Equal(3, transport.Attempts);
+        Assert.Null(outcome.Result.Session);
+        Assert.Equal(2, transport.Attempts);
         Assert.Equal(1, prompt.Count);
         Assert.True(events.IndexOf("transport-hostkey") < events.IndexOf("transport-preferred"));
         Assert.True(events.IndexOf("transport-preferred") < events.IndexOf("client-create-preferred"));
-        Assert.True(events.IndexOf("preferred-client-dispose") < events.IndexOf("transport-fallback"));
-        Assert.True(events.IndexOf("preferred-transport-dispose") < events.IndexOf("transport-fallback"));
-        Assert.Equal(QualityBootstrapAttempt.Fallback, outcome.Result.Session!.BootstrapState.Attempt);
-        await outcome.Result.Session.DisposeAsync();
+        Assert.DoesNotContain("transport-fallback", events);
     }
 
     [Fact]
-    public async Task AcceptedFallbackHostKeyRetrySucceedsWithoutFallbackFailedDiagnostic()
+    public async Task FallbackHostKeyFailureStopsAtTwoTransports()
     {
         var endpoint = new SshHostKeyEndpoint("jump.local", 22);
         var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
@@ -248,15 +245,10 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
             ProfileWithSsh(candidate.Endpoint), stageChanged: null,
             acceptedHostKey: (_, _) => Task.CompletedTask, CancellationToken.None);
 
-        Assert.NotNull(outcome.Result.Session);
-        Assert.Equal(3, transport.Attempts);
-        Assert.Equal(1, prompt.Count);
-        Assert.Equal(2, events.Count(value => value.StartsWith("client-create", StringComparison.Ordinal)));
-        Assert.DoesNotContain(
-            sink.Snapshot().SelectMany(item => item.Fields),
-            field => field.Name == "FallbackFailed" && field.Value == "True");
-        Assert.Single(sink.Snapshot());
-        await outcome.Result.Session!.DisposeAsync();
+        Assert.Null(outcome.Result.Session);
+        Assert.Equal(2, transport.Attempts);
+        Assert.Equal(0, prompt.Count);
+        Assert.Single(events, value => value.StartsWith("client-create", StringComparison.Ordinal));
     }
 
     [Fact]

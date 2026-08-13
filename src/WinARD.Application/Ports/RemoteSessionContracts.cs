@@ -91,6 +91,9 @@ public enum QualityBootstrapFailureReason
     UnsupportedEncoding,
     MalformedFramebufferUpdate,
     RemoteSessionClosed,
+    ScaleRejected,
+    FramebufferSizeMismatch,
+    RectangleOutOfBounds,
 }
 
 public sealed class QualityBootstrapCompatibilityException : Exception

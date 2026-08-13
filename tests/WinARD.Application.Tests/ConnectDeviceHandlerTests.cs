@@ -162,6 +162,7 @@ public sealed class ConnectDeviceHandlerTests
         using var frame = Assert.IsType<RemoteFramebufferMessage>(await session.ReceiveAsync(default));
         Assert.False(session.HasPreloadedFramebuffer);
         Assert.Equal(2, client.ReceiveCount);
+        Assert.Equal(1, client.ConfirmBootstrapCount);
         await session.DisposeAsync();
     }
 
@@ -220,6 +221,35 @@ public sealed class ConnectDeviceHandlerTests
             events.Where(value => value is "receive" || value.StartsWith("request", StringComparison.Ordinal)));
         await result.Session!.DisposeAsync();
         Assert.Equal(1, pixelOwner.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Handler_rejects_a_first_pixel_rectangle_outside_the_server_framebuffer()
+    {
+        var owner = new CountingOwner(4);
+        var client = new TestRfbClient
+        {
+            FramebufferSize = new RemoteFramebufferSize(2, 2),
+            Messages = new Queue<RemoteServerMessage>(
+            [
+                new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(2, 2), owner, 4, 4,
+                    [new RemoteRectangle(1, 1, 2, 1)]),
+            ]),
+        };
+        var mapper = new CapturingErrorMapper();
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            mapper);
+
+        var result = await handler.HandleAsync(CreateProfile(), default);
+
+        Assert.Equal(SessionState.Failed, result.State);
+        var compatibility = Assert.IsType<QualityBootstrapCompatibilityException>(mapper.Exception);
+        Assert.Equal(QualityBootstrapFailureReason.RectangleOutOfBounds, compatibility.Reason);
+        Assert.Equal(1, owner.DisposeCount);
     }
 
     [Fact]
@@ -966,6 +996,8 @@ public sealed class ConnectDeviceHandlerTests
 
     private sealed class TestRfbClient : IRfbClient
     {
+        public RemoteFramebufferSize FramebufferSize { get; init; } = new(1, 1);
+
         public Exception? AuthenticateException { get; init; }
 
         public Exception? NegotiateException { get; init; }
@@ -991,6 +1023,7 @@ public sealed class ConnectDeviceHandlerTests
         public int InitializeCount { get; private set; }
         public int RequestCount { get; private set; }
         public int ReceiveCount { get; private set; }
+        public int ConfirmBootstrapCount { get; private set; }
         public Queue<RemoteServerMessage>? Messages { get; init; }
         public QualityBootstrapSettings? ConfiguredSettings { get; private set; }
 
@@ -1066,6 +1099,11 @@ public sealed class ConnectDeviceHandlerTests
 
             return ValueTask.FromResult(
                 Messages.Dequeue());
+        }
+
+        public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize)
+        {
+            ConfirmBootstrapCount++;
         }
 
         public ValueTask DisposeAsync()
