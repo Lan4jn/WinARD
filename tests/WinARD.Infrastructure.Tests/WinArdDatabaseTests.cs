@@ -13,6 +13,20 @@ namespace WinARD.Infrastructure.Tests;
 public sealed class WinArdDatabaseTests
 {
     [Fact]
+    public async Task Fresh_database_quality_scale_constraint_accepts_percent25_and_rejects_out_of_range()
+    {
+        using var fixture = new TempDatabase();
+        await using var database = new WinArdDatabase(fixture.Path);
+        await database.InitializeAsync(CancellationToken.None);
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+
+        await InsertDeviceWithScaleAsync(connection, 4, "accepted.local");
+        await Assert.ThrowsAsync<SqliteException>(() =>
+            InsertDeviceWithScaleAsync(connection, 5, "rejected.local"));
+    }
+
+    [Fact]
     public async Task Version_three_quality_scales_migrate_in_place_and_percent25_is_allowed()
     {
         await using var fixture = await DatabaseFixture.CreateAtVersionThreeAsync();
@@ -230,6 +244,25 @@ public sealed class WinArdDatabaseTests
         var command = connection.CreateCommand();
         command.CommandText = "SELECT version FROM schema_version;";
         return Convert.ToInt32(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static async Task InsertDeviceWithScaleAsync(
+        SqliteConnection connection,
+        int scale,
+        string host)
+    {
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO devices (
+                id, display_name, host, port, mac_username, transport_mode,
+                quality_scale, created_utc, updated_utc)
+            VALUES ($id, 'Scale fixture', $host, 5900, 'alex', 0, $scale, $now, $now);
+            """;
+        command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("D"));
+        command.Parameters.AddWithValue("$host", host);
+        command.Parameters.AddWithValue("$scale", scale);
+        command.Parameters.AddWithValue("$now", "2026-08-13T00:00:00.0000000+00:00");
+        await command.ExecuteNonQueryAsync();
     }
 
     private static async Task SeedVersionTableAsync(string path, string rowsSql)

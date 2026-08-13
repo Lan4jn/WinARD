@@ -10,6 +10,13 @@ namespace WinARD.Application.Tests.Quality;
 public sealed class QualityBootstrapPlannerTests
 {
     private const long MiB = 1024L * 1024;
+    private static readonly Type[] ThreeParameterSettingsConstructor =
+    [
+        typeof(RemotePixelFormatKind),
+        typeof(IReadOnlyList<int>),
+        typeof(QualityBootstrapReason),
+    ];
+    private static readonly int[] SingleZlibEncoding = [6];
     private static readonly int[] PreferredEncodings = [16, 6, 0, 1, -239, -223];
     private static readonly int[] FallbackEncodings = [6, 16, 0, 1, -239, -223];
 
@@ -213,6 +220,18 @@ public sealed class QualityBootstrapPlannerTests
             scaleFactor));
 
         Assert.Equal("scaleFactor", exception.ParamName);
+    }
+
+    [Fact]
+    public void Settings_preserve_the_exact_public_three_parameter_constructor()
+    {
+        var constructor = typeof(QualityBootstrapSettings).GetConstructor(
+            ThreeParameterSettingsConstructor);
+
+        Assert.NotNull(constructor);
+        var settings = Assert.IsType<QualityBootstrapSettings>(constructor!.Invoke(
+            [RemotePixelFormatKind.Bgra32, SingleZlibEncoding, QualityBootstrapReason.UserFull32]));
+        Assert.Equal(1d, settings.ScaleFactor);
     }
 
     [Fact]

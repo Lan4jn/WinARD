@@ -24,8 +24,16 @@ public sealed record QualityBootstrapSettings
     public QualityBootstrapSettings(
         RemotePixelFormatKind pixelFormat,
         IReadOnlyList<int> encodings,
+        QualityBootstrapReason reason)
+        : this(pixelFormat, encodings, reason, scaleFactor: 1d)
+    {
+    }
+
+    public QualityBootstrapSettings(
+        RemotePixelFormatKind pixelFormat,
+        IReadOnlyList<int> encodings,
         QualityBootstrapReason reason,
-        double scaleFactor = 1d)
+        double scaleFactor)
     {
         if (!Enum.IsDefined(pixelFormat))
         {
