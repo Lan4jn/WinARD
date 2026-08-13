@@ -8,6 +8,28 @@ namespace WinARD.Desktop.Tests.Views;
 public sealed class RemoteSessionQualityPanelTests
 {
     [Fact]
+    public void Quality_panel_is_a_root_overlay_instead_of_a_button_flyout()
+    {
+        var document = XDocument.Parse(File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml")));
+        XNamespace presentation = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+        XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+
+        var button = Assert.Single(document.Descendants(presentation + "Button"),
+            item => (string?)item.Attribute(x + "Name") == "QualitySummaryButton");
+        Assert.Empty(button.Descendants(presentation + "Flyout"));
+        var overlay = Assert.Single(document.Descendants(),
+            item => (string?)item.Attribute(x + "Name") == "QualityOverlay");
+        Assert.Equal("2", (string?)overlay.Attribute("Canvas.ZIndex"));
+        Assert.NotNull(overlay.Descendants().SingleOrDefault(item =>
+            (string?)item.Attribute(x + "Name") == "QualityCloseButton"));
+        Assert.NotNull(overlay.Descendants().SingleOrDefault(item =>
+            (string?)item.Attribute(x + "Name") == "QualityReconnectNowButton"));
+        Assert.NotNull(overlay.Descendants().SingleOrDefault(item =>
+            (string?)item.Attribute(x + "Name") == "QualityLaterButton"));
+    }
+
+    [Fact]
     public void Flyout_exposes_stable_desired_and_applied_automation_ids()
     {
         var document = XDocument.Parse(File.ReadAllText(RepositoryFile(
@@ -55,6 +77,18 @@ public sealed class RemoteSessionQualityPanelTests
             "performance.PrimaryFramebufferEncoding",
             source,
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Explicit_quality_reconnect_uses_the_latest_persisted_profile()
+    {
+        var window = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+        var main = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "MainWindow.xaml.cs"));
+
+        Assert.Contains("ownership.Profile", main, StringComparison.Ordinal);
+        Assert.Contains("UpdateConnectedQualityProfileAsync", main, StringComparison.Ordinal);
     }
 
     private static void AssertQualityTextBlock(

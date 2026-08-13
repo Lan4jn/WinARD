@@ -41,6 +41,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly FrameRateSaveStatus _frameRateSaveStatus = new();
     private readonly PerformanceTextPresentationState _performanceTextPresentation = new();
     private readonly QualityProfileSelectionCoordinator _qualityProfileSelection = new();
+    private readonly QualityOverlayState _qualityOverlayState = new();
     private readonly Func<FrameRefreshPolicy, CancellationToken, Task<ConnectionProfile>>?
         _updateFrameRefreshPolicy;
     private readonly Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>?
@@ -200,6 +201,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         FramePanel.Loaded += OnFramePanelLoaded;
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
         FrameScrollViewer.SizeChanged += (_, _) => UpdateFrameSizing();
+        RootGrid.SizeChanged += (_, _) => UpdateQualityOverlayPlacement();
         UpdateFrameSizing();
     }
 
@@ -443,6 +445,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs args)
     {
+        if (args.Key == Windows.System.VirtualKey.Escape && HandleQualityOverlayEscape())
+        {
+            args.Handled = true;
+            return;
+        }
+
         if (IsInputClosing())
         {
             RecordKeyboardDropped(RemoteInputDropReason.SessionClosing);
@@ -664,6 +672,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnQualityRefreshDropDownOpened(object sender, object args)
     {
+        _qualityOverlayState.SetDropDownOpen(true);
         for (var index = 0; index < ViewModel.FrameRefreshOptions.Count; index++)
         {
             if (QualityRefreshComboBox.ContainerFromIndex(index) is ComboBoxItem item)
@@ -676,10 +685,22 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     }
 
     private void OnQualityColorDropDownOpened(object sender, object args) =>
-        ApplyQualityChoiceAvailability(QualityColorComboBox, ViewModel.QualityColorOptions);
+        OpenQualityChoiceDropDown(QualityColorComboBox, ViewModel.QualityColorOptions);
 
     private void OnQualityScaleDropDownOpened(object sender, object args) =>
-        ApplyQualityChoiceAvailability(QualityScaleComboBox, ViewModel.QualityScaleOptions);
+        OpenQualityChoiceDropDown(QualityScaleComboBox, ViewModel.QualityScaleOptions);
+
+    private void OpenQualityChoiceDropDown<T>(ComboBox comboBox, IReadOnlyList<QualityChoice<T>> options)
+    {
+        _qualityOverlayState.SetDropDownOpen(true);
+        ApplyQualityChoiceAvailability(comboBox, options);
+    }
+
+    private void OnQualityDropDownOpened(object sender, object args) =>
+        _qualityOverlayState.SetDropDownOpen(true);
+
+    private void OnQualityDropDownClosed(object sender, object args) =>
+        _qualityOverlayState.SetDropDownOpen(false);
 
     private static void ApplyQualityChoiceAvailability<T>(
         ComboBox comboBox,
@@ -788,6 +809,17 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             QualityDesiredText.Text = desired;
             QualityAppliedText.Text = applied;
             QualityStatusText.Text = QualityPresentation.StatusText(status);
+            var resolvedScale = ViewModel.ResolvedQualityScale;
+            var actualScale = presentation.Actual?.Scale ?? QualityScale.Percent100;
+            QualityScaleStateText.Text = QualityPresentation.ScaleStateText(
+                profile.Scale,
+                resolvedScale,
+                actualScale,
+                presentation.PendingReconnect,
+                presentation.Actual?.FallbackUsed == true);
+            QualityReconnectActions.Visibility = presentation.PendingReconnect
+                ? Visibility.Visible
+                : Visibility.Collapsed;
             AutomationProperties.SetName(QualityStatusText, $"画质状态：{QualityPresentation.StatusText(status)}");
             AutomationProperties.SetName(QualityDesiredText, desired);
             AutomationProperties.SetName(QualityAppliedText, applied);
@@ -801,6 +833,118 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         {
             _qualitySynchronizationDepth--;
         }
+    }
+
+    private void OnQualitySummaryClicked(object sender, RoutedEventArgs args)
+    {
+        SetQualityOverlayVisible(_qualityOverlayState.Toggle());
+    }
+
+    private void OnQualityCloseClicked(object sender, RoutedEventArgs args) => CloseQualityOverlay();
+
+    private void OnQualityLaterClicked(object sender, RoutedEventArgs args) => CloseQualityOverlay();
+
+    private async void OnQualityReconnectNowClicked(object sender, RoutedEventArgs args)
+    {
+        QualityReconnectNowButton.IsEnabled = false;
+        try
+        {
+            await _windowLifecycle.RetryAsync(_lifetime.Token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception)
+        {
+            QualityReconnectNowButton.IsEnabled = true;
+            ShowFrameRateSaveStatus("重新连接失败；设置已保留");
+        }
+    }
+
+    private void OnQualityOverlayPointerPressed(object sender, PointerRoutedEventArgs args) =>
+        args.Handled = true;
+
+    private void OnQualityOverlayKeyDown(object sender, KeyRoutedEventArgs args)
+    {
+        if (args.Key == Windows.System.VirtualKey.Escape)
+        {
+            _ = HandleQualityOverlayEscape();
+        }
+        args.Handled = true;
+    }
+
+    private void CloseQualityOverlay()
+    {
+        _qualityOverlayState.Close();
+        SetQualityOverlayVisible(false);
+    }
+
+    private void SetQualityOverlayVisible(bool visible)
+    {
+        QualityOverlay.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        QualityOverlayLayer.IsHitTestVisible = visible;
+        if (visible)
+        {
+            UpdateQualityOverlayPlacement();
+            QualityCloseButton.Focus(FocusState.Programmatic);
+        }
+        else
+        {
+            QualitySummaryButton.Focus(FocusState.Programmatic);
+        }
+    }
+
+    private bool HandleQualityOverlayEscape()
+    {
+        var action = _qualityOverlayState.HandleEscape();
+        if (action == QualityOverlayEscapeAction.CloseDropDown)
+        {
+            CloseOpenQualityDropDown();
+            return true;
+        }
+        if (action == QualityOverlayEscapeAction.CloseOverlay)
+        {
+            SetQualityOverlayVisible(false);
+            return true;
+        }
+        return false;
+    }
+
+    private void CloseOpenQualityDropDown()
+    {
+        foreach (var comboBox in new[]
+        {
+            QualityPresetComboBox,
+            QualityBandwidthComboBox,
+            QualityColorComboBox,
+            QualityScaleComboBox,
+            QualityRefreshComboBox,
+        })
+        {
+            comboBox.IsDropDownOpen = false;
+        }
+    }
+
+    private void UpdateQualityOverlayPlacement()
+    {
+        if (!_qualityOverlayState.IsOpen || RootGrid.ActualWidth <= 0)
+        {
+            return;
+        }
+
+        var anchor = QualitySummaryButton.TransformToVisual(RootGrid)
+            .TransformPoint(new Windows.Foundation.Point(0, QualitySummaryButton.ActualHeight));
+        var placement = QualityOverlayPlacement.Calculate(
+            RootGrid.ActualWidth,
+            RootGrid.ActualHeight,
+            anchor.X,
+            anchor.Y,
+            384,
+            620,
+            8);
+        Canvas.SetLeft(QualityOverlay, placement.Left);
+        Canvas.SetTop(QualityOverlay, placement.Top);
+        QualityOverlayScrollViewer.MaxHeight = placement.MaxHeight;
     }
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs args) =>

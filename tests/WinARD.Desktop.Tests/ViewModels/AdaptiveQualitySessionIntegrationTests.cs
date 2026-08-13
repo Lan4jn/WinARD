@@ -222,7 +222,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
     [InlineData(QualityColor.Grayscale, QualityColor.Color16, RemotePixelFormatKind.Bgra32, true)]
     [InlineData(QualityColor.Grayscale, QualityColor.Full32, RemotePixelFormatKind.Bgra32, false)]
     [InlineData(QualityColor.Full32, QualityColor.Color16, RemotePixelFormatKind.Bgra32, true)]
-    [InlineData(QualityColor.Full32, QualityColor.Automatic, RemotePixelFormatKind.Bgra32, false)]
+    [InlineData(QualityColor.Full32, QualityColor.Automatic, RemotePixelFormatKind.Bgra32, true)]
     public async Task Active_explicit_color_change_sets_pending_only_when_next_differs_from_actual(
         QualityColor oldColor,
         QualityColor newColor,
@@ -284,10 +284,9 @@ public sealed class AdaptiveQualitySessionIntegrationTests
 
         viewModel.SetQualityProfile(Profile(finalColor));
 
-        Assert.False(viewModel.QualityPresentationSnapshot.PendingReconnect);
-        Assert.NotEqual(
-            QualityPresentationStatus.ReconnectRequired,
-            QualityPresentation.StatusFor(viewModel.QualityPresentationSnapshot));
+        Assert.Equal(
+            finalColor == QualityColor.Automatic,
+            viewModel.QualityPresentationSnapshot.PendingReconnect);
     }
 
     [Fact]
@@ -449,7 +448,7 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         Assert.Equal(QualityPresentationStatus.SafeFallback, QualityPresentation.StatusFor(viewModel.QualityPresentationSnapshot));
 
         viewModel.SetQualityProfile(QualityPresentation.WithBandwidth(color16, 4L << 20));
-        Assert.Equal(QualityPresentationStatus.SafeFallback, QualityPresentation.StatusFor(viewModel.QualityPresentationSnapshot));
+        Assert.Equal(QualityPresentationStatus.ReconnectRequired, QualityPresentation.StatusFor(viewModel.QualityPresentationSnapshot));
 
         viewModel.SetQualityProfile(QualityProfile.Original);
         viewModel.SetQualityProfile(color16);
@@ -501,6 +500,39 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         Assert.Equal(
             "下次连接生效",
             QualityPresentation.StatusText(QualityPresentationStatus.ReconnectRequired));
+    }
+
+    [Fact]
+    public async Task Active_scale_change_keeps_wire_state_and_reports_actual_scale_pending_reconnect()
+    {
+        var events = new ConcurrentQueue<string>();
+        var runtime = new TransitionRuntime(
+            events,
+            frameCount: 2,
+            qualityCapabilities: RfbClient.ConfirmedStandardQualityCapabilities,
+            gateSecondFrame: true);
+        await using var viewModel = new RemoteSessionViewModel(
+            runtime,
+            new AsyncLifetime(),
+            new EventPresenter(events),
+            new InlineDispatcher(),
+            clipboardBridge: null,
+            diagnosticSink: null,
+            QualityProfile.Original);
+        await viewModel.StartAsync(default);
+        await runtime.SecondRequest.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        viewModel.SetQualityProfile(QualityPresentation.WithScale(
+            QualityProfile.Original,
+            QualityScale.Percent50));
+
+        Assert.Null(runtime.LastAppliedSettings);
+        Assert.True(viewModel.QualityPresentationSnapshot.PendingReconnect);
+        Assert.Equal(QualityScale.Percent100, viewModel.QualityPresentationSnapshot.Actual?.Scale);
+
+        viewModel.SetQualityProfile(QualityProfile.Original);
+        Assert.False(viewModel.QualityPresentationSnapshot.PendingReconnect);
+        runtime.ReleaseSecondFrame.TrySetResult();
     }
 
     [Fact]
@@ -1321,7 +1353,9 @@ public sealed class AdaptiveQualitySessionIntegrationTests
         color,
         QualityScale.Percent100,
         FrameRefreshPolicy.Automatic,
-        allowAutomaticGrayscale: color is QualityColor.Automatic or QualityColor.Grayscale);
+        allowAutomaticGrayscale: color is QualityColor.Automatic or QualityColor.Grayscale,
+        colorLocked: color != QualityColor.Automatic,
+        scaleLocked: true);
 
     private sealed class ManualTimeProvider : TimeProvider
     {

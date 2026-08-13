@@ -292,6 +292,20 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
     internal QualityPresentationSnapshot QualityPresentationSnapshot =>
         Volatile.Read(ref _qualityPresentationSnapshot);
 
+    internal QualityScale ResolvedQualityScale
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return ScaleFromFactor(QualityBootstrapPlanner.CreatePlan(
+                    _qualityProfile,
+                    _adaptiveQualityCapabilities,
+                    _qualityDecoderGates).Preferred.ScaleFactor);
+            }
+        }
+    }
+
     internal IReadOnlyList<QualityChoice<QualityColor>> QualityColorOptions =>
         QualityPresentation.ColorOptionsFor(
             _qualityProfile.Color,
@@ -431,14 +445,15 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
 
             previousOperations = _qualityProfileOperations;
             _qualityProfileOperations = new CancellationTokenSource();
-            var nextDesiredPixelFormat = DesiredPixelFormat(profile.Color);
-            var colorChanged = _qualityProfile.Color != profile.Color;
+            var desiredBootstrap = QualityBootstrapPlanner.CreatePlan(
+                profile,
+                _adaptiveQualityCapabilities,
+                _qualityDecoderGates).Preferred;
             _qualityProfile = profile;
             _latestQualityDecision = null;
             _qualityReconnectRequired = _receiveTask is not null &&
-                nextDesiredPixelFormat is { } desiredPixelFormat &&
-                desiredPixelFormat != _actualQualityState.PixelFormat &&
-                (_qualityReconnectRequired || colorChanged);
+                (desiredBootstrap.ScaleFactor != _bootstrapState.ActualQuality.ScaleFactor ||
+                    desiredBootstrap.PixelFormat != _actualQualityState.PixelFormat);
             _latestQualityTransitionStatus = _qualityReconnectRequired
                 ? QualityTransitionStatus.ReconnectRequired
                 : QualityTransitionStatus.NoChange;
@@ -1355,8 +1370,19 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         return new QualityActualState(
             bootstrapState.ActualQuality.PixelFormat,
             encoding is { } value ? MapActualEncoding(value) : previousEncoding,
-            bootstrapState.FallbackUsed);
+            bootstrapState.FallbackUsed)
+        {
+            Scale = ScaleFromFactor(bootstrapState.ActualQuality.ScaleFactor),
+        };
     }
+
+    private static QualityScale ScaleFromFactor(double factor) => factor switch
+    {
+        0.25d => QualityScale.Percent25,
+        0.5d => QualityScale.Percent50,
+        0.75d => QualityScale.Percent75,
+        _ => QualityScale.Percent100,
+    };
 
     private static bool IsPrimaryEncodingCandidate(int encoding) => encoding is not
         (int)RfbEncodingType.CopyRect and not
@@ -1365,13 +1391,6 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         (int)RfbEncodingType.ArdDisplayInfo and not
         (int)RfbEncodingType.ArdSessionEncryption and not
         (int)RfbEncodingType.ArdDisplayInfo2;
-
-    private static RemotePixelFormatKind? DesiredPixelFormat(QualityColor color) => color switch
-    {
-        QualityColor.Full32 => RemotePixelFormatKind.Bgra32,
-        QualityColor.Color16 => RemotePixelFormatKind.Rgb565,
-        _ => null,
-    };
 
     private static QualityActualEncoding MapActualEncoding(int encoding) => encoding switch
     {

@@ -10,6 +10,32 @@ namespace WinARD.Desktop.Tests.ViewModels;
 
 public sealed class QualityPresentationTests
 {
+    [Fact]
+    public void Scale_state_separates_saved_resolved_and_actual_values()
+    {
+        var text = QualityPresentation.ScaleStateText(
+            QualityScale.Automatic,
+            QualityScale.Percent50,
+            QualityScale.Percent50,
+            pendingReconnect: false,
+            safeFallback: false);
+
+        Assert.Equal("设置：自动 · 本连接解析：50% · 本连接实际：50%", text);
+    }
+
+    [Fact]
+    public void Scale_state_exposes_pending_reconnect_and_safe_fallback()
+    {
+        Assert.Equal(
+            "设置：25% · 本连接解析：25% · 本连接实际：100%（已安全回退） · 需要重新连接后生效",
+            QualityPresentation.ScaleStateText(
+                QualityScale.Percent25,
+                QualityScale.Percent25,
+                QualityScale.Percent100,
+                pendingReconnect: true,
+                safeFallback: true));
+    }
+
     private const double MiB = 1024 * 1024;
 
     [Fact]

@@ -45,118 +45,8 @@
                         x:Name="QualitySummaryButton"
                         AutomationProperties.AutomationId="RemoteQualitySummaryButton"
                         AutomationProperties.Name="画质设置"
-                        Content="画质  自动 · — · — · — · —">
-                        <Button.Flyout>
-                            <Flyout Placement="Bottom">
-                                <ScrollViewer MaxHeight="620">
-                                    <StackPanel Width="360" Spacing="8">
-                                        <TextBlock FontSize="18" Text="画质" />
-                                        <TextBlock
-                                            x:Name="QualityStatusText"
-                                            AutomationProperties.AutomationId="RemoteQualityStatus"
-                                            AutomationProperties.Name="画质状态：状态未知"
-                                            AutomationProperties.LiveSetting="Polite"
-                                            Text="状态未知" />
-                                        <TextBlock
-                                            x:Name="QualityDesiredText"
-                                            AutomationProperties.AutomationId="RemoteQualityDesiredText"
-                                            AutomationProperties.Name="期望画质"
-                                            Text="期望：—" />
-                                        <TextBlock
-                                            x:Name="QualityAppliedText"
-                                            AutomationProperties.AutomationId="RemoteQualityAppliedText"
-                                            AutomationProperties.Name="实际画质"
-                                            AutomationProperties.LiveSetting="Polite"
-                                            Text="实际：—" />
-                                        <TextBlock Text="预设" />
-                                        <ComboBox
-                                            x:Name="QualityPresetComboBox"
-                                            AutomationProperties.AutomationId="RemoteQualityPresetComboBox"
-                                            AutomationProperties.Name="画质预设"
-                                            DisplayMemberPath="DisplayName"
-                                            SelectionChanged="OnQualityPresetSelectionChanged" />
-                                        <TextBlock Text="带宽目标" />
-                                        <ComboBox
-                                            x:Name="QualityBandwidthComboBox"
-                                            AutomationProperties.AutomationId="RemoteQualityBandwidthComboBox"
-                                            AutomationProperties.Name="画质带宽目标"
-                                            DisplayMemberPath="DisplayName"
-                                            SelectionChanged="OnQualityDetailSelectionChanged" />
-                                        <NumberBox
-                                            x:Name="QualityCustomBandwidthBox"
-                                            AutomationProperties.AutomationId="RemoteQualityCustomBandwidthBox"
-                                            AutomationProperties.Name="自定义带宽，MiB 每秒"
-                                            Header="自定义带宽 (MiB/s)"
-                                            Minimum="0.1"
-                                            Maximum="1048576"
-                                            SmallChange="0.1"
-                                            SpinButtonPlacementMode="Compact"
-                                            Value="3"
-                                            ValueChanged="OnQualityCustomBandwidthChanged" />
-                                        <TextBlock Text="色彩" />
-                                        <ComboBox
-                                            x:Name="QualityColorComboBox"
-                                            AutomationProperties.AutomationId="RemoteQualityColorComboBox"
-                                            AutomationProperties.Name="画质色彩"
-                                            DropDownOpened="OnQualityColorDropDownOpened"
-                                            SelectionChanged="OnQualityDetailSelectionChanged">
-                                            <ComboBox.ItemTemplate>
-                                                <DataTemplate>
-                                                    <StackPanel>
-                                                        <TextBlock Text="{Binding DisplayName}" />
-                                                        <TextBlock FontSize="11" Opacity="0.7" Text="{Binding ConstraintText}" />
-                                                    </StackPanel>
-                                                </DataTemplate>
-                                            </ComboBox.ItemTemplate>
-                                        </ComboBox>
-                                        <TextBlock Text="缩放" />
-                                        <ComboBox
-                                            x:Name="QualityScaleComboBox"
-                                            AutomationProperties.AutomationId="RemoteQualityScaleComboBox"
-                                            AutomationProperties.Name="画质缩放"
-                                            DropDownOpened="OnQualityScaleDropDownOpened"
-                                            SelectionChanged="OnQualityDetailSelectionChanged">
-                                            <ComboBox.ItemTemplate>
-                                                <DataTemplate>
-                                                    <StackPanel>
-                                                        <TextBlock Text="{Binding DisplayName}" />
-                                                        <TextBlock FontSize="11" Opacity="0.7" Text="{Binding ConstraintText}" />
-                                                    </StackPanel>
-                                                </DataTemplate>
-                                            </ComboBox.ItemTemplate>
-                                        </ComboBox>
-                                        <TextBlock Text="刷新率" />
-                                        <ComboBox
-                                            x:Name="QualityRefreshComboBox"
-                                            AutomationProperties.AutomationId="RemoteQualityRefreshComboBox"
-                                            AutomationProperties.Name="画质刷新率"
-                                            DisplayMemberPath="DisplayName"
-                                            DropDownOpened="OnQualityRefreshDropDownOpened"
-                                            SelectionChanged="OnQualityDetailSelectionChanged" />
-                                        <ToggleSwitch
-                                            x:Name="QualityGrayscaleToggle"
-                                            AutomationProperties.AutomationId="RemoteQualityAllowGrayscaleToggle"
-                                            AutomationProperties.Name="允许自动使用灰度"
-                                            Header="允许自动使用灰度"
-                                            Toggled="OnQualityDetailToggled" />
-                                        <TextBlock Text="锁定项" />
-                                        <StackPanel Orientation="Horizontal" Spacing="10">
-                                            <CheckBox x:Name="QualityBandwidthLock" AutomationProperties.AutomationId="RemoteQualityBandwidthLock" AutomationProperties.Name="锁定带宽目标" Content="带宽" Click="OnQualityLockClicked" />
-                                            <CheckBox x:Name="QualityColorLock" AutomationProperties.AutomationId="RemoteQualityColorLock" AutomationProperties.Name="锁定色彩" Content="色彩" Click="OnQualityLockClicked" />
-                                            <CheckBox x:Name="QualityScaleLock" AutomationProperties.AutomationId="RemoteQualityScaleLock" AutomationProperties.Name="锁定缩放" Content="缩放" Click="OnQualityLockClicked" />
-                                            <CheckBox x:Name="QualityRefreshLock" AutomationProperties.AutomationId="RemoteQualityRefreshLock" AutomationProperties.Name="锁定刷新率" Content="刷新" Click="OnQualityLockClicked" />
-                                        </StackPanel>
-                                        <TextBlock Text="当前编码" />
-                                        <TextBlock
-                                            x:Name="QualityEncodingText"
-                                            AutomationProperties.AutomationId="RemoteQualityEncodingText"
-                                            AutomationProperties.Name="当前编码：Unknown"
-                                            Text="Unknown" />
-                                    </StackPanel>
-                                </ScrollViewer>
-                            </Flyout>
-                        </Button.Flyout>
-                    </Button>
+                        Click="OnQualitySummaryClicked"
+                        Content="画质  自动 · — · — · — · —" />
                 </StackPanel>
             </CommandBar.Content>
             <AppBarButton
@@ -254,6 +144,64 @@
                 HorizontalAlignment="Center"
                 VerticalAlignment="Top" />
         </Grid>
+
+        <Canvas
+            x:Name="QualityOverlayLayer"
+            Grid.RowSpan="3"
+            Canvas.ZIndex="2"
+            IsHitTestVisible="False">
+            <Border
+                x:Name="QualityOverlay"
+                AutomationProperties.AutomationId="RemoteQualityOverlay"
+                AutomationProperties.Name="画质悬浮面板"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                Canvas.ZIndex="2"
+                IsHitTestVisible="True"
+                KeyDown="OnQualityOverlayKeyDown"
+                Padding="12"
+                PointerPressed="OnQualityOverlayPointerPressed"
+                Visibility="Collapsed">
+                <ScrollViewer x:Name="QualityOverlayScrollViewer" MaxHeight="620">
+                    <StackPanel Width="360" Spacing="8">
+                        <Grid>
+                            <TextBlock FontSize="18" Text="画质" />
+                            <Button x:Name="QualityCloseButton" HorizontalAlignment="Right" AutomationProperties.AutomationId="RemoteQualityCloseButton" AutomationProperties.Name="关闭画质面板" Click="OnQualityCloseClicked" Content="关闭" />
+                        </Grid>
+                        <TextBlock x:Name="QualityStatusText" AutomationProperties.AutomationId="RemoteQualityStatus" AutomationProperties.Name="画质状态" AutomationProperties.LiveSetting="Polite" Text="状态未知" />
+                        <TextBlock x:Name="QualityDesiredText" AutomationProperties.AutomationId="RemoteQualityDesiredText" AutomationProperties.Name="期望画质" Text="期望：—" />
+                        <TextBlock x:Name="QualityAppliedText" AutomationProperties.AutomationId="RemoteQualityAppliedText" AutomationProperties.Name="实际画质" AutomationProperties.LiveSetting="Polite" Text="实际：—" />
+                        <TextBlock x:Name="QualityScaleStateText" AutomationProperties.AutomationId="RemoteQualityScaleStateText" AutomationProperties.Name="缩放设置与实际状态" Text="设置：自动 · 本连接解析：— · 本连接实际：—" TextWrapping="Wrap" />
+                        <TextBlock Text="预设" />
+                        <ComboBox x:Name="QualityPresetComboBox" AutomationProperties.AutomationId="RemoteQualityPresetComboBox" AutomationProperties.Name="画质预设" DisplayMemberPath="DisplayName" DropDownClosed="OnQualityDropDownClosed" DropDownOpened="OnQualityDropDownOpened" SelectionChanged="OnQualityPresetSelectionChanged" />
+                        <TextBlock Text="带宽目标" />
+                        <ComboBox x:Name="QualityBandwidthComboBox" AutomationProperties.AutomationId="RemoteQualityBandwidthComboBox" AutomationProperties.Name="带宽目标" DisplayMemberPath="DisplayName" DropDownClosed="OnQualityDropDownClosed" DropDownOpened="OnQualityDropDownOpened" SelectionChanged="OnQualityDetailSelectionChanged" />
+                        <NumberBox x:Name="QualityCustomBandwidthBox" AutomationProperties.AutomationId="RemoteQualityCustomBandwidthBox" AutomationProperties.Name="自定义带宽" Header="自定义带宽 (MiB/s)" Minimum="0.1" Maximum="1048576" SmallChange="0.1" SpinButtonPlacementMode="Compact" Value="3" ValueChanged="OnQualityCustomBandwidthChanged" />
+                        <TextBlock Text="色彩" />
+                        <ComboBox x:Name="QualityColorComboBox" AutomationProperties.AutomationId="RemoteQualityColorComboBox" AutomationProperties.Name="画质色彩" DisplayMemberPath="DisplayName" DropDownClosed="OnQualityDropDownClosed" DropDownOpened="OnQualityColorDropDownOpened" SelectionChanged="OnQualityDetailSelectionChanged" />
+                        <TextBlock Text="缩放" />
+                        <ComboBox x:Name="QualityScaleComboBox" AutomationProperties.AutomationId="RemoteQualityScaleComboBox" AutomationProperties.Name="画质缩放" DisplayMemberPath="DisplayName" DropDownClosed="OnQualityDropDownClosed" DropDownOpened="OnQualityScaleDropDownOpened" SelectionChanged="OnQualityDetailSelectionChanged" />
+                        <TextBlock Text="刷新率" />
+                        <ComboBox x:Name="QualityRefreshComboBox" AutomationProperties.AutomationId="RemoteQualityRefreshComboBox" AutomationProperties.Name="画质刷新率" DisplayMemberPath="DisplayName" DropDownClosed="OnQualityDropDownClosed" DropDownOpened="OnQualityRefreshDropDownOpened" SelectionChanged="OnQualityDetailSelectionChanged" />
+                        <ToggleSwitch x:Name="QualityGrayscaleToggle" AutomationProperties.AutomationId="RemoteQualityAllowGrayscaleToggle" AutomationProperties.Name="允许自动使用灰度" Header="允许自动使用灰度" Toggled="OnQualityDetailToggled" />
+                        <TextBlock Text="锁定项" />
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <CheckBox x:Name="QualityBandwidthLock" Content="带宽" Click="OnQualityLockClicked" />
+                            <CheckBox x:Name="QualityColorLock" Content="色彩" Click="OnQualityLockClicked" />
+                            <CheckBox x:Name="QualityScaleLock" Content="缩放" Click="OnQualityLockClicked" />
+                            <CheckBox x:Name="QualityRefreshLock" Content="刷新" Click="OnQualityLockClicked" />
+                        </StackPanel>
+                        <TextBlock Text="当前编码" />
+                        <TextBlock x:Name="QualityEncodingText" AutomationProperties.AutomationId="RemoteQualityEncodingText" AutomationProperties.Name="当前编码" Text="Unknown" />
+                        <StackPanel x:Name="QualityReconnectActions" Orientation="Horizontal" Spacing="8" Visibility="Collapsed">
+                            <Button x:Name="QualityReconnectNowButton" AutomationProperties.AutomationId="RemoteQualityReconnectNowButton" AutomationProperties.Name="立即重新连接" Click="OnQualityReconnectNowClicked" Content="立即重新连接" />
+                            <Button x:Name="QualityLaterButton" AutomationProperties.AutomationId="RemoteQualityLaterButton" AutomationProperties.Name="稍后重新连接" Click="OnQualityLaterClicked" Content="稍后" />
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Canvas>
 
         <Grid Grid.Row="2" Padding="12,8" ColumnSpacing="16">
             <Grid.ColumnDefinitions>

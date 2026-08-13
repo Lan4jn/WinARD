@@ -51,7 +51,10 @@ public enum QualityActualEncoding
 public sealed record QualityActualState(
     RemotePixelFormatKind PixelFormat,
     QualityActualEncoding Encoding,
-    bool FallbackUsed);
+    bool FallbackUsed)
+{
+    public QualityScale Scale { get; init; } = QualityScale.Percent100;
+}
 
 public sealed record QualityPresentationSnapshot(
     QualityProfile Profile,
@@ -197,6 +200,19 @@ public static class QualityPresentation
             : "不限制";
         return $"期望：{ColorName(color)} · {ScaleName(scale)} · " +
             $"{(targetFps is > 0 ? $"{targetFps} FPS" : "—")} · {bandwidth}";
+    }
+
+    public static string ScaleStateText(
+        QualityScale saved,
+        QualityScale resolved,
+        QualityScale actual,
+        bool pendingReconnect,
+        bool safeFallback)
+    {
+        var fallback = safeFallback ? "（已安全回退）" : string.Empty;
+        var pending = pendingReconnect ? " · 需要重新连接后生效" : string.Empty;
+        return $"设置：{ScaleName(saved)} · 本连接解析：{ScaleName(resolved)} · " +
+            $"本连接实际：{ScaleName(actual)}{fallback}{pending}";
     }
 
     public static string AppliedText(
