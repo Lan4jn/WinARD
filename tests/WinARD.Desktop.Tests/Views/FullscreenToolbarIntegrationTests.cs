@@ -14,11 +14,25 @@ public sealed class FullscreenToolbarIntegrationTests
         Assert.Contains("x:Name=\"FullscreenToolbarLayer\"", xaml, StringComparison.Ordinal);
         Assert.Contains("x:Name=\"FullscreenToolbarHotZone\"", xaml, StringComparison.Ordinal);
         Assert.Contains("Grid.RowSpan=\"3\"", xaml, StringComparison.Ordinal);
-        Assert.Contains("DispatcherTimer", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("DispatcherTimer", source, StringComparison.Ordinal);
         Assert.Contains("TimeSpan.FromSeconds(2)", source, StringComparison.Ordinal);
         Assert.Contains("_fullscreenToolbarController.IsHotZoneEnabled", source, StringComparison.Ordinal);
-        Assert.Contains("_fullscreenToolbarTimer.Stop()", source, StringComparison.Ordinal);
-        Assert.Contains("_fullscreenToolbarTimer.Tick -= OnFullscreenToolbarTimerTick", source, StringComparison.Ordinal);
+        Assert.Contains("FullscreenToolbarHideScheduler", source, StringComparison.Ordinal);
+        Assert.Contains("Cancel()", source, StringComparison.Ordinal);
+    }
+
+
+    [Fact]
+    public void FullscreenRecallShortcutIsDiscoverableAndConsumedBeforeRemoteInput()
+    {
+        var xaml = File.ReadAllText(RepositoryFile("src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml"));
+        var source = File.ReadAllText(RepositoryFile("src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Contains("Ctrl+Alt+T", xaml, StringComparison.Ordinal);
+        Assert.Contains("HandleFullscreenToolbarRecall", source, StringComparison.Ordinal);
+        Assert.Contains("_consumeToolbarRecallKeys", source, StringComparison.Ordinal);
+        Assert.Contains("ReleaseInputAsync", source, StringComparison.Ordinal);
+        Assert.Contains("args.Handled = true", source, StringComparison.Ordinal);
     }
 
     [Fact]

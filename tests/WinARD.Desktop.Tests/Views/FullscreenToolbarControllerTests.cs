@@ -73,4 +73,19 @@ public sealed class FullscreenToolbarControllerTests
     {
         Assert.Equal(expected, FullscreenToolbarController.EscapeAction(dropDown, overlay, fullscreen));
     }
+
+    [Theory]
+    [InlineData(true, true, true, true)]
+    [InlineData(true, true, false, false)]
+    [InlineData(true, false, true, false)]
+    [InlineData(false, true, true, false)]
+    public void RecallShortcutRequiresFullscreenControlAltT(
+        bool fullscreen,
+        bool control,
+        bool alt,
+        bool expected)
+    {
+        Assert.Equal(expected, FullscreenToolbarController.IsRecallShortcut(
+            fullscreen, control, alt, isTKey: true));
+    }
 }

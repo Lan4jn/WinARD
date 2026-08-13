@@ -72,4 +72,11 @@ public sealed class FullscreenToolbarController
                 : isFullscreen
                     ? FullscreenEscapeAction.ExitFullscreen
                     : FullscreenEscapeAction.None;
+
+    public static bool IsRecallShortcut(
+        bool isFullscreen,
+        bool isControlDown,
+        bool isAltDown,
+        bool isTKey) =>
+        isFullscreen && isControlDown && isAltDown && isTKey;
 }

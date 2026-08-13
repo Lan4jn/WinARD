@@ -92,6 +92,7 @@
                 Label="导出诊断" />
             <AppBarButton
                 AutomationProperties.AutomationId="RemoteFullscreenButton"
+                ToolTipService.ToolTip="全屏；全屏时按 Ctrl+Alt+T 唤回工具栏"
                 Click="OnFullscreenClicked"
                 Label="全屏" />
             <AppBarButton

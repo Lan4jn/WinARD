@@ -48,7 +48,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly QualityOverlayState _qualityOverlayState = new();
     private readonly QualityOverlayOpenCoordinator _qualityOverlayOpenCoordinator;
     private readonly FullscreenToolbarController _fullscreenToolbarController = new();
-    private readonly DispatcherTimer _fullscreenToolbarTimer = new();
+    private readonly FullscreenToolbarHideScheduler _fullscreenToolbarHideScheduler;
     private readonly IReconnectProfileCapture? _reconnectProfileCapture;
     private readonly ReconnectSessionReservation? _reconnectReservation;
     private readonly Func<CancellationToken, Task>? _retryWithoutReservation;
@@ -74,7 +74,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private int _closingStarted;
     private bool _fullscreen;
     private bool _consumeEscapeKeyUp;
-    private long _fullscreenToolbarHideGeneration;
+    private readonly HashSet<Windows.System.VirtualKey> _consumeToolbarRecallKeys = [];
     private bool _allowClose;
     private int _qualitySynchronizationDepth;
     private long _suppressedReconnectGeneration;
@@ -156,8 +156,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _diagnosticExportState = new RemoteSessionDiagnosticExportState(
             serviceAvailable: diagnosticExportService is not null);
         InitializeComponent();
-        _fullscreenToolbarTimer.Interval = TimeSpan.FromSeconds(2);
-        _fullscreenToolbarTimer.Tick += OnFullscreenToolbarTimerTick;
+        _fullscreenToolbarHideScheduler = new FullscreenToolbarHideScheduler(
+            token => Task.Delay(TimeSpan.FromSeconds(2), token),
+            action => _dispatcher.InvokeAsync(action, _lifetime.Token));
         RefreshDiagnosticExportState();
         _remoteSize = session.FramebufferSize;
         presenter ??= new D3DFramePresenter(FramePanel);
@@ -545,7 +546,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void SetFullscreen(bool fullscreen)
     {
-        _fullscreenToolbarTimer.Stop();
+        _fullscreenToolbarHideScheduler.Cancel();
         _fullscreen = fullscreen;
         _fullscreenToolbarController.SetFullscreen(fullscreen);
         _appWindow.SetPresenter(
@@ -558,6 +559,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs args)
     {
+        if (HandleFullscreenToolbarRecall(args))
+        {
+            args.Handled = true;
+            return;
+        }
+
         if (args.Key == Windows.System.VirtualKey.Escape && HandleLocalEscape())
         {
             _consumeEscapeKeyUp = true;
@@ -601,6 +608,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnKeyUp(object sender, KeyRoutedEventArgs args)
     {
+        if (_consumeToolbarRecallKeys.Remove(args.Key))
+        {
+            args.Handled = true;
+            return;
+        }
+
         if (args.Key == Windows.System.VirtualKey.Escape && _consumeEscapeKeyUp)
         {
             _consumeEscapeKeyUp = false;
@@ -745,6 +758,33 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
     }
 
+    private bool HandleFullscreenToolbarRecall(KeyRoutedEventArgs args)
+    {
+        if (!_fullscreen)
+        {
+            return false;
+        }
+
+        var controlDown = Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(
+            Windows.System.VirtualKey.Control).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+        var altDown = Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(
+            Windows.System.VirtualKey.Menu).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+        if (!FullscreenToolbarController.IsRecallShortcut(
+            _fullscreen, controlDown, altDown, args.Key == Windows.System.VirtualKey.T))
+        {
+            return false;
+        }
+
+        _consumeToolbarRecallKeys.Add(Windows.System.VirtualKey.Control);
+        _consumeToolbarRecallKeys.Add(Windows.System.VirtualKey.Menu);
+        _consumeToolbarRecallKeys.Add(args.Key);
+        _textInput.Reset();
+        _ = _inputOperations.RunAsync(() => ReleaseInputAsync(_lifetime.Token));
+        ShowFullscreenToolbar();
+        ScheduleFullscreenToolbarHide();
+        return true;
+    }
+
     private void OnFullscreenToolbarHotZoneEntered(object sender, PointerRoutedEventArgs args)
     {
         if (!_fullscreenToolbarController.IsHotZoneEnabled)
@@ -760,7 +800,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void ShowFullscreenToolbar()
     {
-        _fullscreenToolbarTimer.Stop();
+        _fullscreenToolbarHideScheduler.Cancel();
         _fullscreenToolbarController.ShowFromHotZone();
         UpdateFullscreenToolbarVisual();
     }
@@ -772,18 +812,18 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             return;
         }
 
-        _fullscreenToolbarHideGeneration = _fullscreenToolbarController.ScheduleHide();
-        _fullscreenToolbarTimer.Stop();
-        _fullscreenToolbarTimer.Start();
+        ScheduleFullscreenToolbarHide();
     }
 
-    private void OnFullscreenToolbarTimerTick(object? sender, object args)
+    private void ScheduleFullscreenToolbarHide()
     {
-        _fullscreenToolbarTimer.Stop();
-        if (_fullscreenToolbarController.TryHide(_fullscreenToolbarHideGeneration))
+        var generation = _fullscreenToolbarController.ScheduleHide();
+        _fullscreenToolbarHideScheduler.Schedule(generation, hideGeneration =>
         {
-            UpdateFullscreenToolbarVisual();
-        }
+            var hidden = _fullscreenToolbarController.TryHide(hideGeneration);
+            if (hidden) UpdateFullscreenToolbarVisual();
+            return hidden;
+        });
     }
 
     private void UpdateFullscreenToolbarVisual()
@@ -1923,6 +1963,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private async Task CloseWindowCoreAsync()
     {
+        _fullscreenToolbarHideScheduler.Cancel();
+        await _fullscreenToolbarHideScheduler.WhenIdleAsync().ConfigureAwait(false);
         _lifetime.Cancel();
         try
         {
@@ -1984,8 +2026,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnClosed(object sender, WindowEventArgs args)
     {
-        _fullscreenToolbarTimer.Stop();
-        _fullscreenToolbarTimer.Tick -= OnFullscreenToolbarTimerTick;
+        _fullscreenToolbarHideScheduler.Cancel();
         _appWindow.Closing -= OnClosing;
         InputSurface.RemoveHandler(UIElement.KeyDownEvent, _keyDownHandler);
         InputSurface.RemoveHandler(UIElement.KeyUpEvent, _keyUpHandler);
