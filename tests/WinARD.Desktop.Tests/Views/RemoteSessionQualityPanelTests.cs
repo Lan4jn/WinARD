@@ -27,6 +27,12 @@ public sealed class RemoteSessionQualityPanelTests
             (string?)item.Attribute(x + "Name") == "QualityReconnectNowButton"));
         Assert.NotNull(overlay.Descendants().SingleOrDefault(item =>
             (string?)item.Attribute(x + "Name") == "QualityLaterButton"));
+        var content = Assert.Single(overlay.Descendants(presentation + "StackPanel"),
+            item => item.Parent?.Name == presentation + "ScrollViewer");
+        Assert.Null(content.Attribute("Width"));
+        var scroller = Assert.Single(overlay.Descendants(presentation + "ScrollViewer"));
+        Assert.Equal("Auto", (string?)scroller.Attribute("HorizontalScrollBarVisibility"));
+        Assert.Equal("Auto", (string?)scroller.Attribute("VerticalScrollBarVisibility"));
     }
 
     [Fact]

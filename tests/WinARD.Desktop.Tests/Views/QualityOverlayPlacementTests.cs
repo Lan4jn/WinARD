@@ -18,7 +18,7 @@ public sealed class QualityOverlayPlacementTests
 
         Assert.Equal(432, placement.Left);
         Assert.Equal(50, placement.Top);
-        Assert.Equal(442, placement.MaxHeight);
+        Assert.Equal(442, placement.Height);
     }
 
     [Fact]
@@ -28,8 +28,9 @@ public sealed class QualityOverlayPlacementTests
 
         Assert.Equal(8, placement.Left);
         Assert.Equal(8, placement.Top);
-        Assert.Equal(27, placement.MaxHeight);
+        Assert.Equal(24, placement.Height);
         Assert.Equal(84, placement.Width);
         Assert.True(placement.Left + placement.Width <= 92);
+        Assert.True(placement.Top + placement.Height <= 32);
     }
 }

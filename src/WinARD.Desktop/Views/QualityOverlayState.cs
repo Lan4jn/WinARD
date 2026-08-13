@@ -43,7 +43,7 @@ internal sealed class QualityOverlayState
     }
 }
 
-internal readonly record struct QualityOverlayPlacement(double Left, double Top, double Width, double MaxHeight)
+internal readonly record struct QualityOverlayPlacement(double Left, double Top, double Width, double Height)
 {
     public static QualityOverlayPlacement Calculate(
         double windowWidth,
@@ -63,7 +63,8 @@ internal readonly record struct QualityOverlayPlacement(double Left, double Top,
         var top = useAbove
             ? Math.Max(margin, anchorBottom - maxHeight)
             : Math.Max(margin, Math.Min(anchorBottom, windowHeight - margin));
-        return new(left, top, width, maxHeight);
+        var height = Math.Max(0, Math.Min(maxHeight, windowHeight - top - margin));
+        return new(left, top, width, height);
     }
 }
 

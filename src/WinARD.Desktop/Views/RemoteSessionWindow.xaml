@@ -163,8 +163,13 @@
                 Padding="12"
                 PointerPressed="OnQualityOverlayPointerPressed"
                 Visibility="Collapsed">
-                <ScrollViewer x:Name="QualityOverlayScrollViewer" MaxHeight="620">
-                    <StackPanel Width="360" Spacing="8">
+                <ScrollViewer
+                    x:Name="QualityOverlayScrollViewer"
+                    HorizontalScrollBarVisibility="Auto"
+                    HorizontalScrollMode="Enabled"
+                    VerticalScrollBarVisibility="Auto"
+                    VerticalScrollMode="Enabled">
+                    <StackPanel MinWidth="120" Spacing="8">
                         <Grid>
                             <TextBlock FontSize="18" Text="画质" />
                             <Button x:Name="QualityCloseButton" HorizontalAlignment="Right" AutomationProperties.AutomationId="RemoteQualityCloseButton" AutomationProperties.Name="关闭画质面板" Click="OnQualityCloseClicked" Content="关闭" />

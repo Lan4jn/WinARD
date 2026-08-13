@@ -1036,8 +1036,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             8);
         Canvas.SetLeft(QualityOverlay, placement.Left);
         Canvas.SetTop(QualityOverlay, placement.Top);
-        QualityOverlayScrollViewer.MaxHeight = placement.MaxHeight;
         QualityOverlay.Width = placement.Width;
+        QualityOverlay.Height = placement.Height;
     }
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs args)
