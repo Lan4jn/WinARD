@@ -2,10 +2,19 @@ namespace WinARD.Desktop.Views;
 
 public sealed class FullscreenToolbarHideScheduler : IAsyncDisposable
 {
+    private sealed class Operation(CancellationTokenSource cancellation)
+    {
+        public CancellationTokenSource Cancellation { get; } = cancellation;
+        public Task Task { get; set; } = Task.CompletedTask;
+    }
+
+    private readonly object _sync = new();
     private readonly Func<CancellationToken, Task> _delay;
     private readonly Func<Action, Task> _dispatch;
-    private CancellationTokenSource? _pending;
-    private Task _operation = Task.CompletedTask;
+    private readonly HashSet<Operation> _active = [];
+    private readonly List<Exception> _unobservedErrors = [];
+    private TaskCompletionSource _stateChanged = NewStateChanged();
+    private bool _disposed;
 
     public FullscreenToolbarHideScheduler(
         Func<CancellationToken, Task> delay,
@@ -18,45 +27,117 @@ public sealed class FullscreenToolbarHideScheduler : IAsyncDisposable
     public void Schedule(long generation, Func<long, bool> tryHide)
     {
         ArgumentNullException.ThrowIfNull(tryHide);
-        Cancel();
-        var cancellation = new CancellationTokenSource();
-        _pending = cancellation;
-        _operation = RunAsync(generation, tryHide, cancellation);
+        Operation operation;
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            CancelLocked();
+            operation = new Operation(new CancellationTokenSource());
+            _active.Add(operation);
+            SignalStateChangedLocked();
+            operation.Task = RunAsync(generation, tryHide, operation);
+        }
     }
 
     public void Cancel()
     {
-        Interlocked.Exchange(ref _pending, null)?.Cancel();
+        lock (_sync)
+        {
+            CancelLocked();
+        }
     }
 
-    public Task WhenIdleAsync() => _operation;
+    public Task WhenIdleAsync() => WaitForIdleAsync(dispose: false);
 
     private async Task RunAsync(
         long generation,
         Func<long, bool> tryHide,
-        CancellationTokenSource cancellation)
+        Operation operation)
     {
         try
         {
-            await _delay(cancellation.Token).ConfigureAwait(false);
-            if (!cancellation.IsCancellationRequested)
+            await _delay(operation.Cancellation.Token).ConfigureAwait(false);
+            if (!operation.Cancellation.IsCancellationRequested)
             {
                 await _dispatch(() => _ = tryHide(generation)).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (operation.Cancellation.IsCancellationRequested)
         {
+        }
+        catch (Exception exception)
+        {
+            lock (_sync)
+            {
+                _unobservedErrors.Add(exception);
+            }
         }
         finally
         {
-            _ = Interlocked.CompareExchange(ref _pending, null, cancellation);
-            cancellation.Dispose();
+            lock (_sync)
+            {
+                _active.Remove(operation);
+                SignalStateChangedLocked();
+            }
+            operation.Cancellation.Dispose();
         }
     }
 
-    public async ValueTask DisposeAsync()
+    private async Task WaitForIdleAsync(bool dispose)
     {
-        Cancel();
-        await _operation.ConfigureAwait(false);
+        while (true)
+        {
+            Task changed;
+            lock (_sync)
+            {
+                if (dispose)
+                {
+                    _disposed = true;
+                    CancelLocked();
+                }
+
+                if (_active.Count == 0)
+                {
+                    ThrowAndClearErrorsLocked();
+                    return;
+                }
+
+                changed = _stateChanged.Task;
+            }
+
+            await changed.ConfigureAwait(false);
+        }
     }
+
+    private void CancelLocked()
+    {
+        foreach (var operation in _active)
+        {
+            operation.Cancellation.Cancel();
+        }
+    }
+
+    private void SignalStateChangedLocked()
+    {
+        var previous = _stateChanged;
+        _stateChanged = NewStateChanged();
+        previous.TrySetResult();
+    }
+
+    private void ThrowAndClearErrorsLocked()
+    {
+        if (_unobservedErrors.Count == 0)
+        {
+            return;
+        }
+
+        var errors = _unobservedErrors.ToArray();
+        _unobservedErrors.Clear();
+        throw new AggregateException(errors);
+    }
+
+    private static TaskCompletionSource NewStateChanged() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public ValueTask DisposeAsync() => new(WaitForIdleAsync(dispose: true));
 }
