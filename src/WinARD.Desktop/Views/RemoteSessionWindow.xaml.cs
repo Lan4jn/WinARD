@@ -47,6 +47,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly QualityProfileSelectionCoordinator _qualityProfileSelection = new();
     private readonly QualityOverlayState _qualityOverlayState = new();
     private readonly QualityOverlayOpenCoordinator _qualityOverlayOpenCoordinator;
+    private readonly FullscreenToolbarController _fullscreenToolbarController = new();
+    private readonly DispatcherTimer _fullscreenToolbarTimer = new();
     private readonly IReconnectProfileCapture? _reconnectProfileCapture;
     private readonly ReconnectSessionReservation? _reconnectReservation;
     private readonly Func<CancellationToken, Task>? _retryWithoutReservation;
@@ -71,6 +73,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private RemotePoint _lastPointer;
     private int _closingStarted;
     private bool _fullscreen;
+    private bool _consumeEscapeKeyUp;
+    private long _fullscreenToolbarHideGeneration;
     private bool _allowClose;
     private int _qualitySynchronizationDepth;
     private long _suppressedReconnectGeneration;
@@ -152,6 +156,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _diagnosticExportState = new RemoteSessionDiagnosticExportState(
             serviceAvailable: diagnosticExportService is not null);
         InitializeComponent();
+        _fullscreenToolbarTimer.Interval = TimeSpan.FromSeconds(2);
+        _fullscreenToolbarTimer.Tick += OnFullscreenToolbarTimerTick;
         RefreshDiagnosticExportState();
         _remoteSize = session.FramebufferSize;
         presenter ??= new D3DFramePresenter(FramePanel);
@@ -287,6 +293,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
         FrameScrollViewer.SizeChanged += _frameScrollViewerSizeChangedHandler;
         RootGrid.SizeChanged += _rootGridSizeChangedHandler;
+        UpdateFullscreenToolbarVisual();
         UpdateFrameSizing();
     }
 
@@ -533,9 +540,17 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnFullscreenClicked(object sender, RoutedEventArgs args)
     {
-        _fullscreen = !_fullscreen;
+        SetFullscreen(!_fullscreen);
+    }
+
+    private void SetFullscreen(bool fullscreen)
+    {
+        _fullscreenToolbarTimer.Stop();
+        _fullscreen = fullscreen;
+        _fullscreenToolbarController.SetFullscreen(fullscreen);
         _appWindow.SetPresenter(
             _fullscreen ? AppWindowPresenterKind.FullScreen : AppWindowPresenterKind.Overlapped);
+        UpdateFullscreenToolbarVisual();
     }
 
     private void OnDisconnectClicked(object sender, RoutedEventArgs args) =>
@@ -543,8 +558,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs args)
     {
-        if (args.Key == Windows.System.VirtualKey.Escape && HandleQualityOverlayEscape())
+        if (args.Key == Windows.System.VirtualKey.Escape && HandleLocalEscape())
         {
+            _consumeEscapeKeyUp = true;
             _textInput.Reset();
             args.Handled = true;
             return;
@@ -585,6 +601,13 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnKeyUp(object sender, KeyRoutedEventArgs args)
     {
+        if (args.Key == Windows.System.VirtualKey.Escape && _consumeEscapeKeyUp)
+        {
+            _consumeEscapeKeyUp = false;
+            args.Handled = true;
+            return;
+        }
+
         if (ConsumeLocalQualityKeyboardInput())
         {
             args.Handled = true;
@@ -696,6 +719,79 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                     FrameRefreshOptionPresentation.AutomationName(option));
             }
         }
+    }
+
+    private bool HandleLocalEscape()
+    {
+        var action = FullscreenToolbarController.EscapeAction(
+            _qualityOverlayState.IsDropDownOpen || FrameRateComboBox.IsDropDownOpen,
+            _qualityOverlayState.IsOpen,
+            _fullscreen);
+        switch (action)
+        {
+            case FullscreenEscapeAction.CloseDropDown:
+                FrameRateComboBox.IsDropDownOpen = false;
+                CloseOpenQualityDropDown();
+                _qualityOverlayState.SetDropDownOpen(false);
+                return true;
+            case FullscreenEscapeAction.CloseQualityOverlay:
+                CloseQualityOverlay();
+                return true;
+            case FullscreenEscapeAction.ExitFullscreen:
+                SetFullscreen(false);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void OnFullscreenToolbarHotZoneEntered(object sender, PointerRoutedEventArgs args)
+    {
+        if (!_fullscreenToolbarController.IsHotZoneEnabled)
+        {
+            return;
+        }
+
+        ShowFullscreenToolbar();
+    }
+
+    private void OnFullscreenToolbarEntered(object sender, PointerRoutedEventArgs args) =>
+        ShowFullscreenToolbar();
+
+    private void ShowFullscreenToolbar()
+    {
+        _fullscreenToolbarTimer.Stop();
+        _fullscreenToolbarController.ShowFromHotZone();
+        UpdateFullscreenToolbarVisual();
+    }
+
+    private void OnFullscreenToolbarExited(object sender, PointerRoutedEventArgs args)
+    {
+        if (!_fullscreenToolbarController.IsFullscreen)
+        {
+            return;
+        }
+
+        _fullscreenToolbarHideGeneration = _fullscreenToolbarController.ScheduleHide();
+        _fullscreenToolbarTimer.Stop();
+        _fullscreenToolbarTimer.Start();
+    }
+
+    private void OnFullscreenToolbarTimerTick(object? sender, object args)
+    {
+        _fullscreenToolbarTimer.Stop();
+        if (_fullscreenToolbarController.TryHide(_fullscreenToolbarHideGeneration))
+        {
+            UpdateFullscreenToolbarVisual();
+        }
+    }
+
+    private void UpdateFullscreenToolbarVisual()
+    {
+        SessionCommandBar.Visibility = _fullscreenToolbarController.IsToolbarVisible
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        FullscreenToolbarHotZone.IsHitTestVisible = _fullscreenToolbarController.IsHotZoneEnabled;
     }
 
     private async Task ObserveSessionCompletionAsync()
@@ -1157,7 +1253,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     {
         if (args.Key == Windows.System.VirtualKey.Escape)
         {
-            _ = HandleQualityOverlayEscape();
+            _ = HandleLocalEscape();
         }
         args.Handled = true;
     }
@@ -1185,22 +1281,6 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         {
             QualitySummaryButton.Focus(FocusState.Programmatic);
         }
-    }
-
-    private bool HandleQualityOverlayEscape()
-    {
-        var action = _qualityOverlayState.HandleEscape();
-        if (action == QualityOverlayEscapeAction.CloseDropDown)
-        {
-            CloseOpenQualityDropDown();
-            return true;
-        }
-        if (action == QualityOverlayEscapeAction.CloseOverlay)
-        {
-            _qualityOverlayOpenCoordinator.Close();
-            return true;
-        }
-        return false;
     }
 
     private void CloseOpenQualityDropDown()
@@ -1904,6 +1984,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnClosed(object sender, WindowEventArgs args)
     {
+        _fullscreenToolbarTimer.Stop();
+        _fullscreenToolbarTimer.Tick -= OnFullscreenToolbarTimerTick;
         _appWindow.Closing -= OnClosing;
         InputSurface.RemoveHandler(UIElement.KeyDownEvent, _keyDownHandler);
         InputSurface.RemoveHandler(UIElement.KeyUpEvent, _keyUpHandler);

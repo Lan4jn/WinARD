@@ -12,7 +12,22 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <CommandBar DefaultLabelPosition="Right">
+        <Grid
+            x:Name="FullscreenToolbarLayer"
+            Grid.RowSpan="3"
+            Canvas.ZIndex="4"
+            VerticalAlignment="Top">
+            <Border
+                x:Name="FullscreenToolbarHotZone"
+                Height="8"
+                Background="Transparent"
+                Canvas.ZIndex="5"
+                PointerEntered="OnFullscreenToolbarHotZoneEntered" />
+            <CommandBar
+                x:Name="SessionCommandBar"
+                DefaultLabelPosition="Right"
+                PointerEntered="OnFullscreenToolbarEntered"
+                PointerExited="OnFullscreenToolbarExited">
             <CommandBar.Content>
                 <StackPanel
                     Margin="8,0,16,0"
@@ -83,7 +98,8 @@
                 AutomationProperties.AutomationId="RemoteDisconnectButton"
                 Click="OnDisconnectClicked"
                 Label="断开" />
-        </CommandBar>
+            </CommandBar>
+        </Grid>
 
         <Grid x:Name="ViewportHost" Grid.Row="1" Background="Black">
             <ScrollViewer
