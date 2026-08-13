@@ -269,7 +269,8 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         TestButton.IsEnabled = state.TestEnabled;
         IsPrimaryButtonEnabled = state.SaveEnabled;
         StatusText.Text = state.StatusMessage;
-        SshPasswordBox.Visibility = state.ShowSshPassword ? Visibility.Visible : Visibility.Collapsed;
+        SshPasswordBox.Visibility = state.ShowSshSecret ? Visibility.Visible : Visibility.Collapsed;
+        SshPasswordBox.Header = state.SshSecretTitle;
         PrivateKeyPathBox.Visibility = state.ShowPrivateKeyPath ? Visibility.Visible : Visibility.Collapsed;
     }
 

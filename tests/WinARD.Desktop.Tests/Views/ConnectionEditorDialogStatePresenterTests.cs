@@ -18,11 +18,13 @@ public sealed class ConnectionEditorDialogStatePresenterTests
             (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
 
         viewModel.SshAuthenticationMode = SshAuthenticationMode.Password;
-        Assert.True(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowSshPassword);
+        Assert.True(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowSshSecret);
+        Assert.Equal("SSH 密码", ConnectionEditorDialogStatePresenter.Present(viewModel).SshSecretTitle);
         Assert.False(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowPrivateKeyPath);
 
         viewModel.SshAuthenticationMode = SshAuthenticationMode.PrivateKey;
-        Assert.False(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowSshPassword);
+        Assert.True(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowSshSecret);
+        Assert.Equal("私钥口令（可选）", ConnectionEditorDialogStatePresenter.Present(viewModel).SshSecretTitle);
         Assert.True(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowPrivateKeyPath);
     }
     [Fact]

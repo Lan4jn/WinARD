@@ -229,14 +229,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public string PrivateKeyPath
     {
         get => _privateKeyPath;
-        set
-        {
-            var normalized = value ?? string.Empty;
-            SetValidated(ref _privateKeyPath, normalized);
-            SshAuthenticationMode = string.IsNullOrWhiteSpace(normalized)
-                ? SshAuthenticationMode.Password
-                : SshAuthenticationMode.PrivateKey;
-        }
+        set => SetValidated(ref _privateKeyPath, value ?? string.Empty);
     }
 
     public string SshTargetHost
@@ -422,8 +415,12 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             if (originalSsh is not null && originalMode == SshAuthenticationMode)
             {
                 ssh = ssh.WithAuthenticationCredentials(
-                    originalSsh.PasswordCredentialReference,
-                    originalSsh.PrivateKeyPassphraseCredentialReference);
+                    SshAuthenticationMode == SshAuthenticationMode.Password
+                        ? originalSsh.PasswordCredentialReference
+                        : null,
+                    SshAuthenticationMode == SshAuthenticationMode.PrivateKey
+                        ? originalSsh.PrivateKeyPassphraseCredentialReference
+                        : null);
             }
         }
         if (_hostKeyPin is { } pin)

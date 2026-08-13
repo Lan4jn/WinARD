@@ -7,8 +7,9 @@ public sealed record ConnectionEditorDialogState(
     bool SaveEnabled,
     bool TestEnabled,
     string StatusMessage,
-    bool ShowSshPassword,
-    bool ShowPrivateKeyPath);
+    bool ShowSshSecret,
+    bool ShowPrivateKeyPath,
+    string SshSecretTitle);
 
 public static class ConnectionEditorDialogStatePresenter
 {
@@ -20,7 +21,10 @@ public static class ConnectionEditorDialogStatePresenter
             viewModel.SaveCommand.CanExecute(null),
             viewModel.TestConnectionCommand.CanExecute(null),
             viewModel.StatusMessage,
-            viewModel.SshAuthenticationMode == SshAuthenticationMode.Password,
-            viewModel.SshAuthenticationMode == SshAuthenticationMode.PrivateKey);
+            ShowSshSecret: true,
+            viewModel.SshAuthenticationMode == SshAuthenticationMode.PrivateKey,
+            viewModel.SshAuthenticationMode == SshAuthenticationMode.PrivateKey
+                ? "私钥口令（可选）"
+                : "SSH 密码");
     }
 }

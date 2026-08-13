@@ -37,6 +37,47 @@ public sealed class ConnectionEditorViewModelTests
     }
 
     [Fact]
+    public void EditingPrivateKeyPathNeverChangesExplicitPasswordMode()
+    {
+        var sut = CreateValidViewModel();
+        sut.SshAuthenticationMode = SshAuthenticationMode.Password;
+
+        sut.PrivateKeyPath = "C:\\Keys\\stale_key";
+        sut.PrivateKeyPath = string.Empty;
+
+        Assert.Equal(SshAuthenticationMode.Password, sut.SshAuthenticationMode);
+    }
+
+    [Fact]
+    public void EditingPrivateKeyPathNeverChangesExplicitPrivateKeyMode()
+    {
+        var sut = CreateValidViewModel();
+        sut.SshAuthenticationMode = SshAuthenticationMode.PrivateKey;
+
+        sut.PrivateKeyPath = "C:\\Keys\\id_ed25519";
+        sut.PrivateKeyPath = string.Empty;
+
+        Assert.Equal(SshAuthenticationMode.PrivateKey, sut.SshAuthenticationMode);
+    }
+
+    [Fact]
+    public void PrivateKeyModePreservesOnlyPassphraseReference()
+    {
+        var password = CredentialReference.Create("windows", "ssh/password");
+        var passphrase = CredentialReference.Create("windows", "ssh/passphrase");
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "operator")
+            .WithSsh(SshProfile.Create("jump.local", 22, "ssh-user", "C:\\Keys\\id_ed25519",
+                    "target.local", 5900, null, null, null)
+                .WithAuthenticationCredentials(password, passphrase));
+        var sut = CreateFor(profile);
+
+        var ssh = sut.BuildProfile().SshProfile!;
+
+        Assert.Null(ssh.PasswordCredentialReference);
+        Assert.Equal(passphrase, ssh.PrivateKeyPassphraseCredentialReference);
+    }
+
+    [Fact]
     public void Ssh_jump_and_target_endpoints_round_trip_independently()
     {
         var original = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "library.local", 5900, "operator")
@@ -112,6 +153,7 @@ public sealed class ConnectionEditorViewModelTests
 
         Assert.False(sut.SaveCommand.CanExecute(null));
 
+        sut.SshAuthenticationMode = SshAuthenticationMode.PrivateKey;
         sut.PrivateKeyPath = "C:\\Keys\\id_ed25519";
 
         Assert.True(sut.SaveCommand.CanExecute(null));
