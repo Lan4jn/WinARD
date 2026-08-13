@@ -29,7 +29,13 @@
                     <TextBox x:Name="SshHostBox" Header="SSH 主机" AutomationProperties.AutomationId="ConnectionSshHost" />
                     <NumberBox x:Name="SshPortBox" Header="SSH 端口" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="ConnectionSshPort" />
                     <TextBox x:Name="SshUsernameBox" Header="SSH 用户名" AutomationProperties.AutomationId="ConnectionSshUsername" />
-                    <TextBox x:Name="PrivateKeyPathBox" Header="私钥路径（留空表示密码认证）" AutomationProperties.AutomationId="ConnectionPrivateKeyPath" />
+                    <TextBox x:Name="SshTargetHostBox" Header="目标 Mac 主机" AutomationProperties.AutomationId="ConnectionSshTargetHost" />
+                    <NumberBox x:Name="SshTargetPortBox" Header="目标 Mac 端口" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Compact" AutomationProperties.AutomationId="ConnectionSshTargetPort" />
+                    <ComboBox x:Name="SshAuthenticationModeBox" Header="SSH 认证方式" SelectionChanged="OnSshAuthenticationModeChanged" AutomationProperties.AutomationId="ConnectionSshAuthenticationMode">
+                        <ComboBoxItem Content="密码" />
+                        <ComboBoxItem Content="私钥" />
+                    </ComboBox>
+                    <TextBox x:Name="PrivateKeyPathBox" Header="私钥路径" AutomationProperties.AutomationId="ConnectionPrivateKeyPath" />
                     <PasswordBox x:Name="SshPasswordBox" Header="SSH 密码或私钥口令（临时）" PasswordChanged="OnPasswordChanged" AutomationProperties.AutomationId="ConnectionSshPassword" />
                 </StackPanel>
             </Expander>

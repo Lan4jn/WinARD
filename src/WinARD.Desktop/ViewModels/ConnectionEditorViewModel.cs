@@ -15,6 +15,18 @@ public enum CredentialSaveMode
     AskEveryTime,
 }
 
+public enum SshAuthenticationMode
+{
+    Password,
+    PrivateKey,
+}
+
+public sealed record ConnectionEditorDraft(
+    string DisplayName,
+    string Host,
+    int Port,
+    string MacUsername);
+
 public sealed record ConnectionTestStageResult(
     ConnectionStage Stage,
     bool Succeeded,
@@ -50,6 +62,9 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     private int _sshPort = 22;
     private string _sshUsername = string.Empty;
     private string _privateKeyPath = string.Empty;
+    private string _sshTargetHost = string.Empty;
+    private int _sshTargetPort = 5900;
+    private SshAuthenticationMode _sshAuthenticationMode;
     private bool _hasSshAuthenticationSecret;
     private bool _hasUnsupportedCredentialReference;
     private bool _credentialModeChanged;
@@ -58,6 +73,24 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     private IReadOnlyList<ConnectionTestStageResult> _testResults = [];
     private string _statusMessage = string.Empty;
     private int _busy;
+
+    public static ConnectionEditorViewModel FromDraft(
+        ConnectionEditorDraft draft,
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> save,
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileTestResult>> test)
+    {
+        ArgumentNullException.ThrowIfNull(draft);
+        var viewModel = new ConnectionEditorViewModel((ConnectionProfile?)null, save, test)
+        {
+            _displayName = draft.DisplayName,
+            _host = draft.Host,
+            _port = draft.Port,
+            _macUsername = draft.MacUsername,
+            _sshTargetHost = draft.Host,
+            _sshTargetPort = draft.Port,
+        };
+        return viewModel;
+    }
 
     public ConnectionEditorViewModel(
         ConnectionProfile? profile,
@@ -123,6 +156,11 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             _sshPort = ssh.Port;
             _sshUsername = ssh.Username;
             _privateKeyPath = ssh.PrivateKeyPath ?? string.Empty;
+            _sshTargetHost = ssh.TargetHost;
+            _sshTargetPort = ssh.TargetPort;
+            _sshAuthenticationMode = ssh.PrivateKeyPath is null
+                ? SshAuthenticationMode.Password
+                : SshAuthenticationMode.PrivateKey;
             _hostKeyPin = ssh.HostKeyPin;
         }
     }
@@ -140,7 +178,16 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public string Host
     {
         get => _host;
-        set => SetValidated(ref _host, value ?? string.Empty);
+        set
+        {
+            var normalized = value ?? string.Empty;
+            var initializeTarget = string.IsNullOrWhiteSpace(_sshTargetHost);
+            SetValidated(ref _host, normalized);
+            if (initializeTarget)
+            {
+                SshTargetHost = normalized;
+            }
+        }
     }
 
     public int Port
@@ -182,8 +229,36 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public string PrivateKeyPath
     {
         get => _privateKeyPath;
-        set => SetValidated(ref _privateKeyPath, value ?? string.Empty);
+        set
+        {
+            var normalized = value ?? string.Empty;
+            SetValidated(ref _privateKeyPath, normalized);
+            SshAuthenticationMode = string.IsNullOrWhiteSpace(normalized)
+                ? SshAuthenticationMode.Password
+                : SshAuthenticationMode.PrivateKey;
+        }
     }
+
+    public string SshTargetHost
+    {
+        get => _sshTargetHost;
+        set => SetValidated(ref _sshTargetHost, value ?? string.Empty);
+    }
+
+    public int SshTargetPort
+    {
+        get => _sshTargetPort;
+        set => SetValidated(ref _sshTargetPort, value);
+    }
+
+    public SshAuthenticationMode SshAuthenticationMode
+    {
+        get => _sshAuthenticationMode;
+        set => SetValidated(ref _sshAuthenticationMode, value);
+    }
+
+    public IReadOnlyList<SshAuthenticationMode> SshAuthenticationModes { get; } =
+        Enum.GetValues<SshAuthenticationMode>();
 
     public bool HasSshAuthenticationSecret
     {
@@ -333,17 +408,23 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             SshHost,
             SshPort,
             SshUsername,
-            string.IsNullOrWhiteSpace(PrivateKeyPath) ? null : PrivateKeyPath,
-            Host,
-            Port,
+            SshAuthenticationMode == SshAuthenticationMode.PrivateKey ? PrivateKeyPath : null,
+            SshTargetHost,
+            SshTargetPort,
             credentialReference: null,
             originalSsh?.PinnedHostKeyAlgorithm,
             originalSsh?.PinnedHostKeySha256);
         if (!_credentialModeChanged)
         {
-            ssh = ssh.WithAuthenticationCredentials(
-                originalSsh?.PasswordCredentialReference,
-                originalSsh?.PrivateKeyPassphraseCredentialReference);
+            var originalMode = originalSsh?.PrivateKeyPath is null
+                ? SshAuthenticationMode.Password
+                : SshAuthenticationMode.PrivateKey;
+            if (originalSsh is not null && originalMode == SshAuthenticationMode)
+            {
+                ssh = ssh.WithAuthenticationCredentials(
+                    originalSsh.PasswordCredentialReference,
+                    originalSsh.PrivateKeyPassphraseCredentialReference);
+            }
         }
         if (_hostKeyPin is { } pin)
         {
@@ -371,13 +452,16 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             return true;
         }
 
-        var hasCurrentCredential = string.IsNullOrWhiteSpace(PrivateKeyPath)
-            ? _original?.SshProfile?.PasswordCredentialReference is not null
-            : _original?.SshProfile?.PrivateKeyPassphraseCredentialReference is not null;
+        var originalSsh = _original?.SshProfile;
+        var hasCurrentCredential = SshAuthenticationMode == SshAuthenticationMode.Password &&
+            originalSsh is { PrivateKeyPath: null, PasswordCredentialReference: not null };
         return ValidHost(SshHost) && SshPort is >= 1 and <= 65535 &&
+            ValidHost(SshTargetHost) && SshTargetPort is >= 1 and <= 65535 &&
             !string.IsNullOrWhiteSpace(SshUsername) &&
-            (!string.IsNullOrWhiteSpace(PrivateKeyPath) || HasSshAuthenticationSecret ||
-             (!_credentialModeChanged && hasCurrentCredential) || CredentialSaveMode == CredentialSaveMode.AskEveryTime);
+            (SshAuthenticationMode == SshAuthenticationMode.PrivateKey
+                ? !string.IsNullOrWhiteSpace(PrivateKeyPath)
+                : HasSshAuthenticationSecret || (!_credentialModeChanged && hasCurrentCredential) ||
+                  CredentialSaveMode == CredentialSaveMode.AskEveryTime);
     }
 
     private static bool ValidHost(string value)

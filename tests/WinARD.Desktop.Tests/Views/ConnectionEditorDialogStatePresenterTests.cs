@@ -10,6 +10,22 @@ namespace WinARD.Desktop.Tests.Views;
 public sealed class ConnectionEditorDialogStatePresenterTests
 {
     [Fact]
+    public void AuthenticationModeControlsVisibleInput()
+    {
+        var viewModel = new ConnectionEditorViewModel(
+            null,
+            (saved, _, _, _) => Task.FromResult(saved),
+            (_, _, _, _) => Task.FromResult<IReadOnlyList<ConnectionTestStageResult>>([]));
+
+        viewModel.SshAuthenticationMode = SshAuthenticationMode.Password;
+        Assert.True(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowSshPassword);
+        Assert.False(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowPrivateKeyPath);
+
+        viewModel.SshAuthenticationMode = SshAuthenticationMode.PrivateKey;
+        Assert.False(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowSshPassword);
+        Assert.True(ConnectionEditorDialogStatePresenter.Present(viewModel).ShowPrivateKeyPath);
+    }
+    [Fact]
     public void UnknownCredentialStateIsVisibleImmediatelyAndUpdatesAfterExplicitModeSelection()
     {
         var profile = ConnectionProfile.Create(

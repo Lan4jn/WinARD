@@ -6,7 +6,9 @@ public sealed record ConnectionEditorDialogState(
     bool IsBusy,
     bool SaveEnabled,
     bool TestEnabled,
-    string StatusMessage);
+    string StatusMessage,
+    bool ShowSshPassword,
+    bool ShowPrivateKeyPath);
 
 public static class ConnectionEditorDialogStatePresenter
 {
@@ -17,6 +19,8 @@ public static class ConnectionEditorDialogStatePresenter
             viewModel.IsBusy,
             viewModel.SaveCommand.CanExecute(null),
             viewModel.TestConnectionCommand.CanExecute(null),
-            viewModel.StatusMessage);
+            viewModel.StatusMessage,
+            viewModel.SshAuthenticationMode == SshAuthenticationMode.Password,
+            viewModel.SshAuthenticationMode == SshAuthenticationMode.PrivateKey);
     }
 }

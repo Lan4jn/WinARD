@@ -52,6 +52,9 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         SshHostBox.Text = viewModel.SshHost;
         SshPortBox.Value = viewModel.SshPort;
         SshUsernameBox.Text = viewModel.SshUsername;
+        SshTargetHostBox.Text = viewModel.SshTargetHost;
+        SshTargetPortBox.Value = viewModel.SshTargetPort;
+        SshAuthenticationModeBox.SelectedIndex = (int)viewModel.SshAuthenticationMode;
         PrivateKeyPathBox.Text = viewModel.PrivateKeyPath;
         CredentialModeBox.SelectedIndex = viewModel.HasUnsupportedCredentialReference
             ? -1
@@ -87,6 +90,8 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         SshHostBox.TextChanged += (_, _) => { ViewModel.SshHost = SshHostBox.Text; UpdateState(); };
         SshPortBox.ValueChanged += (_, _) => { ViewModel.SshPort = NumberValue(SshPortBox); UpdateState(); };
         SshUsernameBox.TextChanged += (_, _) => { ViewModel.SshUsername = SshUsernameBox.Text; UpdateState(); };
+        SshTargetHostBox.TextChanged += (_, _) => { ViewModel.SshTargetHost = SshTargetHostBox.Text; UpdateState(); };
+        SshTargetPortBox.ValueChanged += (_, _) => { ViewModel.SshTargetPort = NumberValue(SshTargetPortBox); UpdateState(); };
         PrivateKeyPathBox.TextChanged += (_, _) => { ViewModel.PrivateKeyPath = PrivateKeyPathBox.Text; UpdateState(); };
     }
 
@@ -102,6 +107,16 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         if (CredentialModeBox.SelectedIndex >= 0)
         {
             ViewModel.CredentialSaveMode = (CredentialSaveMode)CredentialModeBox.SelectedIndex;
+        }
+
+        UpdateState();
+    }
+
+    private void OnSshAuthenticationModeChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (SshAuthenticationModeBox.SelectedIndex >= 0)
+        {
+            ViewModel.SshAuthenticationMode = (SshAuthenticationMode)SshAuthenticationModeBox.SelectedIndex;
         }
 
         UpdateState();
@@ -254,6 +269,8 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
         TestButton.IsEnabled = state.TestEnabled;
         IsPrimaryButtonEnabled = state.SaveEnabled;
         StatusText.Text = state.StatusMessage;
+        SshPasswordBox.Visibility = state.ShowSshPassword ? Visibility.Visible : Visibility.Collapsed;
+        PrivateKeyPathBox.Visibility = state.ShowPrivateKeyPath ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private static int NumberValue(NumberBox box) =>

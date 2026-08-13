@@ -45,6 +45,8 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly TextBlock _detailName = new();
     private readonly TextBlock _detailSource = new();
     private readonly TextBlock _detailEndpoint = new();
+    private readonly TextBlock _detailUsername = new();
+    private readonly TextBlock _detailNetworkPath = new();
     private readonly ConnectionErrorCard _connectionErrorCard = new();
     private readonly ISafeDiagnosticSink _diagnosticSink;
     private readonly DiagnosticExportService _diagnosticExportService;
@@ -90,6 +92,7 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.PropertyChanged += OnViewModelPropertyChanged;
         ViewModel.AddDeviceRequested += OnAddDeviceRequested;
         ViewModel.EditDeviceRequested += OnEditDeviceRequested;
+        ViewModel.ConnectRequested += OnConnectRequested;
         _credentialPromptService.SetReferenceHandler(PromptForReferenceCredentialAsync);
         _hostKeyPromptService.SetHandler(PromptForHostKeyAsync);
         _sessionController.ProfileUpdated += OnConnectionProfileUpdated;
@@ -237,6 +240,9 @@ public sealed partial class MainWindow : Window, IDisposable
         details.Children.Add(_detailName);
         details.Children.Add(_detailSource);
         details.Children.Add(_detailEndpoint);
+        details.Children.Add(_detailUsername);
+        details.Children.Add(_detailNetworkPath);
+        details.Children.Add(new TextBlock { Text = "无预览", Opacity = 0.62 });
         _connectionErrorCard.ActionRequested += OnConnectionErrorActionRequested;
         _connectionErrorCard.IsActionEnabled = action =>
             action != ConnectionErrorActionKind.ReplaceHostKey || _pendingHostKeyFailure is not null;
@@ -295,6 +301,7 @@ public sealed partial class MainWindow : Window, IDisposable
             SelectionMode = ListViewSelectionMode.Single,
         };
         list.ItemClick += OnDeviceItemClick;
+        list.DoubleTapped += (_, _) => ViewModel.ActivateSelectedCommand.Execute(null);
         return list;
     }
 
@@ -339,25 +346,39 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.SelectedDevice = item;
     }
 
-    private void OnAddDeviceRequested(object? sender, EventArgs args) =>
-        _ = _uiOperation.RunAsync(() => OpenConnectionEditorAsync(null), _shutdown.Token);
+    private void OnAddDeviceRequested(ConnectionEditorDraft? draft) =>
+        _ = _uiOperation.RunAsync(() => OpenConnectionEditorAsync(null, draft), _shutdown.Token);
+
+    private void OnConnectRequested(ConnectionProfile profile) =>
+        _ = _uiOperation.RunAsync(() => ConnectProfileWithHandlingAsync(profile), _shutdown.Token);
 
     private void OnEditDeviceRequested(ConnectionProfile profile) =>
         _ = _uiOperation.RunAsync(() => OpenConnectionEditorAsync(profile), _shutdown.Token);
 
-    private async Task OpenConnectionEditorAsync(ConnectionProfile? profile)
+    private async Task OpenConnectionEditorAsync(
+        ConnectionProfile? profile,
+        ConnectionEditorDraft? draft = null)
     {
         using var hostKeyPrompt = new ConnectionEditorHostKeyPrompt();
-        var viewModel = new ConnectionEditorViewModel(
-            profile,
-            _connectionEditorService.SaveWithResultAsync,
-            (candidate, mode, secret, cancellationToken) =>
-                _connectionEditorService.TestAsync(
-                    candidate,
-                    mode,
-                    secret,
-                    hostKeyPrompt,
-                    cancellationToken));
+        ConnectionEditorViewModel viewModel;
+        if (draft is null)
+        {
+            viewModel = new ConnectionEditorViewModel(
+                profile,
+                _connectionEditorService.SaveWithResultAsync,
+                (candidate, mode, secret, cancellationToken) =>
+                    _connectionEditorService.TestAsync(
+                        candidate, mode, secret, hostKeyPrompt, cancellationToken));
+        }
+        else
+        {
+            viewModel = ConnectionEditorViewModel.FromDraft(
+                draft,
+                _connectionEditorService.SaveWithResultAsync,
+                (candidate, mode, secret, cancellationToken) =>
+                    _connectionEditorService.TestAsync(
+                        candidate, mode, secret, hostKeyPrompt, cancellationToken));
+        }
         using var dialog = new ConnectionEditorDialog(
             viewModel,
             _vaultSession,
@@ -966,6 +987,9 @@ public sealed partial class MainWindow : Window, IDisposable
         _detailName.Text = item.DisplayName;
         _detailSource.Text = item.SourceLabel;
         _detailEndpoint.Text = $"地址  {item.Endpoint}";
+        var presentation = DeviceDetailsPresentation.From(item);
+        _detailUsername.Text = $"用户名  {presentation.Username}";
+        _detailNetworkPath.Text = $"网络路径  {presentation.NetworkPath}";
         _detailsHost.Visibility = Visibility.Visible;
         _emptyState.Visibility = Visibility.Collapsed;
         _deleteButton.Visibility = item.Profile is null ? Visibility.Collapsed : Visibility.Visible;
@@ -1012,6 +1036,7 @@ public sealed partial class MainWindow : Window, IDisposable
         ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
         ViewModel.AddDeviceRequested -= OnAddDeviceRequested;
         ViewModel.EditDeviceRequested -= OnEditDeviceRequested;
+        ViewModel.ConnectRequested -= OnConnectRequested;
         _credentialPromptService.ClearReferenceHandler();
         _hostKeyPromptService.ClearHandler();
         _sessionController.ProfileUpdated -= OnConnectionProfileUpdated;

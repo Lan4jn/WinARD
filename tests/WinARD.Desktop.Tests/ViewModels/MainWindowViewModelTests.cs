@@ -16,6 +16,53 @@ public sealed class MainWindowViewModelTests
     private static readonly Guid OfficeId = Guid.Parse("22222222-2222-2222-2222-222222222222");
 
     [Fact]
+    public async Task Activating_discovered_device_requests_prefilled_unsaved_draft()
+    {
+        var repository = new FakeRepository();
+        var discovery = new FakeDiscovery(Discovered("nearby", "Nearby MacBook", "nearby.local"));
+        await using var viewModel = Create(repository, discovery);
+        await viewModel.InitializeAsync(CancellationToken.None);
+        ConnectionEditorDraft? requested = null;
+        viewModel.AddDeviceRequested += draft => requested = draft;
+        viewModel.SelectedDevice = Assert.Single(viewModel.DiscoveredDevices);
+
+        viewModel.ActivateSelectedCommand.Execute(null);
+
+        Assert.Equal("Nearby MacBook", requested!.DisplayName);
+        Assert.Equal("nearby.local", requested.Host);
+        Assert.Equal(5900, requested.Port);
+        Assert.Empty(requested.MacUsername);
+    }
+
+    [Fact]
+    public async Task Activating_saved_device_requests_connection_but_selection_alone_does_not()
+    {
+        var profile = Profile(StudioId, "Studio Mac", "studio.local");
+        await using var viewModel = Create(new FakeRepository(profile));
+        await viewModel.InitializeAsync(CancellationToken.None);
+        ConnectionProfile? requested = null;
+        viewModel.ConnectRequested += candidate => requested = candidate;
+
+        viewModel.SelectedDevice = Assert.Single(viewModel.SavedDevices);
+        Assert.Null(requested);
+        viewModel.ActivateSelectedCommand.Execute(null);
+
+        Assert.Equal(profile, requested);
+    }
+
+    [Fact]
+    public async Task Explicit_add_requests_blank_draft()
+    {
+        await using var viewModel = Create(new FakeRepository());
+        ConnectionEditorDraft? requested = new("sentinel", "sentinel", 1, "sentinel");
+        viewModel.AddDeviceRequested += draft => requested = draft;
+
+        viewModel.AddDeviceCommand.Execute(null);
+
+        Assert.Null(requested);
+    }
+
+    [Fact]
     public async Task Initialize_filters_only_saved_devices_and_keeps_discovery_updates_visible()
     {
         var repository = new FakeRepository(

@@ -3,6 +3,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using WinARD.Application.Ports;
 using WinARD.Desktop.Threading;
+using WinARD.Domain.Connections;
 
 namespace WinARD.Desktop.ViewModels;
 
@@ -37,7 +38,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _discovery.Changed += OnDiscoveryChanged;
-        AddDeviceCommand = new RelayCommand(() => AddDeviceRequested?.Invoke(this, EventArgs.Empty));
+        AddDeviceCommand = new RelayCommand(() => AddDeviceRequested?.Invoke(null));
+        ActivateSelectedCommand = new RelayCommand(ActivateSelected, () => SelectedDevice is not null);
         EditDeviceCommand = new RelayCommand(
             () => EditDeviceRequested?.Invoke(SelectedDevice!.Profile!),
             () => SelectedDevice?.Profile is not null);
@@ -47,8 +49,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public ObservableCollection<DeviceItemViewModel> DiscoveredDevices { get; } = [];
     public IRelayCommand AddDeviceCommand { get; }
     public IRelayCommand EditDeviceCommand { get; }
+    public IRelayCommand ActivateSelectedCommand { get; }
 
-    public event EventHandler? AddDeviceRequested;
+    public event Action<ConnectionEditorDraft?>? AddDeviceRequested;
+
+    public event Action<ConnectionProfile>? ConnectRequested;
 
     public event Action<WinARD.Domain.Connections.ConnectionProfile>? EditDeviceRequested;
 
@@ -72,8 +77,29 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             if (SetProperty(ref _selectedDevice, value))
             {
                 EditDeviceCommand.NotifyCanExecuteChanged();
+                ActivateSelectedCommand.NotifyCanExecuteChanged();
             }
         }
+    }
+
+    private void ActivateSelected()
+    {
+        if (SelectedDevice is not { } item)
+        {
+            return;
+        }
+
+        if (item.Profile is { } profile)
+        {
+            ConnectRequested?.Invoke(profile);
+            return;
+        }
+
+        AddDeviceRequested?.Invoke(new ConnectionEditorDraft(
+            item.DisplayName,
+            item.Host,
+            item.Port,
+            string.Empty));
     }
 
     public string StatusMessage
