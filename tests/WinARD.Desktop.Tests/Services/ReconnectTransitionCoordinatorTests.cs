@@ -42,9 +42,42 @@ public sealed class ReconnectTransitionCoordinatorTests
         await Assert.ThrowsAsync<ObjectDisposedException>(() => automatic.StartAsync(new IOException(), default));
     }
 
+    [Fact]
+    public async Task Cleanup_failures_do_not_skip_reservation_or_close_and_are_aggregated()
+    {
+        var reservation = new ThrowingDisposable();
+        var closed = false;
+        await using var automatic = new AutomaticReconnectCoordinator(
+            _ => true,
+            new ReconnectPolicy(TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(1), new Random(1)),
+            _ => Task.CompletedTask,
+            delay: (_, _) => Task.CompletedTask);
+        var transition = new ReconnectTransitionCoordinator(
+            automatic,
+            reservation,
+            () => { closed = true; return Task.FromException(new IOException("close")); },
+            _ => Task.CompletedTask);
+
+        var failure = await Assert.ThrowsAsync<AggregateException>(() => transition.RunAsync(default));
+
+        Assert.True(reservation.Disposed);
+        Assert.True(closed);
+        Assert.Equal(2, failure.InnerExceptions.Count);
+    }
+
     private sealed class TrackingDisposable : IAsyncDisposable
     {
         public bool Disposed { get; private set; }
         public ValueTask DisposeAsync() { Disposed = true; return ValueTask.CompletedTask; }
+    }
+
+    private sealed class ThrowingDisposable : IAsyncDisposable
+    {
+        public bool Disposed { get; private set; }
+        public ValueTask DisposeAsync()
+        {
+            Disposed = true;
+            return ValueTask.FromException(new InvalidOperationException("reservation"));
+        }
     }
 }

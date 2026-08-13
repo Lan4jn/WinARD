@@ -582,19 +582,10 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             catch
             {
-                if (remoteWindow is not null)
-                {
-                    remoteWindow.Closed -= OnRemoteSessionWindowClosed;
-                    await remoteWindow.CloseSessionAsync();
-                }
-                else
-                {
-                    await ownership.DisposeAsync();
-                }
-                if (nextReconnectReservation is not null)
-                {
-                    await nextReconnectReservation.DisposeAsync();
-                }
+                if (remoteWindow is not null) remoteWindow.Closed -= OnRemoteSessionWindowClosed;
+                await CleanupSequence.RunAsync(
+                    () => remoteWindow?.CloseSessionAsync() ?? ownership.DisposeAsync().AsTask(),
+                    () => nextReconnectReservation?.DisposeAsync().AsTask() ?? Task.CompletedTask);
                 throw;
             }
         }

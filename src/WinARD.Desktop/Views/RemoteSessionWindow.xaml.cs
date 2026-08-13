@@ -294,20 +294,18 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     public async Task CloseSessionAsync()
     {
-        SuppressAndCancelAutomaticReconnect();
-        if (_automaticReconnect is not null)
+        try
         {
-            await _automaticReconnect.StopAsync();
+            SuppressAndCancelAutomaticReconnect();
         }
-        await _windowLifecycle.DisconnectAsync();
-        if (_automaticReconnect is not null)
+        catch (ObjectDisposedException)
         {
-            await _automaticReconnect.DisposeAsync();
         }
-        if (_reconnectReservation is not null)
-        {
-            await _reconnectReservation.DisposeAsync();
-        }
+        await CleanupSequence.RunAsync(
+            () => _automaticReconnect?.StopAsync() ?? Task.CompletedTask,
+            _windowLifecycle.DisconnectAsync,
+            () => _automaticReconnect?.DisposeAsync().AsTask() ?? Task.CompletedTask,
+            () => _reconnectReservation?.DisposeAsync().AsTask() ?? Task.CompletedTask);
     }
 
     public ValueTask DisposeAsync() => new(CloseSessionAsync());
@@ -719,6 +717,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
         else
         {
+            var generation = _automaticReconnect.Generation;
             if (_reconnectReservation is not null)
             {
                 await _reconnectReservation.DisposeAsync();
@@ -726,6 +725,11 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             await _dispatcher.InvokeAsync(
                 () =>
                 {
+                    if (_lifetime.IsCancellationRequested ||
+                        generation <= Volatile.Read(ref _suppressedReconnectGeneration))
+                    {
+                        return;
+                    }
                     AutomaticReconnectPanel.Visibility = Visibility.Collapsed;
                     ShowAutomaticReconnectFailure(_automaticReconnect.LastFailure);
                 },

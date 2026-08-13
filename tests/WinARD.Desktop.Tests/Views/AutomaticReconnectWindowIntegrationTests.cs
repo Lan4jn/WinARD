@@ -39,7 +39,8 @@ public sealed class AutomaticReconnectWindowIntegrationTests
         Assert.Contains("throwOnFailure: true", source, StringComparison.Ordinal);
         Assert.Contains("operationToken.ThrowIfCancellationRequested();", source, StringComparison.Ordinal);
         Assert.Contains("remoteWindow = new RemoteSessionWindow", source, StringComparison.Ordinal);
-        Assert.Contains("await remoteWindow.CloseSessionAsync();", source, StringComparison.Ordinal);
+        Assert.Contains("remoteWindow?.CloseSessionAsync()", source, StringComparison.Ordinal);
+        Assert.Contains("CleanupSequence.RunAsync", source, StringComparison.Ordinal);
     }
 
     [Fact]

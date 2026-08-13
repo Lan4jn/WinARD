@@ -25,25 +25,11 @@ public sealed class ReconnectTransitionCoordinator(
 
     private async Task RunCoreAsync(CancellationToken token)
     {
-        Exception? cleanupFailure = null;
-        try
-        {
-            await _automaticReconnect.StopAsync().ConfigureAwait(false);
-            await _automaticReconnect.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            cleanupFailure = exception;
-        }
-        finally
-        {
-            await _reservation.DisposeAsync().ConfigureAwait(false);
-        }
-        if (cleanupFailure is not null)
-        {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
-        }
-        await _closeWindow().ConfigureAwait(false);
+        await CleanupSequence.RunAsync(
+            _automaticReconnect.StopAsync,
+            () => _automaticReconnect.DisposeAsync().AsTask(),
+            () => _reservation.DisposeAsync().AsTask(),
+            _closeWindow).ConfigureAwait(false);
         await _reconnect(token).ConfigureAwait(false);
     }
 }
