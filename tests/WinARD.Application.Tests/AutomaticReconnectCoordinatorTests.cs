@@ -223,6 +223,56 @@ public sealed class AutomaticReconnectCoordinatorTests
         Assert.False(coordinator.IsRunning);
     }
 
+    [Fact]
+    public async Task Dispose_waits_for_explicit_reconnect_before_disposing_connect_gate()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var exited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var coordinator = Create(_ => true, async token =>
+        {
+            entered.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { exited.TrySetResult(); }
+        });
+        var reconnect = coordinator.ReconnectNowAsync(default);
+        await entered.Task;
+
+        await coordinator.DisposeAsync();
+
+        Assert.True(exited.Task.IsCompleted);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => reconnect);
+    }
+
+    [Fact]
+    public async Task Concurrent_stop_and_dispose_share_explicit_reconnect_shutdown()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var coordinator = Create(_ => true, token =>
+        {
+            entered.TrySetResult();
+            return Task.Delay(Timeout.InfiniteTimeSpan, token);
+        });
+        var reconnect = coordinator.ReconnectNowAsync(default);
+        await entered.Task;
+
+        await Task.WhenAll(coordinator.StopAsync(), coordinator.DisposeAsync().AsTask());
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => reconnect);
+    }
+
+    [Fact]
+    public async Task Deterministic_attempt_failure_is_retained_for_manual_retry()
+    {
+        var failure = new UnauthorizedAccessException("auth");
+        var coordinator = Create(
+            exception => exception is IOException,
+            _ => Task.FromException(failure));
+
+        Assert.False(await coordinator.StartAsync(new IOException(), default));
+
+        Assert.Same(failure, coordinator.LastFailure);
+    }
+
     private static AutomaticReconnectCoordinator Create(
         Func<Exception, bool> transient,
         Func<CancellationToken, Task> connect,

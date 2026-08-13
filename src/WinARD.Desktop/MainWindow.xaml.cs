@@ -547,6 +547,7 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             var ownership = _sessionController.TransferConnectedSession();
             ReconnectSessionReservation? nextReconnectReservation = null;
+            RemoteSessionWindow? remoteWindow = null;
             try
             {
                 nextReconnectReservation = ownership.ReserveForReconnect();
@@ -554,7 +555,8 @@ public sealed partial class MainWindow : Window, IDisposable
                     ownership.Profile,
                     (latestProfile, retryToken) => InvokeReconnectAsync(
                         latestProfile, nextReconnectReservation, retryToken));
-                var remoteWindow = new RemoteSessionWindow(
+                operationToken.ThrowIfCancellationRequested();
+                remoteWindow = new RemoteSessionWindow(
                     ownership.Session,
                     ownership,
                     _dispatcher,
@@ -577,7 +579,15 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             catch
             {
-                await ownership.DisposeAsync();
+                if (remoteWindow is not null)
+                {
+                    remoteWindow.Closed -= OnRemoteSessionWindowClosed;
+                    await remoteWindow.CloseSessionAsync();
+                }
+                else
+                {
+                    await ownership.DisposeAsync();
+                }
                 if (nextReconnectReservation is not null)
                 {
                     await nextReconnectReservation.DisposeAsync();

@@ -23,6 +23,8 @@ public sealed class AutomaticReconnectWindowIntegrationTests
         Assert.Contains("RuntimeReconnectFailureClassifier.IsTransient", window, StringComparison.Ordinal);
         Assert.Contains("SuppressAndCancelAutomaticReconnect();", window, StringComparison.Ordinal);
         Assert.Contains("await _automaticReconnect.DisposeAsync()", window, StringComparison.Ordinal);
+        Assert.Contains("ShowAutomaticReconnectFailure", window, StringComparison.Ordinal);
+        Assert.DoesNotContain("await _reconnectReservation.DisposeAsync();\r\n        }\r\n    }\r\n\r\n    private void ShowAutomaticReconnectProgress", window, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -34,6 +36,9 @@ public sealed class AutomaticReconnectWindowIntegrationTests
         Assert.Contains("throwOnFailure", source, StringComparison.Ordinal);
         Assert.Contains("throw new ReconnectFailureException(error)", source, StringComparison.Ordinal);
         Assert.Contains("throwOnFailure: true", source, StringComparison.Ordinal);
+        Assert.Contains("operationToken.ThrowIfCancellationRequested();", source, StringComparison.Ordinal);
+        Assert.Contains("remoteWindow = new RemoteSessionWindow", source, StringComparison.Ordinal);
+        Assert.Contains("await remoteWindow.CloseSessionAsync();", source, StringComparison.Ordinal);
     }
 
     [Fact]

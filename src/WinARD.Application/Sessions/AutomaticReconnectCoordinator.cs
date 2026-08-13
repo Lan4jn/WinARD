@@ -12,11 +12,14 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly TimeSpan _countdownInterval;
     private readonly SemaphoreSlim _connectGate = new(1, 1);
+    private readonly CancellationTokenSource _shutdown = new();
+    private readonly HashSet<Task> _activeConnections = [];
     private CancellationTokenSource? _loopCancellation;
     private Task<bool>? _loop;
     private Task? _disposeTask;
     private bool _disposed;
     private long _generation;
+    private Exception? _lastFailure;
 
     public AutomaticReconnectCoordinator(
         Func<Exception, bool> isTransient,
@@ -45,15 +48,21 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
         get { lock (_sync) return _generation; }
     }
 
+    public Exception? LastFailure
+    {
+        get { lock (_sync) return _lastFailure; }
+    }
+
     public Task<bool> StartAsync(Exception failure, CancellationToken token)
     {
         ArgumentNullException.ThrowIfNull(failure);
-        if (!_isTransient(failure)) return Task.FromResult(false);
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_isTransient(failure)) return Task.FromResult(false);
             if (_loop is { IsCompleted: false }) return _loop;
             _loopCancellation?.Dispose();
+            _lastFailure = failure;
             _loopCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
             return _loop = RunAsync(failure, ++_generation, _loopCancellation.Token);
         }
@@ -61,21 +70,35 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
 
     public void Cancel()
     {
-        lock (_sync) _loopCancellation?.Cancel();
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _loopCancellation?.Cancel();
+        }
     }
 
     public async Task StopAsync()
     {
         Task<bool>? loop;
+        Task[] connections;
         lock (_sync)
         {
+            _shutdown.Cancel();
             _loopCancellation?.Cancel();
             loop = _loop;
+            connections = [.. _activeConnections];
         }
 
         if (loop is not null)
         {
             await loop.ConfigureAwait(false);
+        }
+        try
+        {
+            await Task.WhenAll(connections).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
         }
     }
 
@@ -94,7 +117,7 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
             await automatic.ConfigureAwait(false);
         }
 
-        await ConnectOnceAsync(token).ConfigureAwait(false);
+        await TrackConnectAsync(token).ConfigureAwait(false);
     }
 
     private async Task<bool> RunAsync(Exception failure, long generation, CancellationToken token)
@@ -102,7 +125,11 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
         var current = failure;
         for (var index = 0; ; index++)
         {
-            if (!_isTransient(current)) return false;
+            if (!_isTransient(current))
+            {
+                lock (_sync) _lastFailure = current;
+                return false;
+            }
             try
             {
                 var remaining = _policy.DelayForAttempt(index);
@@ -114,7 +141,8 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
                     remaining -= slice;
                 }
                 _progress?.Invoke(new(generation, index + 1, TimeSpan.Zero));
-                await ConnectOnceAsync(token).ConfigureAwait(false);
+                await TrackConnectAsync(token).ConfigureAwait(false);
+                lock (_sync) _lastFailure = null;
                 return true;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -123,6 +151,7 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
             }
             catch (Exception exception)
             {
+                lock (_sync) _lastFailure = exception;
                 current = exception;
             }
         }
@@ -141,6 +170,33 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
         }
     }
 
+    private Task TrackConnectAsync(CancellationToken token)
+    {
+        CancellationTokenSource linked;
+        Task operation;
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            linked = CancellationTokenSource.CreateLinkedTokenSource(token, _shutdown.Token);
+            operation = ConnectOnceAndDisposeTokenAsync(linked);
+            _activeConnections.Add(operation);
+        }
+
+        _ = operation.ContinueWith(completed =>
+        {
+            lock (_sync) _activeConnections.Remove(completed);
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return operation;
+    }
+
+    private async Task ConnectOnceAndDisposeTokenAsync(CancellationTokenSource linked)
+    {
+        using (linked)
+        {
+            await ConnectOnceAsync(linked.Token).ConfigureAwait(false);
+        }
+    }
+
     public ValueTask DisposeAsync()
     {
         lock (_sync)
@@ -151,19 +207,29 @@ public sealed class AutomaticReconnectCoordinator : IAsyncDisposable
             }
 
             _disposed = true;
+            _shutdown.Cancel();
             _loopCancellation?.Cancel();
-            return new ValueTask(_disposeTask = DisposeCoreAsync(_loop));
+            return new ValueTask(_disposeTask = DisposeCoreAsync(
+                _loop, [.. _activeConnections]));
         }
     }
 
-    private async Task DisposeCoreAsync(Task<bool>? loop)
+    private async Task DisposeCoreAsync(Task<bool>? loop, Task[] connections)
     {
         if (loop is not null) await loop.ConfigureAwait(false);
+        try
+        {
+            await Task.WhenAll(connections).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
         lock (_sync)
         {
             _loopCancellation?.Dispose();
             _loopCancellation = null;
         }
         _connectGate.Dispose();
+        _shutdown.Dispose();
     }
 }

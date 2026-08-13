@@ -700,13 +700,25 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         else
         {
             await _dispatcher.InvokeAsync(
-                () => AutomaticReconnectPanel.Visibility = Visibility.Collapsed,
+                () =>
+                {
+                    AutomaticReconnectPanel.Visibility = Visibility.Collapsed;
+                    ShowAutomaticReconnectFailure(_automaticReconnect.LastFailure);
+                },
                 CancellationToken.None);
-            if (_reconnectReservation is not null)
-            {
-                await _reconnectReservation.DisposeAsync();
-            }
         }
+    }
+
+    private void ShowAutomaticReconnectFailure(Exception? failure)
+    {
+        if (failure is not ReconnectFailureException reconnectFailure)
+        {
+            return;
+        }
+
+        SessionErrorCard.ViewModel = ConnectionErrorViewModel.FromError(reconnectFailure.Error);
+        StatusText.Text = reconnectFailure.Error.UserMessage;
+        RefreshErrorActionState();
     }
 
     private void ShowAutomaticReconnectProgress(AutomaticReconnectProgress progress)
