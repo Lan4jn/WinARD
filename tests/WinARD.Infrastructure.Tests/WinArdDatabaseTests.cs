@@ -13,6 +13,19 @@ namespace WinARD.Infrastructure.Tests;
 public sealed class WinArdDatabaseTests
 {
     [Fact]
+    public async Task Version_three_quality_scales_migrate_in_place_and_percent25_is_allowed()
+    {
+        await using var fixture = await DatabaseFixture.CreateAtVersionThreeAsync();
+
+        await fixture.Database.InitializeAsync(CancellationToken.None);
+
+        Assert.Equal(4, await fixture.ReadSchemaVersionAsync());
+        Assert.Equal(new long[] { 0, 1, 2, 3 }, await fixture.ReadQualityScalesAsync());
+        await fixture.InsertDeviceWithQualityScaleAsync(4);
+        Assert.Equal(new long[] { 0, 1, 2, 3, 4 }, await fixture.ReadQualityScalesAsync());
+    }
+
+    [Fact]
     public async Task Version_two_devices_migrate_to_custom_quality_without_losing_refresh()
     {
         await using var fixture = await DatabaseFixture.CreateAtVersionTwoAsync();
@@ -56,7 +69,7 @@ public sealed class WinArdDatabaseTests
         Assert.Equal("ssh-ed25519", ssh.HostKeyPin.Algorithm);
         Assert.Equal("AAAALegacyKey", ssh.HostKeyPin.PublicKeyBase64);
         Assert.Equal("SHA256:legacy", ssh.HostKeyPin.Fingerprint);
-        Assert.Equal(3, await fixture.ReadSchemaVersionAsync());
+        Assert.Equal(4, await fixture.ReadSchemaVersionAsync());
     }
 
     [Fact]
@@ -108,8 +121,8 @@ public sealed class WinArdDatabaseTests
             await using var reader = await command.ExecuteReaderAsync();
             Assert.True(await reader.ReadAsync());
             Assert.Equal(1L, reader.GetInt64(0));
-            Assert.Equal(3L, reader.GetInt64(1));
-            Assert.Equal(3L, reader.GetInt64(2));
+            Assert.Equal(4L, reader.GetInt64(1));
+            Assert.Equal(4L, reader.GetInt64(2));
         }
         finally
         {
@@ -364,6 +377,79 @@ public sealed class WinArdDatabaseTests
             }
 
             return new DatabaseFixture(directory, database);
+        }
+
+        public static async Task<DatabaseFixture> CreateAtVersionThreeAsync()
+        {
+            var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "WinARD.Tests", Guid.NewGuid().ToString("N"));
+            var path = System.IO.Path.Combine(directory, "winard.db");
+            var database = new WinArdDatabase(path);
+            await database.InitializeAsync(
+                [
+                    new Migration001Initial(),
+                    new RecordingMigration(
+                        1,
+                        2,
+                        "ALTER TABLE devices ADD COLUMN refresh_mode INTEGER NOT NULL DEFAULT 0 CHECK(refresh_mode IN (0, 1, 2)); ALTER TABLE devices ADD COLUMN refresh_fps INTEGER NULL CHECK(refresh_fps IS NULL OR refresh_fps IN (30, 45, 60, 75, 90, 105, 120));"),
+                    new RecordingMigration(
+                        2,
+                        3,
+                        "ALTER TABLE devices ADD COLUMN quality_preset INTEGER NOT NULL DEFAULT 4 CHECK(quality_preset IN (0, 1, 2, 3, 4)); ALTER TABLE devices ADD COLUMN quality_bandwidth_bps INTEGER NULL CHECK(quality_bandwidth_bps IS NULL OR quality_bandwidth_bps BETWEEN 1 AND 1099511627776); ALTER TABLE devices ADD COLUMN quality_color INTEGER NOT NULL DEFAULT 0 CHECK(quality_color IN (0, 1, 2, 3)); ALTER TABLE devices ADD COLUMN quality_scale INTEGER NOT NULL DEFAULT 0 CHECK(quality_scale IN (0, 1, 2, 3)); ALTER TABLE devices ADD COLUMN quality_allow_gray INTEGER NOT NULL DEFAULT 1 CHECK(quality_allow_gray IN (0, 1)); ALTER TABLE devices ADD COLUMN quality_bandwidth_locked INTEGER NOT NULL DEFAULT 0 CHECK(quality_bandwidth_locked IN (0, 1)); ALTER TABLE devices ADD COLUMN quality_color_locked INTEGER NOT NULL DEFAULT 0 CHECK(quality_color_locked IN (0, 1)); ALTER TABLE devices ADD COLUMN quality_scale_locked INTEGER NOT NULL DEFAULT 0 CHECK(quality_scale_locked IN (0, 1)); ALTER TABLE devices ADD COLUMN quality_refresh_locked INTEGER NOT NULL DEFAULT 0 CHECK(quality_refresh_locked IN (0, 1));"),
+                ],
+                CancellationToken.None);
+            await using var connection = database.CreateConnection();
+            await connection.OpenAsync();
+            for (var scale = 0; scale <= 3; scale++)
+            {
+                var command = connection.CreateCommand();
+                command.CommandText = """
+                    INSERT INTO devices (
+                        id, display_name, host, port, mac_username, transport_mode,
+                        quality_scale, created_utc, updated_utc)
+                    VALUES ($id, $name, $host, 5900, 'alex', 0, $scale, $now, $now);
+                    """;
+                command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("D"));
+                command.Parameters.AddWithValue("$name", $"Scale {scale}");
+                command.Parameters.AddWithValue("$host", $"scale-{scale}.local");
+                command.Parameters.AddWithValue("$scale", scale);
+                command.Parameters.AddWithValue("$now", "2026-08-13T00:00:00.0000000+00:00");
+                await command.ExecuteNonQueryAsync();
+            }
+
+            return new DatabaseFixture(directory, database);
+        }
+
+        public async Task InsertDeviceWithQualityScaleAsync(int scale)
+        {
+            await using var connection = Database.CreateConnection();
+            await connection.OpenAsync();
+            var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO devices (
+                    id, display_name, host, port, mac_username, transport_mode,
+                    quality_scale, created_utc, updated_utc)
+                VALUES ($id, 'Percent 25', 'scale-25.local', 5900, 'alex', 0, $scale, $now, $now);
+                """;
+            command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("D"));
+            command.Parameters.AddWithValue("$scale", scale);
+            command.Parameters.AddWithValue("$now", "2026-08-13T00:00:00.0000000+00:00");
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task<long[]> ReadQualityScalesAsync()
+        {
+            await using var connection = Database.CreateConnection();
+            await connection.OpenAsync();
+            var command = connection.CreateCommand();
+            command.CommandText = "SELECT quality_scale FROM devices ORDER BY quality_scale;";
+            await using var reader = await command.ExecuteReaderAsync();
+            var values = new List<long>();
+            while (await reader.ReadAsync())
+            {
+                values.Add(reader.GetInt64(0));
+            }
+
+            return values.ToArray();
         }
 
         public async Task<int> ReadSchemaVersionAsync()

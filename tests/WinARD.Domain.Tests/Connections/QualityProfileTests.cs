@@ -8,6 +8,17 @@ namespace WinARD.Domain.Tests.Connections;
 public sealed class QualityProfileTests
 {
     [Fact]
+    public void Quality_scale_values_preserve_native_as_the_percent100_compatibility_alias()
+    {
+        Assert.Equal(0, (int)QualityScale.Automatic);
+        Assert.Equal(1, (int)QualityScale.Percent100);
+        Assert.Equal(QualityScale.Percent100, QualityScale.Native);
+        Assert.Equal(2, (int)QualityScale.Percent75);
+        Assert.Equal(3, (int)QualityScale.Percent50);
+        Assert.Equal(4, (int)QualityScale.Percent25);
+    }
+
+    [Fact]
     public void Automatic_profile_has_expected_defaults()
     {
         var profile = QualityProfile.Automatic;

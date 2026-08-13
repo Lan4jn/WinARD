@@ -24,7 +24,8 @@ public sealed record QualityBootstrapSettings
     public QualityBootstrapSettings(
         RemotePixelFormatKind pixelFormat,
         IReadOnlyList<int> encodings,
-        QualityBootstrapReason reason)
+        QualityBootstrapReason reason,
+        double scaleFactor = 1d)
     {
         if (!Enum.IsDefined(pixelFormat))
         {
@@ -53,9 +54,15 @@ public sealed record QualityBootstrapSettings
             throw new ArgumentOutOfRangeException(nameof(reason));
         }
 
+        if (!double.IsFinite(scaleFactor) || scaleFactor is <= 0d or > 1d)
+        {
+            throw new ArgumentOutOfRangeException(nameof(scaleFactor));
+        }
+
         PixelFormat = pixelFormat;
         Encodings = Array.AsReadOnly(snapshot);
         Reason = reason;
+        ScaleFactor = scaleFactor;
     }
 
     public RemotePixelFormatKind PixelFormat { get; }
@@ -64,11 +71,14 @@ public sealed record QualityBootstrapSettings
 
     public QualityBootstrapReason Reason { get; }
 
+    public double ScaleFactor { get; }
+
     public bool Equals(QualityBootstrapSettings? other) =>
         ReferenceEquals(this, other) ||
         (other is not null &&
             PixelFormat == other.PixelFormat &&
             Reason == other.Reason &&
+            ScaleFactor.Equals(other.ScaleFactor) &&
             Encodings.SequenceEqual(other.Encodings));
 
     public override int GetHashCode()
@@ -76,6 +86,7 @@ public sealed record QualityBootstrapSettings
         var hash = new HashCode();
         hash.Add(PixelFormat);
         hash.Add(Reason);
+        hash.Add(ScaleFactor);
         foreach (var encoding in Encodings)
         {
             hash.Add(encoding);

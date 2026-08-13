@@ -9,6 +9,7 @@ namespace WinARD.Application.Tests.Quality;
 
 public sealed class QualityBootstrapPlannerTests
 {
+    private const long MiB = 1024L * 1024;
     private static readonly int[] PreferredEncodings = [16, 6, 0, 1, -239, -223];
     private static readonly int[] FallbackEncodings = [6, 16, 0, 1, -239, -223];
 
@@ -148,6 +149,70 @@ public sealed class QualityBootstrapPlannerTests
             RemotePixelFormatKind.Bgra32,
             QualityBootstrapReason.SafeFallback,
             FallbackEncodings);
+        Assert.Equal(1d, plan.Fallback.ScaleFactor);
+    }
+
+    [Theory]
+    [InlineData(1 * MiB, 0.25)]
+    [InlineData(1 * MiB + 1, 0.5)]
+    [InlineData(2 * MiB, 0.5)]
+    [InlineData(2 * MiB + 1, 0.75)]
+    [InlineData(4 * MiB, 0.75)]
+    [InlineData(4 * MiB + 1, 1.0)]
+    public void Automatic_scale_maps_bandwidth_boundaries(long targetBytesPerSecond, double expected)
+    {
+        var profile = QualityProfile.CreateCustom(
+            targetBytesPerSecond,
+            QualityColor.Automatic,
+            QualityScale.Automatic,
+            FrameRefreshPolicy.Automatic);
+
+        Assert.Equal(expected, CreatePlan(profile).Preferred.ScaleFactor);
+    }
+
+    [Fact]
+    public void Automatic_scale_maps_unlimited_bandwidth_to_percent100()
+    {
+        var profile = QualityProfile.CreateCustom(
+            null,
+            QualityColor.Automatic,
+            QualityScale.Automatic,
+            FrameRefreshPolicy.Automatic);
+
+        Assert.Equal(1d, CreatePlan(profile).Preferred.ScaleFactor);
+    }
+
+    [Theory]
+    [InlineData(QualityScale.Percent100, 1.0)]
+    [InlineData(QualityScale.Percent75, 0.75)]
+    [InlineData(QualityScale.Percent50, 0.5)]
+    [InlineData(QualityScale.Percent25, 0.25)]
+    public void Explicit_scale_is_not_overridden_by_bandwidth(QualityScale scale, double expected)
+    {
+        var profile = QualityProfile.CreateCustom(
+            1,
+            QualityColor.Automatic,
+            scale,
+            FrameRefreshPolicy.Automatic);
+
+        Assert.Equal(expected, CreatePlan(profile).Preferred.ScaleFactor);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-0.1)]
+    [InlineData(1.01)]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    public void Settings_reject_invalid_scale_factors(double scaleFactor)
+    {
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(() => new QualityBootstrapSettings(
+            RemotePixelFormatKind.Bgra32,
+            [6],
+            QualityBootstrapReason.UserFull32,
+            scaleFactor));
+
+        Assert.Equal("scaleFactor", exception.ParamName);
     }
 
     [Fact]

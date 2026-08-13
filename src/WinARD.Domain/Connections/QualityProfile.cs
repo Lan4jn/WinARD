@@ -21,8 +21,10 @@ public enum QualityScale
 {
     Automatic = 0,
     Native = 1,
+    Percent100 = Native,
     Percent75 = 2,
     Percent50 = 3,
+    Percent25 = 4,
 }
 
 public sealed record QualityProfile

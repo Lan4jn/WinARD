@@ -18,13 +18,31 @@ public static class QualityBootstrapPlanner
         ArgumentNullException.ThrowIfNull(decoderGates);
 
         var (pixelFormat, reason) = SelectPreferredSettings(profile, capabilities, decoderGates);
+        var scaleFactor = ResolveScaleFactor(profile.Scale, profile.TargetBytesPerSecond);
         return new QualityBootstrapPlan(
-            new QualityBootstrapSettings(pixelFormat, PreferredEncodings, reason),
+            new QualityBootstrapSettings(pixelFormat, PreferredEncodings, reason, scaleFactor),
             new QualityBootstrapSettings(
                 RemotePixelFormatKind.Bgra32,
                 FallbackEncodings,
-                QualityBootstrapReason.SafeFallback));
+                QualityBootstrapReason.SafeFallback,
+                scaleFactor: 1d));
     }
+
+    public static double ResolveScaleFactor(QualityScale scale, long? targetBytesPerSecond) => scale switch
+    {
+        QualityScale.Automatic => targetBytesPerSecond switch
+        {
+            <= 1L * 1024 * 1024 => 0.25d,
+            <= 2L * 1024 * 1024 => 0.5d,
+            <= 4L * 1024 * 1024 => 0.75d,
+            _ => 1d,
+        },
+        QualityScale.Native => 1d,
+        QualityScale.Percent75 => 0.75d,
+        QualityScale.Percent50 => 0.5d,
+        QualityScale.Percent25 => 0.25d,
+        _ => throw new ArgumentOutOfRangeException(nameof(scale)),
+    };
 
     private static (RemotePixelFormatKind PixelFormat, QualityBootstrapReason Reason) SelectPreferredSettings(
         QualityProfile profile,

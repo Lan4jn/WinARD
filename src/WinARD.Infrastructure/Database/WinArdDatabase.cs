@@ -32,7 +32,12 @@ public sealed class WinArdDatabase : IAsyncDisposable
 
     public Task InitializeAsync(CancellationToken cancellationToken) =>
         InitializeAsync(
-            [new Migration001Initial(), new Migration002FrameRefreshPolicy(), new Migration003QualityProfile()],
+            [
+                new Migration001Initial(),
+                new Migration002FrameRefreshPolicy(),
+                new Migration003QualityProfile(),
+                new Migration004QualityScalePercent(),
+            ],
             cancellationToken);
 
     public async Task InitializeAsync(
