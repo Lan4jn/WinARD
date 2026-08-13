@@ -273,7 +273,7 @@ public sealed class ConnectionEditorViewModel : ObservableObject
             if (_hasSshAuthenticationSecret != value)
             {
                 SetValidated(ref _hasSshAuthenticationSecret, value);
-                AuthenticationGenerationChanged();
+                _ = Interlocked.Increment(ref _sshAuthenticationGeneration);
             }
         }
     }

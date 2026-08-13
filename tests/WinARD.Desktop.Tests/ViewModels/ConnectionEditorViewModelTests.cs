@@ -98,6 +98,34 @@ public sealed class ConnectionEditorViewModelTests
     }
 
     [Fact]
+    public void SecretPresenceChangesGenerationWithoutRaisingConfigurationChanged()
+    {
+        var sut = CreateValidViewModel();
+        var changes = 0;
+        sut.SshAuthenticationConfigurationChanged += (_, _) => changes++;
+        var initial = sut.SshAuthenticationGeneration;
+
+        sut.HasSshAuthenticationSecret = true;
+
+        Assert.True(sut.SshAuthenticationGeneration > initial);
+        Assert.Equal(0, changes);
+    }
+
+    [Fact]
+    public void AuthenticationFieldChangeClearsSecretAndRaisesConfigurationChangedOnce()
+    {
+        var sut = CreateValidViewModel();
+        sut.HasSshAuthenticationSecret = true;
+        var changes = 0;
+        sut.SshAuthenticationConfigurationChanged += (_, _) => changes++;
+
+        sut.SshUsername = "changed-user";
+
+        Assert.False(sut.HasSshAuthenticationSecret);
+        Assert.Equal(1, changes);
+    }
+
+    [Fact]
     public async Task StaleHostKeyFailureAfterModeChangeIsDiscarded()
     {
         var release = new TaskCompletionSource<ConnectionProfileTestResult>(TaskCreationOptions.RunContinuationsAsynchronously);

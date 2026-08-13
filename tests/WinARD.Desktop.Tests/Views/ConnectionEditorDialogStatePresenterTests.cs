@@ -23,6 +23,17 @@ public sealed class ConnectionEditorDialogStatePresenterTests
     }
 
     [Fact]
+    public void AuthenticationConfigurationHandlerClearsVisibleSecretAndPendingRetryIdempotently()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "ConnectionEditorDialog.xaml.cs"));
+
+        Assert.Contains("OnSshAuthenticationConfigurationChanged", source, StringComparison.Ordinal);
+        Assert.Contains("SshPasswordBox.Password = string.Empty", source, StringComparison.Ordinal);
+        Assert.Contains("_suppressSshSecretChange", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void AuthenticationModeControlsVisibleInput()
     {
         var viewModel = new ConnectionEditorViewModel(

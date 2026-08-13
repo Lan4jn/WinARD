@@ -24,6 +24,7 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
     private readonly Window? _owner;
     private readonly SecretRedactor? _redactor;
     private ConnectionEditorSecretPackage? _pendingHostKeyRetrySecret;
+    private bool _suppressSshSecretChange;
     private bool _saved;
 
     public ConnectionEditorDialog(
@@ -132,12 +133,33 @@ public sealed partial class ConnectionEditorDialog : ContentDialog, IDisposable
 
     private void OnPasswordChanged(object sender, RoutedEventArgs args)
     {
+        if (_suppressSshSecretChange)
+        {
+            return;
+        }
+
         ViewModel.HasSshAuthenticationSecret = SshPasswordBox.Password.Length > 0;
         UpdateState();
     }
 
-    private void OnSshAuthenticationConfigurationChanged(object? sender, EventArgs args) =>
+    private void OnSshAuthenticationConfigurationChanged(object? sender, EventArgs args)
+    {
         Interlocked.Exchange(ref _pendingHostKeyRetrySecret, null)?.Dispose();
+        if (SshPasswordBox.Password.Length == 0)
+        {
+            return;
+        }
+
+        _suppressSshSecretChange = true;
+        try
+        {
+            SshPasswordBox.Password = string.Empty;
+        }
+        finally
+        {
+            _suppressSshSecretChange = false;
+        }
+    }
 
     private void OnSaveClicked(ContentDialog sender, ContentDialogButtonClickEventArgs args)
     {
