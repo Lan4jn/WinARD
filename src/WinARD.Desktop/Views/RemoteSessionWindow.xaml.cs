@@ -9,6 +9,7 @@ using Microsoft.UI.Xaml.Media.Imaging;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Runtime.ExceptionServices;
 using WinARD.Application.Ports;
+using WinARD.Application.Sessions;
 using WinARD.Desktop.Clipboard;
 using WinARD.Desktop.Input;
 using WinARD.Desktop.Rendering;
@@ -17,6 +18,7 @@ using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Remote.Protocol.Errors;
 using WinRT.Interop;
 
 namespace WinARD.Desktop.Views;
@@ -37,6 +39,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly RemoteSessionDiagnosticExportState _diagnosticExportState;
     private readonly ConnectionErrorActionHandler _errorActionHandler;
     private readonly RemoteSessionWindowLifecycle _windowLifecycle;
+    private readonly AutomaticReconnectCoordinator? _automaticReconnect;
     private readonly FrameRateSelectionCoordinator _frameRateSelection = new();
     private readonly FrameRateSaveStatus _frameRateSaveStatus = new();
     private readonly PerformanceTextPresentationState _performanceTextPresentation = new();
@@ -128,18 +131,24 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             _clipboardBridge,
             diagnosticSink,
             profile?.Quality ?? QualityProfile.Automatic);
+        _automaticReconnect = retryRequested is null ? null : new AutomaticReconnectCoordinator(
+            IsTransientRuntimeFailure,
+            new ReconnectPolicy(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30), Random.Shared),
+            retryRequested,
+            progress => _ = _dispatcher.InvokeAsync(
+                () => ShowAutomaticReconnectProgress(progress), CancellationToken.None));
         _windowLifecycle = new RemoteSessionWindowLifecycle(
             ViewModel.Completion,
             () => ViewModel.Error is not null,
             StopSessionCoreAsync,
             CloseWindowCoreAsync,
-            retryRequested,
+            _automaticReconnect is null ? null : ReconnectNowAndDisposeAsync,
             BeginClosingDiagnostics);
         var handlers = new Dictionary<ConnectionErrorActionKind, Func<CancellationToken, Task>>
         {
             [ConnectionErrorActionKind.CopyCorrelationId] = CopyCorrelationIdAsync,
-            [ConnectionErrorActionKind.Disconnect] = _ => _windowLifecycle.DisconnectAsync(),
-            [ConnectionErrorActionKind.Cancel] = _ => _windowLifecycle.DisconnectAsync(),
+            [ConnectionErrorActionKind.Disconnect] = _ => CloseSessionAsync(),
+            [ConnectionErrorActionKind.Cancel] = _ => CloseSessionAsync(),
         };
         if (_diagnosticExportService is not null)
         {
@@ -238,8 +247,15 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     public RemoteSessionViewModel ViewModel { get; }
 
-    public Task CloseSessionAsync()
-        => _windowLifecycle.DisconnectAsync();
+    public async Task CloseSessionAsync()
+    {
+        _automaticReconnect?.Cancel();
+        await _windowLifecycle.DisconnectAsync();
+        if (_automaticReconnect is not null)
+        {
+            await _automaticReconnect.DisposeAsync();
+        }
+    }
 
     public ValueTask DisposeAsync() => new(CloseSessionAsync());
 
@@ -381,7 +397,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     {
         FramePanel.Loaded -= OnFramePanelLoaded;
         _ = ViewModel.StartAsync(_lifetime.Token);
-        _ = ObserveFailureAsync(_windowLifecycle.ObserveCompletionAsync(_lifetime.Token));
+        _ = ObserveFailureAsync(ObserveSessionCompletionAsync());
         _ = ObserveFailureAsync(ObserveSmokePointerProbeAsync());
     }
 
@@ -628,6 +644,66 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                     item,
                     FrameRefreshOptionPresentation.AutomationName(option));
             }
+        }
+    }
+
+    private async Task ObserveSessionCompletionAsync()
+    {
+        await _windowLifecycle.ObserveCompletionAsync(_lifetime.Token);
+        if (_lifetime.IsCancellationRequested || ViewModel.Error is not { } error ||
+            _automaticReconnect is null)
+        {
+            return;
+        }
+
+        var connected = await _automaticReconnect.StartAsync(
+            ViewModel.TerminalFailure ?? new ReconnectFailureException(error),
+            _lifetime.Token);
+        if (connected)
+        {
+            await _automaticReconnect.DisposeAsync();
+            await CloseWindowCoreAsync();
+        }
+        else
+        {
+            await _dispatcher.InvokeAsync(
+                () => AutomaticReconnectPanel.Visibility = Visibility.Collapsed,
+                CancellationToken.None);
+        }
+    }
+
+    private void ShowAutomaticReconnectProgress(AutomaticReconnectProgress progress)
+    {
+        AutomaticReconnectStatusText.Text = progress.Remaining > TimeSpan.Zero
+            ? $"第 {progress.Attempt} 次重连将在 {Math.Ceiling(progress.Remaining.TotalSeconds)} 秒后开始"
+            : $"正在进行第 {progress.Attempt} 次重连…";
+        AutomaticReconnectPanel.Visibility = Visibility.Visible;
+    }
+
+    private void OnCancelAutomaticReconnectClicked(object sender, RoutedEventArgs args)
+    {
+        _automaticReconnect?.Cancel();
+        AutomaticReconnectPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = "已取消自动重连。";
+    }
+
+    private static bool IsTransientRuntimeFailure(Exception failure) =>
+        ReconnectFailureClassifier.IsTransient(failure) ||
+        failure is RfbProtocolException
+        {
+            Failure.Kind: RfbProtocolFailureKind.TruncatedRead,
+            InnerException: IOException
+        };
+
+    private async Task ReconnectNowAndDisposeAsync(CancellationToken token)
+    {
+        try
+        {
+            await _automaticReconnect!.ReconnectNowAsync(token);
+        }
+        finally
+        {
+            await _automaticReconnect!.DisposeAsync();
         }
     }
 

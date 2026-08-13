@@ -493,6 +493,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         PostQualityPresentationChanged();
     }
 
+    public Exception? TerminalFailure { get; private set; }
+
     private void PostQualityPresentationChanged() =>
         QueueUiUpdateBestEffort(
             () => OnPropertyChanged(nameof(QualityPresentationVersion)));
@@ -1813,6 +1815,7 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
                     RfbProtocolFailureKind.RemoteSessionClosed;
                 var exception = protocolException ?? completed.Exception?.GetBaseException() ??
                     new InvalidOperationException("Remote session terminated unexpectedly.");
+                TerminalFailure = exception;
                 var error = WinArdError.Create(
                     ConnectionStage.Connected,
                     ReferenceEquals(completed, present)

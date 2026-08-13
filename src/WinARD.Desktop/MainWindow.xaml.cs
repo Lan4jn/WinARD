@@ -499,6 +499,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private async Task ConnectProfileWithHandlingAsync(
         ConnectionProfile profile,
         ISshHostKeyPrompt? hostKeyPrompt = null,
+        bool throwOnFailure = false,
         CancellationToken cancellationToken = default)
     {
         using var operationLifetime = CancellationTokenSource.CreateLinkedTokenSource(
@@ -530,7 +531,8 @@ public sealed partial class MainWindow : Window, IDisposable
                     (latestProfile, retryToken) => _uiOperation.RunAsync(
                         () => ConnectProfileWithHandlingAsync(
                             latestProfile,
-                            cancellationToken: retryToken),
+                            cancellationToken: retryToken,
+                            throwOnFailure: true),
                         retryToken));
                 var remoteWindow = new RemoteSessionWindow(
                     ownership.Session,
@@ -574,6 +576,10 @@ public sealed partial class MainWindow : Window, IDisposable
                 "Connection attempt failed.",
                 [new("stage", error.Stage.ToString())],
                 exception));
+            if (throwOnFailure)
+            {
+                throw new ReconnectFailureException(error);
+            }
         }
         catch (SessionAlreadyActiveException)
         {
@@ -592,6 +598,10 @@ public sealed partial class MainWindow : Window, IDisposable
                 error.CorrelationId,
                 "Unexpected connection failure.",
                 Exception: exception));
+            if (throwOnFailure)
+            {
+                throw new ReconnectFailureException(error);
+            }
         }
         finally
         {
