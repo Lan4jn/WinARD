@@ -61,6 +61,7 @@ public interface IRfbClient : IAsyncDisposable
 
     void ConfirmBootstrap(RemoteFramebufferSize framebufferSize)
     {
+        throw new NotSupportedException("Bootstrap confirmation is not supported.");
     }
 
     ValueTask SendPointerAsync(

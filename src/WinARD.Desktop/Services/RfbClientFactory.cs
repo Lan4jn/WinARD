@@ -881,6 +881,12 @@ internal sealed class RfbClient : IRfbClient
                 RfbProtocolReadStage.FramebufferRectanglePayload:
                 reason = QualityBootstrapFailureReason.MalformedFramebufferUpdate;
                 return true;
+            case RfbProtocolFailureKind.TruncatedRead
+            when failure.ReadStage == RfbProtocolReadStage.ServerMessageType &&
+                 scalingWritten &&
+                 !firstPixelConfirmed:
+                reason = QualityBootstrapFailureReason.ScaleRejected;
+                return true;
             default:
                 reason = default;
                 return false;

@@ -198,9 +198,22 @@ public sealed class ConnectDeviceHandler
 
                 if (message is RemoteFramebufferMessage pixelFrame)
                 {
-                    ValidateFirstPixelFrame(client, pixelFrame);
-                    client.ConfirmBootstrap(pixelFrame.Size);
-                    preloadedMessages.Add(pixelFrame);
+                    var transferred = false;
+                    try
+                    {
+                        ValidateFirstPixelFrame(client, pixelFrame);
+                        client.ConfirmBootstrap(pixelFrame.Size);
+                        preloadedMessages.Add(pixelFrame);
+                        transferred = true;
+                    }
+                    finally
+                    {
+                        if (!transferred)
+                        {
+                            pixelFrame.Dispose();
+                        }
+                    }
+
                     break;
                 }
 
@@ -275,7 +288,6 @@ public sealed class ConnectDeviceHandler
 
         if (frame.Size != actualSize)
         {
-            frame.Dispose();
             throw new QualityBootstrapCompatibilityException(
                 QualityBootstrapFailureReason.FramebufferSizeMismatch);
         }
@@ -286,7 +298,6 @@ public sealed class ConnectDeviceHandler
                 (long)rectangle.X + rectangle.Width > actualSize.Width ||
                 (long)rectangle.Y + rectangle.Height > actualSize.Height)
             {
-                frame.Dispose();
                 throw new QualityBootstrapCompatibilityException(
                     QualityBootstrapFailureReason.RectangleOutOfBounds);
             }

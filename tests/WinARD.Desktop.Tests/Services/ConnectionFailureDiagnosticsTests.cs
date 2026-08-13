@@ -830,6 +830,10 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
                     new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
                     [new RemoteRectangle(0, 0, 1, 1)]));
         }
+        public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize)
+        {
+            _state = _state.ConfirmApplied();
+        }
         public ValueTask DisposeAsync()
         {
             events.Add($"{name}-client-dispose");

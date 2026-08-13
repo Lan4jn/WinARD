@@ -253,6 +253,32 @@ public sealed class ConnectDeviceHandlerTests
     }
 
     [Fact]
+    public async Task Handler_disposes_first_pixel_once_when_bootstrap_confirmation_fails()
+    {
+        var owner = new CountingOwner(4);
+        var confirmationFailure = new QualityBootstrapCompatibilityException(
+            QualityBootstrapFailureReason.FramebufferSizeMismatch);
+        var client = new TestRfbClient
+        {
+            ConfirmBootstrapException = confirmationFailure,
+            Messages = new Queue<RemoteServerMessage>([CreateFramebufferMessage(owner)]),
+        };
+        var mapper = new CapturingErrorMapper();
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            mapper);
+
+        var result = await handler.HandleAsync(CreateProfile(), default);
+
+        Assert.Equal(SessionState.Failed, result.State);
+        Assert.Same(confirmationFailure, mapper.Exception);
+        Assert.Equal(1, owner.DisposeCount);
+        Assert.Equal(1, client.ConfirmBootstrapCount);
+    }
+
+    [Fact]
     public async Task Handler_preserves_cursor_order_across_a_nonpixel_frame_and_reissues_only_for_the_frame()
     {
         var events = new List<string>();
@@ -1008,6 +1034,8 @@ public sealed class ConnectDeviceHandlerTests
 
         public Exception? ReceiveException { get; init; }
 
+        public Exception? ConfirmBootstrapException { get; init; }
+
         public Exception? DisposeException { get; init; }
 
         public List<string>? Events { get; init; }
@@ -1104,6 +1132,10 @@ public sealed class ConnectDeviceHandlerTests
         public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize)
         {
             ConfirmBootstrapCount++;
+            if (ConfirmBootstrapException is not null)
+            {
+                throw ConfirmBootstrapException;
+            }
         }
 
         public ValueTask DisposeAsync()

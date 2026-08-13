@@ -1629,6 +1629,53 @@ public sealed class FramePresentationTests
         Assert.Equal(default, reason);
     }
 
+    [Fact]
+    public async Task Ard_scaling_followed_by_top_level_eof_is_scale_rejected()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(100, 80)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        await client.ConfigureBootstrapAsync(
+            new QualityBootstrapSettings(
+                RemotePixelFormatKind.Rgb565,
+                [16, 6, 0, 1, -239, -223],
+                QualityBootstrapReason.AutomaticBandwidth,
+                0.75d),
+            QualityBootstrapAttempt.Preferred,
+            default);
+
+        var compatibility = await Assert.ThrowsAsync<QualityBootstrapCompatibilityException>(() =>
+            client.ReceiveBootstrapAsync(default).AsTask());
+
+        Assert.Equal(QualityBootstrapFailureReason.ScaleRejected, compatibility.Reason);
+    }
+
+    [Fact]
+    public async Task Ard_one_hundred_percent_followed_by_top_level_eof_is_not_bootstrap_compatibility()
+    {
+        await using var stream = new ScriptedDuplexStream(
+            [.. Handshake("RFB 003.889\n"), .. ArdServerInit(100, 80)]);
+        await using var client = new RfbClient(stream);
+        await client.NegotiateAsync(default);
+        await client.InitializeAsync(default);
+        await client.ConfigureBootstrapAsync(
+            new QualityBootstrapSettings(
+                RemotePixelFormatKind.Bgra32,
+                [6, 16, 0, 1, -239, -223],
+                QualityBootstrapReason.SafeFallback,
+                1d),
+            QualityBootstrapAttempt.Fallback,
+            default);
+
+        var protocol = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            client.ReceiveBootstrapAsync(default).AsTask());
+
+        Assert.Equal(RfbProtocolFailureKind.TruncatedRead, protocol.Failure?.Kind);
+        Assert.Equal(RfbProtocolReadStage.ServerMessageType, protocol.Failure?.ReadStage);
+    }
+
     [Theory]
     [InlineData(3, 3, 0.75d, 2, 2)]
     [InlineData(3, 3, 0.75d, 3, 3)]
@@ -1713,6 +1760,8 @@ public sealed class FramePresentationTests
 
         await Assert.ThrowsAsync<NotSupportedException>(() =>
             client.ConfigureBootstrapAsync(settings, QualityBootstrapAttempt.Preferred, default).AsTask());
+        Assert.Throws<NotSupportedException>(() =>
+            client.ConfirmBootstrap(new RemoteFramebufferSize(1, 1)));
 
         Assert.Same(QualityBootstrapState.LegacyBgra32, client.BootstrapState);
     }
