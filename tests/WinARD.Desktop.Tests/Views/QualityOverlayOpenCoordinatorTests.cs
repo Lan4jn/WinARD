@@ -28,7 +28,9 @@ public sealed class QualityOverlayOpenCoordinatorTests
         release.SetResult();
         await Task.WhenAll(first, second);
 
-        Assert.Equal(["release-start", "release-end", "visible"], events);
+        Assert.Equal(
+            ["release-start", "release-end", "release-start", "release-end", "visible"],
+            events);
     }
 
     [Fact]
@@ -46,5 +48,52 @@ public sealed class QualityOverlayOpenCoordinatorTests
         await opening;
 
         Assert.False(visible);
+    }
+
+    [Fact]
+    public async Task Opening_is_local_input_mode_and_performs_final_release_before_visible()
+    {
+        var firstRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCalls = 0;
+        var visibleAfterCalls = 0;
+        var coordinator = new QualityOverlayOpenCoordinator(
+            async token =>
+            {
+                releaseCalls++;
+                if (releaseCalls == 1)
+                {
+                    await firstRelease.Task.WaitAsync(token);
+                }
+            },
+            visible =>
+            {
+                if (visible)
+                {
+                    visibleAfterCalls = releaseCalls;
+                }
+            });
+
+        var opening = coordinator.ToggleAsync(default);
+        Assert.True(coordinator.ConsumesRemoteInput);
+        firstRelease.SetResult();
+        await opening;
+
+        Assert.Equal(2, releaseCalls);
+        Assert.Equal(2, visibleAfterCalls);
+    }
+
+    [Fact]
+    public async Task External_close_synchronizes_visibility_so_next_click_reopens_once()
+    {
+        var visibleChanges = new List<bool>();
+        var coordinator = new QualityOverlayOpenCoordinator(
+            _ => Task.CompletedTask,
+            visibleChanges.Add);
+
+        await coordinator.ToggleAsync(default);
+        coordinator.Close();
+        await coordinator.ToggleAsync(default);
+
+        Assert.Equal([true, false, true], visibleChanges);
     }
 }

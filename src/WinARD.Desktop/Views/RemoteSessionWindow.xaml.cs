@@ -573,6 +573,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnPointerPressed(object sender, PointerRoutedEventArgs args)
     {
+        if (ConsumeLocalQualityPointerInput(args)) return;
         _ = InputSurface.Focus(FocusState.Pointer);
         _ = FrameSurface.CapturePointer(args.Pointer);
         QueuePointerBarrierSend(args);
@@ -938,7 +939,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private bool ConsumeLocalQualityKeyboardInput()
     {
-        if (!_qualityOverlayState.IsOpen && !_qualityOverlayState.IsDropDownOpen)
+        if (!_qualityOverlayOpenCoordinator.ConsumesRemoteInput &&
+            !_qualityOverlayState.IsDropDownOpen)
         {
             return false;
         }
@@ -994,7 +996,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         }
         if (action == QualityOverlayEscapeAction.CloseOverlay)
         {
-            SetQualityOverlayVisible(false);
+            _qualityOverlayOpenCoordinator.Close();
             return true;
         }
         return false;
@@ -1038,11 +1040,14 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         QualityOverlay.Width = placement.Width;
     }
 
-    private void OnPointerMoved(object sender, PointerRoutedEventArgs args) =>
-        QueuePointerMove(args);
+    private void OnPointerMoved(object sender, PointerRoutedEventArgs args)
+    {
+        if (!ConsumeLocalQualityPointerInput(args)) QueuePointerMove(args);
+    }
 
     private void OnPointerReleased(object sender, PointerRoutedEventArgs args)
     {
+        if (ConsumeLocalQualityPointerInput(args)) return;
         FrameSurface.ReleasePointerCapture(args.Pointer);
         QueuePointerBarrierSend(args);
         args.Handled = true;
@@ -1050,6 +1055,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnPointerCanceled(object sender, PointerRoutedEventArgs args)
     {
+        if (ConsumeLocalQualityPointerInput(args)) return;
         if (IsInputClosing())
         {
             RecordPointerDropped(RemoteInputDropReason.SessionClosing);
@@ -1070,8 +1076,16 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void OnPointerWheelChanged(object sender, PointerRoutedEventArgs args)
     {
+        if (ConsumeLocalQualityPointerInput(args)) return;
         QueueWheelSend(args);
         args.Handled = true;
+    }
+
+    private bool ConsumeLocalQualityPointerInput(PointerRoutedEventArgs args)
+    {
+        if (!_qualityOverlayOpenCoordinator.ConsumesRemoteInput) return false;
+        args.Handled = true;
+        return true;
     }
 
     private void QueueWheelSend(PointerRoutedEventArgs args)
@@ -1851,6 +1865,7 @@ internal sealed class QualityProfileSelectionCoordinator
             onCurrentCompletion();
         }
     }
+
 }
 
 internal sealed class FrameRateSaveStatus

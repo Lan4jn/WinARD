@@ -75,6 +75,18 @@ internal sealed class QualityOverlayOpenCoordinator(
     private Task? _openTask;
     private long _version;
     private bool _visible;
+    private bool _opening;
+
+    public bool ConsumesRemoteInput
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _opening || _visible;
+            }
+        }
+    }
 
     public Task ToggleAsync(CancellationToken token)
     {
@@ -85,7 +97,12 @@ internal sealed class QualityOverlayOpenCoordinator(
                 CloseNoLock();
                 return Task.CompletedTask;
             }
-            return _openTask ??= OpenAsync(++_version, token);
+            if (_openTask is null)
+            {
+                _opening = true;
+                _openTask = OpenAsync(++_version, token);
+            }
+            return _openTask;
         }
     }
 
@@ -100,6 +117,7 @@ internal sealed class QualityOverlayOpenCoordinator(
     private void CloseNoLock()
     {
         _version++;
+        _opening = false;
         _visible = false;
         setVisible(false);
     }
@@ -108,11 +126,14 @@ internal sealed class QualityOverlayOpenCoordinator(
     {
         try
         {
+            await Task.Yield();
+            await releaseInput(token);
             await releaseInput(token);
             lock (_sync)
             {
                 if (version == _version)
                 {
+                    _opening = false;
                     _visible = true;
                     setVisible(true);
                 }
@@ -122,6 +143,10 @@ internal sealed class QualityOverlayOpenCoordinator(
         {
             lock (_sync)
             {
+                if (version == _version)
+                {
+                    _opening = false;
+                }
                 _openTask = null;
             }
         }

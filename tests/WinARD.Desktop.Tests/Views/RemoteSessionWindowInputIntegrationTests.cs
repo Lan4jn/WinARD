@@ -607,6 +607,8 @@ public sealed class RemoteSessionWindowInputIntegrationTests
 
         Assert.Contains("token => ReleaseInputAsync(token, releasePointer: true)", source, StringComparison.Ordinal);
         Assert.Contains("await _qualityOverlayOpenCoordinator.ToggleAsync", source, StringComparison.Ordinal);
+        Assert.Contains("_qualityOverlayOpenCoordinator.ConsumesRemoteInput", source, StringComparison.Ordinal);
+        Assert.Contains("ConsumeLocalQualityPointerInput", source, StringComparison.Ordinal);
         Assert.Contains("private void OnKeyUp", source, StringComparison.Ordinal);
         Assert.Contains("if (ConsumeLocalQualityKeyboardInput())", source, StringComparison.Ordinal);
     }
@@ -741,11 +743,8 @@ public sealed class RemoteSessionWindowInputIntegrationTests
                 "src", "WinARD.Desktop", "ViewModels", "RemoteSessionViewModel.cs"))
             .ReplaceLineEndings("\n");
 
-        Assert.Contains(
-            "private void OnPointerMoved(object sender, PointerRoutedEventArgs args) =>\n" +
-            "        QueuePointerMove(args);",
-            windowSource,
-            StringComparison.Ordinal);
+        Assert.Contains("private void OnPointerMoved(object sender, PointerRoutedEventArgs args)", windowSource, StringComparison.Ordinal);
+        Assert.Contains("if (!ConsumeLocalQualityPointerInput(args)) QueuePointerMove(args);", windowSource, StringComparison.Ordinal);
         var localMoveUpdate = windowSource.IndexOf(
             "UpdateLocalPointerState(point, pointerMask);",
             StringComparison.Ordinal);
