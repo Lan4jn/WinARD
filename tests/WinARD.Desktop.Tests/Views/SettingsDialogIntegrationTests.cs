@@ -17,6 +17,8 @@ public sealed class SettingsDialogIntegrationTests
         Assert.Contains("ApplicationSettingsButton", main, StringComparison.Ordinal);
         Assert.Contains("CredentialBackendMigrationService", main, StringComparison.Ordinal);
         Assert.Contains("ConfirmSourceCleanupAsync", main, StringComparison.Ordinal);
+        Assert.Contains("if (!requiresVault || _vaultSession.IsUnlocked)", main, StringComparison.Ordinal);
+        Assert.Contains("_vaultSession.UnlockAsync(master, cancellationToken)", main, StringComparison.Ordinal);
         Assert.Contains("ApplyApplicationDefaults", main, StringComparison.Ordinal);
         Assert.Contains("LockVaultNowButton", dialog, StringComparison.Ordinal);
         Assert.Contains("DiagnosticLevelBox", dialog, StringComparison.Ordinal);

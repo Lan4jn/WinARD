@@ -37,12 +37,12 @@ public sealed class CredentialBackendMigrationService
 {
     private readonly WinArdDatabase _database;
     private readonly ICredentialStore _store;
-    private readonly Func<CredentialBackend, CancellationToken, ValueTask> _validateTarget;
+    private readonly Func<CredentialBackend, bool, CancellationToken, ValueTask> _validateTarget;
 
     public CredentialBackendMigrationService(
         WinArdDatabase database,
         ICredentialStore store,
-        Func<CredentialBackend, CancellationToken, ValueTask> validateTarget)
+        Func<CredentialBackend, bool, CancellationToken, ValueTask> validateTarget)
     {
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _store = store ?? throw new ArgumentNullException(nameof(store));
@@ -68,11 +68,35 @@ public sealed class CredentialBackendMigrationService
             throw new ArgumentOutOfRangeException(nameof(targetBackend));
         }
 
+        IReadOnlyList<CredentialReference> managed;
         try
         {
-            await _validateTarget(targetBackend, cancellationToken).ConfigureAwait(false);
+            managed = await ReadManagedReferencesAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
+        {
+            return Empty(CredentialBackendMigrationCode.Cancelled);
+        }
+        catch
+        {
+            return Empty(CredentialBackendMigrationCode.DatabaseCommitFailed);
+        }
+        var targetStore = StoreName(targetBackend);
+        var sources = managed
+            .Where(reference => !string.Equals(
+                reference.Store, targetStore, StringComparison.OrdinalIgnoreCase))
+            .Distinct()
+            .ToArray();
+        var requiresVault = string.Equals(
+                targetStore, "vault", StringComparison.OrdinalIgnoreCase) ||
+            managed.Any(static reference =>
+                string.Equals(reference.Store, "vault", StringComparison.OrdinalIgnoreCase));
+        try
+        {
+            await _validateTarget(targetBackend, requiresVault, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
         {
             return Empty(CredentialBackendMigrationCode.Cancelled);
         }
@@ -80,15 +104,19 @@ public sealed class CredentialBackendMigrationService
         {
             return Empty(CredentialBackendMigrationCode.TargetValidationFailed);
         }
-
-        var managed = await ReadManagedReferencesAsync(cancellationToken).ConfigureAwait(false);
-        var targetStore = StoreName(targetBackend);
-        var sources = managed
-            .Where(reference => !string.Equals(
-                reference.Store, targetStore, StringComparison.OrdinalIgnoreCase))
-            .Distinct()
-            .ToArray();
-        var settingsState = await ReadSettingsStateAsync(cancellationToken).ConfigureAwait(false);
+        SettingsState settingsState;
+        try
+        {
+            settingsState = await ReadSettingsStateAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return Empty(CredentialBackendMigrationCode.Cancelled);
+        }
+        catch
+        {
+            return Empty(CredentialBackendMigrationCode.DatabaseCommitFailed);
+        }
         if (targetBackend == CredentialBackend.AskEveryTime)
         {
             var cleanupVersions = new List<SourceCleanup>(sources.Length);
@@ -118,6 +146,13 @@ public sealed class CredentialBackendMigrationService
             }
             var rewrites = sources.Select(source => new ReferenceRewrite(
                 source, TargetReference(targetBackend))).ToArray();
+            var revalidation = await RevalidateSourcesAsync(
+                cleanupVersions, cancellationToken).ConfigureAwait(false);
+            if (revalidation != CredentialBackendMigrationCode.Succeeded)
+            {
+                DisposeCleanupVersions(cleanupVersions);
+                return new(revalidation, managed.Count, 0, 0, 0);
+            }
             var commit = await TryCommitAsync(
                 managed, rewrites, settingsState, targetBackend, cancellationToken)
                 .ConfigureAwait(false);
@@ -236,6 +271,18 @@ public sealed class CredentialBackendMigrationService
                 0,
                 compensationFailures + uncertainTargetWriteCount,
                 0);
+        }
+
+        var validationSources = copies.Select(static copy =>
+            new SourceCleanup(copy.Source, copy.SourceVersion.Clone())).ToArray();
+        var sourceRevalidation = await RevalidateSourcesAsync(
+            validationSources, cancellationToken).ConfigureAwait(false);
+        DisposeCleanupVersions(validationSources);
+        if (sourceRevalidation != CredentialBackendMigrationCode.Succeeded)
+        {
+            var compensationFailures = await CompensateAsync(copies).ConfigureAwait(false);
+            DisposeCopies(copies);
+            return new(sourceRevalidation, managed.Count, 0, compensationFailures, 0);
         }
 
         var commitCode = await TryCommitAsync(
@@ -513,12 +560,7 @@ public sealed class CredentialBackendMigrationService
         {
             try
             {
-                using var result = await _store.CompareExchangeWithVersionAsync(
-                    source.Reference,
-                    source.Version,
-                    replacement: null,
-                    CancellationToken.None).ConfigureAwait(false);
-                if (result.Result != CredentialStoreCompareExchangeResult.Succeeded)
+                if (!await TryCleanupSourceAsync(source).ConfigureAwait(false))
                 {
                     failures++;
                 }
@@ -533,6 +575,101 @@ public sealed class CredentialBackendMigrationService
             }
         }
         return failures;
+    }
+
+    private async Task<bool> TryCleanupSourceAsync(SourceCleanup source)
+    {
+        await using var connection = _database.CreateConnection();
+        await connection.OpenAsync(CancellationToken.None).ConfigureAwait(false);
+        await WinArdDatabase.ConfigureConnectionAsync(connection, CancellationToken.None)
+            .ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(
+            IsolationLevel.Serializable, deferred: false);
+        try
+        {
+            if (await CountReferencesAsync(
+                    connection, transaction, source.Reference, CancellationToken.None)
+                    .ConfigureAwait(false) != 0)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return false;
+            }
+
+            using var result = await _store.CompareExchangeWithVersionAsync(
+                source.Reference,
+                source.Version,
+                replacement: null,
+                CancellationToken.None).ConfigureAwait(false);
+            if (result.Result != CredentialStoreCompareExchangeResult.Succeeded)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return false;
+            }
+            await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
+            return true;
+        }
+        catch
+        {
+            try
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+            return false;
+        }
+    }
+
+    private static async Task<long> CountReferencesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CredentialReference reference,
+        CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT
+                (SELECT COUNT(*) FROM devices
+                 WHERE credential_store = $store AND credential_key = $key) +
+                (SELECT COUNT(*) FROM ssh_profiles
+                 WHERE password_credential_store = $store AND password_credential_key = $key) +
+                (SELECT COUNT(*) FROM ssh_profiles
+                 WHERE passphrase_credential_store = $store AND passphrase_credential_key = $key);
+            """;
+        command.Parameters.AddWithValue("$store", reference.Store);
+        command.Parameters.AddWithValue("$key", reference.Key);
+        return Convert.ToInt64(
+            await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
+            System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private async Task<CredentialBackendMigrationCode> RevalidateSourcesAsync(
+        IReadOnlyCollection<SourceCleanup> sources,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            foreach (var source in sources)
+            {
+                using var current = await _store.ReadSnapshotAsync(
+                    source.Reference, cancellationToken).ConfigureAwait(false);
+                if (current is null || !source.Version.FixedTimeEquals(current.Version))
+                {
+                    return CredentialBackendMigrationCode.ConcurrentReferenceChanged;
+                }
+            }
+            return CredentialBackendMigrationCode.Succeeded;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return CredentialBackendMigrationCode.Cancelled;
+        }
+        catch
+        {
+            return CredentialBackendMigrationCode.SourceReadFailed;
+        }
     }
 
     private static void DisposeCleanupVersions(IEnumerable<SourceCleanup> sources)

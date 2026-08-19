@@ -467,9 +467,10 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async ValueTask ValidateCredentialTargetAsync(
         CredentialBackend backend,
+        bool requiresVault,
         CancellationToken cancellationToken)
     {
-        if (backend != CredentialBackend.EncryptedVault || _vaultSession.IsUnlocked)
+        if (!requiresVault || _vaultSession.IsUnlocked)
         {
             return;
         }
