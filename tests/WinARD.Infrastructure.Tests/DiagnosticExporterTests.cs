@@ -24,6 +24,42 @@ public sealed class DiagnosticExporterTests : IDisposable
     }
 
     [Fact]
+    public void ExportLimitsRejectUnboundedNumericConfiguration()
+    {
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new DiagnosticExporter(
+            sink, redactor, new DiagnosticExportLimits(MaxEvents: int.MaxValue)));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new DiagnosticExporter(
+            sink, redactor, new DiagnosticExportLimits(MaxArchiveBytes: long.MaxValue)));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new DiagnosticExporter(
+            sink, redactor, new DiagnosticExportLimits(MaxEntryUncompressedBytes: long.MaxValue)));
+    }
+
+    [Fact]
+    public async Task EventTtlAllowsSmallClockSkewButRejectsClearlyFutureEvents()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var nearFuture = new SafeDiagnosticEvent(
+            now + TimeSpan.FromMinutes(4), "NEAR_FUTURE", Guid.NewGuid().ToString("N"),
+            "ignored", [], null);
+        var farFuture = nearFuture with
+        {
+            Timestamp = now + TimeSpan.FromMinutes(6),
+            Code = "FAR_FUTURE",
+        };
+
+        using var document = await ExportSingleEventAsync(
+            new StaticSnapshotSink([nearFuture, farFuture]),
+            "future-events.zip");
+
+        var events = document.RootElement.GetProperty("events").EnumerateArray().ToArray();
+        var exported = Assert.Single(events);
+        Assert.Equal("NEAR_FUTURE", exported.GetProperty("code").GetString());
+    }
+
+    [Fact]
     public async Task ExportContainsOnlyWhitelistedRedactedJsonAndManifest()
     {
         Directory.CreateDirectory(_directory);
@@ -212,6 +248,77 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.DoesNotContain("private-host.internal", root.GetRawText(), StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(-1, false)]
+    [InlineData(0, false)]
+    [InlineData(1, true)]
+    [InlineData(65535, true)]
+    [InlineData(65536, false)]
+    [InlineData(int.MaxValue, false)]
+    public async Task ProfilePortUsesTheProtocolRange(int port, bool retained)
+    {
+        var context = DiagnosticExportContext.Empty with
+        {
+            Profiles = [new("Remote session", "private-host", port, "private-user", "RFB 3.x", "ARD-30")],
+        };
+
+        using var document = await ExportContextAsync(context, $"port-{port}.zip");
+
+        var value = document.RootElement.GetProperty("profiles")[0].GetProperty("Port");
+        Assert.Equal(retained ? JsonValueKind.Number : JsonValueKind.Null, value.ValueKind);
+    }
+
+    [Fact]
+    public async Task PerformanceAndEncodingStatisticsRejectValuesOutsideTheirCategoryBounds()
+    {
+        const long maximumRate = 10L * 1024 * 1024 * 1024;
+        const long maximumCount = 1_000_000_000_000;
+        const long maximumDurationMilliseconds = 3_600_000;
+        var context = new DiagnosticExportContext(
+            DiagnosticExportContext.Empty.Application,
+            [
+                new DiagnosticProfileSummary(
+                    "Remote session", "private-host", 5900, "private-user", "RFB 3.x", "ARD-30",
+                    new Dictionary<string, long>
+                    {
+                        ["Raw"] = -1,
+                        ["CopyRect"] = maximumCount,
+                        ["Zlib"] = maximumCount + 1,
+                        ["ZRLE"] = long.MaxValue,
+                    }),
+            ],
+            new Dictionary<string, long>
+            {
+                ["Session.RefreshMode"] = -1,
+                ["Session.TargetFps"] = 120,
+                ["Session.ActualFps"] = 1_001,
+                ["Session.ReceiveBytesPerSecond"] = maximumRate,
+                ["Session.ResponseMilliseconds"] = maximumDurationMilliseconds + 1,
+                ["Session.PresentationMilliseconds"] = maximumDurationMilliseconds,
+                ["Session.InputQueueDepth"] = long.MaxValue,
+                ["Session.ReceiveRateInsideSshTunnel"] = 2,
+            },
+            IncludeHosts: false);
+
+        using var document = await ExportContextAsync(context, "bounded-statistics.zip");
+
+        var performance = document.RootElement.GetProperty("performanceCounters");
+        Assert.False(performance.TryGetProperty("Session.RefreshMode", out _));
+        Assert.Equal(120, performance.GetProperty("Session.TargetFps").GetInt64());
+        Assert.False(performance.TryGetProperty("Session.ActualFps", out _));
+        Assert.Equal(maximumRate, performance.GetProperty("Session.ReceiveBytesPerSecond").GetInt64());
+        Assert.False(performance.TryGetProperty("Session.ResponseMilliseconds", out _));
+        Assert.Equal(maximumDurationMilliseconds,
+            performance.GetProperty("Session.PresentationMilliseconds").GetInt64());
+        Assert.False(performance.TryGetProperty("Session.InputQueueDepth", out _));
+        Assert.False(performance.TryGetProperty("Session.ReceiveRateInsideSshTunnel", out _));
+        var encodings = document.RootElement.GetProperty("profiles")[0].GetProperty("encodingStatistics");
+        Assert.False(encodings.TryGetProperty("Raw", out _));
+        Assert.Equal(maximumCount, encodings.GetProperty("CopyRect").GetInt64());
+        Assert.False(encodings.TryGetProperty("Zlib", out _));
+        Assert.False(encodings.TryGetProperty("ZRLE", out _));
+    }
+
     [Fact]
     public async Task AdaptiveQualityUsesOnlyTheFixedAllowlistedSchema()
     {
@@ -269,6 +376,53 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.DoesNotContain(
             exported.EnumerateObject().Select(property => property.Name),
             name => forbiddenNameTokens.Any(token => name.Contains(token, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [Fact]
+    public async Task AdaptiveQualityRejectsEveryNumericValueAboveItsProductBound()
+    {
+        var quality = new DiagnosticQualitySummary(
+            "Automatic", 1024L * 1024 * 1024 * 1024 + 1, "Q3", "Motion", "Color16", 50,
+            "Zlib", 121, 1_001, 10L * 1024 * 1024 * 1024 + 1,
+            10L * 1024 * 1024 * 1024 + 1, 3_600_001,
+            "Observed", "Observed", "Observed", "Unknown", "Unsupported",
+            true, false, "SevereOverTarget", false);
+
+        using var document = await ExportContextAsync(
+            DiagnosticExportContext.Empty with { Quality = quality },
+            "invalid-quality-numbers.zip");
+
+        var exported = document.RootElement.GetProperty("quality");
+        foreach (var propertyName in new[]
+        {
+            "targetBps", "targetFps", "actualFps", "averageBps", "peakBps", "responseMs",
+        })
+        {
+            Assert.Equal(JsonValueKind.Null, exported.GetProperty(propertyName).ValueKind);
+        }
+    }
+
+    [Fact]
+    public async Task AdaptiveQualityRetainsNumericProductBoundaries()
+    {
+        const long maximumRate = 10L * 1024 * 1024 * 1024;
+        var quality = new DiagnosticQualitySummary(
+            "Automatic", 1024L * 1024 * 1024 * 1024, "Q3", "Motion", "Color16", 50, "Zlib",
+            120, 1_000, 0, maximumRate, 3_600_000,
+            "Observed", "Observed", "Observed", "Unknown", "Unsupported",
+            true, false, "SevereOverTarget", false);
+
+        using var document = await ExportContextAsync(
+            DiagnosticExportContext.Empty with { Quality = quality },
+            "valid-quality-number-bounds.zip");
+
+        var exported = document.RootElement.GetProperty("quality");
+        Assert.Equal(1024L * 1024 * 1024 * 1024, exported.GetProperty("targetBps").GetInt64());
+        Assert.Equal(120, exported.GetProperty("targetFps").GetInt32());
+        Assert.Equal(1_000, exported.GetProperty("actualFps").GetInt32());
+        Assert.Equal(0, exported.GetProperty("averageBps").GetInt64());
+        Assert.Equal(maximumRate, exported.GetProperty("peakBps").GetInt64());
+        Assert.Equal(3_600_000, exported.GetProperty("responseMs").GetInt32());
     }
 
     [Fact]
@@ -557,6 +711,43 @@ public sealed class DiagnosticExporterTests : IDisposable
         {
             Assert.Equal(JsonValueKind.Null, property.Value.ValueKind);
         }
+    }
+
+    [Fact]
+    public async Task TransferEfficiencyRejectsValuesAboveItsAggregateBounds()
+    {
+        var transfer = new DiagnosticTransferSummary(
+            "Bgra32", "Bgra32", "Preferred", null, "ZlibFirst",
+            4_096_001, 1_000_000_000_000_001, 1024L * 1024 * 1024 * 1024 + 1,
+            268_435_456_001, 500, "Full32", "Full32",
+            new Dictionary<string, long>
+            {
+                ["Raw"] = -1,
+                ["CopyRect"] = 1024L * 1024 * 1024 * 1024,
+                ["Zlib"] = 1024L * 1024 * 1024 * 1024 + 1,
+                ["ZRLE"] = long.MaxValue,
+            })
+        {
+            FirstFrameWidth = ushort.MaxValue,
+            FirstFrameHeight = ushort.MaxValue + 1,
+        };
+
+        using var document = await ExportContextAsync(
+            DiagnosticExportContext.Empty with { Transfer = transfer },
+            "invalid-transfer-numbers.zip");
+
+        var exported = document.RootElement.GetProperty("transfer");
+        foreach (var propertyName in new[]
+        {
+            "RectangleCount", "PixelArea", "WirePayloadBytes", "BytesPerPixelMilli",
+            "EncodingRawWireBytes", "EncodingZlibWireBytes", "EncodingZrleWireBytes", "FirstFrameHeight",
+        })
+        {
+            Assert.Equal(JsonValueKind.Null, exported.GetProperty(propertyName).ValueKind);
+        }
+        Assert.Equal(1024L * 1024 * 1024 * 1024,
+            exported.GetProperty("EncodingCopyRectWireBytes").GetInt64());
+        Assert.Equal(ushort.MaxValue, exported.GetProperty("FirstFrameWidth").GetInt32());
     }
 
     [Fact]
@@ -977,6 +1168,53 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.Equal("UnsupportedEncoding", exported.GetProperty("PreferredFailureReason").GetString());
     }
 
+    [Theory]
+    [InlineData("Count", "1000000000000", true)]
+    [InlineData("Count", "1000000000001", false)]
+    [InlineData("Count", "9223372036854775807", false)]
+    [InlineData("ExpectedByteCount", "268435456", true)]
+    [InlineData("ExpectedByteCount", "268435457", false)]
+    [InlineData("ActualByteCount", "-1", false)]
+    [InlineData("RectangleIndex", "4095", true)]
+    [InlineData("RectangleIndex", "4096", false)]
+    [InlineData("ArdCiphertextLength", "1", true)]
+    [InlineData("ArdCiphertextLength", "65535", true)]
+    [InlineData("ArdCiphertextLength", "0", false)]
+    [InlineData("ArdCiphertextLength", "65536", false)]
+    [InlineData("ArdCiphertextLength", "2147483647", false)]
+    public async Task NumericEventFieldsUseTheirProtocolOrProductBounds(
+        string name,
+        string value,
+        bool retained)
+    {
+        var diagnosticEvent = new SafeDiagnosticEvent(
+            DateTimeOffset.UtcNow, "BOUNDED_NUMBER", Guid.NewGuid().ToString("N"), "ignored",
+            [new SafeDiagnosticField(name, value, DiagnosticFieldCategory.Public)], null);
+
+        using var document = await ExportSingleEventAsync(
+            diagnosticEvent, false, $"bounded-{name}-{value}.zip");
+
+        var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
+        var exportedName = name == "ArdCiphertextLength" ? "ArdEncryptedPacketLength" : name;
+        Assert.Equal(retained, fields.TryGetProperty(exportedName, out _));
+    }
+
+    [Theory]
+    [InlineData("0x00000000")]
+    [InlineData("0x80004005")]
+    [InlineData("0xFFFFFFFF")]
+    public async Task HResultRetainsEveryStableInt32BitPattern(string hResult)
+    {
+        var diagnosticEvent = new SafeDiagnosticEvent(
+            DateTimeOffset.UtcNow, "HRESULT", Guid.NewGuid().ToString("N"), "ignored", [],
+            new SafeDiagnosticFailureMetadata("IOException", hResult));
+
+        using var document = await ExportSingleEventAsync(diagnosticEvent, false, $"hresult-{hResult[2..]}.zip");
+
+        Assert.Equal(hResult, document.RootElement.GetProperty("events")[0]
+            .GetProperty("exception").GetProperty("hResult").GetString());
+    }
+
     [Fact]
     public async Task BootstrapFieldsExportOnlyClosedValuesAndDropRawMarkers()
     {
@@ -1394,6 +1632,32 @@ public sealed class DiagnosticExporterTests : IDisposable
         using var redactor = new SecretRedactor();
         using var exporter = new DiagnosticExporter(new StaticSnapshotSink([diagnosticEvent]), redactor, limits);
         var context = DiagnosticExportContext.Empty with { IncludeHosts = includeHosts };
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+        using var archive = ZipFile.OpenRead(destination);
+        return JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+    }
+
+    private async Task<JsonDocument> ExportSingleEventAsync(
+        ISafeDiagnosticSink sink,
+        string archiveName)
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, archiveName);
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(sink, redactor);
+        await exporter.ExportAsync(destination, DiagnosticExportContext.Empty, CancellationToken.None);
+        using var archive = ZipFile.OpenRead(destination);
+        return JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+    }
+
+    private async Task<JsonDocument> ExportContextAsync(
+        DiagnosticExportContext context,
+        string archiveName)
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, archiveName);
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
         await exporter.ExportAsync(destination, context, CancellationToken.None);
         using var archive = ZipFile.OpenRead(destination);
         return JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));

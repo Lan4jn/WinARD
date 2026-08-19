@@ -109,6 +109,30 @@ public sealed record DiagnosticExportLimits(
 
 public sealed class DiagnosticExporter : IDisposable
 {
+    private const int MaximumPort = ushort.MaxValue;
+    private const int MaximumFramebufferDimension = ushort.MaxValue;
+    private const int MaximumRectanglesPerUpdate = 4_096;
+    private const long MaximumRectanglesPerDiagnosticWindow = 4_096_000;
+    private const long MaximumCumulativeCount = 1_000_000_000_000;
+    private const long MaximumPixelAreaPerDiagnosticWindow = 1_000_000_000_000_000;
+    private const long MaximumByteTotal = 1024L * 1024 * 1024 * 1024;
+    private const long MaximumBytesPerSecond = 10L * 1024 * 1024 * 1024;
+    private const long MaximumBytesPerPixelMilli = 268_435_456_000;
+    private const int MaximumDurationMilliseconds = 3_600_000;
+    private const int MaximumTargetFramesPerSecond = 120;
+    private const int MaximumActualFramesPerSecond = 1_000;
+    private const int MaximumQueueDepth = 1_000_000;
+    private const int MaximumProtocolByteCount = 256 * 1024 * 1024;
+    private const int MaximumExportEvents = 10_000;
+    private const int MaximumExportProfiles = 10_000;
+    private const int MaximumExportDictionaryEntries = 10_000;
+    private const int MaximumExportFieldsPerEvent = 1_000;
+    private const int MaximumExportStringCharacters = 1_000_000;
+    private const int MaximumExportStringUtf8Bytes = 1024 * 1024;
+    private const long MaximumArchiveBytes = 1024L * 1024 * 1024;
+    private const long MaximumUncompressedBytes = 4L * 1024 * 1024 * 1024;
+    private const long MaximumEntryUncompressedBytes = 1024L * 1024 * 1024;
+    private static readonly TimeSpan FutureEventTolerance = TimeSpan.FromMinutes(5);
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly string[] ForbiddenFieldNameTokens =
     [
@@ -301,6 +325,20 @@ public sealed class DiagnosticExporter : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxStringUtf8Bytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxUncompressedBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxEntryUncompressedBytes);
+        if (_limits.MaxEvents > MaximumExportEvents ||
+            _limits.MaxFieldLength > MaximumExportStringCharacters ||
+            _limits.MaxArchiveBytes > MaximumArchiveBytes ||
+            _limits.MaxProfiles > MaximumExportProfiles ||
+            _limits.MaxEncodingStatisticsPerProfile > MaximumExportDictionaryEntries ||
+            _limits.MaxPerformanceCounters > MaximumExportDictionaryEntries ||
+            _limits.MaxFieldsPerEvent > MaximumExportFieldsPerEvent ||
+            _limits.MaxStringUtf8Bytes > MaximumExportStringUtf8Bytes ||
+            _limits.MaxUncompressedBytes > MaximumUncompressedBytes ||
+            _limits.MaxEntryUncompressedBytes > MaximumEntryUncompressedBytes ||
+            _limits.MaxEntryUncompressedBytes > _limits.MaxUncompressedBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(limits));
+        }
         var eventAge = _limits.MaxEventAge.Value;
         if (eventAge <= TimeSpan.Zero || eventAge > TimeSpan.FromDays(30))
         {
@@ -384,9 +422,11 @@ public sealed class DiagnosticExporter : IDisposable
         CancellationToken cancellationToken)
     {
         var privacy = new ExportPrivacyCounters();
-        var eventCutoff = DateTimeOffset.UtcNow - _limits.MaxEventAge!.Value;
+        var now = DateTimeOffset.UtcNow;
+        var eventCutoff = now - _limits.MaxEventAge!.Value;
+        var eventFutureCutoff = now + FutureEventTolerance;
         var events = _sink.Snapshot()
-            .Where(item => item.Timestamp >= eventCutoff)
+            .Where(item => item.Timestamp >= eventCutoff && item.Timestamp <= eventFutureCutoff)
             .TakeLast(_limits.MaxEvents)
             .Select(item => SafeEvent(item, privacy))
             .ToArray();
@@ -394,7 +434,7 @@ public sealed class DiagnosticExporter : IDisposable
         {
             displayName = "Remote session",
             host = OmitProfileHost(privacy),
-            profile.Port,
+            Port = profile.Port is >= 1 and <= MaximumPort ? profile.Port : (int?)null,
             username = (string?)null,
             protocolVersion = ExportProfileProtocolVersion(profile.ProtocolVersion),
             securityType = ExportProfileSecurityType(profile.SecurityType),
@@ -547,7 +587,10 @@ public sealed class DiagnosticExporter : IDisposable
                      .Where(pair => AllowedPerformanceCounterKeys.Contains(pair.Key))
                      .Take(maxCount))
         {
-            safe[pair.Key] = pair.Value;
+            if (ExportPerformanceCounter(pair.Key, pair.Value) is { } value)
+            {
+                safe[pair.Key] = value;
+            }
         }
 
         return safe;
@@ -577,26 +620,44 @@ public sealed class DiagnosticExporter : IDisposable
         var safe = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (var pair in values.Where(pair => IsAllowedEncodingStatisticKey(pair.Key)).Take(maxCount))
         {
-            safe[pair.Key] = pair.Value;
+            if (BoundedOrNull(pair.Value, 0, MaximumCumulativeCount) is { } value)
+            {
+                safe[pair.Key] = value;
+            }
         }
 
         return safe;
     }
 
+    private static long? ExportPerformanceCounter(string key, long value) => key switch
+    {
+        "Session.RefreshMode" => BoundedOrNull(value, 0, 2),
+        "Session.TargetFps" => BoundedOrNull(value, 1, MaximumTargetFramesPerSecond),
+        "Session.ActualFps" => BoundedOrNull(value, 0, MaximumActualFramesPerSecond),
+        "Session.ReceiveBytesPerSecond" => BoundedOrNull(value, 0, MaximumBytesPerSecond),
+        "Session.ResponseMilliseconds" or "Session.PresentationMilliseconds" or
+        "Session.InputWriteMilliseconds" => BoundedOrNull(value, 0, MaximumDurationMilliseconds),
+        "Session.InputQueueDepth" => BoundedOrNull(value, 0, MaximumQueueDepth),
+        "Session.PointerMovesCoalesced" or "Session.AutomaticTargetChanges" =>
+            BoundedOrNull(value, 0, MaximumCumulativeCount),
+        "Session.ReceiveRateInsideSshTunnel" => BoundedOrNull(value, 0, 1),
+        _ => null,
+    };
+
     private static object ExportQuality(DiagnosticQualitySummary quality) => new
     {
         preset = ExportAllowedValue(quality.Preset, AllowedQualityPresets),
-        targetBps = NonNegativeOrNull(quality.TargetBytesPerSecond),
+        targetBps = BoundedOrNull(quality.TargetBytesPerSecond, 1, MaximumByteTotal),
         qualityLevel = ExportAllowedValue(quality.QualityLevel, AllowedQualityLevels),
         contentState = ExportAllowedValue(quality.ContentState, AllowedQualityContentStates),
         color = ExportAllowedValue(quality.Color, AllowedQualityColors),
         scalePercent = quality.ScalePercent is 25 or 50 or 75 or 100 ? quality.ScalePercent : (int?)null,
         encodingName = ExportAllowedValue(quality.EncodingName, AllowedEncodingNames) ?? "Other",
-        targetFps = PositiveOrNull(quality.TargetFramesPerSecond),
-        actualFps = NonNegativeOrNull(quality.ActualFramesPerSecond),
-        averageBps = NonNegativeOrNull(quality.AverageBytesPerSecond),
-        peakBps = NonNegativeOrNull(quality.PeakBytesPerSecond),
-        responseMs = NonNegativeOrNull(quality.ResponseMilliseconds),
+        targetFps = BoundedOrNull(quality.TargetFramesPerSecond, 1, MaximumTargetFramesPerSecond),
+        actualFps = BoundedOrNull(quality.ActualFramesPerSecond, 0, MaximumActualFramesPerSecond),
+        averageBps = BoundedOrNull(quality.AverageBytesPerSecond, 0, MaximumBytesPerSecond),
+        peakBps = BoundedOrNull(quality.PeakBytesPerSecond, 0, MaximumBytesPerSecond),
+        responseMs = BoundedOrNull(quality.ResponseMilliseconds, 0, MaximumDurationMilliseconds),
         zlibCapability = ExportAllowedValue(quality.ZlibCapability, AllowedCapabilitySupportValues),
         rgb565Capability = ExportAllowedValue(quality.Rgb565Capability, AllowedCapabilitySupportValues),
         serverScalingCapability = ExportAllowedValue(
@@ -634,10 +695,10 @@ public sealed class DiagnosticExporter : IDisposable
         PreferredEncodingOrder = ExportNullableAllowedValue(
             transfer.PreferredEncodingOrder,
             AllowedEncodingOrders),
-        RectangleCount = NonNegativeOrNull(transfer.RectangleCount),
-        PixelArea = NonNegativeOrNull(transfer.PixelArea),
-        WirePayloadBytes = NonNegativeOrNull(transfer.WirePayloadBytes),
-        BytesPerPixelMilli = NonNegativeOrNull(transfer.BytesPerPixelMilli),
+        RectangleCount = BoundedOrNull(transfer.RectangleCount, 0, MaximumRectanglesPerDiagnosticWindow),
+        PixelArea = BoundedOrNull(transfer.PixelArea, 0, MaximumPixelAreaPerDiagnosticWindow),
+        WirePayloadBytes = BoundedOrNull(transfer.WirePayloadBytes, 0, MaximumByteTotal),
+        BytesPerPixelMilli = BoundedOrNull(transfer.BytesPerPixelMilli, 0, MaximumBytesPerPixelMilli),
         DirtyCoveragePermille = transfer.DirtyCoveragePermille is >= 0 and <= 1000
             ? transfer.DirtyCoveragePermille
             : (int?)null,
@@ -646,27 +707,34 @@ public sealed class DiagnosticExporter : IDisposable
         DesiredScalePercent = ExportScalePercent(transfer.DesiredScalePercent),
         ResolvedScalePercent = ExportScalePercent(transfer.ResolvedScalePercent),
         AppliedScalePercent = ExportScalePercent(transfer.AppliedScalePercent),
-        FirstFrameWidth = ExportPositiveUInt16(transfer.FirstFrameWidth),
-        FirstFrameHeight = ExportPositiveUInt16(transfer.FirstFrameHeight),
-        FirstFrameRectangleCount = transfer.FirstFrameRectangleCount is >= 0 and <= 4096
+        FirstFrameWidth = BoundedOrNull(transfer.FirstFrameWidth, 1, MaximumFramebufferDimension),
+        FirstFrameHeight = BoundedOrNull(transfer.FirstFrameHeight, 1, MaximumFramebufferDimension),
+        FirstFrameRectangleCount = transfer.FirstFrameRectangleCount is >= 0 and <= MaximumRectanglesPerUpdate
             ? transfer.FirstFrameRectangleCount
             : null,
-        EncodingRawWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Raw"),
-        EncodingCopyRectWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "CopyRect"),
-        EncodingZlibWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Zlib"),
-        EncodingZrleWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "ZRLE"),
-        EncodingDesktopSizeWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "DesktopSize"),
-        EncodingCursorWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Cursor"),
+        EncodingRawWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Raw", MaximumByteTotal),
+        EncodingCopyRectWireBytes = ExportEncodingWireBytes(
+            transfer.EncodingWireBytes, "CopyRect", MaximumByteTotal),
+        EncodingZlibWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Zlib", MaximumByteTotal),
+        EncodingZrleWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "ZRLE", MaximumByteTotal),
+        EncodingDesktopSizeWireBytes = ExportEncodingWireBytes(
+            transfer.EncodingWireBytes, "DesktopSize", MaximumByteTotal),
+        EncodingCursorWireBytes = ExportEncodingWireBytes(
+            transfer.EncodingWireBytes, "Cursor", MaximumByteTotal),
         EncodingArdDisplayInfoWireBytes = ExportEncodingWireBytes(
             transfer.EncodingWireBytes,
-            "ARD.DisplayInfo"),
+            "ARD.DisplayInfo",
+            MaximumByteTotal),
         EncodingArdSessionEncryptionWireBytes = ExportEncodingWireBytes(
             transfer.EncodingWireBytes,
-            "ARD.SessionEncryption"),
+            "ARD.SessionEncryption",
+            MaximumByteTotal),
         EncodingArdDisplayInfo2WireBytes = ExportEncodingWireBytes(
             transfer.EncodingWireBytes,
-            "ARD.DisplayInfo2"),
-        EncodingOtherWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Other"),
+            "ARD.DisplayInfo2",
+            MaximumByteTotal),
+        EncodingOtherWireBytes = ExportEncodingWireBytes(
+            transfer.EncodingWireBytes, "Other", MaximumByteTotal),
     };
 
     private static object ExportReconnect(DiagnosticReconnectSummary reconnect) => new
@@ -680,21 +748,26 @@ public sealed class DiagnosticExporter : IDisposable
 
     private static int? ExportScalePercent(int? value) => value is 25 or 50 or 75 or 100 ? value : null;
 
-    private static int? ExportPositiveUInt16(int? value) => value is >= 1 and <= ushort.MaxValue ? value : null;
+    private static long? BoundedOrNull(long value, long minimum, long maximum) =>
+        value >= minimum && value <= maximum ? value : null;
+
+    private static long? BoundedOrNull(long? value, long minimum, long maximum) =>
+        value is { } actual ? BoundedOrNull(actual, minimum, maximum) : null;
+
+    private static int? BoundedOrNull(int value, int minimum, int maximum) =>
+        value >= minimum && value <= maximum ? value : null;
+
+    private static int? BoundedOrNull(int? value, int minimum, int maximum) =>
+        value is { } actual ? BoundedOrNull(actual, minimum, maximum) : null;
 
     private static string? ExportNullableAllowedValue(string? value, HashSet<string> allowed) =>
         value is not null && allowed.Contains(value) ? value : null;
 
     private static long? ExportEncodingWireBytes(
         IReadOnlyDictionary<string, long> values,
-        string key) =>
-        values.TryGetValue(key, out var value) && value >= 0 ? value : null;
-
-    private static long? NonNegativeOrNull(long? value) => value >= 0 ? value : null;
-
-    private static int? NonNegativeOrNull(int value) => value >= 0 ? value : null;
-
-    private static int? PositiveOrNull(int? value) => value > 0 ? value : null;
+        string key,
+        long maximum) =>
+        values.TryGetValue(key, out var value) ? BoundedOrNull(value, 0, maximum) : null;
 
     private static KeyValuePair<string, string>? MapToFinalExportEntry(
         SafeDiagnosticField field,
@@ -766,7 +839,7 @@ public sealed class DiagnosticExporter : IDisposable
         "Action" => ExportAllowedValue(value, AllowedDiagnosticActions),
         "Kind" => ExportAllowedValue(value, AllowedInputKinds),
         "Boundary" => ExportAllowedValue(value, AllowedInputBoundaries),
-        "Count" => ExportNonNegativeInt64(value),
+        "Count" => ExportNonNegativeInt64(value, MaximumCumulativeCount),
         "Reason" => ExportAllowedValue(value, AllowedInputDropReasons),
         "Encrypted" or "Sampled" or "SessionSelectRequired" or "SessionSelectCompleted" =>
             ExportBoolean(value),
@@ -790,8 +863,10 @@ public sealed class DiagnosticExporter : IDisposable
         "MigrationCompensationFailureCount" or "MigrationCleanupFailureCount" =>
             ExportBoundedNonNegativeInt32(value, 1_000_000),
         "RfbHandshakeStage" => ExportAllowedValue(value, AllowedRfbHandshakeStages),
-        "ExpectedByteCount" or "ActualByteCount" or "RectangleIndex" or "ArdEncryptedPacketLength" =>
-            ExportNonNegativeInt32(value),
+        "ExpectedByteCount" or "ActualByteCount" =>
+            ExportNonNegativeInt32(value, MaximumProtocolByteCount),
+        "RectangleIndex" => ExportNonNegativeInt32(value, MaximumRectanglesPerUpdate - 1),
+        "ArdEncryptedPacketLength" => ExportBoundedNonNegativeInt32(value, 1, ushort.MaxValue),
         "PresentationStage" => ExportAllowedValue(value, AllowedPresentationStages),
         "ProtocolReadStage" => ExportAllowedValue(value, AllowedProtocolReadStages),
         "ServerMessageType" => ExportFixedHex(value, 2),
@@ -809,19 +884,24 @@ public sealed class DiagnosticExporter : IDisposable
     private static string? ExportBoolean(string value) =>
         value is "True" or "False" ? value : null;
 
-    private static string? ExportNonNegativeInt64(string value) =>
-        long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+    private static string? ExportNonNegativeInt64(string value, long maximum) =>
+        long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) &&
+        parsed >= 0 && parsed <= maximum
             ? parsed.ToString(CultureInfo.InvariantCulture)
             : null;
 
-    private static string? ExportNonNegativeInt32(string value) =>
-        int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+    private static string? ExportNonNegativeInt32(string value, int maximum) =>
+        int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) &&
+        parsed >= 0 && parsed <= maximum
             ? parsed.ToString(CultureInfo.InvariantCulture)
             : null;
 
     private static string? ExportBoundedNonNegativeInt32(string value, int maximum) =>
+        ExportBoundedNonNegativeInt32(value, 0, maximum);
+
+    private static string? ExportBoundedNonNegativeInt32(string value, int minimum, int maximum) =>
         int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) &&
-        parsed >= 0 && parsed <= maximum
+        parsed >= minimum && parsed <= maximum
             ? parsed.ToString(CultureInfo.InvariantCulture)
             : null;
 

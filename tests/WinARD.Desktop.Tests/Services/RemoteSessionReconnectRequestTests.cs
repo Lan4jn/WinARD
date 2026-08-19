@@ -33,6 +33,32 @@ public sealed class RemoteSessionReconnectRequestTests
     }
 
     [Fact]
+    public async Task Completing_an_old_reconnect_does_not_clear_a_newer_attempt_summary()
+    {
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "private-host", 5900, "private-user");
+        var reconnectStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseReconnect = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var request = new RemoteSessionReconnectRequest(
+            profile,
+            (_, _) => Task.FromResult<ConnectionProfile?>(profile),
+            async (_, summary, _) =>
+            {
+                Assert.Equal(new DiagnosticReconnectSummary("Succeeded", 3, 0), summary);
+                reconnectStarted.TrySetResult();
+                await releaseReconnect.Task;
+            });
+        request.CaptureReconnectDiagnostic(new("Connecting", 3, 0));
+
+        var reconnect = request.InvokeAsync(default);
+        await reconnectStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        request.CaptureReconnectDiagnostic(new("Waiting", 4, 12));
+        releaseReconnect.TrySetResult();
+        await reconnect;
+
+        Assert.Equal(new DiagnosticReconnectSummary("Waiting", 4, 12), request.PendingDiagnosticForTest);
+    }
+
+    [Fact]
     public async Task Manual_retry_clears_the_previous_automatic_summary()
     {
         var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user");
