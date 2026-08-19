@@ -191,7 +191,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _automaticReconnect = retryRequested is null ? null : new AutomaticReconnectCoordinator(
             RuntimeReconnectFailureClassifier.IsTransient,
             new ReconnectPolicy(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30), Random.Shared),
-            retryRequested,
+            token => RetryWithCurrentProfileAsync(retryRequested, token),
             progress => _ = ObserveFailureAsync(_dispatcher.InvokeAsync(
                 () => ShowAutomaticReconnectProgress(progress), _lifetime.Token)));
         _windowLifecycle = new RemoteSessionWindowLifecycle(
@@ -897,7 +897,16 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             SuppressAndCancelAutomaticReconnect();
             RefreshErrorActionState();
         }
+        await _dispatcher.InvokeAsync(CaptureReconnectProfile, token);
         await _manualReconnectTransition!.RunAsync(token);
+    }
+
+    private async Task RetryWithCurrentProfileAsync(
+        Func<CancellationToken, Task> retry,
+        CancellationToken cancellationToken)
+    {
+        await _dispatcher.InvokeAsync(CaptureReconnectProfile, cancellationToken);
+        await retry(cancellationToken);
     }
 
     private void ShowAutomaticReconnectFailure(Exception? failure)

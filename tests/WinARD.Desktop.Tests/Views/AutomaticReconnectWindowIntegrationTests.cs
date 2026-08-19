@@ -44,6 +44,23 @@ public sealed class AutomaticReconnectWindowIntegrationTests
     }
 
     [Fact]
+    public void Every_automatic_and_manual_retry_captures_current_session_quality()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+        var manualStart = source.IndexOf(
+            "private async Task ReconnectWithoutReservationAsync", StringComparison.Ordinal);
+        var manualEnd = source.IndexOf(
+            "private async Task RetryWithCurrentProfileAsync", manualStart, StringComparison.Ordinal);
+        var manual = source[manualStart..manualEnd];
+
+        Assert.Contains("RetryWithCurrentProfileAsync(retryRequested", source, StringComparison.Ordinal);
+        Assert.Contains("await _dispatcher.InvokeAsync(CaptureReconnectProfile, token);", manual,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("\n        CaptureReconnectProfile();", manual, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Runtime_classifier_retries_remote_close_but_not_protocol_or_unknown_failures()
     {
         var remoteClose = RfbProtocolException.Create("closed", new(

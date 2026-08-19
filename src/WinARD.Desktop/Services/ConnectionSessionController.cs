@@ -40,6 +40,10 @@ public sealed class ConnectionSessionController : IAsyncDisposable
 
     public event Action<ConnectionProfile>? ProfileUpdated;
 
+    internal Task<ConnectionProfile?> GetProfileForReconnectAsync(
+        Guid id,
+        CancellationToken cancellationToken) => _repository.GetAsync(id, cancellationToken);
+
     public async Task ConnectAsync(ConnectionProfile profile, CancellationToken cancellationToken)
     {
         await ConnectAsync(profile, hostKeyPrompt: null, cancellationToken).ConfigureAwait(false);

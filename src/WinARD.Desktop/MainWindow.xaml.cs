@@ -779,6 +779,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 nextReconnectReservation = ownership.ReserveForReconnect();
                 var reconnectRequest = new RemoteSessionReconnectRequest(
                     ownership.Profile,
+                    _sessionController.GetProfileForReconnectAsync,
                     (latestProfile, retryToken) => InvokeReconnectAsync(
                         latestProfile, nextReconnectReservation, retryToken),
                     (latestProfile, retryToken) => InvokeReconnectAsync(
