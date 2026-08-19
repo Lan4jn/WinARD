@@ -202,7 +202,14 @@ public sealed class ConnectDeviceHandler
                     try
                     {
                         ValidateFirstPixelFrame(client, pixelFrame);
-                        client.ConfirmBootstrap(pixelFrame.Size, pixelFrame.DirtyRectangles.Count);
+                        var wireRectangleCount =
+                            pixelFrame.Statistics.TransferStatistics.RectangleCount;
+                        if (wireRectangleCount is < 0 or > 4096)
+                        {
+                            throw new QualityBootstrapCompatibilityException(
+                                QualityBootstrapFailureReason.MalformedFramebufferUpdate);
+                        }
+                        client.ConfirmBootstrap(pixelFrame.Size, (int)wireRectangleCount);
                         preloadedMessages.Add(pixelFrame);
                         transferred = true;
                     }

@@ -171,7 +171,7 @@ public sealed record QualityBootstrapState
         {
             throw new ArgumentOutOfRangeException(nameof(firstFrameSize));
         }
-        if (firstFrameRectangleCount is < 1 or > ushort.MaxValue)
+        if (firstFrameRectangleCount is < 0 or > 4096)
         {
             throw new ArgumentOutOfRangeException(nameof(firstFrameRectangleCount));
         }

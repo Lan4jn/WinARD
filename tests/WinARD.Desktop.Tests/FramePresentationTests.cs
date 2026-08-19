@@ -1706,10 +1706,12 @@ public sealed class FramePresentationTests
             default);
 
         using var resize = Assert.IsType<RemoteFramebufferMessage>(await client.ReceiveBootstrapAsync(default));
-        client.ConfirmBootstrap(resize.Size);
+        client.ConfirmBootstrap(resize.Size, 3);
 
         Assert.True(client.BootstrapState.IsFirstPixelConfirmed);
         Assert.Equal(scaleFactor, client.BootstrapState.AppliedScaleFactor);
+        Assert.Equal(resize.Size, client.BootstrapState.FirstFrameSize);
+        Assert.Equal(3, client.BootstrapState.FirstFrameRectangleCount);
     }
 
     [Theory]

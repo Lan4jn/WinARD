@@ -2,6 +2,7 @@ using WinARD.Desktop.Services;
 using WinARD.Application.Sessions;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Security;
+using WinARD.Infrastructure.Diagnostics;
 using Xunit;
 
 #pragma warning disable CA1707
@@ -10,6 +11,48 @@ namespace WinARD.Desktop.Tests.Services;
 
 public sealed class RemoteSessionReconnectRequestTests
 {
+    [Fact]
+    public async Task Automatic_success_transfers_only_the_current_bounded_summary_to_the_new_session()
+    {
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "private-host", 5900, "private-user");
+        DiagnosticReconnectSummary? transferred = null;
+        var request = new RemoteSessionReconnectRequest(
+            profile,
+            (_, _) => Task.FromResult<ConnectionProfile?>(profile),
+            (_, summary, _) =>
+            {
+                transferred = summary;
+                return Task.CompletedTask;
+            });
+        request.CaptureReconnectDiagnostic(new("Connecting", 3, 0));
+
+        await request.InvokeAsync(default);
+
+        Assert.Equal(new DiagnosticReconnectSummary("Succeeded", 3, 0), transferred);
+        Assert.Null(request.PendingDiagnosticForTest);
+    }
+
+    [Fact]
+    public async Task Manual_retry_clears_the_previous_automatic_summary()
+    {
+        var profile = ConnectionProfile.Create(Guid.NewGuid(), "Mac", "host", 5900, "user");
+        DiagnosticReconnectSummary? transferred = new("Failed", 99, 0);
+        var request = new RemoteSessionReconnectRequest(
+            profile,
+            (_, _) => Task.FromResult<ConnectionProfile?>(profile),
+            (_, summary, _) =>
+            {
+                transferred = summary;
+                return Task.CompletedTask;
+            });
+        request.CaptureReconnectDiagnostic(new("Connecting", 3, 0));
+
+        request.ClearReconnectDiagnostic();
+        await request.InvokeAsync(default);
+
+        Assert.Null(transferred);
+    }
+
     [Fact]
     public async Task Capture_is_atomic_and_invoke_uses_latest_desired_profile()
     {

@@ -113,7 +113,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             initialError, retryRequested, profile, updateFrameRefreshPolicy, updateQualityProfile,
             reconnectProfileCapture: null,
             reconnectReservation: null,
-            retryWithoutReservation)
+            retryWithoutReservation,
+            initialReconnectDiagnostic: null)
     {
     }
 
@@ -152,7 +153,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         Func<QualityProfile, CancellationToken, Task<ConnectionProfile>>? updateQualityProfile,
         IReconnectProfileCapture? reconnectProfileCapture,
         ReconnectSessionReservation? reconnectReservation,
-        Func<CancellationToken, Task>? retryWithoutReservation = null)
+        Func<CancellationToken, Task>? retryWithoutReservation = null,
+        DiagnosticReconnectSummary? initialReconnectDiagnostic = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(ownership);
@@ -165,6 +167,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         _reconnectProfileCapture = reconnectProfileCapture;
         _reconnectReservation = reconnectReservation;
         _retryWithoutReservation = retryWithoutReservation;
+        _diagnosticReconnect = initialReconnectDiagnostic;
         _inputDiagnostics = new RemoteInputDiagnosticTracker(diagnosticSink);
         _diagnosticExportState = new RemoteSessionDiagnosticExportState(
             serviceAvailable: diagnosticExportService is not null);
@@ -193,8 +196,14 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             RuntimeReconnectFailureClassifier.IsTransient,
             new ReconnectPolicy(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30), Random.Shared),
             token => RetryWithCurrentProfileAsync(retryRequested, token),
-            progress => _ = ObserveFailureAsync(_dispatcher.InvokeAsync(
-                () => ShowAutomaticReconnectProgress(progress), _lifetime.Token)));
+            progress =>
+            {
+                var diagnostic = ToReconnectDiagnostic(progress);
+                Volatile.Write(ref _diagnosticReconnect, diagnostic);
+                _reconnectProfileCapture?.CaptureReconnectDiagnostic(diagnostic);
+                _ = ObserveFailureAsync(_dispatcher.InvokeAsync(
+                    () => ShowAutomaticReconnectProgress(progress), _lifetime.Token));
+            });
         _windowLifecycle = new RemoteSessionWindowLifecycle(
             ViewModel.Completion,
             () => ViewModel.Error is not null,
@@ -212,7 +221,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                 _automaticReconnect,
                 _reconnectReservation,
                 CloseWindowCoreAsync,
-                retryWithoutReservation);
+                RetryWithoutAutomaticDiagnosticAsync);
         }
         var handlers = new Dictionary<ConnectionErrorActionKind, Func<CancellationToken, Task>>
         {
@@ -902,6 +911,12 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         await _manualReconnectTransition!.RunAsync(token);
     }
 
+    private Task RetryWithoutAutomaticDiagnosticAsync(CancellationToken token)
+    {
+        _reconnectProfileCapture?.ClearReconnectDiagnostic();
+        return _retryWithoutReservation!(token);
+    }
+
     private async Task RetryWithCurrentProfileAsync(
         Func<CancellationToken, Task> retry,
         CancellationToken cancellationToken)
@@ -933,15 +948,16 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         {
             return;
         }
-        _diagnosticReconnect = new DiagnosticReconnectSummary(
-            progress.Remaining > TimeSpan.Zero ? "Waiting" : "Connecting",
-            Math.Clamp(progress.Attempt, 1, 1_000),
-            Math.Clamp((int)Math.Ceiling(progress.Remaining.TotalSeconds), 0, 3_600));
         AutomaticReconnectStatusText.Text = progress.Remaining > TimeSpan.Zero
             ? $"第 {progress.Attempt} 次重连将在 {Math.Ceiling(progress.Remaining.TotalSeconds)} 秒后开始"
             : $"正在进行第 {progress.Attempt} 次重连…";
         AutomaticReconnectPanel.Visibility = Visibility.Visible;
     }
+
+    private static DiagnosticReconnectSummary ToReconnectDiagnostic(AutomaticReconnectProgress progress) => new(
+        progress.Remaining > TimeSpan.Zero ? "Waiting" : "Connecting",
+        Math.Clamp(progress.Attempt, 1, 1_000),
+        Math.Clamp((int)Math.Ceiling(progress.Remaining.TotalSeconds), 0, 3_600));
 
     private async void OnCancelAutomaticReconnectClicked(object sender, RoutedEventArgs args)
     {

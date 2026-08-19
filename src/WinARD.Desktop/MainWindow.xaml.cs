@@ -727,6 +727,7 @@ public sealed partial class MainWindow : Window, IDisposable
         ISshHostKeyPrompt? hostKeyPrompt = null,
         bool throwOnFailure = false,
         ReconnectSessionReservation? reconnectReservation = null,
+        DiagnosticReconnectSummary? reconnectDiagnostic = null,
         CancellationToken cancellationToken = default)
     {
         using var operationLifetime = CancellationTokenSource.CreateLinkedTokenSource(
@@ -780,10 +781,10 @@ public sealed partial class MainWindow : Window, IDisposable
                 var reconnectRequest = new RemoteSessionReconnectRequest(
                     ownership.Profile,
                     _sessionController.GetProfileForReconnectAsync,
-                    (latestProfile, retryToken) => InvokeReconnectAsync(
-                        latestProfile, nextReconnectReservation, retryToken),
-                    (latestProfile, retryToken) => InvokeReconnectAsync(
-                        latestProfile, reservation: null, retryToken));
+                    (latestProfile, diagnostic, retryToken) => InvokeReconnectAsync(
+                        latestProfile, nextReconnectReservation, diagnostic, retryToken),
+                    (latestProfile, diagnostic, retryToken) => InvokeReconnectAsync(
+                        latestProfile, reservation: null, diagnostic, retryToken));
                 operationToken.ThrowIfCancellationRequested();
                 remoteWindow = new RemoteSessionWindow(
                     ownership.Session,
@@ -801,7 +802,8 @@ public sealed partial class MainWindow : Window, IDisposable
                     updateQualityProfile:
                         _sessionController.UpdateConnectedQualityProfileAsync,
                     reconnectProfileCapture: reconnectRequest,
-                    reconnectReservation: nextReconnectReservation);
+                    reconnectReservation: nextReconnectReservation,
+                    initialReconnectDiagnostic: reconnectDiagnostic);
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
                 remoteWindow.ApplyApplicationDefaults(
                     ToElementTheme(_appSettings.Settings.Theme),
@@ -885,6 +887,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private Task InvokeReconnectAsync(
         ConnectionProfile profile,
         ReconnectSessionReservation? reservation,
+        DiagnosticReconnectSummary? reconnectDiagnostic,
         CancellationToken cancellationToken)
     {
         if (DispatcherQueue.HasThreadAccess)
@@ -893,7 +896,8 @@ public sealed partial class MainWindow : Window, IDisposable
                 profile,
                 throwOnFailure: true,
                 reconnectReservation: reservation,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken,
+                reconnectDiagnostic: reconnectDiagnostic);
         }
 
         var completion = new TaskCompletionSource(
@@ -906,7 +910,8 @@ public sealed partial class MainWindow : Window, IDisposable
                     profile,
                     throwOnFailure: true,
                     reconnectReservation: reservation,
-                    cancellationToken: cancellationToken);
+                    cancellationToken: cancellationToken,
+                    reconnectDiagnostic: reconnectDiagnostic);
                 completion.TrySetResult();
             }
             catch (OperationCanceledException exception)

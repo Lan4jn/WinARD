@@ -42,6 +42,88 @@ public sealed class ConnectDeviceHandlerTests
     }
 
     [Fact]
+    public async Task First_frame_diagnostic_uses_wire_rectangle_count_not_dirty_rectangle_count()
+    {
+        var transfer = new RemoteFramebufferTransferStatistics(
+            3, 12, 12, 3, 4_000,
+            new Dictionary<int, int> { [0] = 3 },
+            new Dictionary<int, long> { [0] = 12 },
+            new Dictionary<int, long> { [0] = 12 });
+        var client = new TestRfbClient
+        {
+            Messages = new Queue<RemoteServerMessage>(
+            [
+                new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+                    [new RemoteRectangle(0, 0, 1, 1)], null,
+                    new RemoteUpdateStatistics(1, new Dictionary<int, int> { [0] = 1 }, transfer)),
+            ]),
+        };
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            new ErrorMapper(() => "correlation-id"));
+
+        var result = await handler.HandleAsync(CreateProfile(), CancellationToken.None);
+
+        Assert.NotNull(result.Session);
+        Assert.Equal(3, client.ConfirmedFirstFrameRectangleCount);
+        await result.Session.DisposeAsync();
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(4096)]
+    public void First_frame_wire_rectangle_count_accepts_protocol_bounds(int rectangleCount)
+    {
+        _ = QualityBootstrapState.LegacyBgra32.ConfirmApplied(
+            new RemoteFramebufferSize(1, 1), rectangleCount);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(4097)]
+    public void First_frame_wire_rectangle_count_rejects_out_of_protocol_range(int rectangleCount)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            QualityBootstrapState.LegacyBgra32.ConfirmApplied(
+                new RemoteFramebufferSize(1, 1), rectangleCount));
+    }
+
+    [Theory]
+    [InlineData(4097)]
+    [InlineData(2147483648)]
+    public async Task Handler_rejects_wire_rectangle_count_above_protocol_limit_before_confirmation(
+        long rectangleCount)
+    {
+        var transfer = new RemoteFramebufferTransferStatistics(
+            rectangleCount, 0, 0, 0, null,
+            new Dictionary<int, int>(), new Dictionary<int, long>(), new Dictionary<int, long>());
+        var client = new TestRfbClient
+        {
+            Messages = new Queue<RemoteServerMessage>(
+            [
+                new RemoteFramebufferMessage(
+                    new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+                    [new RemoteRectangle(0, 0, 1, 1)], null,
+                    new RemoteUpdateStatistics(1, new Dictionary<int, int>(), transfer)),
+            ]),
+        };
+        var handler = new ConnectDeviceHandler(
+            new TestTransportFactory(),
+            new TestSecretProvider(new TestConnectionSecret()),
+            new TestRfbClientFactory(client),
+            new ErrorMapper(() => "correlation-id"));
+
+        var result = await handler.HandleAsync(CreateProfile(), CancellationToken.None);
+
+        Assert.Null(result.Session);
+        Assert.NotNull(result.Error);
+        Assert.Equal(0, client.ConfirmBootstrapCount);
+    }
+
+    [Fact]
     public void Handler_preserves_the_exact_legacy_four_parameter_constructor()
     {
         Assert.NotNull(typeof(ConnectDeviceHandler).GetConstructor(
@@ -1052,6 +1134,7 @@ public sealed class ConnectDeviceHandlerTests
         public int RequestCount { get; private set; }
         public int ReceiveCount { get; private set; }
         public int ConfirmBootstrapCount { get; private set; }
+        public int? ConfirmedFirstFrameRectangleCount { get; private set; }
         public Queue<RemoteServerMessage>? Messages { get; init; }
         public QualityBootstrapSettings? ConfiguredSettings { get; private set; }
 
@@ -1136,6 +1219,14 @@ public sealed class ConnectDeviceHandlerTests
             {
                 throw ConfirmBootstrapException;
             }
+        }
+
+        public void ConfirmBootstrap(
+            RemoteFramebufferSize framebufferSize,
+            int firstFrameRectangleCount)
+        {
+            ConfirmedFirstFrameRectangleCount = firstFrameRectangleCount;
+            ConfirmBootstrap(framebufferSize);
         }
 
         public ValueTask DisposeAsync()

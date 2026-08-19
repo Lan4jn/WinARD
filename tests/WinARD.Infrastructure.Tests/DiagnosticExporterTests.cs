@@ -356,6 +356,34 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.Equal(12, reconnect.GetProperty("DelaySeconds").GetInt32());
     }
 
+    [Theory]
+    [InlineData(0, true)]
+    [InlineData(4096, true)]
+    [InlineData(4097, false)]
+    public async Task FirstFrameRectangleCountUsesTheProtocolBound(int count, bool retained)
+    {
+        var context = DiagnosticExportContext.Empty with
+        {
+            Transfer = new DiagnosticTransferSummary(
+                "Bgra32", "Bgra32", "Preferred", null, "ZlibFirst",
+                0, 0, 0, null, 0, "Full32", "Full32", new Dictionary<string, long>())
+            {
+                FirstFrameRectangleCount = count,
+            },
+        };
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, $"rectangle-bound-{count}.zip");
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var value = document.RootElement.GetProperty("transfer").GetProperty("FirstFrameRectangleCount");
+        Assert.Equal(retained ? JsonValueKind.Number : JsonValueKind.Null, value.ValueKind);
+    }
+
     [Fact]
     public async Task MigrationEvidenceExportsOnlyStableResultAndBoundedCounts()
     {
@@ -428,7 +456,7 @@ public sealed class DiagnosticExporterTests : IDisposable
                 markers[6], markers[6], markers[6], markers[6], markers[6],
                 0, 0, 0, null, 0, markers[6], markers[6],
                 new Dictionary<string, long> { [markers[6]] = 1 }),
-            Reconnect = new DiagnosticReconnectSummary(markers[5], int.MaxValue, int.MaxValue),
+            Reconnect = new DiagnosticReconnectSummary("Succeeded", 3, 0),
         };
 
         await exporter.ExportAsync(destination, context, CancellationToken.None);
@@ -442,9 +470,9 @@ public sealed class DiagnosticExporterTests : IDisposable
         using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
         Assert.Single(document.RootElement.GetProperty("events").EnumerateArray());
         var reconnect = document.RootElement.GetProperty("reconnect");
-        Assert.Equal(JsonValueKind.Null, reconnect.GetProperty("State").ValueKind);
-        Assert.Equal(JsonValueKind.Null, reconnect.GetProperty("Attempt").ValueKind);
-        Assert.Equal(JsonValueKind.Null, reconnect.GetProperty("DelaySeconds").ValueKind);
+        Assert.Equal("Succeeded", reconnect.GetProperty("State").GetString());
+        Assert.Equal(3, reconnect.GetProperty("Attempt").GetInt32());
+        Assert.Equal(0, reconnect.GetProperty("DelaySeconds").GetInt32());
     }
 
     [Fact]

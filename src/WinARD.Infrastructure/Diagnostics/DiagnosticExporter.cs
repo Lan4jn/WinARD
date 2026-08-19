@@ -648,7 +648,9 @@ public sealed class DiagnosticExporter : IDisposable
         AppliedScalePercent = ExportScalePercent(transfer.AppliedScalePercent),
         FirstFrameWidth = ExportPositiveUInt16(transfer.FirstFrameWidth),
         FirstFrameHeight = ExportPositiveUInt16(transfer.FirstFrameHeight),
-        FirstFrameRectangleCount = ExportPositiveUInt16(transfer.FirstFrameRectangleCount),
+        FirstFrameRectangleCount = transfer.FirstFrameRectangleCount is >= 0 and <= 4096
+            ? transfer.FirstFrameRectangleCount
+            : null,
         EncodingRawWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Raw"),
         EncodingCopyRectWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "CopyRect"),
         EncodingZlibWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Zlib"),

@@ -18,6 +18,24 @@ namespace WinARD.Desktop.Tests.Views;
 public sealed class RemoteSessionDiagnosticExportStateTests
 {
     [Fact]
+    public void New_session_context_retains_successful_automatic_reconnect_summary()
+    {
+        var profile = ConnectionProfile.Create(
+            Guid.NewGuid(), "Mac", "private-host", 5900, "private-user");
+        var performance = new SessionPerformanceDiagnosticSnapshot(
+            new SessionPerformanceSnapshot(
+                FrameRefreshMode.Automatic, null, 0, 0, null, 0, 0, 0, 0, 0),
+            0, 0, new Dictionary<int, long>());
+
+        var context = DesktopDiagnosticContextFactory.CreateSession(
+            profile,
+            CreateDiagnosticSnapshot(profile, performance),
+            new DiagnosticReconnectSummary("Succeeded", 3, 0));
+
+        Assert.Equal(new DiagnosticReconnectSummary("Succeeded", 3, 0), context.Reconnect);
+    }
+
+    [Fact]
     public void Session_context_maps_atomic_bootstrap_quality_and_transfer_evidence()
     {
         var profile = ConnectionProfile.Create(
