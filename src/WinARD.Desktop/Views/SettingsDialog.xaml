@@ -1,0 +1,43 @@
+<ContentDialog
+    x:Class="WinARD.Desktop.Views.SettingsDialog"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="设置"
+    PrimaryButtonText="保存"
+    PrimaryButtonClick="OnPrimaryButtonClick"
+    CloseButtonText="取消"
+    DefaultButton="Primary">
+    <ScrollViewer MaxHeight="560">
+        <StackPanel Spacing="14" MinWidth="420">
+            <ComboBox x:Name="ThemeBox" Header="主题" SelectedIndex="0">
+                <ComboBoxItem Content="跟随系统" />
+                <ComboBoxItem Content="浅色" />
+                <ComboBoxItem Content="深色" />
+            </ComboBox>
+            <ComboBox x:Name="DiagnosticLevelBox" Header="诊断日志等级" SelectedIndex="1">
+                <ComboBoxItem Content="最少" />
+                <ComboBoxItem Content="标准" />
+                <ComboBoxItem Content="详细（仅安全结构化事件）" />
+            </ComboBox>
+            <CheckBox x:Name="ClipboardDefaultBox" Content="新会话默认启用文本剪贴板" />
+            <ComboBox x:Name="CredentialBackendBox" Header="默认凭据后端" SelectedIndex="1">
+                <ComboBoxItem Content="每次询问" />
+                <ComboBoxItem Content="Windows 凭据管理器" />
+                <ComboBoxItem Content="加密保险库" />
+            </ComboBox>
+            <NumberBox
+                x:Name="VaultTimeoutBox"
+                Header="保险库自动锁定（分钟）"
+                Minimum="1"
+                Maximum="1440"
+                SpinButtonPlacementMode="Compact" />
+            <Button
+                x:Name="LockVaultButton"
+                AutomationProperties.AutomationId="LockVaultNowButton"
+                Click="OnLockVaultClicked"
+                Content="立即锁定保险库"
+                HorizontalAlignment="Left" />
+            <TextBlock x:Name="StatusText" TextWrapping="Wrap" Opacity="0.72" />
+        </StackPanel>
+    </ScrollViewer>
+</ContentDialog>

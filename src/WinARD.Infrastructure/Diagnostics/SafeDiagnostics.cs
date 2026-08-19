@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Text;
 using System.Text.RegularExpressions;
+using WinARD.Domain.Settings;
 
 namespace WinARD.Infrastructure.Diagnostics;
 
@@ -60,6 +61,32 @@ public interface ISafeDiagnosticSink
     IReadOnlyList<SafeDiagnosticEvent> Snapshot();
 }
 
+public sealed class SafeDiagnosticLevelController
+{
+    private int _level = (int)SafeDiagnosticLevel.Standard;
+
+    public SafeDiagnosticLevel Level
+    {
+        get => (SafeDiagnosticLevel)Volatile.Read(ref _level);
+        set
+        {
+            if (!Enum.IsDefined(value))
+            {
+                throw new ArgumentOutOfRangeException(nameof(value));
+            }
+            Volatile.Write(ref _level, (int)value);
+        }
+    }
+
+    internal int MaximumFields => Level switch
+    {
+        SafeDiagnosticLevel.Minimal => 0,
+        SafeDiagnosticLevel.Standard => 16,
+        SafeDiagnosticLevel.Verbose => int.MaxValue,
+        _ => throw new InvalidOperationException("Diagnostic level is invalid."),
+    };
+}
+
 public static class SafeDiagnosticWriter
 {
     public static bool TryWrite(
@@ -97,6 +124,7 @@ public sealed partial class InMemorySafeDiagnosticSink : ISafeDiagnosticSink
     private readonly object _sync = new();
     private readonly SecretRedactor _redactor;
     private readonly SafeDiagnosticLimits _limits;
+    private readonly SafeDiagnosticLevelController? _levelController;
     private readonly Queue<StoredEvent> _events;
     private long _approximateSizeBytes;
 
@@ -109,6 +137,12 @@ public sealed partial class InMemorySafeDiagnosticSink : ISafeDiagnosticSink
             MaxRingApproximateBytes: 4 * 1_024 * 1_024))
     {
     }
+
+    public InMemorySafeDiagnosticSink(
+        SecretRedactor redactor,
+        SafeDiagnosticLevelController levelController)
+        : this(redactor, new SafeDiagnosticLimits()) =>
+        _levelController = levelController ?? throw new ArgumentNullException(nameof(levelController));
 
     public InMemorySafeDiagnosticSink(SecretRedactor redactor, SafeDiagnosticLimits limits)
     {
@@ -138,7 +172,10 @@ public sealed partial class InMemorySafeDiagnosticSink : ISafeDiagnosticSink
         ArgumentNullException.ThrowIfNull(diagnosticEvent);
         var fields = new Dictionary<string, SafeDiagnosticField>(StringComparer.OrdinalIgnoreCase);
         var inputFields = diagnosticEvent.Fields ?? [];
-        for (var index = 0; index < Math.Min(inputFields.Count, _limits.MaxFieldsPerEvent); index++)
+        var maximumFields = Math.Min(
+            _limits.MaxFieldsPerEvent,
+            _levelController?.MaximumFields ?? int.MaxValue);
+        for (var index = 0; index < Math.Min(inputFields.Count, maximumFields); index++)
         {
             var field = inputFields[index];
             var name = LimitUtf8(field.Name, _limits.MaxFieldUtf8Bytes);

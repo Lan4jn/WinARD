@@ -78,10 +78,12 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public static ConnectionEditorViewModel FromDraft(
         ConnectionEditorDraft draft,
         Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> save,
-        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileTestResult>> test)
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileTestResult>> test,
+        CredentialSaveMode defaultCredentialSaveMode = CredentialSaveMode.WindowsCredentialManager)
     {
         ArgumentNullException.ThrowIfNull(draft);
-        var viewModel = new ConnectionEditorViewModel((ConnectionProfile?)null, save, test)
+        var viewModel = new ConnectionEditorViewModel(
+            (ConnectionProfile?)null, save, test, defaultCredentialSaveMode)
         {
             _displayName = draft.DisplayName,
             _host = draft.Host,
@@ -123,7 +125,8 @@ public sealed class ConnectionEditorViewModel : ObservableObject
     public ConnectionEditorViewModel(
         ConnectionProfile? profile,
         Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileSaveResult>> save,
-        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileTestResult>> test)
+        Func<ConnectionProfile, CredentialSaveMode, ISecret?, CancellationToken, Task<ConnectionProfileTestResult>> test,
+        CredentialSaveMode defaultCredentialSaveMode = CredentialSaveMode.WindowsCredentialManager)
     {
         _original = profile;
         _save = save ?? throw new ArgumentNullException(nameof(save));
@@ -137,6 +140,11 @@ public sealed class ConnectionEditorViewModel : ObservableObject
 
         if (profile is null)
         {
+            if (!Enum.IsDefined(defaultCredentialSaveMode))
+            {
+                throw new ArgumentOutOfRangeException(nameof(defaultCredentialSaveMode));
+            }
+            _credentialSaveMode = defaultCredentialSaveMode;
             return;
         }
 

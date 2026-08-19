@@ -82,6 +82,16 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private int _automaticReconnectCancellationStarted;
     private int _closedCleanupStarted;
 
+    public void ApplyApplicationDefaults(ElementTheme theme, bool clipboardEnabled)
+    {
+        RootGrid.RequestedTheme = theme;
+        ClipboardButton.IsChecked = clipboardEnabled;
+        _clipboardBridge.IsEnabled = clipboardEnabled;
+    }
+
+    public void ApplyApplicationTheme(ElementTheme theme) =>
+        RootGrid.RequestedTheme = theme;
+
     public RemoteSessionWindow(
         IRemoteSessionRuntime session,
         IAsyncDisposable ownership,

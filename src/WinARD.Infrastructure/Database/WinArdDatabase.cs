@@ -37,6 +37,7 @@ public sealed class WinArdDatabase : IAsyncDisposable
                 new Migration002FrameRefreshPolicy(),
                 new Migration003QualityProfile(),
                 new Migration004QualityScalePercent(),
+                new Migration005AppSettings(),
             ],
             cancellationToken);
 

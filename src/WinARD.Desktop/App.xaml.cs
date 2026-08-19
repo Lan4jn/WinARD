@@ -12,6 +12,7 @@ using WinARD.Infrastructure.Database;
 using WinARD.Infrastructure.Devices;
 using WinARD.Infrastructure.Discovery;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Infrastructure.Settings;
 using WinARD.Security.WindowsCredentials;
 using WinARD.Security.Vault;
 
@@ -104,11 +105,14 @@ public partial class App : Microsoft.UI.Xaml.Application
         }
         services.AddSingleton(new WinArdDatabase(Path.Combine(dataDirectory, "winard.db")));
         services.AddSingleton<SecretRedactor>();
+        services.AddSingleton<SafeDiagnosticLevelController>();
         services.AddSingleton<ISafeDiagnosticSink>(provider => new InMemorySafeDiagnosticSink(
-            provider.GetRequiredService<SecretRedactor>()));
+            provider.GetRequiredService<SecretRedactor>(),
+            provider.GetRequiredService<SafeDiagnosticLevelController>()));
         services.AddSingleton<DiagnosticExporter>();
         services.AddSingleton<DiagnosticExportService>();
         services.AddSingleton<IDeviceRepository, SqliteDeviceRepository>();
+        services.AddSingleton<IAppSettingsRepository, SqliteAppSettingsRepository>();
         services.AddSingleton<IBonjourServiceWatcher, DnssdServiceWatcher>();
         services.AddSingleton<IDeviceDiscovery, BonjourDeviceDiscovery>();
         var windowsStore = new WindowsCredentialStore();

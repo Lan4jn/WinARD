@@ -12,6 +12,22 @@ namespace WinARD.Desktop.Tests.ViewModels;
 
 public sealed class ConnectionEditorViewModelTests
 {
+    [Theory]
+    [InlineData(CredentialSaveMode.WindowsCredentialManager)]
+    [InlineData(CredentialSaveMode.EncryptedVault)]
+    [InlineData(CredentialSaveMode.AskEveryTime)]
+    public void New_profile_uses_configured_default_credential_backend(CredentialSaveMode mode)
+    {
+        var sut = new ConnectionEditorViewModel(
+            profile: null,
+            (_, _, _, _) => Task.FromResult(new ConnectionProfileSaveResult(
+                ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex"))),
+            (_, _, _, _) => Task.FromResult(new ConnectionProfileTestResult(
+                ConnectionProfile.Create(Guid.NewGuid(), "Mac", "mac.local", 5900, "alex"), [])),
+            mode);
+
+        Assert.Equal(mode, sut.CredentialSaveMode);
+    }
     [Fact]
     public void Draft_prefills_endpoint_without_becoming_an_existing_profile()
     {

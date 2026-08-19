@@ -18,7 +18,7 @@ public sealed class VaultCredentialStoreSession : ICredentialStore, IAsyncDispos
 {
     private readonly IVaultSessionFactory _factory;
     private readonly TimeProvider _timeProvider;
-    private readonly TimeSpan _idleTimeout;
+    private TimeSpan _idleTimeout;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly object _disposeSync = new();
     private readonly Dictionary<IVaultSessionInstance, int> _activeOperations =
@@ -165,6 +165,34 @@ public sealed class VaultCredentialStoreSession : ICredentialStore, IAsyncDispos
         if (disposal is not null)
         {
             await CompleteDisposalAsync(disposal).ConfigureAwait(false);
+        }
+    }
+
+    public async ValueTask UpdateIdleTimeoutAsync(
+        TimeSpan idleTimeout,
+        CancellationToken cancellationToken)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(idleTimeout, TimeSpan.Zero);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _idleTimeout = idleTimeout;
+            if (_vault is not null)
+            {
+                var remaining = (_lastActivity + idleTimeout) - _timeProvider.GetUtcNow();
+                Volatile.Write(
+                    ref _idleDeadlineUtcTicks,
+                    (_lastActivity + idleTimeout).UtcTicks);
+                var generation = checked(++_activityGeneration);
+                ScheduleIdleTimerLocked(
+                    generation,
+                    remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
+            }
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 

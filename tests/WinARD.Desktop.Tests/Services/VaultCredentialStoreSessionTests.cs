@@ -110,6 +110,26 @@ public sealed class VaultCredentialStoreSessionTests : IDisposable
     }
 
     [Fact]
+    public async Task UpdatingIdleTimeoutReplacesUnlockedSessionDeadline()
+    {
+        var time = new ManualTimeProvider();
+        await using var sut = new VaultCredentialStoreSession(
+            new QueueVaultFactory(new FakeVaultInstance()),
+            time,
+            TimeSpan.FromMinutes(15));
+        using var master = Secret("master");
+        await sut.UnlockAsync(master, CancellationToken.None);
+
+        time.Advance(TimeSpan.FromMinutes(2));
+        await sut.UpdateIdleTimeoutAsync(TimeSpan.FromMinutes(3), CancellationToken.None);
+        time.Advance(TimeSpan.FromSeconds(59));
+        Assert.True(sut.IsUnlocked);
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        Assert.False(sut.IsUnlocked);
+    }
+
+    [Fact]
     public async Task LockedFailureFromOldOperationDoesNotClearNewlyUnlockedInstance()
     {
         var old = new FakeVaultInstance();

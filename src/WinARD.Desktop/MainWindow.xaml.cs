@@ -14,8 +14,10 @@ using WinARD.Desktop.Views;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
 using WinARD.Domain.Sessions;
+using WinARD.Domain.Settings;
 using WinARD.Infrastructure.Database;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Infrastructure.Settings;
 using WinARD.Security.Secrets;
 using WinRT.Interop;
 
@@ -51,11 +53,16 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly ISafeDiagnosticSink _diagnosticSink;
     private readonly DiagnosticExportService _diagnosticExportService;
     private readonly SecretRedactor _secretRedactor;
+    private readonly IAppSettingsRepository _appSettingsRepository;
+    private readonly ICredentialStore _credentialStore;
+    private readonly SafeDiagnosticLevelController _diagnosticLevel;
+    private AppSettingsSnapshot _appSettings = new(AppSettings.Default, 0);
     private Task? _shutdownTask;
     private RemoteSessionWindow? _remoteSessionWindow;
     private SshHostKeyPromptRequest? _pendingHostKeyFailure;
     private bool _allowClose;
     private bool _sessionBusy;
+    private int _settingsBusy;
     private int _disposed;
 
     public MainWindow(
@@ -69,7 +76,10 @@ public sealed partial class MainWindow : Window, IDisposable
         SshHostKeyPromptService hostKeyPromptService,
         ISafeDiagnosticSink diagnosticSink,
         DiagnosticExportService diagnosticExportService,
-        SecretRedactor secretRedactor)
+        SecretRedactor secretRedactor,
+        IAppSettingsRepository appSettingsRepository,
+        ICredentialStore credentialStore,
+        SafeDiagnosticLevelController diagnosticLevel)
     {
         ViewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         _database = database ?? throw new ArgumentNullException(nameof(database));
@@ -82,6 +92,9 @@ public sealed partial class MainWindow : Window, IDisposable
         _diagnosticSink = diagnosticSink ?? throw new ArgumentNullException(nameof(diagnosticSink));
         _diagnosticExportService = diagnosticExportService ?? throw new ArgumentNullException(nameof(diagnosticExportService));
         _secretRedactor = secretRedactor ?? throw new ArgumentNullException(nameof(secretRedactor));
+        _appSettingsRepository = appSettingsRepository ?? throw new ArgumentNullException(nameof(appSettingsRepository));
+        _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
+        _diagnosticLevel = diagnosticLevel ?? throw new ArgumentNullException(nameof(diagnosticLevel));
         InitializeComponent();
         BuildDeviceLibrary();
         var windowHandle = WindowNative.GetWindowHandle(this);
@@ -185,6 +198,11 @@ public sealed partial class MainWindow : Window, IDisposable
             Spacing = 8,
             HorizontalAlignment = HorizontalAlignment.Right,
         };
+        var settings = new Button { Content = "设置" };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+            settings, "ApplicationSettingsButton");
+        settings.Click += OnSettingsClicked;
+        actions.Children.Add(settings);
         _editButton.Content = "编辑设备";
         _editButton.Visibility = Visibility.Collapsed;
         _editButton.Click += (_, _) => ViewModel.EditDeviceCommand.Execute(null);
@@ -317,6 +335,8 @@ public sealed partial class MainWindow : Window, IDisposable
         try
         {
             await Task.Run(() => _database.InitializeAsync(_shutdown.Token), _shutdown.Token);
+            _appSettings = await _appSettingsRepository.GetAsync(_shutdown.Token);
+            await ApplySettingsAsync(_appSettings.Settings, _shutdown.Token);
             await ViewModel.InitializeAsync(_shutdown.Token);
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
@@ -365,6 +385,159 @@ public sealed partial class MainWindow : Window, IDisposable
     private void OnAddDeviceRequested(ConnectionEditorDraft? draft) =>
         _ = _uiOperation.RunAsync(() => OpenConnectionEditorAsync(null, draft), _shutdown.Token);
 
+    private async void OnSettingsClicked(object sender, RoutedEventArgs args)
+    {
+        if (Interlocked.Exchange(ref _settingsBusy, 1) != 0)
+        {
+            return;
+        }
+        try
+        {
+            var dialog = new SettingsDialog(
+                _appSettings.Settings,
+                () => _vaultSession.LockAsync())
+            {
+                XamlRoot = ShellRoot.XamlRoot,
+            };
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            {
+                return;
+            }
+
+            var desired = dialog.SelectedSettings;
+            if (desired.DefaultCredentialBackend !=
+                _appSettings.Settings.DefaultCredentialBackend)
+            {
+                var migration = new CredentialBackendMigrationService(
+                    _database, _credentialStore, ValidateCredentialTargetAsync);
+                var result = await migration.MigrateAsync(
+                    desired.DefaultCredentialBackend,
+                    ConfirmSourceCleanupAsync,
+                    _shutdown.Token);
+                _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
+                    "CREDENTIAL_BACKEND_MIGRATION",
+                    Guid.NewGuid().ToString("N"),
+                    "Credential backend migration completed.",
+                    [
+                        new("result", result.Code.ToString()),
+                        new("managed_count", result.ManagedReferenceCount.ToString(
+                            System.Globalization.CultureInfo.InvariantCulture)),
+                        new("migrated_count", result.MigratedReferenceCount.ToString(
+                            System.Globalization.CultureInfo.InvariantCulture)),
+                        new("compensation_failure_count", result.CompensationFailureCount.ToString(
+                            System.Globalization.CultureInfo.InvariantCulture)),
+                        new("cleanup_failure_count", result.SourceCleanupFailureCount.ToString(
+                            System.Globalization.CultureInfo.InvariantCulture)),
+                    ]));
+                if (result.Code is not CredentialBackendMigrationCode.Succeeded and
+                    not CredentialBackendMigrationCode.SucceededWithCleanupFailures)
+                {
+                    await ShowSettingsMessageAsync(
+                        "凭据迁移未提交",
+                        "迁移未删除源凭据；配置可能已由其他操作更新。请检查后重试。");
+                    return;
+                }
+                _appSettings = await _appSettingsRepository.GetAsync(_shutdown.Token);
+            }
+
+            var saved = await _appSettingsRepository.TryUpdateAsync(
+                _appSettings.Revision, desired, _shutdown.Token);
+            if (!saved)
+            {
+                _appSettings = await _appSettingsRepository.GetAsync(_shutdown.Token);
+                await ShowSettingsMessageAsync("设置已更改", "设置已由另一项操作更新，请重新打开设置。");
+                return;
+            }
+
+            _appSettings = await _appSettingsRepository.GetAsync(_shutdown.Token);
+            await ApplySettingsAsync(_appSettings.Settings, _shutdown.Token);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
+        catch
+        {
+            await ShowSettingsMessageAsync("无法保存设置", "设置未完整应用，请重试。");
+        }
+        finally
+        {
+            Volatile.Write(ref _settingsBusy, 0);
+        }
+    }
+
+    private async ValueTask ValidateCredentialTargetAsync(
+        CredentialBackend backend,
+        CancellationToken cancellationToken)
+    {
+        if (backend != CredentialBackend.EncryptedVault || _vaultSession.IsUnlocked)
+        {
+            return;
+        }
+        using var master = await PromptForSecretAsync(
+            "凭据保险库主密码", "解锁目标凭据保险库", cancellationToken);
+        await _vaultSession.UnlockAsync(master, cancellationToken);
+    }
+
+    private async ValueTask<bool> ConfirmSourceCleanupAsync(
+        CredentialSourceCleanupPrompt prompt,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (prompt.TotalCount == 0)
+        {
+            return false;
+        }
+        var dialog = new ContentDialog
+        {
+            Title = "凭据迁移已完成",
+            Content = prompt.RequiresIndividualConfirmation
+                ? $"数据库引用已安全更新。是否清理第 {prompt.ItemNumber}/{prompt.TotalCount} 个不再引用的源凭据？"
+                : $"数据库引用已安全更新。是否清理 {prompt.TotalCount} 个不再引用的源凭据？",
+            PrimaryButtonText = "清理源凭据",
+            CloseButtonText = "保留",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = ShellRoot.XamlRoot,
+        };
+        return await dialog.ShowAsync() == ContentDialogResult.Primary;
+    }
+
+    private async Task ApplySettingsAsync(
+        AppSettings settings,
+        CancellationToken cancellationToken)
+    {
+        ShellRoot.RequestedTheme = ToElementTheme(settings.Theme);
+        _diagnosticLevel.Level = settings.DiagnosticLevel;
+        _remoteSessionWindow?.ApplyApplicationTheme(ToElementTheme(settings.Theme));
+        await _vaultSession.UpdateIdleTimeoutAsync(
+            settings.VaultIdleTimeout, cancellationToken);
+    }
+
+    private Task<ContentDialogResult> ShowSettingsMessageAsync(string title, string content) =>
+        new ContentDialog
+        {
+            Title = title,
+            Content = content,
+            CloseButtonText = "关闭",
+            XamlRoot = ShellRoot.XamlRoot,
+        }.ShowAsync().AsTask();
+
+    private static ElementTheme ToElementTheme(AppTheme theme) => theme switch
+    {
+        AppTheme.System => ElementTheme.Default,
+        AppTheme.Light => ElementTheme.Light,
+        AppTheme.Dark => ElementTheme.Dark,
+        _ => throw new ArgumentOutOfRangeException(nameof(theme)),
+    };
+
+    private static CredentialSaveMode DefaultCredentialSaveMode(CredentialBackend backend) =>
+        backend switch
+        {
+            CredentialBackend.Windows => CredentialSaveMode.WindowsCredentialManager,
+            CredentialBackend.EncryptedVault => CredentialSaveMode.EncryptedVault,
+            CredentialBackend.AskEveryTime => CredentialSaveMode.AskEveryTime,
+            _ => throw new ArgumentOutOfRangeException(nameof(backend)),
+        };
+
     private void OnConnectRequested(ConnectionProfile profile) =>
         _ = _uiOperation.RunAsync(() => ConnectProfileWithHandlingAsync(profile), _shutdown.Token);
 
@@ -384,7 +557,8 @@ public sealed partial class MainWindow : Window, IDisposable
                 _connectionEditorService.SaveWithResultAsync,
                 (candidate, mode, secret, cancellationToken) =>
                     _connectionEditorService.TestAsync(
-                        candidate, mode, secret, hostKeyPrompt, cancellationToken));
+                        candidate, mode, secret, hostKeyPrompt, cancellationToken),
+                DefaultCredentialSaveMode(_appSettings.Settings.DefaultCredentialBackend));
         }
         else
         {
@@ -393,7 +567,8 @@ public sealed partial class MainWindow : Window, IDisposable
                 _connectionEditorService.SaveWithResultAsync,
                 (candidate, mode, secret, cancellationToken) =>
                     _connectionEditorService.TestAsync(
-                        candidate, mode, secret, hostKeyPrompt, cancellationToken));
+                        candidate, mode, secret, hostKeyPrompt, cancellationToken),
+                DefaultCredentialSaveMode(_appSettings.Settings.DefaultCredentialBackend));
         }
         using var dialog = new ConnectionEditorDialog(
             viewModel,
@@ -613,6 +788,9 @@ public sealed partial class MainWindow : Window, IDisposable
                     reconnectProfileCapture: reconnectRequest,
                     reconnectReservation: nextReconnectReservation);
                 remoteWindow.Closed += OnRemoteSessionWindowClosed;
+                remoteWindow.ApplyApplicationDefaults(
+                    ToElementTheme(_appSettings.Settings.Theme),
+                    _appSettings.Settings.ClipboardEnabledByDefault);
                 operationToken.ThrowIfCancellationRequested();
                 _remoteSessionWindow = remoteWindow;
                 remoteWindow.Activate();
