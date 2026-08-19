@@ -357,6 +357,39 @@ public sealed class DiagnosticExporterTests : IDisposable
     }
 
     [Theory]
+    [InlineData("unknown-reconnect-state-marker", 3, 12, "State", "unknown-reconnect-state-marker")]
+    [InlineData("Waiting", 0, 12, "Attempt", "\"Attempt\":0")]
+    [InlineData("Waiting", 1001, 12, "Attempt", "\"Attempt\":1001")]
+    [InlineData("Waiting", 3, -1, "DelaySeconds", "\"DelaySeconds\":-1")]
+    [InlineData("Waiting", 3, 3601, "DelaySeconds", "\"DelaySeconds\":3601")]
+    public async Task ReconnectEvidenceRejectsEachInvalidFieldWithoutLeakingItsRawValue(
+        string state,
+        int attempt,
+        int delaySeconds,
+        string rejectedProperty,
+        string rawValue)
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, $"invalid-reconnect-{rejectedProperty}-{attempt}-{delaySeconds}.zip");
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
+        var context = DiagnosticExportContext.Empty with
+        {
+            Reconnect = new DiagnosticReconnectSummary(state, attempt, delaySeconds),
+        };
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        var content = await ReadAllAsync(archive);
+        var compactContent = string.Concat(content.Where(character => !char.IsWhiteSpace(character)));
+        Assert.DoesNotContain(rawValue, compactContent, StringComparison.Ordinal);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var reconnect = document.RootElement.GetProperty("reconnect");
+        Assert.Equal(JsonValueKind.Null, reconnect.GetProperty(rejectedProperty).ValueKind);
+    }
+
+    [Theory]
     [InlineData(0, true)]
     [InlineData(4096, true)]
     [InlineData(4097, false)]
