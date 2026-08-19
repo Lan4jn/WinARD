@@ -29,6 +29,8 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         await using var transaction = connection.BeginTransaction(IsolationLevel.Serializable);
         try
         {
+            await RejectRetiredCredentialReferencesAsync(
+                connection, transaction, profile, cancellationToken).ConfigureAwait(false);
             await SaveDeviceAsync(connection, transaction, profile, canonicalHost, now, cancellationToken).ConfigureAwait(false);
             await DeleteSshAsync(connection, transaction, profile.Id, cancellationToken).ConfigureAwait(false);
             if (profile.SshProfile is not null)
@@ -350,6 +352,39 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
             FrameRefreshMode.Unlimited when reader.IsDBNull(fpsOrdinal) => FrameRefreshPolicy.Unlimited,
             _ => throw new InvalidDataException("Persisted frame refresh policy is invalid."),
         };
+    }
+
+    private static async Task RejectRetiredCredentialReferencesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ConnectionProfile profile,
+        CancellationToken cancellationToken)
+    {
+        CredentialReference?[] references =
+        [
+            profile.CredentialReference,
+            profile.SshProfile?.PasswordCredentialReference,
+            profile.SshProfile?.PrivateKeyPassphraseCredentialReference,
+        ];
+        foreach (var reference in references.OfType<CredentialReference>().Distinct())
+        {
+            var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT COUNT(*)
+                FROM retired_credential_references
+                WHERE backend = $backend AND credential_key = $credential_key;
+                """;
+            command.Parameters.AddWithValue("$backend", reference.Store);
+            command.Parameters.AddWithValue("$credential_key", reference.Key);
+            var retired = Convert.ToInt64(
+                await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
+                System.Globalization.CultureInfo.InvariantCulture) != 0;
+            if (retired)
+            {
+                throw new RetiredCredentialReferenceException(reference);
+            }
+        }
     }
 
     private static QualityProfile ReadQualityProfile(SqliteDataReader reader)

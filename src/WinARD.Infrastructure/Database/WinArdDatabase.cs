@@ -30,6 +30,8 @@ public sealed class WinArdDatabase : IAsyncDisposable
 
     public string ConnectionString { get; }
 
+    public string DatabasePath => _databasePath;
+
     public Task InitializeAsync(CancellationToken cancellationToken) =>
         InitializeAsync(
             [
@@ -38,6 +40,7 @@ public sealed class WinArdDatabase : IAsyncDisposable
                 new Migration003QualityProfile(),
                 new Migration004QualityScalePercent(),
                 new Migration005AppSettings(),
+                new Migration006RetiredCredentialReferences(),
             ],
             cancellationToken);
 

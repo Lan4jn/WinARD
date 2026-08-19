@@ -4,6 +4,7 @@ using CommunityToolkit.Mvvm.Input;
 using WinARD.Application.Ports;
 using WinARD.Desktop.Threading;
 using WinARD.Domain.Connections;
+using WinARD.Infrastructure.Settings;
 
 namespace WinARD.Desktop.ViewModels;
 
@@ -14,6 +15,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly IDeviceDiscovery _discovery;
     private readonly ICredentialStore _credentialStore;
     private readonly IUiDispatcher _dispatcher;
+    private readonly CredentialMutationGate _credentialMutationGate;
+    private readonly ICredentialReferenceRetirementService _retirementService;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly SemaphoreSlim _deleteGate = new(1, 1);
     private readonly List<DeviceItemViewModel> _allSaved = [];
@@ -31,12 +34,16 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         IDeviceRepository repository,
         IDeviceDiscovery discovery,
         ICredentialStore credentialStore,
-        IUiDispatcher dispatcher)
+        IUiDispatcher dispatcher,
+        CredentialMutationGate credentialMutationGate,
+        ICredentialReferenceRetirementService retirementService)
     {
         _repository = repository ?? throw new ArgumentNullException(nameof(repository));
         _discovery = discovery ?? throw new ArgumentNullException(nameof(discovery));
         _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        _credentialMutationGate = credentialMutationGate ?? throw new ArgumentNullException(nameof(credentialMutationGate));
+        _retirementService = retirementService ?? throw new ArgumentNullException(nameof(retirementService));
         _discovery.Changed += OnDiscoveryChanged;
         AddDeviceCommand = new RelayCommand(() => AddDeviceRequested?.Invoke(null));
         ActivateSelectedCommand = new RelayCommand(ActivateSelected, () => SelectedDevice is not null);
@@ -178,6 +185,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         await _deleteGate.WaitAsync(operationToken).ConfigureAwait(false);
         try
         {
+            using var mutationLease = await _credentialMutationGate.EnterAsync(operationToken)
+                .ConfigureAwait(false);
             operationToken.ThrowIfCancellationRequested();
             lock (_lifecycleGate)
             {
@@ -225,18 +234,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 if (remainingProfiles is not null)
                 {
                     var retainedReferences = remainingProfiles.SelectMany(GetCredentialReferences).ToHashSet();
-                    foreach (var reference in GetCredentialReferences(profile).Except(retainedReferences))
+                    try
                     {
-                        try
-                        {
-                            await Task.Run(
-                                async () => await _credentialStore.DeleteAsync(reference, commitToken).ConfigureAwait(false),
-                                commitToken).ConfigureAwait(false);
-                        }
-                        catch (Exception)
+                        var candidates = await _retirementService.CaptureAsync(
+                            GetCredentialReferences(profile).Except(retainedReferences), commitToken)
+                            .ConfigureAwait(false);
+                        if (await _retirementService.RetireUnreferencedAsync(candidates, commitToken)
+                                .ConfigureAwait(false) != 0)
                         {
                             credentialCleanupFailed = true;
                         }
+                    }
+                    catch (Exception)
+                    {
+                        credentialCleanupFailed = true;
                     }
                 }
             }

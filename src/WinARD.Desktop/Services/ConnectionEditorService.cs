@@ -5,6 +5,7 @@ using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
 using WinARD.Domain.Security;
+using WinARD.Infrastructure.Settings;
 
 namespace WinARD.Desktop.Services;
 
@@ -12,12 +13,16 @@ public sealed class ConnectionEditorService(
     IDeviceRepository repository,
     ICredentialStore credentialStore,
     ITransientCredentialStore transientStore,
-    ConnectionAttemptWorkflow attemptWorkflow)
+    ConnectionAttemptWorkflow attemptWorkflow,
+    CredentialMutationGate credentialMutationGate,
+    ICredentialReferenceRetirementService retirementService)
 {
     private readonly IDeviceRepository _repository = repository ?? throw new ArgumentNullException(nameof(repository));
     private readonly ICredentialStore _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
     private readonly ITransientCredentialStore _transientStore = transientStore ?? throw new ArgumentNullException(nameof(transientStore));
     private readonly ConnectionAttemptWorkflow _attemptWorkflow = attemptWorkflow ?? throw new ArgumentNullException(nameof(attemptWorkflow));
+    private readonly CredentialMutationGate _credentialMutationGate = credentialMutationGate ?? throw new ArgumentNullException(nameof(credentialMutationGate));
+    private readonly ICredentialReferenceRetirementService _retirementService = retirementService ?? throw new ArgumentNullException(nameof(retirementService));
 
     public async Task<ConnectionProfile> SaveAsync(
         ConnectionProfile profile,
@@ -33,6 +38,8 @@ public sealed class ConnectionEditorService(
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(profile);
+        using var mutationLease = await _credentialMutationGate.EnterAsync(cancellationToken)
+            .ConfigureAwait(false);
         var oldProfile = await _repository.GetAsync(profile.Id, cancellationToken).ConfigureAwait(false);
         if (CredentialReferences(profile).Any(static reference => !IsSupportedStore(reference.Store)))
         {
@@ -313,7 +320,13 @@ public sealed class ConnectionEditorService(
             .Where(static candidate => IsManagedStore(candidate.Store))
             .Except(retained))
         {
-            await _credentialStore.DeleteAsync(oldReference, cancellationToken).ConfigureAwait(false);
+            var candidates = await _retirementService.CaptureAsync(
+                [oldReference], cancellationToken).ConfigureAwait(false);
+            if (await _retirementService.RetireUnreferencedAsync(candidates, cancellationToken)
+                    .ConfigureAwait(false) != 0)
+            {
+                throw new InvalidOperationException("旧凭据未能安全清理。");
+            }
         }
     }
 

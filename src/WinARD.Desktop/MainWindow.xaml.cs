@@ -55,6 +55,8 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly SecretRedactor _secretRedactor;
     private readonly IAppSettingsRepository _appSettingsRepository;
     private readonly ICredentialStore _credentialStore;
+    private readonly CredentialMutationGate _credentialMutationGate;
+    private readonly ICredentialReferenceRetirementService _retirementService;
     private readonly SafeDiagnosticLevelController _diagnosticLevel;
     private AppSettingsSnapshot _appSettings = new(AppSettings.Default, 0);
     private Task? _shutdownTask;
@@ -79,6 +81,8 @@ public sealed partial class MainWindow : Window, IDisposable
         SecretRedactor secretRedactor,
         IAppSettingsRepository appSettingsRepository,
         ICredentialStore credentialStore,
+        CredentialMutationGate credentialMutationGate,
+        ICredentialReferenceRetirementService retirementService,
         SafeDiagnosticLevelController diagnosticLevel)
     {
         ViewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
@@ -94,6 +98,8 @@ public sealed partial class MainWindow : Window, IDisposable
         _secretRedactor = secretRedactor ?? throw new ArgumentNullException(nameof(secretRedactor));
         _appSettingsRepository = appSettingsRepository ?? throw new ArgumentNullException(nameof(appSettingsRepository));
         _credentialStore = credentialStore ?? throw new ArgumentNullException(nameof(credentialStore));
+        _credentialMutationGate = credentialMutationGate ?? throw new ArgumentNullException(nameof(credentialMutationGate));
+        _retirementService = retirementService ?? throw new ArgumentNullException(nameof(retirementService));
         _diagnosticLevel = diagnosticLevel ?? throw new ArgumentNullException(nameof(diagnosticLevel));
         InitializeComponent();
         BuildDeviceLibrary();
@@ -409,7 +415,11 @@ public sealed partial class MainWindow : Window, IDisposable
                 _appSettings.Settings.DefaultCredentialBackend)
             {
                 var migration = new CredentialBackendMigrationService(
-                    _database, _credentialStore, ValidateCredentialTargetAsync);
+                    _database,
+                    _credentialStore,
+                    ValidateCredentialTargetAsync,
+                    _credentialMutationGate,
+                    _retirementService);
                 var result = await migration.MigrateAsync(
                     desired.DefaultCredentialBackend,
                     ConfirmSourceCleanupAsync,
@@ -475,7 +485,7 @@ public sealed partial class MainWindow : Window, IDisposable
             return;
         }
         using var master = await PromptForSecretAsync(
-            "凭据保险库主密码", "解锁目标凭据保险库", cancellationToken);
+            "凭据保险库主密码", "解锁迁移所需的凭据保险库", cancellationToken);
         await _vaultSession.UnlockAsync(master, cancellationToken);
     }
 

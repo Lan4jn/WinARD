@@ -113,6 +113,9 @@ public partial class App : Microsoft.UI.Xaml.Application
         services.AddSingleton<DiagnosticExportService>();
         services.AddSingleton<IDeviceRepository, SqliteDeviceRepository>();
         services.AddSingleton<IAppSettingsRepository, SqliteAppSettingsRepository>();
+        services.AddSingleton(provider => new CredentialMutationGate(
+            provider.GetRequiredService<WinArdDatabase>().DatabasePath));
+        services.AddSingleton<ICredentialReferenceRetirementService, CredentialReferenceRetirementService>();
         services.AddSingleton<IBonjourServiceWatcher, DnssdServiceWatcher>();
         services.AddSingleton<IDeviceDiscovery, BonjourDeviceDiscovery>();
         var windowsStore = new WindowsCredentialStore();

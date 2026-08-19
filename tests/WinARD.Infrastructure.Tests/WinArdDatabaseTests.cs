@@ -13,6 +13,86 @@ namespace WinARD.Infrastructure.Tests;
 public sealed class WinArdDatabaseTests
 {
     [Fact]
+    public async Task Migration006_creates_retired_credential_reference_tombstones_on_fresh_database()
+    {
+        using var fixture = new TempDatabase();
+        await using var database = new WinArdDatabase(fixture.Path);
+
+        await database.InitializeAsync(CancellationToken.None);
+
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+        var columns = connection.CreateCommand();
+        columns.CommandText = "PRAGMA table_info(retired_credential_references);";
+        await using var reader = await columns.ExecuteReaderAsync();
+        var schema = new List<(string Name, bool Required, int PrimaryKeyOrder)>();
+        while (await reader.ReadAsync())
+        {
+            schema.Add((reader.GetString(1), reader.GetInt32(3) == 1, reader.GetInt32(5)));
+        }
+
+        Assert.Equal(
+            [
+                ("backend", true, 1),
+                ("credential_key", true, 2),
+                ("retired_utc", true, 0),
+            ],
+            schema);
+        Assert.Equal(6, await ReadSchemaVersionAsync(connection));
+    }
+
+    [Fact]
+    public async Task Migration006_upgrades_version_five_without_changing_existing_data()
+    {
+        await using var fixture = await DatabaseFixture.CreateAtVersionThreeAsync();
+        await fixture.Database.InitializeAsync(
+            [new Migration004QualityScalePercent(), new Migration005AppSettings()],
+            CancellationToken.None);
+        await using (var connection = fixture.Database.CreateConnection())
+        {
+            await connection.OpenAsync();
+            var seed = connection.CreateCommand();
+            seed.CommandText = "INSERT INTO app_settings(setting_key, setting_value) VALUES ('migration006_fixture', 'preserved');";
+            await seed.ExecuteNonQueryAsync();
+        }
+
+        await fixture.Database.InitializeAsync(CancellationToken.None);
+
+        await using var reopened = fixture.Database.CreateConnection();
+        await reopened.OpenAsync();
+        var preserved = reopened.CreateCommand();
+        preserved.CommandText = "SELECT setting_value FROM app_settings WHERE setting_key = 'migration006_fixture';";
+        Assert.Equal("preserved", await preserved.ExecuteScalarAsync());
+        Assert.Equal(6, await ReadSchemaVersionAsync(reopened));
+    }
+
+    [Fact]
+    public async Task Failed_migration006_rolls_back_and_leaves_version_five_reopenable()
+    {
+        await using var fixture = await DatabaseFixture.CreateAtVersionThreeAsync();
+        await fixture.Database.InitializeAsync(
+            [new Migration004QualityScalePercent(), new Migration005AppSettings()],
+            CancellationToken.None);
+        await using (var connection = fixture.Database.CreateConnection())
+        {
+            await connection.OpenAsync();
+            var conflict = connection.CreateCommand();
+            conflict.CommandText = "CREATE TABLE retired_credential_references(conflicting_column TEXT NOT NULL);";
+            await conflict.ExecuteNonQueryAsync();
+        }
+
+        await Assert.ThrowsAsync<SqliteException>(() =>
+            fixture.Database.InitializeAsync(CancellationToken.None));
+
+        await using var reopened = fixture.Database.CreateConnection();
+        await reopened.OpenAsync();
+        Assert.Equal(5, await ReadSchemaVersionAsync(reopened));
+        var conflictPreserved = reopened.CreateCommand();
+        conflictPreserved.CommandText = "SELECT COUNT(*) FROM pragma_table_info('retired_credential_references') WHERE name = 'conflicting_column';";
+        Assert.Equal(1L, await conflictPreserved.ExecuteScalarAsync());
+    }
+
+    [Fact]
     public async Task Migration005_adds_app_settings_defaults_after_existing_version_four()
     {
         await using var fixture = await DatabaseFixture.CreateAtVersionThreeAsync();
@@ -28,7 +108,7 @@ public sealed class WinArdDatabaseTests
         var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM app_settings WHERE setting_key IN ('settings_version', 'revision', 'theme', 'diagnostic_level', 'clipboard_default', 'credential_backend', 'vault_idle_minutes');";
         Assert.Equal(7L, Convert.ToInt64(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture));
-        Assert.Equal(5, await fixture.ReadSchemaVersionAsync());
+        Assert.Equal(6, await fixture.ReadSchemaVersionAsync());
     }
 
     [Fact]
@@ -99,7 +179,7 @@ public sealed class WinArdDatabaseTests
 
         await fixture.Database.InitializeAsync(CancellationToken.None);
 
-        Assert.Equal(5, await fixture.ReadSchemaVersionAsync());
+        Assert.Equal(6, await fixture.ReadSchemaVersionAsync());
         Assert.Equal(new long[] { 0, 1, 2, 3 }, await fixture.ReadQualityScalesAsync());
         await fixture.InsertDeviceWithQualityScaleAsync(4);
         Assert.Equal(new long[] { 0, 1, 2, 3, 4 }, await fixture.ReadQualityScalesAsync());
@@ -139,7 +219,7 @@ public sealed class WinArdDatabaseTests
         Assert.Equal(3, await fixture.ReadSchemaVersionAsync());
 
         await fixture.Database.InitializeAsync(CancellationToken.None);
-        Assert.Equal(5, await fixture.ReadSchemaVersionAsync());
+        Assert.Equal(6, await fixture.ReadSchemaVersionAsync());
     }
 
     [Fact]
@@ -206,7 +286,7 @@ public sealed class WinArdDatabaseTests
         Assert.Equal("ssh-ed25519", ssh.HostKeyPin.Algorithm);
         Assert.Equal("AAAALegacyKey", ssh.HostKeyPin.PublicKeyBase64);
         Assert.Equal("SHA256:legacy", ssh.HostKeyPin.Fingerprint);
-        Assert.Equal(5, await fixture.ReadSchemaVersionAsync());
+        Assert.Equal(6, await fixture.ReadSchemaVersionAsync());
     }
 
     [Fact]
@@ -258,8 +338,8 @@ public sealed class WinArdDatabaseTests
             await using var reader = await command.ExecuteReaderAsync();
             Assert.True(await reader.ReadAsync());
             Assert.Equal(1L, reader.GetInt64(0));
-            Assert.Equal(5L, reader.GetInt64(1));
-            Assert.Equal(5L, reader.GetInt64(2));
+            Assert.Equal(6L, reader.GetInt64(1));
+            Assert.Equal(6L, reader.GetInt64(2));
         }
         finally
         {
@@ -465,6 +545,15 @@ public sealed class WinArdDatabaseTests
         public string Path { get; }
 
         public void Dispose() => System.IO.Directory.Delete(_directory, recursive: true);
+    }
+
+    private static async Task<int> ReadSchemaVersionAsync(SqliteConnection connection)
+    {
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT version FROM schema_version;";
+        return Convert.ToInt32(
+            await command.ExecuteScalarAsync(),
+            System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private sealed class DatabaseFixture : IAsyncDisposable

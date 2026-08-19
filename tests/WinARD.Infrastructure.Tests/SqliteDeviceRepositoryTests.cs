@@ -12,6 +12,13 @@ namespace WinARD.Infrastructure.Tests;
 
 public sealed class SqliteDeviceRepositoryTests
 {
+    public enum RetiredCredentialSlot
+    {
+        Device,
+        SshPassword,
+        SshPassphrase,
+    }
+
     public static TheoryData<FrameRefreshPolicy> RefreshPolicies =>
     [
         FrameRefreshPolicy.Automatic,
@@ -197,6 +204,58 @@ public sealed class SqliteDeviceRepositoryTests
         {
             Assert.IsType<ArgumentOutOfRangeException>(exception.InnerException);
         }
+    }
+
+    [Theory]
+    [InlineData(RetiredCredentialSlot.Device)]
+    [InlineData(RetiredCredentialSlot.SshPassword)]
+    [InlineData(RetiredCredentialSlot.SshPassphrase)]
+    public async Task Save_rejects_retired_credential_reference_without_endpoint_conflict_mapping(
+        RetiredCredentialSlot slot)
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database, new FixedTimeProvider());
+        var retired = CredentialReference.Create("vault", $"retired/{slot}");
+        await fixture.ExecuteAsync($"""
+            INSERT INTO retired_credential_references(backend, credential_key, retired_utc)
+            VALUES ('{retired.Store}', '{retired.Key}', '2026-08-19T00:00:00.0000000+00:00');
+            """);
+        var ssh = SshProfile.Create(
+                "jump.local", 22, "jump", null, "target.local", 5900, null, null, null)
+            .WithAuthenticationCredentials(
+                slot == RetiredCredentialSlot.SshPassword ? retired : null,
+                slot == RetiredCredentialSlot.SshPassphrase ? retired : null);
+        var profile = ConnectionProfile.Create(
+            Guid.NewGuid(), $"Mac {slot}", $"{slot.ToString().ToLowerInvariant()}.local", 5900, "alex");
+        profile = slot == RetiredCredentialSlot.Device
+            ? profile.WithCredential(retired)
+            : profile.WithSsh(ssh);
+
+        var exception = await Assert.ThrowsAsync<RetiredCredentialReferenceException>(() =>
+            repository.SaveAsync(profile, CancellationToken.None));
+
+        Assert.Equal(retired, exception.Reference);
+        Assert.Null(await repository.GetAsync(profile.Id, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Retired_backend_matching_is_case_insensitive_like_credential_routing()
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        await fixture.ExecuteAsync("""
+            INSERT INTO retired_credential_references(backend, credential_key, retired_utc)
+            VALUES ('vault', 'retired/case', '2026-08-19T00:00:00.0000000+00:00');
+            """);
+        var reference = CredentialReference.Create("VAULT", "retired/case");
+        var profile = ConnectionProfile.Create(
+                Guid.NewGuid(), "Case Mac", "case.local", 5900, "alex")
+            .WithCredential(reference);
+
+        var exception = await Assert.ThrowsAsync<RetiredCredentialReferenceException>(() =>
+            repository.SaveAsync(profile, CancellationToken.None));
+
+        Assert.Equal(reference, exception.Reference);
     }
 
     [Theory]

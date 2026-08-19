@@ -3,6 +3,7 @@ using WinARD.Application.Ports;
 using WinARD.Desktop.Threading;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
+using WinARD.Infrastructure.Settings;
 using WinARD.Domain.Security;
 using Xunit;
 
@@ -89,7 +90,13 @@ public sealed class MainWindowViewModelTests
         var nearby = Discovered("nearby", "Nearby MacBook", "nearby.local");
         var discovery = new FakeDiscovery(nearby);
         var dispatcher = new RecordingDispatcher();
-        await using var viewModel = new MainWindowViewModel(repository, discovery, new FakeCredentialStore(), dispatcher)
+        await using var viewModel = new MainWindowViewModel(
+            repository,
+            discovery,
+            new FakeCredentialStore(),
+            dispatcher,
+            NewGate(),
+            new TestRetirementService(new FakeCredentialStore()))
         {
             SearchText = "studio",
         };
@@ -378,7 +385,12 @@ public sealed class MainWindowViewModelTests
             Profile(OfficeId, "Office Mini", "office.local").WithCredential(shared));
         var credentialStore = new FakeCredentialStore();
         await using var viewModel = new MainWindowViewModel(
-            repository, new FakeDiscovery(), credentialStore, new RecordingDispatcher());
+            repository,
+            new FakeDiscovery(),
+            credentialStore,
+            new RecordingDispatcher(),
+            NewGate(),
+            new TestRetirementService(credentialStore));
         await viewModel.InitializeAsync(CancellationToken.None);
         viewModel.SelectedDevice = viewModel.SavedDevices.Single(item => item.Profile?.Id == StudioId);
         var first = viewModel.DeleteSelectedAsync(deleteCredential: true, CancellationToken.None);
@@ -395,6 +407,30 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task DeleteWaitsForSharedCredentialMutationGate()
+    {
+        using var gate = NewGate();
+        using var held = await gate.EnterAsync(CancellationToken.None);
+        var repository = new FakeRepository(Profile(StudioId, "Studio Mac", "studio.local"));
+        await using var viewModel = new MainWindowViewModel(
+            repository,
+            new FakeDiscovery(),
+            new FakeCredentialStore(),
+            new RecordingDispatcher(),
+            gate,
+            new TestRetirementService(new FakeCredentialStore()));
+        await viewModel.InitializeAsync(CancellationToken.None);
+        viewModel.SelectedDevice = Assert.Single(viewModel.SavedDevices);
+
+        var delete = viewModel.DeleteSelectedAsync(deleteCredential: false, CancellationToken.None);
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            delete.WaitAsync(TimeSpan.FromMilliseconds(150)));
+        held.Dispose();
+        Assert.True(await delete.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
     public async Task Dispose_does_not_cancel_an_entered_delete_and_waits_for_credential_cleanup()
     {
         var credential = CredentialReference.Create("windows", "shutdown-commit");
@@ -403,7 +439,12 @@ public sealed class MainWindowViewModelTests
         var credentialStore = new FakeCredentialStore();
         using var shutdown = new CancellationTokenSource();
         var viewModel = new MainWindowViewModel(
-            repository, new FakeDiscovery(), credentialStore, new RecordingDispatcher());
+            repository,
+            new FakeDiscovery(),
+            credentialStore,
+            new RecordingDispatcher(),
+            NewGate(),
+            new TestRetirementService(credentialStore));
         await viewModel.InitializeAsync(CancellationToken.None);
         viewModel.SelectedDevice = Assert.Single(viewModel.SavedDevices);
         var delete = viewModel.DeleteSelectedAsync(deleteCredential: true, shutdown.Token);
@@ -431,7 +472,12 @@ public sealed class MainWindowViewModelTests
             Profile(OfficeId, "Office Mini", "office.local"));
         using var shutdown = new CancellationTokenSource();
         var viewModel = new MainWindowViewModel(
-            repository, new FakeDiscovery(), new FakeCredentialStore(), new RecordingDispatcher());
+            repository,
+            new FakeDiscovery(),
+            new FakeCredentialStore(),
+            new RecordingDispatcher(),
+            NewGate(),
+            new TestRetirementService(new FakeCredentialStore()));
         await viewModel.InitializeAsync(CancellationToken.None);
         viewModel.SelectedDevice = viewModel.SavedDevices.Single(item => item.Profile?.Id == StudioId);
         var entered = viewModel.DeleteSelectedAsync(deleteCredential: false, shutdown.Token);
@@ -460,7 +506,12 @@ public sealed class MainWindowViewModelTests
         var credentialStore = new FakeCredentialStore();
         using var shutdown = new CancellationTokenSource();
         var viewModel = new MainWindowViewModel(
-            repository, new FakeDiscovery(), credentialStore, new RecordingDispatcher());
+            repository,
+            new FakeDiscovery(),
+            credentialStore,
+            new RecordingDispatcher(),
+            NewGate(),
+            new TestRetirementService(credentialStore));
         await viewModel.InitializeAsync(CancellationToken.None);
         viewModel.SelectedDevice = Assert.Single(viewModel.SavedDevices);
         var delete = viewModel.DeleteSelectedAsync(deleteCredential: false, shutdown.Token);
@@ -561,11 +612,44 @@ public sealed class MainWindowViewModelTests
         FakeRepository repository,
         FakeDiscovery? discovery = null,
         FakeCredentialStore? credentialStore = null,
-        IUiDispatcher? dispatcher = null) =>
-        new(repository, discovery ?? new FakeDiscovery(), credentialStore ?? new FakeCredentialStore(), dispatcher ?? new RecordingDispatcher());
+        IUiDispatcher? dispatcher = null)
+    {
+        var store = credentialStore ?? new FakeCredentialStore();
+        return new(
+            repository,
+            discovery ?? new FakeDiscovery(),
+            store,
+            dispatcher ?? new RecordingDispatcher(),
+            NewGate(),
+            new TestRetirementService(store));
+    }
 
     private static ConnectionProfile Profile(Guid id, string name, string host) =>
         ConnectionProfile.Create(id, name, host, 5900, "alex");
+
+    private static CredentialMutationGate NewGate() => new(Path.Combine(
+        Path.GetTempPath(), "WinARD.Tests", Guid.NewGuid().ToString("N"), "winard.db"));
+
+    private sealed class TestRetirementService(ICredentialStore store)
+        : ICredentialReferenceRetirementService
+    {
+        public ValueTask<IReadOnlyList<CredentialRetirementCandidate>> CaptureAsync(
+            IEnumerable<CredentialReference> references,
+            CancellationToken cancellationToken) => ValueTask.FromResult<IReadOnlyList<CredentialRetirementCandidate>>(
+                references.Select(reference => new CredentialRetirementCandidate(reference, null)).ToArray());
+
+        public async Task<int> RetireUnreferencedAsync(
+            IEnumerable<CredentialRetirementCandidate> candidates,
+            CancellationToken cancellationToken)
+        {
+            foreach (var candidate in candidates)
+            {
+                await store.DeleteAsync(candidate.Reference, cancellationToken);
+                candidate.Dispose();
+            }
+            return 0;
+        }
+    }
 
     private static DiscoveredDevice Discovered(string identity, string name, string host) =>
         new(identity, name, host, 5900, new Dictionary<string, string>(), DateTimeOffset.UtcNow.AddMinutes(1));

@@ -4,6 +4,7 @@ using WinARD.Application.Ports;
 using WinARD.Domain.Security;
 using WinARD.Domain.Settings;
 using WinARD.Infrastructure.Database;
+using WinARD.Infrastructure.Devices;
 using WinARD.Infrastructure.Settings;
 using Xunit;
 
@@ -63,6 +64,49 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         Assert.Equal(CredentialBackendMigrationCode.Succeeded, result.Code);
         Assert.Null(_store.Text(source));
         Assert.Equal("alpha", _store.Text(await ReadMacReferenceAsync()));
+        Assert.True(await IsRetiredAsync(source));
+    }
+
+    [Fact]
+    public async Task Failed_source_delete_keeps_durable_retirement_tombstone()
+    {
+        var source = CredentialReference.Create("windows", "profile/one/mac");
+        _store.FailSourceDelete = true;
+
+        var result = await CreateService().MigrateAsync(
+            CredentialBackend.EncryptedVault, true, CancellationToken.None);
+
+        Assert.Equal(CredentialBackendMigrationCode.SucceededWithCleanupFailures, result.Code);
+        Assert.Equal("alpha", _store.Text(source));
+        Assert.True(await IsRetiredAsync(source));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Stale_profile_cannot_restore_retired_device_or_ssh_reference(int slot)
+    {
+        var source = CredentialReference.Create("windows", "profile/one/mac");
+        var migration = await CreateService().MigrateAsync(
+            CredentialBackend.EncryptedVault, true, CancellationToken.None);
+        Assert.Equal(CredentialBackendMigrationCode.Succeeded, migration.Code);
+        await using var repository = new SqliteDeviceRepository(_database);
+        var current = Assert.Single(await repository.GetAllAsync(CancellationToken.None));
+        var stale = slot switch
+        {
+            0 => current.WithCredential(source),
+            1 => current.WithSsh(WinARD.Domain.Connections.SshProfile.Create(
+                "jump.local", 22, "alex", null, "target.local", 5900, source, null, null)),
+            2 => current.WithSsh(WinARD.Domain.Connections.SshProfile.Create(
+                    "jump.local", 22, "alex", "C:\\keys\\id_ed25519", "target.local", 5900,
+                    null, null, null)
+                .WithAuthenticationCredentials(null, source)),
+            _ => throw new ArgumentOutOfRangeException(nameof(slot)),
+        };
+
+        await Assert.ThrowsAsync<RetiredCredentialReferenceException>(() =>
+            repository.SaveAsync(stale, CancellationToken.None));
     }
 
     [Fact]
@@ -440,6 +484,40 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         Assert.Equal(0, _store.References.Count(static reference => reference.Store == "vault"));
     }
 
+    [Fact]
+    public async Task Shared_gate_blocks_writer_after_revalidation_until_commit_is_visible()
+    {
+        using var gate = new CredentialMutationGate(_database.DatabasePath);
+        var revalidated = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueCommit = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var migration = CreateService(
+            gate: gate,
+            beforeCommit: async cancellationToken =>
+            {
+                revalidated.SetResult();
+                await continueCommit.Task.WaitAsync(cancellationToken);
+            }).MigrateAsync(
+                CredentialBackend.EncryptedVault, false, CancellationToken.None);
+        await revalidated.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var writer = Task.Run(async () =>
+        {
+            using var lease = await gate.EnterAsync(CancellationToken.None);
+            return (await ReadMacReferenceAsync()).Store;
+        });
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            writer.WaitAsync(TimeSpan.FromMilliseconds(150)));
+
+        continueCommit.SetResult();
+        var migrationResult = await migration.WaitAsync(TimeSpan.FromSeconds(2));
+        var observedStore = await writer.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(CredentialBackendMigrationCode.Succeeded, migrationResult.Code);
+        Assert.Equal("vault", observedStore);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -497,6 +575,38 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         Assert.Equal(CredentialBackendMigrationCode.SucceededWithCleanupFailures, result.Code);
         Assert.Equal(1, result.SourceCleanupFailureCount);
         Assert.Equal("alpha", _store.Text(source));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Cleanup_treats_backend_case_variants_as_the_same_live_reference(int slot)
+    {
+        var source = CredentialReference.Create("windows", "profile/one/mac");
+        var result = await CreateService().MigrateAsync(
+            CredentialBackend.EncryptedVault,
+            async (_, _) =>
+            {
+                if (slot == 0)
+                {
+                    await InsertDeviceAsync("Windows", source.Key, "case-reference.local");
+                }
+                else if (slot == 1)
+                {
+                    await InsertSshReferenceAsync("Windows", source.Key);
+                }
+                else
+                {
+                    await InsertSshPassphraseReferenceAsync("Windows", source.Key);
+                }
+                return true;
+            },
+            CancellationToken.None);
+
+        Assert.Equal(CredentialBackendMigrationCode.SucceededWithCleanupFailures, result.Code);
+        Assert.Equal("alpha", _store.Text(source));
+        Assert.False(await IsRetiredAsync(source));
     }
 
     [Fact]
@@ -578,8 +688,16 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
     }
 
     private CredentialBackendMigrationService CreateService(
-        Func<CredentialBackend, bool, CancellationToken, ValueTask>? validator = null) =>
-        new(_database, _store, validator ?? ((_, _, _) => ValueTask.CompletedTask));
+        Func<CredentialBackend, bool, CancellationToken, ValueTask>? validator = null,
+        CredentialMutationGate? gate = null,
+        Func<CancellationToken, ValueTask>? beforeCommit = null) =>
+        new(
+            _database,
+            _store,
+            validator ?? ((_, _, _) => ValueTask.CompletedTask),
+            gate ?? new CredentialMutationGate(_database.DatabasePath),
+            new CredentialReferenceRetirementService(_database, _store),
+            beforeCommit);
 
     private Task InsertDeviceAsync(string store, string key) =>
         InsertDeviceAsync(store, key, "fixture.local");
@@ -601,6 +719,15 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
             device_id, ssh_host, ssh_port, ssh_username, target_host, target_port,
             password_credential_store, password_credential_key)
         SELECT id, 'jump.local', 22, 'alex', 'target.local', 5900, '{store}', '{key}'
+        FROM devices LIMIT 1;
+        """);
+
+    private Task InsertSshPassphraseReferenceAsync(string store, string key) => ExecuteAsync($"""
+        INSERT INTO ssh_profiles (
+            device_id, ssh_host, ssh_port, ssh_username, private_key_path, target_host, target_port,
+            passphrase_credential_store, passphrase_credential_key)
+        SELECT id, 'jump.local', 22, 'alex', 'C:\keys\id_ed25519', 'target.local', 5900,
+               '{store}', '{key}'
         FROM devices LIMIT 1;
         """);
 
@@ -632,6 +759,22 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         var command = connection.CreateCommand();
         command.CommandText = "SELECT password_credential_store FROM ssh_profiles LIMIT 1;";
         return Assert.IsType<string>(await command.ExecuteScalarAsync());
+    }
+
+    private async Task<bool> IsRetiredAsync(CredentialReference reference)
+    {
+        await using var connection = _database.CreateConnection();
+        await connection.OpenAsync();
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT COUNT(*) FROM retired_credential_references
+            WHERE backend = $backend AND credential_key = $key;
+            """;
+        command.Parameters.AddWithValue("$backend", reference.Store);
+        command.Parameters.AddWithValue("$key", reference.Key);
+        return Convert.ToInt64(
+            await command.ExecuteScalarAsync(),
+            System.Globalization.CultureInfo.InvariantCulture) != 0;
     }
 
     private async Task ExecuteAsync(string sql)

@@ -19,6 +19,8 @@ public sealed class SettingsDialogIntegrationTests
         Assert.Contains("ConfirmSourceCleanupAsync", main, StringComparison.Ordinal);
         Assert.Contains("if (!requiresVault || _vaultSession.IsUnlocked)", main, StringComparison.Ordinal);
         Assert.Contains("_vaultSession.UnlockAsync(master, cancellationToken)", main, StringComparison.Ordinal);
+        Assert.Contains("解锁迁移所需的凭据保险库", main, StringComparison.Ordinal);
+        Assert.DoesNotContain("解锁目标凭据保险库", main, StringComparison.Ordinal);
         Assert.Contains("ApplyApplicationDefaults", main, StringComparison.Ordinal);
         Assert.Contains("LockVaultNowButton", dialog, StringComparison.Ordinal);
         Assert.Contains("DiagnosticLevelBox", dialog, StringComparison.Ordinal);
@@ -27,7 +29,17 @@ public sealed class SettingsDialogIntegrationTests
         Assert.Contains("VaultTimeoutBox", dialog, StringComparison.Ordinal);
     }
 
-    private static string RepositoryFile(params string[] segments) => Path.Combine(
-        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "..")),
-        Path.Combine(segments));
+    private static string RepositoryFile(params string[] segments)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "WinARD.sln")))
+            {
+                return Path.Combine(directory.FullName, Path.Combine(segments));
+            }
+        }
+        throw new DirectoryNotFoundException("The repository root could not be located.");
+    }
 }

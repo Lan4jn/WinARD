@@ -6,6 +6,7 @@ using WinARD.Application.Sessions;
 using WinARD.Desktop.Services;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
+using WinARD.Infrastructure.Settings;
 using WinARD.Security.Secrets;
 using WinARD.Transport.Ssh;
 using Xunit;
@@ -14,6 +15,26 @@ namespace WinARD.Desktop.Tests.Services;
 
 public sealed class ConnectionEditorServiceTests
 {
+    [Fact]
+    public async Task SaveWaitsForSharedCredentialMutationGate()
+    {
+        using var gate = NewGate();
+        using var held = await gate.EnterAsync(CancellationToken.None);
+        using var store = new VersionedCredentialStore();
+        var repository = new FakeRepository();
+        var service = CreateService(repository, store, store, gate);
+        using var secret = Secret("password");
+
+        var save = service.SaveAsync(
+            Profile(), CredentialSaveMode.WindowsCredentialManager, secret, CancellationToken.None);
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            save.WaitAsync(TimeSpan.FromMilliseconds(150)));
+        held.Dispose();
+        await save.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(1, repository.SaveCalls);
+    }
+
     [Fact]
     public async Task PrivateKeySecretSavesPassphraseReferenceWithoutPasswordReference()
     {
@@ -527,7 +548,9 @@ public sealed class ConnectionEditorServiceTests
             repository,
             persistent,
             transient,
-            workflow);
+            workflow,
+            NewGate(),
+            new TestRetirementService(persistent));
         using var mac = Secret("mac-password");
         using var prompt = new ConnectionEditorHostKeyPrompt();
         var promptShown = new TaskCompletionSource(
@@ -601,7 +624,9 @@ public sealed class ConnectionEditorServiceTests
             transient,
             new ConnectionAttemptWorkflow(
                 handler,
-                new Prompt(SshHostKeyPromptDecision.Cancel)));
+                new Prompt(SshHostKeyPromptDecision.Cancel)),
+            NewGate(),
+            new TestRetirementService(persistent));
         using var mac = Secret("mac-password");
         var prompt = new ConnectionEditorHostKeyPrompt();
         var shown = new TaskCompletionSource(
@@ -632,7 +657,8 @@ public sealed class ConnectionEditorServiceTests
     private static ConnectionEditorService CreateService(
         IDeviceRepository repository,
         ICredentialStore store,
-        ITransientCredentialStore? transientStore = null) => new(
+        ITransientCredentialStore? transientStore = null,
+        CredentialMutationGate? gate = null) => new(
             repository,
             store,
             transientStore ?? (ITransientCredentialStore)store,
@@ -642,7 +668,33 @@ public sealed class ConnectionEditorServiceTests
                     new UnusedSecretProvider(),
                     new RfbClientFactory(),
                     new ErrorMapper()),
-                new Prompt(SshHostKeyPromptDecision.Cancel)));
+                new Prompt(SshHostKeyPromptDecision.Cancel)),
+            gate ?? NewGate(),
+            new TestRetirementService(store));
+
+    private static CredentialMutationGate NewGate() => new(Path.Combine(
+        Path.GetTempPath(), "WinARD.Tests", Guid.NewGuid().ToString("N"), "winard.db"));
+
+    private sealed class TestRetirementService(ICredentialStore store)
+        : ICredentialReferenceRetirementService
+    {
+        public ValueTask<IReadOnlyList<CredentialRetirementCandidate>> CaptureAsync(
+            IEnumerable<WinARD.Domain.Security.CredentialReference> references,
+            CancellationToken cancellationToken) => ValueTask.FromResult<IReadOnlyList<CredentialRetirementCandidate>>(
+                references.Select(reference => new CredentialRetirementCandidate(reference, null)).ToArray());
+
+        public async Task<int> RetireUnreferencedAsync(
+            IEnumerable<CredentialRetirementCandidate> candidates,
+            CancellationToken cancellationToken)
+        {
+            foreach (var candidate in candidates)
+            {
+                await store.DeleteAsync(candidate.Reference, cancellationToken);
+                candidate.Dispose();
+            }
+            return 0;
+        }
+    }
 
     private static ConnectionProfile Profile() => ConnectionProfile.Create(
         Guid.NewGuid(),
