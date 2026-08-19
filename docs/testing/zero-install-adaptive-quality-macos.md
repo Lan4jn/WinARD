@@ -6,6 +6,14 @@ This runbook targets a real **macOS 26.5** host with **one display**. The real-h
 
 No row may be changed to a successful result without evidence from the exact candidate build and the fixed environment below.
 
+## Percentage-scale and reconnect gate
+
+The Mac remains zero-install: use only macOS Remote Management (and Remote Login for SSH). For the exact candidate, connect separately with Automatic, 100%, 75%, 50%, and 25%. A percentage is resolved before connection and cannot change inside an established byte stream. If changed during a session, verify the reconnect-required notice and both “reconnect now” and “later” paths.
+
+For every scale, record only the original framebuffer size, the sanitized applied framebuffer width/height, the stable bootstrap attempt/reason, aggregate throughput/FPS/response, and whether fallback occurred. An incompatible preferred bootstrap may create exactly one fresh `100% + BGRA32 + Zlib-first` fallback connection. Also interrupt a connected session, verify reconnect attempt/countdown/cancel, and verify deterministic authentication/protocol/host-key failures do not retry.
+
+All percentage-scale, fallback, automatic-reconnect, full-screen shortcut, settings, and credential-migration real-host results remain **Not run / External gate** until this section is executed. Automated tests do not establish a bandwidth reduction claim.
+
 ## Privacy and evidence boundary
 
 Record only aggregate telemetry and enumerated product state:

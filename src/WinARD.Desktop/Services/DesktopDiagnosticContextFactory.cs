@@ -11,7 +11,8 @@ internal static class DesktopDiagnosticContextFactory
 {
     public static DiagnosticExportContext CreateSession(
         ConnectionProfile? profile,
-        RemoteSessionDiagnosticQualitySnapshot snapshot)
+        RemoteSessionDiagnosticQualitySnapshot snapshot,
+        DiagnosticReconnectSummary? reconnect = null)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         var session = snapshot.Performance;
@@ -67,6 +68,7 @@ internal static class DesktopDiagnosticContextFactory
                     qualityCapabilities,
                     qualityPresentation.Actual),
             Transfer = BuildTransferSummary(snapshot),
+            Reconnect = reconnect,
         };
     }
 
@@ -188,7 +190,17 @@ internal static class DesktopDiagnosticContextFactory
             transfer.DirtyCoveragePermille,
             snapshot.QualityPresentation.Profile.Color.ToString(),
             AppliedColor(snapshot.QualityPresentation.Actual, PixelFormatColorValue(actualPixelFormat)),
-            encodingBytes);
+            encodingBytes)
+        {
+            DesiredScalePercent = DesiredScalePercent(snapshot.QualityPresentation.Profile.Scale),
+            ResolvedScalePercent = ScalePercent(snapshot.PreferredBootstrap.ScaleFactor),
+            AppliedScalePercent = snapshot.BootstrapState.AppliedScaleFactor is { } applied
+                ? ScalePercent(applied)
+                : null,
+            FirstFrameWidth = snapshot.BootstrapState.FirstFrameSize?.Width,
+            FirstFrameHeight = snapshot.BootstrapState.FirstFrameSize?.Height,
+            FirstFrameRectangleCount = snapshot.BootstrapState.FirstFrameRectangleCount,
+        };
     }
 
     private static string? PreferredEncodingOrder(IReadOnlyList<int> encodings) =>
@@ -227,8 +239,22 @@ internal static class DesktopDiagnosticContextFactory
         QualityScale.Percent100 => 100,
         QualityScale.Percent75 => 75,
         QualityScale.Percent50 => 50,
+        QualityScale.Percent25 => 25,
         _ => throw new ArgumentOutOfRangeException(nameof(scale)),
     };
+
+    private static int ScalePercent(double scale) => scale switch
+    {
+        0.25d => 25,
+        0.5d => 50,
+        0.75d => 75,
+        1d => 100,
+        _ => throw new ArgumentOutOfRangeException(nameof(scale)),
+    };
+
+    private static int? DesiredScalePercent(QualityScale scale) => scale == QualityScale.Automatic
+        ? null
+        : ScalePercent(scale);
 
     private static int RoundNonNegative(double value) =>
         (int)Math.Clamp(Math.Round(value, MidpointRounding.AwayFromZero), 0, int.MaxValue);

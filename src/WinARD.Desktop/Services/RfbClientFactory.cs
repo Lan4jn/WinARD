@@ -806,6 +806,14 @@ internal sealed class RfbClient : IRfbClient
     }
 
     public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize)
+        => ConfirmBootstrapCore(framebufferSize, firstFrameRectangleCount: null);
+
+    public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize, int firstFrameRectangleCount)
+        => ConfirmBootstrapCore(framebufferSize, firstFrameRectangleCount);
+
+    private void ConfirmBootstrapCore(
+        RemoteFramebufferSize framebufferSize,
+        int? firstFrameRectangleCount)
     {
         ThrowIfDisposed();
         lock (_lifecycleSync)
@@ -834,7 +842,11 @@ internal sealed class RfbClient : IRfbClient
                     QualityBootstrapFailureReason.FramebufferSizeMismatch);
             }
 
-            Volatile.Write(ref _bootstrapState, _bootstrapState.ConfirmApplied());
+            Volatile.Write(
+                ref _bootstrapState,
+                firstFrameRectangleCount is { } count
+                    ? _bootstrapState.ConfirmApplied(framebufferSize, count)
+                    : _bootstrapState.ConfirmApplied());
         }
     }
 

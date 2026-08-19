@@ -101,7 +101,7 @@ public sealed class ConnectionErrorCardIntegrationTests
             "if (!_diagnosticExportState.IsClosing)\n            {\n                RefreshDiagnosticActionState();",
             window,
             StringComparison.Ordinal);
-        Assert.Contains("BeginClosingDiagnostics);", window, StringComparison.Ordinal);
+        Assert.Contains("BeginClosingDiagnostics,", window, StringComparison.Ordinal);
         Assert.Contains("_diagnosticExportState.BeginClosing()", window, StringComparison.Ordinal);
     }
 
@@ -240,10 +240,11 @@ public sealed class ConnectionErrorCardIntegrationTests
             "ViewModel.ReportInputFailureAsync,\r\n            CloseSessionAsync",
             window,
             StringComparison.Ordinal);
-        Assert.Contains("retryToken => _uiOperation.RunAsync", main, StringComparison.Ordinal);
-        Assert.Contains("cancellationToken: retryToken", main, StringComparison.Ordinal);
+        Assert.Contains("new RemoteSessionReconnectRequest(", main, StringComparison.Ordinal);
+        Assert.Contains("reconnectRequest.InvokeAsync", main, StringComparison.Ordinal);
+        Assert.Contains("reconnectRequest.InvokeWithoutReservationAsync", main, StringComparison.Ordinal);
         Assert.Contains(
-            "ConnectProfileWithHandlingAsync(\n                            ownership.Profile,",
+            "ConnectProfileWithHandlingAsync(\n                    profile,",
             main,
             StringComparison.Ordinal);
         Assert.Contains("profile: ownership.Profile", main, StringComparison.Ordinal);

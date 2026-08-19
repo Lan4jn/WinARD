@@ -11,6 +11,18 @@ public sealed class DiagnosticExporterTests : IDisposable
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"winard-diag-{Guid.NewGuid():N}");
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(31)]
+    public void EventTtlMustStayWithinTheDocumentedBound(int days)
+    {
+        using var redactor = new SecretRedactor();
+        Assert.Throws<ArgumentOutOfRangeException>(() => new DiagnosticExporter(
+            new InMemorySafeDiagnosticSink(redactor),
+            redactor,
+            new DiagnosticExportLimits(MaxEventAge: TimeSpan.FromDays(days))));
+    }
+
     [Fact]
     public async Task ExportContainsOnlyWhitelistedRedactedJsonAndManifest()
     {
@@ -299,6 +311,140 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.DoesNotContain(transfer.EnumerateObject(), property =>
             property.Name.Contains("Coordinates", StringComparison.OrdinalIgnoreCase) ||
             property.Name.Contains("Rectangles", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task BootstrapAndReconnectEvidenceUsesBoundedClosedSchemaValues()
+    {
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "bootstrap-reconnect.zip");
+        using var redactor = new SecretRedactor();
+        using var exporter = new DiagnosticExporter(new InMemorySafeDiagnosticSink(redactor), redactor);
+        var context = DiagnosticExportContext.Empty with
+        {
+            Transfer = new DiagnosticTransferSummary(
+                "Rgb565", "Bgra32", "Fallback", "FramebufferSizeMismatch", "ZlibFirst",
+                3, 2_000, 800, 400, 200, "Color16", "Full32",
+                new Dictionary<string, long>())
+            {
+                DesiredScalePercent = 25,
+                ResolvedScalePercent = 25,
+                AppliedScalePercent = 100,
+                FirstFrameWidth = 1680,
+                FirstFrameHeight = 1050,
+                FirstFrameRectangleCount = 3,
+            },
+            Reconnect = new DiagnosticReconnectSummary("Waiting", 4, 12),
+        };
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        var root = document.RootElement;
+        var transfer = root.GetProperty("transfer");
+        Assert.Equal(25, transfer.GetProperty("DesiredScalePercent").GetInt32());
+        Assert.Equal(25, transfer.GetProperty("ResolvedScalePercent").GetInt32());
+        Assert.Equal(100, transfer.GetProperty("AppliedScalePercent").GetInt32());
+        Assert.Equal(1680, transfer.GetProperty("FirstFrameWidth").GetInt32());
+        Assert.Equal(1050, transfer.GetProperty("FirstFrameHeight").GetInt32());
+        Assert.Equal(3, transfer.GetProperty("FirstFrameRectangleCount").GetInt32());
+        Assert.Equal("FramebufferSizeMismatch", transfer.GetProperty("BootstrapFallbackReason").GetString());
+        var reconnect = root.GetProperty("reconnect");
+        Assert.Equal("Waiting", reconnect.GetProperty("State").GetString());
+        Assert.Equal(4, reconnect.GetProperty("Attempt").GetInt32());
+        Assert.Equal(12, reconnect.GetProperty("DelaySeconds").GetInt32());
+    }
+
+    [Fact]
+    public async Task MigrationEvidenceExportsOnlyStableResultAndBoundedCounts()
+    {
+        var diagnosticEvent = new SafeDiagnosticEvent(
+            DateTimeOffset.UtcNow,
+            "CREDENTIAL_BACKEND_MIGRATION",
+            Guid.NewGuid().ToString("N"),
+            "ignored",
+            [
+                new("result", "SucceededWithCleanupFailures", DiagnosticFieldCategory.Public),
+                new("managed_count", "4", DiagnosticFieldCategory.Public),
+                new("migrated_count", "4", DiagnosticFieldCategory.Public),
+                new("compensation_failure_count", "0", DiagnosticFieldCategory.Public),
+                new("cleanup_failure_count", "1", DiagnosticFieldCategory.Public),
+            ],
+            null);
+
+        using var document = await ExportSingleEventAsync(
+            diagnosticEvent, false, "migration-evidence.zip");
+
+        var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
+        Assert.Equal("SucceededWithCleanupFailures", fields.GetProperty("MigrationResult").GetString());
+        Assert.Equal("4", fields.GetProperty("MigrationManagedCount").GetString());
+        Assert.Equal("4", fields.GetProperty("MigrationMigratedCount").GetString());
+        Assert.Equal("0", fields.GetProperty("MigrationCompensationFailureCount").GetString());
+        Assert.Equal("1", fields.GetProperty("MigrationCleanupFailureCount").GetString());
+    }
+
+    [Fact]
+    public async Task ExportOmitsExpiredEventsAndAllInjectedSensitiveMaterial()
+    {
+        string[] markers =
+        [
+            "host-sensitive-marker", "user-sensitive-marker", @"C:\Users\private\sensitive-marker.key",
+            "password-sensitive-marker", "clipboard-sensitive-marker", "raw-exception-sensitive-marker",
+            "credential-key-sensitive-marker", "remote-pixel-sensitive-marker",
+        ];
+        var diagnosticEvent = new SafeDiagnosticEvent(
+            DateTimeOffset.UtcNow,
+            "CURRENT_EVENT",
+            Guid.NewGuid().ToString("N"),
+            string.Join('|', markers),
+            [
+                new("endpoint", markers[0], DiagnosticFieldCategory.Host),
+                new("Username", markers[1], DiagnosticFieldCategory.Public),
+                new("Path", markers[2], DiagnosticFieldCategory.Path),
+                new("Password", markers[3], DiagnosticFieldCategory.Password),
+                new("Clipboard", markers[4], DiagnosticFieldCategory.ClipboardContent),
+                new("CredentialKey", markers[6], DiagnosticFieldCategory.Credential),
+                new("RemoteFrameBytes", markers[7], DiagnosticFieldCategory.Public),
+            ],
+            new("InvalidOperationException", "0x80131509"));
+        Directory.CreateDirectory(_directory);
+        var destination = Path.Combine(_directory, "strict-private.zip");
+        using var redactor = new SecretRedactor();
+        var expiredEvent = diagnosticEvent with
+        {
+            Timestamp = DateTimeOffset.UtcNow - TimeSpan.FromDays(2),
+            Code = "EXPIRED_EVENT",
+        };
+        using var exporter = new DiagnosticExporter(
+            new StaticSnapshotSink([expiredEvent, diagnosticEvent]),
+            redactor,
+            new DiagnosticExportLimits(MaxEventAge: TimeSpan.FromDays(1)));
+        var context = DiagnosticExportContext.Empty with
+        {
+            IncludeHosts = true,
+            Profiles = [new("Remote session", markers[0], 5900, markers[1], "RFB 3.x", "ARD-30")],
+            Transfer = new DiagnosticTransferSummary(
+                markers[6], markers[6], markers[6], markers[6], markers[6],
+                0, 0, 0, null, 0, markers[6], markers[6],
+                new Dictionary<string, long> { [markers[6]] = 1 }),
+            Reconnect = new DiagnosticReconnectSummary(markers[5], int.MaxValue, int.MaxValue),
+        };
+
+        await exporter.ExportAsync(destination, context, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(destination);
+        var content = await ReadAllAsync(archive);
+        foreach (var marker in markers)
+        {
+            Assert.DoesNotContain(marker, content, StringComparison.OrdinalIgnoreCase);
+        }
+        using var document = JsonDocument.Parse(await ReadEntryAsync(archive, "diagnostics.json"));
+        Assert.Single(document.RootElement.GetProperty("events").EnumerateArray());
+        var reconnect = document.RootElement.GetProperty("reconnect");
+        Assert.Equal(JsonValueKind.Null, reconnect.GetProperty("State").ValueKind);
+        Assert.Equal(JsonValueKind.Null, reconnect.GetProperty("Attempt").ValueKind);
+        Assert.Equal(JsonValueKind.Null, reconnect.GetProperty("DelaySeconds").ValueKind);
     }
 
     [Fact]
@@ -761,7 +907,7 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.Equal("0x00AF", exported.GetProperty("Flags").GetString());
         Assert.Equal("DesktopSize", exported.GetProperty("EncodingName").GetString());
         Assert.Equal("InvalidCompressedStream", exported.GetProperty("DecoderFailureReason").GetString());
-        Assert.Equal("safe.example", exported.GetProperty("endpoint").GetString());
+        Assert.False(exported.TryGetProperty("endpoint", out _));
         Assert.Equal(fingerprint, exported.GetProperty("fingerprint").GetString());
         Assert.Equal("48", exported.GetProperty("ArdEncryptedPacketLength").GetString());
         Assert.Equal("Fallback", exported.GetProperty("BootstrapAttempt").GetString());
@@ -914,18 +1060,9 @@ public sealed class DiagnosticExporterTests : IDisposable
 
         var exported = document.RootElement.GetProperty("events")[0].GetProperty("fields");
         Assert.Equal(2, exported.EnumerateObject().Count());
-        if (includeHosts)
-        {
-            Assert.Equal("safe.example", exported.GetProperty("endpoint").GetString());
-            Assert.Equal("1", exported.GetProperty("Count").GetString());
-            Assert.False(exported.TryGetProperty("Encrypted", out _));
-        }
-        else
-        {
-            Assert.Equal("1", exported.GetProperty("Count").GetString());
-            Assert.Equal("True", exported.GetProperty("Encrypted").GetString());
-            Assert.False(exported.TryGetProperty("endpoint", out _));
-        }
+        Assert.Equal("1", exported.GetProperty("Count").GetString());
+        Assert.Equal("True", exported.GetProperty("Encrypted").GetString());
+        Assert.False(exported.TryGetProperty("endpoint", out _));
     }
 
     [Fact]
@@ -1151,19 +1288,12 @@ public sealed class DiagnosticExporterTests : IDisposable
         Assert.DoesNotContain(hostHash, content, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(oldFingerprint, content, StringComparison.Ordinal);
         Assert.Contains(newFingerprint, content, StringComparison.Ordinal);
-        if (includeHosts)
-        {
-            Assert.Contains(host, content, StringComparison.Ordinal);
-        }
-        else
-        {
-            Assert.DoesNotContain(host, content, StringComparison.Ordinal);
-        }
+        Assert.DoesNotContain(host, content, StringComparison.Ordinal);
 
         using var manifest = JsonDocument.Parse(await ReadEntryAsync(archive, "manifest.json"));
         var privacy = manifest.RootElement.GetProperty("privacy");
         Assert.True(privacy.GetProperty("pathFieldsOmitted").GetInt32() >= 1);
-        Assert.Equal(includeHosts ? 1 : 2, privacy.GetProperty("hostFieldsOmitted").GetInt32());
+        Assert.Equal(2, privacy.GetProperty("hostFieldsOmitted").GetInt32());
     }
 
     public void Dispose()

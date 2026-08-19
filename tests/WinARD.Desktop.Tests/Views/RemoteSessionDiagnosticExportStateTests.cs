@@ -61,7 +61,8 @@ public sealed class RemoteSessionDiagnosticExportStateTests
                     RemotePixelFormatKind.Bgra32,
                     [6, 16, 0, 1, -239, -223],
                     QualityBootstrapReason.SafeFallback),
-                QualityBootstrapFailureReason.DecoderFailure),
+                QualityBootstrapFailureReason.DecoderFailure)
+                .ConfirmApplied(new RemoteFramebufferSize(1680, 1050), 3),
             PreferredBootstrap = new QualityBootstrapSettings(
                 RemotePixelFormatKind.Rgb565,
                 [16, 6, 0, 1, -239, -223],
@@ -79,6 +80,12 @@ public sealed class RemoteSessionDiagnosticExportStateTests
         Assert.Equal("ZrleFirst", transfer.PreferredEncodingOrder);
         Assert.Equal("Color16", transfer.DesiredColor);
         Assert.Equal("Full32", transfer.AppliedColor);
+        Assert.Equal(75, transfer.DesiredScalePercent);
+        Assert.Equal(100, transfer.ResolvedScalePercent);
+        Assert.Equal(100, transfer.AppliedScalePercent);
+        Assert.Equal(1680, transfer.FirstFrameWidth);
+        Assert.Equal(1050, transfer.FirstFrameHeight);
+        Assert.Equal(3, transfer.FirstFrameRectangleCount);
         Assert.Equal(3, transfer.RectangleCount);
         Assert.Equal(9, transfer.EncodingWireBytes["Other"]);
         Assert.Equal(700, transfer.EncodingWireBytes["Zlib"]);

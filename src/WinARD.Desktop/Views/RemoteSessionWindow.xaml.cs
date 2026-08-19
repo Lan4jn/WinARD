@@ -40,6 +40,7 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
     private readonly ConnectionErrorActionHandler _errorActionHandler;
     private readonly RemoteSessionWindowLifecycle _windowLifecycle;
     private readonly AutomaticReconnectCoordinator? _automaticReconnect;
+    private DiagnosticReconnectSummary? _diagnosticReconnect;
     private readonly ReconnectTransitionCoordinator? _manualReconnectTransition;
     private readonly FrameRateSelectionCoordinator _frameRateSelection = new();
     private readonly FrameRateSaveStatus _frameRateSaveStatus = new();
@@ -911,6 +912,10 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
 
     private void ShowAutomaticReconnectFailure(Exception? failure)
     {
+        _diagnosticReconnect = new DiagnosticReconnectSummary(
+            "Failed",
+            Math.Max(1, _diagnosticReconnect?.Attempt ?? 1),
+            0);
         if (failure is not ReconnectFailureException reconnectFailure)
         {
             return;
@@ -928,6 +933,10 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
         {
             return;
         }
+        _diagnosticReconnect = new DiagnosticReconnectSummary(
+            progress.Remaining > TimeSpan.Zero ? "Waiting" : "Connecting",
+            Math.Clamp(progress.Attempt, 1, 1_000),
+            Math.Clamp((int)Math.Ceiling(progress.Remaining.TotalSeconds), 0, 3_600));
         AutomaticReconnectStatusText.Text = progress.Remaining > TimeSpan.Zero
             ? $"第 {progress.Attempt} 次重连将在 {Math.Ceiling(progress.Remaining.TotalSeconds)} 秒后开始"
             : $"正在进行第 {progress.Attempt} 次重连…";
@@ -957,6 +966,10 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             {
                 AutomaticReconnectPanel.Visibility = Visibility.Collapsed;
                 StatusText.Text = "已取消自动重连。";
+                _diagnosticReconnect = new DiagnosticReconnectSummary(
+                    "Cancelled",
+                    Math.Max(1, _diagnosticReconnect?.Attempt ?? 1),
+                    0);
             }
         }
         catch (Exception) when (_lifetime.IsCancellationRequested)
@@ -1939,7 +1952,8 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
             this,
             DesktopDiagnosticContextFactory.CreateSession(
                 Volatile.Read(ref _profile),
-                ViewModel.CreateDiagnosticQualitySnapshot()),
+                ViewModel.CreateDiagnosticQualitySnapshot(),
+                _diagnosticReconnect),
             cancellationToken);
         if (path is not null && !_diagnosticExportState.IsClosing)
         {

@@ -202,7 +202,7 @@ public sealed class ConnectDeviceHandler
                     try
                     {
                         ValidateFirstPixelFrame(client, pixelFrame);
-                        client.ConfirmBootstrap(pixelFrame.Size);
+                        client.ConfirmBootstrap(pixelFrame.Size, pixelFrame.DirtyRectangles.Count);
                         preloadedMessages.Add(pixelFrame);
                         transferred = true;
                     }

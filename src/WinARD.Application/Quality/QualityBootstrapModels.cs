@@ -140,7 +140,9 @@ public sealed record QualityBootstrapState
         QualityBootstrapAttempt? attempt,
         QualityBootstrapSettings actualQuality,
         QualityBootstrapFailureReason? preferredFailureReason = null,
-        double? appliedScaleFactor = null)
+        double? appliedScaleFactor = null,
+        RemoteFramebufferSize? firstFrameSize = null,
+        int? firstFrameRectangleCount = null)
     {
         if (attempt is { } value && !Enum.IsDefined(value))
         {
@@ -165,10 +167,26 @@ public sealed record QualityBootstrapState
             throw new ArgumentOutOfRangeException(nameof(appliedScaleFactor));
         }
 
+        if (firstFrameSize is { IsValid: false })
+        {
+            throw new ArgumentOutOfRangeException(nameof(firstFrameSize));
+        }
+        if (firstFrameRectangleCount is < 1 or > ushort.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(firstFrameRectangleCount));
+        }
+        if ((firstFrameSize is null) != (firstFrameRectangleCount is null) ||
+            (firstFrameSize is not null && appliedScaleFactor is null))
+        {
+            throw new ArgumentException("First-frame metrics require a confirmed bootstrap.");
+        }
+
         Attempt = attempt;
         ActualQuality = actualQuality ?? throw new ArgumentNullException(nameof(actualQuality));
         PreferredFailureReason = preferredFailureReason;
         AppliedScaleFactor = appliedScaleFactor;
+        FirstFrameSize = firstFrameSize;
+        FirstFrameRectangleCount = firstFrameRectangleCount;
     }
 
     public static QualityBootstrapState LegacyBgra32 { get; } = new(
@@ -190,9 +208,32 @@ public sealed record QualityBootstrapState
 
     public bool IsFirstPixelConfirmed => AppliedScaleFactor is not null;
 
+    public RemoteFramebufferSize? FirstFrameSize { get; }
+
+    public int? FirstFrameRectangleCount { get; }
+
     public QualityBootstrapState ConfirmApplied() => new(
         Attempt,
         ActualQuality,
         PreferredFailureReason,
         ActualQuality.ScaleFactor);
+
+    public QualityBootstrapState ConfirmApplied(
+        RemoteFramebufferSize firstFrameSize,
+        int firstFrameRectangleCount) => new(
+            Attempt,
+            ActualQuality,
+            PreferredFailureReason,
+            ActualQuality.ScaleFactor,
+            firstFrameSize,
+            firstFrameRectangleCount);
+
+    public QualityBootstrapState WithPreferredFailureReason(
+        QualityBootstrapFailureReason? preferredFailureReason) => new(
+            Attempt,
+            ActualQuality,
+            preferredFailureReason,
+            AppliedScaleFactor,
+            FirstFrameSize,
+            FirstFrameRectangleCount);
 }

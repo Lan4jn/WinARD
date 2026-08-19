@@ -11,11 +11,13 @@ public sealed class QualityOverlayOpenCoordinatorTests
     public async Task Open_releases_remote_input_before_publishing_visible_and_coalesces_repeated_clicks()
     {
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var events = new List<string>();
         var coordinator = new QualityOverlayOpenCoordinator(
             async token =>
             {
                 events.Add("release-start");
+                releaseStarted.TrySetResult();
                 await release.Task.WaitAsync(token);
                 events.Add("release-end");
             },
@@ -23,6 +25,7 @@ public sealed class QualityOverlayOpenCoordinatorTests
 
         var first = coordinator.ToggleAsync(default);
         var second = coordinator.ToggleAsync(default);
+        await releaseStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(["release-start"], events);
 
         release.SetResult();

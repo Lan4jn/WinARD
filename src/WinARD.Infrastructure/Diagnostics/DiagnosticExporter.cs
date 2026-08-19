@@ -60,7 +60,17 @@ public sealed record DiagnosticTransferSummary(
     int DirtyCoveragePermille,
     string? DesiredColor,
     string? AppliedColor,
-    IReadOnlyDictionary<string, long> EncodingWireBytes);
+    IReadOnlyDictionary<string, long> EncodingWireBytes)
+{
+    public int? DesiredScalePercent { get; init; }
+    public int? ResolvedScalePercent { get; init; }
+    public int? AppliedScalePercent { get; init; }
+    public int? FirstFrameWidth { get; init; }
+    public int? FirstFrameHeight { get; init; }
+    public int? FirstFrameRectangleCount { get; init; }
+}
+
+public sealed record DiagnosticReconnectSummary(string State, int Attempt, int DelaySeconds);
 
 public sealed record DiagnosticExportContext(
     DiagnosticApplicationInfo Application,
@@ -70,6 +80,7 @@ public sealed record DiagnosticExportContext(
     DiagnosticQualitySummary? Quality = null)
 {
     public DiagnosticTransferSummary? Transfer { get; init; }
+    public DiagnosticReconnectSummary? Reconnect { get; init; }
 
     public static DiagnosticExportContext Empty { get; } = new(
         new DiagnosticApplicationInfo(
@@ -93,7 +104,8 @@ public sealed record DiagnosticExportLimits(
     int MaxFieldsPerEvent = 100,
     int MaxStringUtf8Bytes = 16 * 1024,
     long MaxUncompressedBytes = 20 * 1024 * 1024,
-    long MaxEntryUncompressedBytes = 16 * 1024 * 1024);
+    long MaxEntryUncompressedBytes = 16 * 1024 * 1024,
+    TimeSpan? MaxEventAge = null);
 
 public sealed class DiagnosticExporter : IDisposable
 {
@@ -207,6 +219,17 @@ public sealed class DiagnosticExporter : IDisposable
     private static readonly HashSet<string> AllowedBootstrapFailureReasons = new(StringComparer.Ordinal)
     {
         "DecoderFailure", "UnsupportedEncoding", "MalformedFramebufferUpdate", "RemoteSessionClosed",
+        "ScaleRejected", "FramebufferSizeMismatch", "RectangleOutOfBounds",
+    };
+    private static readonly HashSet<string> AllowedReconnectStates = new(StringComparer.Ordinal)
+    {
+        "Waiting", "Connecting", "Succeeded", "Cancelled", "Failed",
+    };
+    private static readonly HashSet<string> AllowedCredentialMigrationResults = new(StringComparer.Ordinal)
+    {
+        "Succeeded", "SucceededWithCleanupFailures", "TargetValidationFailed", "SourceReadFailed",
+        "TargetWriteFailed", "TargetVerificationFailed", "ConcurrentReferenceChanged",
+        "ConcurrentSettingsChanged", "DatabaseCommitFailed", "Cancelled",
     };
     private static readonly HashSet<string> AllowedRfbHandshakeStages = new(StringComparer.Ordinal)
     {
@@ -264,6 +287,10 @@ public sealed class DiagnosticExporter : IDisposable
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _redactor = redactor ?? throw new ArgumentNullException(nameof(redactor));
         _limits = limits ?? new DiagnosticExportLimits();
+        if (_limits.MaxEventAge is null)
+        {
+            _limits = _limits with { MaxEventAge = TimeSpan.FromDays(7) };
+        }
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxEvents);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxFieldLength);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxArchiveBytes);
@@ -274,6 +301,11 @@ public sealed class DiagnosticExporter : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxStringUtf8Bytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxUncompressedBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_limits.MaxEntryUncompressedBytes);
+        var eventAge = _limits.MaxEventAge.Value;
+        if (eventAge <= TimeSpan.Zero || eventAge > TimeSpan.FromDays(30))
+        {
+            throw new ArgumentOutOfRangeException(nameof(limits));
+        }
     }
 
     public async Task ExportAsync(
@@ -352,9 +384,11 @@ public sealed class DiagnosticExporter : IDisposable
         CancellationToken cancellationToken)
     {
         var privacy = new ExportPrivacyCounters();
+        var eventCutoff = DateTimeOffset.UtcNow - _limits.MaxEventAge!.Value;
         var events = _sink.Snapshot()
+            .Where(item => item.Timestamp >= eventCutoff)
             .TakeLast(_limits.MaxEvents)
-            .Select(item => SafeEvent(item, context.IncludeHosts, privacy))
+            .Select(item => SafeEvent(item, privacy))
             .ToArray();
         var profiles = context.Profiles.Take(_limits.MaxProfiles).Select(profile => new
         {
@@ -389,6 +423,7 @@ public sealed class DiagnosticExporter : IDisposable
                 _limits.MaxPerformanceCounters),
             quality = context.Quality is null ? null : ExportQuality(context.Quality),
             transfer = context.Transfer is null ? null : ExportTransfer(context.Transfer),
+            reconnect = context.Reconnect is null ? null : ExportReconnect(context.Reconnect),
             events,
         };
         var manifest = new
@@ -406,6 +441,7 @@ public sealed class DiagnosticExporter : IDisposable
             excluded = new[]
             {
                 "Passwords, passphrases, vault master secrets, private keys and credential files",
+                "Host names, network addresses, account names and local paths",
                 "Clipboard content",
                 "SQLite databases and SQLite WAL/SHM files",
                 "known_hosts and temporary host-key material",
@@ -448,14 +484,13 @@ public sealed class DiagnosticExporter : IDisposable
 
     private object SafeEvent(
         SafeDiagnosticEvent item,
-        bool includeHosts,
         ExportPrivacyCounters privacy) => new
         {
             item.Timestamp,
             code = ExportEventCode(item.Code),
             correlationId = ExportCorrelationId(item.CorrelationId),
             message = Safe("Diagnostic event.", privacy),
-            fields = ExportFields(item.Fields, includeHosts, privacy),
+            fields = ExportFields(item.Fields, privacy),
             exception = item.Exception is null
                 ? null
                 : new
@@ -520,12 +555,11 @@ public sealed class DiagnosticExporter : IDisposable
 
     private Dictionary<string, string> ExportFields(
         IReadOnlyList<SafeDiagnosticField> values,
-        bool includeHosts,
         ExportPrivacyCounters privacy)
     {
         var safe = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var entry in values
-                     .Select(field => MapToFinalExportEntry(field, includeHosts, privacy))
+                     .Select(field => MapToFinalExportEntry(field, privacy))
                      .Where(static entry => entry is not null)
                      .Take(_limits.MaxFieldsPerEvent))
         {
@@ -556,7 +590,7 @@ public sealed class DiagnosticExporter : IDisposable
         qualityLevel = ExportAllowedValue(quality.QualityLevel, AllowedQualityLevels),
         contentState = ExportAllowedValue(quality.ContentState, AllowedQualityContentStates),
         color = ExportAllowedValue(quality.Color, AllowedQualityColors),
-        scalePercent = quality.ScalePercent is 50 or 75 or 100 ? quality.ScalePercent : (int?)null,
+        scalePercent = quality.ScalePercent is 25 or 50 or 75 or 100 ? quality.ScalePercent : (int?)null,
         encodingName = ExportAllowedValue(quality.EncodingName, AllowedEncodingNames) ?? "Other",
         targetFps = PositiveOrNull(quality.TargetFramesPerSecond),
         actualFps = NonNegativeOrNull(quality.ActualFramesPerSecond),
@@ -609,6 +643,12 @@ public sealed class DiagnosticExporter : IDisposable
             : (int?)null,
         DesiredColor = ExportNullableAllowedValue(transfer.DesiredColor, AllowedQualityColors),
         AppliedColor = ExportNullableAllowedValue(transfer.AppliedColor, AllowedQualityColors),
+        DesiredScalePercent = ExportScalePercent(transfer.DesiredScalePercent),
+        ResolvedScalePercent = ExportScalePercent(transfer.ResolvedScalePercent),
+        AppliedScalePercent = ExportScalePercent(transfer.AppliedScalePercent),
+        FirstFrameWidth = ExportPositiveUInt16(transfer.FirstFrameWidth),
+        FirstFrameHeight = ExportPositiveUInt16(transfer.FirstFrameHeight),
+        FirstFrameRectangleCount = ExportPositiveUInt16(transfer.FirstFrameRectangleCount),
         EncodingRawWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Raw"),
         EncodingCopyRectWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "CopyRect"),
         EncodingZlibWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Zlib"),
@@ -627,6 +667,19 @@ public sealed class DiagnosticExporter : IDisposable
         EncodingOtherWireBytes = ExportEncodingWireBytes(transfer.EncodingWireBytes, "Other"),
     };
 
+    private static object ExportReconnect(DiagnosticReconnectSummary reconnect) => new
+    {
+        State = ExportAllowedValue(reconnect.State, AllowedReconnectStates),
+        Attempt = reconnect.Attempt is >= 1 and <= 1_000 ? reconnect.Attempt : (int?)null,
+        DelaySeconds = reconnect.DelaySeconds is >= 0 and <= 3_600
+            ? reconnect.DelaySeconds
+            : (int?)null,
+    };
+
+    private static int? ExportScalePercent(int? value) => value is 25 or 50 or 75 or 100 ? value : null;
+
+    private static int? ExportPositiveUInt16(int? value) => value is >= 1 and <= ushort.MaxValue ? value : null;
+
     private static string? ExportNullableAllowedValue(string? value, HashSet<string> allowed) =>
         value is not null && allowed.Contains(value) ? value : null;
 
@@ -641,9 +694,8 @@ public sealed class DiagnosticExporter : IDisposable
 
     private static int? PositiveOrNull(int? value) => value > 0 ? value : null;
 
-    private KeyValuePair<string, string>? MapToFinalExportEntry(
+    private static KeyValuePair<string, string>? MapToFinalExportEntry(
         SafeDiagnosticField field,
-        bool includeHosts,
         ExportPrivacyCounters privacy)
     {
         if (field.Category == DiagnosticFieldCategory.Path)
@@ -678,6 +730,11 @@ public sealed class DiagnosticExporter : IDisposable
             "oldFingerprint" or "newFingerprint" => field.Name,
             "BootstrapAttempt" or "BootstrapFallbackReason" or "FallbackFailed" or
             "PreferredFailureReason" => field.Name,
+            "result" => "MigrationResult",
+            "managed_count" => "MigrationManagedCount",
+            "migrated_count" => "MigrationMigratedCount",
+            "compensation_failure_count" => "MigrationCompensationFailureCount",
+            "cleanup_failure_count" => "MigrationCleanupFailureCount",
             "ArdCiphertextLength" => "ArdEncryptedPacketLength",
             _ => null,
         };
@@ -688,14 +745,8 @@ public sealed class DiagnosticExporter : IDisposable
 
         if (field.Category == DiagnosticFieldCategory.Host)
         {
-            if (key != "endpoint")
-            {
-                privacy.InvalidHostsOmitted++;
-                return null;
-            }
-
-            var host = ExportHost(field.Value, includeHosts, privacy);
-            return host is null ? null : new KeyValuePair<string, string>(key, host);
+            privacy.HostFieldsOmitted++;
+            return null;
         }
 
         if (key == "endpoint")
@@ -732,6 +783,10 @@ public sealed class DiagnosticExporter : IDisposable
         "BootstrapFallbackReason" or "PreferredFailureReason" =>
             ExportAllowedValue(value, AllowedBootstrapFailureReasons),
         "FallbackFailed" => ExportBoolean(value),
+        "MigrationResult" => ExportAllowedValue(value, AllowedCredentialMigrationResults),
+        "MigrationManagedCount" or "MigrationMigratedCount" or
+        "MigrationCompensationFailureCount" or "MigrationCleanupFailureCount" =>
+            ExportBoundedNonNegativeInt32(value, 1_000_000),
         "RfbHandshakeStage" => ExportAllowedValue(value, AllowedRfbHandshakeStages),
         "ExpectedByteCount" or "ActualByteCount" or "RectangleIndex" or "ArdEncryptedPacketLength" =>
             ExportNonNegativeInt32(value),
@@ -759,6 +814,12 @@ public sealed class DiagnosticExporter : IDisposable
 
     private static string? ExportNonNegativeInt32(string value) =>
         int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed.ToString(CultureInfo.InvariantCulture)
+            : null;
+
+    private static string? ExportBoundedNonNegativeInt32(string value, int maximum) =>
+        int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) &&
+        parsed >= 0 && parsed <= maximum
             ? parsed.ToString(CultureInfo.InvariantCulture)
             : null;
 
@@ -855,30 +916,6 @@ public sealed class DiagnosticExporter : IDisposable
             .ToArray());
         return ForbiddenFieldNameTokens.Any(normalized.Contains);
     }
-
-    private string? ExportHost(
-        string value,
-        bool includeHosts,
-        ExportPrivacyCounters privacy)
-    {
-        if (!includeHosts)
-        {
-            privacy.HostFieldsOmitted++;
-            return null;
-        }
-
-        var safe = Safe(value, privacy) ?? string.Empty;
-        if (safe.Length == 0 || !safe.EnumerateRunes().All(IsValidHostRune))
-        {
-            privacy.InvalidHostsOmitted++;
-            return null;
-        }
-
-        return safe;
-    }
-
-    private static bool IsValidHostRune(Rune rune) => Rune.IsLetterOrDigit(rune) ||
-        rune.Value is (int)'.' or (int)'-' or (int)'_' or (int)':' or (int)'[' or (int)']' or (int)'%';
 
     private static string LimitUtf8(string value, int maxBytes)
     {

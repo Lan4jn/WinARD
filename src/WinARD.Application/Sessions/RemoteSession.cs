@@ -54,11 +54,8 @@ public sealed class RemoteSession : IRemoteSessionRuntime, IAsyncDisposable
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _client = client ?? throw new ArgumentNullException(nameof(client));
             var clientBootstrapState = client.BootstrapState;
-            _bootstrapState = clientBootstrapState.Attempt is { } attempt
-                ? new QualityBootstrapState(
-                    attempt,
-                    clientBootstrapState.ActualQuality,
-                    preferredFailureReason)
+            _bootstrapState = clientBootstrapState.Attempt is not null
+                ? clientBootstrapState.WithPreferredFailureReason(preferredFailureReason)
                 : QualityBootstrapState.LegacyBgra32;
             if (snapshot.Length > 8 || snapshot.Count(message => message is RemoteFramebufferMessage) > 1 ||
                 snapshot.Any(message => message is not RemoteCursorMessage and not RemoteFramebufferMessage))
