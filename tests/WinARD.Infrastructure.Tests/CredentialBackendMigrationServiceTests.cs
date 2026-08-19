@@ -297,6 +297,41 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Mixed_case_vault_references_in_all_slots_are_enumerated_and_require_unlock()
+    {
+        await ExecuteAsync("""
+            UPDATE devices
+            SET credential_store = 'VaUlT', credential_key = 'mixed/mac', transport_mode = 1;
+            INSERT INTO ssh_profiles (
+                device_id, ssh_host, ssh_port, ssh_username, private_key_path, target_host, target_port,
+                password_credential_store, password_credential_key,
+                passphrase_credential_store, passphrase_credential_key)
+            SELECT id, 'jump.local', 22, 'alex', 'C:\keys\id_ed25519', 'target.local', 5900,
+                   'VAULT', 'mixed/password', 'vAuLt', 'mixed/passphrase'
+            FROM devices LIMIT 1;
+            """);
+        _store = new FakeCredentialStore();
+        _store.Put(CredentialReference.Create("VaUlT", "mixed/mac"), "alpha");
+        _store.Put(CredentialReference.Create("VAULT", "mixed/password"), "bravo");
+        _store.Put(CredentialReference.Create("vAuLt", "mixed/passphrase"), "charlie");
+        var requiresVault = false;
+
+        var result = await CreateService((_, requested, _) =>
+        {
+            requiresVault = requested;
+            return ValueTask.CompletedTask;
+        }).MigrateAsync(CredentialBackend.Windows, false, CancellationToken.None);
+
+        Assert.True(requiresVault);
+        Assert.Equal(CredentialBackendMigrationCode.Succeeded, result.Code);
+        Assert.Equal(3, result.ManagedReferenceCount);
+        Assert.Equal(3, result.MigratedReferenceCount);
+        Assert.Equal("windows", (await ReadMacReferenceAsync()).Store);
+        Assert.Equal("windows", await ReadSshPasswordStoreAsync());
+        Assert.Equal("windows", await ReadSshPassphraseStoreAsync());
+    }
+
+    [Fact]
     public async Task Ask_every_time_confirms_source_cleanup_individually()
     {
         var first = CredentialReference.Create("windows", "profile/one/mac");
@@ -758,6 +793,15 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         await connection.OpenAsync();
         var command = connection.CreateCommand();
         command.CommandText = "SELECT password_credential_store FROM ssh_profiles LIMIT 1;";
+        return Assert.IsType<string>(await command.ExecuteScalarAsync());
+    }
+
+    private async Task<string> ReadSshPassphraseStoreAsync()
+    {
+        await using var connection = _database.CreateConnection();
+        await connection.OpenAsync();
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT passphrase_credential_store FROM ssh_profiles LIMIT 1;";
         return Assert.IsType<string>(await command.ExecuteScalarAsync());
     }
 

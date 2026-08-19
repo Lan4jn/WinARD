@@ -58,11 +58,14 @@ public sealed class ConnectionEditorService(
             ? package.HasMacSecret ? package.CloneMacSecret() : null
             : secret?.Clone();
         using var sshSecret = package?.HasSshSecret == true ? package.CloneSshSecret() : null;
-        var reference = mode == CredentialSaveMode.AskEveryTime
-            ? ReferenceFor(profile.Id, mode)
-            : macSecret is null
-            ? profile.CredentialReference ?? oldProfile?.CredentialReference
-            : ReferenceFor(profile.Id, mode);
+        var existingReference = profile.CredentialReference ?? oldProfile?.CredentialReference;
+        var reference = macSecret is null && existingReference is not null
+            ? existingReference
+            : mode == CredentialSaveMode.AskEveryTime
+                ? ReferenceFor(profile.Id, mode)
+                : macSecret is null
+                    ? null
+                    : GenerationReference(profile.Id, mode, "mac");
         if (reference is null)
         {
             throw new InvalidOperationException("请选择密码后再保存到所选凭据存储。");
@@ -398,7 +401,7 @@ public sealed class ConnectionEditorService(
             return profile;
         }
 
-        if (!replaceSecret && mode != CredentialSaveMode.AskEveryTime)
+        if (!replaceSecret)
         {
             var oldSsh = oldProfile?.SshProfile;
             var preservedReference = ssh.PrivateKeyPath is null
@@ -410,11 +413,16 @@ public sealed class ConnectionEditorService(
                     (oldSsh?.PrivateKeyPath is not null
                         ? oldSsh.PrivateKeyPassphraseCredentialReference
                         : null);
-            return preservedReference is null
-                ? profile
-                : profile.WithSsh(ssh.PrivateKeyPath is null
+            if (preservedReference is not null)
+            {
+                return profile.WithSsh(ssh.PrivateKeyPath is null
                     ? ssh.WithAuthenticationCredentials(preservedReference, null)
                     : ssh.WithAuthenticationCredentials(null, preservedReference));
+            }
+            if (mode != CredentialSaveMode.AskEveryTime)
+            {
+                return profile;
+            }
         }
 
         var store = mode switch
@@ -424,12 +432,25 @@ public sealed class ConnectionEditorService(
             CredentialSaveMode.AskEveryTime => "ask",
             _ => throw new ArgumentOutOfRangeException(nameof(mode)),
         };
+        var purpose = ssh.PrivateKeyPath is null ? "ssh-password" : "ssh-passphrase";
         var reference = CredentialReference.Create(
             store,
-            $"profile/{profile.Id:D}/{(ssh.PrivateKeyPath is null ? "ssh-password" : "ssh-passphrase")}");
+            $"profile/{profile.Id:D}/{purpose}/{Guid.NewGuid():N}");
         return profile.WithSsh(ssh.PrivateKeyPath is null
             ? ssh.WithAuthenticationCredentials(reference, null)
             : ssh.WithAuthenticationCredentials(null, reference));
     }
+
+    private static CredentialReference GenerationReference(
+        Guid id,
+        CredentialSaveMode mode,
+        string purpose) => mode switch
+        {
+            CredentialSaveMode.WindowsCredentialManager => CredentialReference.Create(
+                "windows", $"profile/{id:D}/{purpose}/{Guid.NewGuid():N}"),
+            CredentialSaveMode.EncryptedVault => CredentialReference.Create(
+                "vault", $"profile/{id:D}/{purpose}/{Guid.NewGuid():N}"),
+            _ => throw new ArgumentOutOfRangeException(nameof(mode)),
+        };
 
 }

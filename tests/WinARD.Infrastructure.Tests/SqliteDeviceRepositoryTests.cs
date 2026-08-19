@@ -259,6 +259,51 @@ public sealed class SqliteDeviceRepositoryTests
     }
 
     [Theory]
+    [InlineData(RetiredCredentialSlot.Device)]
+    [InlineData(RetiredCredentialSlot.SshPassword)]
+    [InlineData(RetiredCredentialSlot.SshPassphrase)]
+    public async Task Fresh_generation_can_replace_a_retired_purpose_reference(
+        RetiredCredentialSlot slot)
+    {
+        await using var fixture = await DatabaseFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var id = Guid.NewGuid();
+        var purpose = slot switch
+        {
+            RetiredCredentialSlot.Device => "mac",
+            RetiredCredentialSlot.SshPassword => "ssh-password",
+            RetiredCredentialSlot.SshPassphrase => "ssh-passphrase",
+            _ => throw new ArgumentOutOfRangeException(nameof(slot)),
+        };
+        var retiredKey = $"profile/{id:D}/{purpose}";
+        await fixture.ExecuteAsync($"""
+            INSERT INTO retired_credential_references(backend, credential_key, retired_utc)
+            VALUES ('windows', '{retiredKey}', '2026-08-19T00:00:00.0000000+00:00');
+            """);
+        var fresh = CredentialReference.Create(
+            "windows", $"profile/{id:D}/{purpose}/{Guid.NewGuid():N}");
+        var profile = ConnectionProfile.Create(id, "Fresh", "fresh.local", 5900, "alex");
+        if (slot == RetiredCredentialSlot.Device)
+        {
+            profile = profile.WithCredential(fresh);
+        }
+        else
+        {
+            profile = profile.WithSsh(SshProfile.Create(
+                    "jump.local", 22, "alex",
+                    slot == RetiredCredentialSlot.SshPassphrase ? "C:\\keys\\id_ed25519" : null,
+                    "target.local", 5900, null, null, null)
+                .WithAuthenticationCredentials(
+                    slot == RetiredCredentialSlot.SshPassword ? fresh : null,
+                    slot == RetiredCredentialSlot.SshPassphrase ? fresh : null));
+        }
+
+        await repository.SaveAsync(profile, CancellationToken.None);
+
+        Assert.Equal(profile, await repository.GetAsync(id, CancellationToken.None));
+    }
+
+    [Theory]
     [InlineData("quality_preset", "99")]
     [InlineData("quality_color", "99")]
     [InlineData("quality_scale", "99")]

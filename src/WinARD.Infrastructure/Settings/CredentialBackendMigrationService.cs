@@ -542,13 +542,13 @@ public sealed class CredentialBackendMigrationService
         command.Transaction = transaction;
         command.CommandText = """
             SELECT credential_store, credential_key FROM devices
-            WHERE credential_store IN ('windows', 'vault')
+            WHERE credential_store COLLATE NOCASE IN ('windows', 'vault')
             UNION ALL
             SELECT password_credential_store, password_credential_key FROM ssh_profiles
-            WHERE password_credential_store IN ('windows', 'vault')
+            WHERE password_credential_store COLLATE NOCASE IN ('windows', 'vault')
             UNION ALL
             SELECT passphrase_credential_store, passphrase_credential_key FROM ssh_profiles
-            WHERE passphrase_credential_store IN ('windows', 'vault')
+            WHERE passphrase_credential_store COLLATE NOCASE IN ('windows', 'vault')
             ORDER BY 1, 2;
             """;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken)
