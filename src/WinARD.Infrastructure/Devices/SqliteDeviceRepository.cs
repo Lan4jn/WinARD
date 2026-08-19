@@ -52,6 +52,45 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         }
     }
 
+    public Task<ConnectionProfile> UpdateHostKeyPinAsync(
+        ConnectionProfile profile,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        var pin = profile.SshProfile?.HostKeyPin ??
+            throw new ArgumentException("The profile must contain an SSH host-key pin.", nameof(profile));
+        return UpdatePartialAsync(
+            profile.Id,
+            current => current.WithSsh((current.SshProfile ??
+                throw new InvalidOperationException("The persisted profile does not use SSH.")).WithHostKeyPin(pin)),
+            UpdateHostKeyPinColumnsAsync,
+            cancellationToken);
+    }
+
+    public Task<ConnectionProfile> UpdateQualityProfileAsync(
+        ConnectionProfile profile,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        return UpdatePartialAsync(
+            profile.Id,
+            current => current.WithQualityProfile(profile.Quality),
+            UpdateQualityColumnsAsync,
+            cancellationToken);
+    }
+
+    public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(
+        ConnectionProfile profile,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        return UpdatePartialAsync(
+            profile.Id,
+            current => current.WithFrameRefreshPolicy(profile.FrameRefreshPolicy),
+            UpdateRefreshColumnsAsync,
+            cancellationToken);
+    }
+
     public async Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -146,19 +185,7 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         command.Parameters.AddWithValue("$mac_username", profile.MacUsername);
         command.Parameters.AddWithValue("$transport_mode", (int)profile.TransportMode);
         AddCredentialParameters(command, "$credential_store", "$credential_key", profile.CredentialReference);
-        command.Parameters.AddWithValue("$refresh_mode", (int)profile.FrameRefreshPolicy.Mode);
-        command.Parameters.AddWithValue(
-            "$refresh_fps",
-            profile.FrameRefreshPolicy.FixedFramesPerSecond is { } framesPerSecond ? framesPerSecond : DBNull.Value);
-        command.Parameters.AddWithValue("$quality_preset", (int)profile.Quality.Preset);
-        command.Parameters.AddWithValue("$quality_bandwidth_bps", profile.Quality.TargetBytesPerSecond is { } bandwidth ? bandwidth : DBNull.Value);
-        command.Parameters.AddWithValue("$quality_color", (int)profile.Quality.Color);
-        command.Parameters.AddWithValue("$quality_scale", (int)profile.Quality.Scale);
-        command.Parameters.AddWithValue("$quality_allow_gray", profile.Quality.AllowAutomaticGrayscale ? 1 : 0);
-        command.Parameters.AddWithValue("$quality_bandwidth_locked", profile.Quality.BandwidthLocked ? 1 : 0);
-        command.Parameters.AddWithValue("$quality_color_locked", profile.Quality.ColorLocked ? 1 : 0);
-        command.Parameters.AddWithValue("$quality_scale_locked", profile.Quality.ScaleLocked ? 1 : 0);
-        command.Parameters.AddWithValue("$quality_refresh_locked", profile.Quality.RefreshLocked ? 1 : 0);
+        AddQualityParameters(command, profile.Quality);
         command.Parameters.AddWithValue("$now", now);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -218,9 +245,12 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static SqliteCommand CreateSelectCommand(SqliteConnection connection)
+    private static SqliteCommand CreateSelectCommand(
+        SqliteConnection connection,
+        SqliteTransaction? transaction = null)
     {
         var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             SELECT
                 d.id, d.display_name, d.host, d.port, d.mac_username, d.transport_mode,
@@ -237,6 +267,134 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
             LEFT JOIN ssh_profiles s ON s.device_id = d.id
             """;
         return command;
+    }
+
+    private async Task<ConnectionProfile> UpdatePartialAsync(
+        Guid id,
+        Func<ConnectionProfile, ConnectionProfile> merge,
+        Func<SqliteConnection, SqliteTransaction, ConnectionProfile, string, CancellationToken, Task> update,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(
+            IsolationLevel.Serializable, deferred: false);
+        try
+        {
+            var current = await ReadProfileAsync(connection, transaction, id, cancellationToken)
+                .ConfigureAwait(false) ?? throw new KeyNotFoundException($"Connection profile {id:D} was not found.");
+            var merged = merge(current);
+            var now = _timeProvider.GetUtcNow().ToUniversalTime().ToString(
+                "O", System.Globalization.CultureInfo.InvariantCulture);
+            await update(connection, transaction, merged, now, cancellationToken).ConfigureAwait(false);
+            var persisted = await ReadProfileAsync(connection, transaction, id, cancellationToken)
+                .ConfigureAwait(false) ?? throw new InvalidOperationException("The updated profile disappeared.");
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return persisted;
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static async Task<ConnectionProfile?> ReadProfileAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid id,
+        CancellationToken cancellationToken)
+    {
+        var command = CreateSelectCommand(connection, transaction);
+        command.CommandText += " WHERE d.id = $id;";
+        command.Parameters.AddWithValue("$id", id.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadProfile(reader) : null;
+    }
+
+    private static async Task UpdateHostKeyPinColumnsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ConnectionProfile profile,
+        string now,
+        CancellationToken cancellationToken)
+    {
+        var pin = profile.SshProfile!.HostKeyPin!;
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE ssh_profiles SET
+                host_key_endpoint_host = $host,
+                host_key_endpoint_port = $port,
+                host_key_algorithm = $algorithm,
+                host_key_public_key_base64 = $public_key,
+                host_key_fingerprint = $fingerprint
+            WHERE device_id = $id;
+            UPDATE devices SET updated_utc = $now WHERE id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", profile.Id.ToString("D"));
+        command.Parameters.AddWithValue("$host", pin.Endpoint.Host);
+        command.Parameters.AddWithValue("$port", pin.Endpoint.Port);
+        command.Parameters.AddWithValue("$algorithm", pin.Algorithm);
+        command.Parameters.AddWithValue("$public_key", pin.PublicKeyBase64);
+        command.Parameters.AddWithValue("$fingerprint", pin.Fingerprint);
+        command.Parameters.AddWithValue("$now", now);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task UpdateQualityColumnsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ConnectionProfile profile,
+        string now,
+        CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE devices SET
+                refresh_mode = $refresh_mode,
+                refresh_fps = $refresh_fps,
+                quality_preset = $quality_preset,
+                quality_bandwidth_bps = $quality_bandwidth_bps,
+                quality_color = $quality_color,
+                quality_scale = $quality_scale,
+                quality_allow_gray = $quality_allow_gray,
+                quality_bandwidth_locked = $quality_bandwidth_locked,
+                quality_color_locked = $quality_color_locked,
+                quality_scale_locked = $quality_scale_locked,
+                quality_refresh_locked = $quality_refresh_locked,
+                updated_utc = $now
+            WHERE id = $id;
+            """;
+        AddQualityParameters(command, profile.Quality);
+        command.Parameters.AddWithValue("$id", profile.Id.ToString("D"));
+        command.Parameters.AddWithValue("$now", now);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task UpdateRefreshColumnsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ConnectionProfile profile,
+        string now,
+        CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE devices SET
+                quality_preset = $quality_preset,
+                refresh_mode = $refresh_mode,
+                refresh_fps = $refresh_fps,
+                updated_utc = $now
+            WHERE id = $id;
+            """;
+        command.Parameters.AddWithValue("$quality_preset", (int)profile.Quality.Preset);
+        AddRefreshParameters(command, profile.FrameRefreshPolicy);
+        command.Parameters.AddWithValue("$id", profile.Id.ToString("D"));
+        command.Parameters.AddWithValue("$now", now);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static ConnectionProfile ReadProfile(SqliteDataReader reader)
@@ -323,6 +481,30 @@ public sealed class SqliteDeviceRepository : IDeviceRepository
     {
         command.Parameters.AddWithValue(storeName, DbValue(credential?.Store));
         command.Parameters.AddWithValue(keyName, DbValue(credential?.Key));
+    }
+
+    private static void AddQualityParameters(SqliteCommand command, QualityProfile quality)
+    {
+        AddRefreshParameters(command, quality.Refresh);
+        command.Parameters.AddWithValue("$quality_preset", (int)quality.Preset);
+        command.Parameters.AddWithValue(
+            "$quality_bandwidth_bps",
+            quality.TargetBytesPerSecond is { } bandwidth ? bandwidth : DBNull.Value);
+        command.Parameters.AddWithValue("$quality_color", (int)quality.Color);
+        command.Parameters.AddWithValue("$quality_scale", (int)quality.Scale);
+        command.Parameters.AddWithValue("$quality_allow_gray", quality.AllowAutomaticGrayscale ? 1 : 0);
+        command.Parameters.AddWithValue("$quality_bandwidth_locked", quality.BandwidthLocked ? 1 : 0);
+        command.Parameters.AddWithValue("$quality_color_locked", quality.ColorLocked ? 1 : 0);
+        command.Parameters.AddWithValue("$quality_scale_locked", quality.ScaleLocked ? 1 : 0);
+        command.Parameters.AddWithValue("$quality_refresh_locked", quality.RefreshLocked ? 1 : 0);
+    }
+
+    private static void AddRefreshParameters(SqliteCommand command, FrameRefreshPolicy policy)
+    {
+        command.Parameters.AddWithValue("$refresh_mode", (int)policy.Mode);
+        command.Parameters.AddWithValue(
+            "$refresh_fps",
+            policy.FixedFramesPerSecond is { } framesPerSecond ? framesPerSecond : DBNull.Value);
     }
 
     private static CredentialReference? ReadCredential(SqliteDataReader reader, int storeOrdinal, int keyOrdinal) =>

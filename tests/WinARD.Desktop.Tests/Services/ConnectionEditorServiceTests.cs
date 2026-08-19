@@ -876,6 +876,13 @@ public sealed class ConnectionEditorServiceTests
             return SaveCallback?.Invoke(cancellationToken) ?? Task.CompletedTask;
         }
 
+        public Task<ConnectionProfile> UpdateHostKeyPinAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile> UpdateQualityProfileAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+
         public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
             Task.FromResult(Saved?.Id == id ? Saved : Existing?.Id == id ? Existing : null);
 

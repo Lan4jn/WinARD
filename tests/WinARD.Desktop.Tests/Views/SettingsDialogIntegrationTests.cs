@@ -16,6 +16,8 @@ public sealed class SettingsDialogIntegrationTests
 
         Assert.Contains("ApplicationSettingsButton", main, StringComparison.Ordinal);
         Assert.Contains("CredentialBackendMigrationService", main, StringComparison.Ordinal);
+        Assert.Contains("dialogBase.Revision", main, StringComparison.Ordinal);
+        Assert.Contains("result.CommittedSettingsRevision", main, StringComparison.Ordinal);
         Assert.Contains("ConfirmSourceCleanupAsync", main, StringComparison.Ordinal);
         Assert.Contains("if (!requiresVault || _vaultSession.IsUnlocked)", main, StringComparison.Ordinal);
         Assert.Contains("_vaultSession.UnlockAsync(master, cancellationToken)", main, StringComparison.Ordinal);
@@ -26,6 +28,7 @@ public sealed class SettingsDialogIntegrationTests
         Assert.Contains("DiagnosticLevelBox", dialog, StringComparison.Ordinal);
         Assert.Contains("ClipboardDefaultBox", dialog, StringComparison.Ordinal);
         Assert.Contains("CredentialBackendBox", dialog, StringComparison.Ordinal);
+        Assert.Contains("旧源密码默认保留", dialog, StringComparison.Ordinal);
         Assert.Contains("VaultTimeoutBox", dialog, StringComparison.Ordinal);
     }
 

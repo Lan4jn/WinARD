@@ -17,6 +17,7 @@ public enum CredentialBackendMigrationCode
     TargetWriteFailed,
     TargetVerificationFailed,
     ConcurrentReferenceChanged,
+    ConcurrentSettingsChanged,
     DatabaseCommitFailed,
     Cancelled,
 }
@@ -26,7 +27,8 @@ public sealed record CredentialBackendMigrationResult(
     int ManagedReferenceCount,
     int MigratedReferenceCount,
     int CompensationFailureCount,
-    int SourceCleanupFailureCount);
+    int SourceCleanupFailureCount,
+    long? CommittedSettingsRevision = null);
 
 public sealed record CredentialSourceCleanupPrompt(
     int ItemNumber,
@@ -39,21 +41,18 @@ public sealed class CredentialBackendMigrationService
     private readonly ICredentialStore _store;
     private readonly Func<CredentialBackend, bool, CancellationToken, ValueTask> _validateTarget;
     private readonly CredentialMutationGate _credentialMutationGate;
-    private readonly ICredentialReferenceRetirementService _retirementService;
     private readonly Func<CancellationToken, ValueTask>? _beforeCommit;
 
     public CredentialBackendMigrationService(
         WinArdDatabase database,
         ICredentialStore store,
         Func<CredentialBackend, bool, CancellationToken, ValueTask> validateTarget,
-        CredentialMutationGate credentialMutationGate,
-        ICredentialReferenceRetirementService retirementService)
+        CredentialMutationGate credentialMutationGate)
         : this(
             database,
             store,
             validateTarget,
             credentialMutationGate,
-            retirementService,
             beforeCommit: null)
     {
     }
@@ -63,27 +62,56 @@ public sealed class CredentialBackendMigrationService
         ICredentialStore store,
         Func<CredentialBackend, bool, CancellationToken, ValueTask> validateTarget,
         CredentialMutationGate credentialMutationGate,
-        ICredentialReferenceRetirementService retirementService,
         Func<CancellationToken, ValueTask>? beforeCommit = null)
     {
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _validateTarget = validateTarget ?? throw new ArgumentNullException(nameof(validateTarget));
         _credentialMutationGate = credentialMutationGate ?? throw new ArgumentNullException(nameof(credentialMutationGate));
-        _retirementService = retirementService ?? throw new ArgumentNullException(nameof(retirementService));
         _beforeCommit = beforeCommit;
     }
 
-    public async Task<CredentialBackendMigrationResult> MigrateAsync(
+    internal async Task<CredentialBackendMigrationResult> MigrateAsync(
         CredentialBackend targetBackend,
         bool deleteUnreferencedSources,
         CancellationToken cancellationToken) => await MigrateAsync(
             targetBackend,
+            expectedSettingsRevision: null,
             (_, _) => ValueTask.FromResult(deleteUnreferencedSources),
             cancellationToken).ConfigureAwait(false);
 
     public async Task<CredentialBackendMigrationResult> MigrateAsync(
         CredentialBackend targetBackend,
+        long expectedSettingsRevision,
+        bool deleteUnreferencedSources,
+        CancellationToken cancellationToken) => await MigrateAsync(
+            targetBackend,
+            expectedSettingsRevision,
+            (_, _) => ValueTask.FromResult(deleteUnreferencedSources),
+            cancellationToken).ConfigureAwait(false);
+
+    internal async Task<CredentialBackendMigrationResult> MigrateAsync(
+        CredentialBackend targetBackend,
+        Func<CredentialSourceCleanupPrompt, CancellationToken, ValueTask<bool>> confirmSourceCleanup,
+        CancellationToken cancellationToken) => await MigrateAsync(
+            targetBackend,
+            expectedSettingsRevision: null,
+            confirmSourceCleanup,
+            cancellationToken).ConfigureAwait(false);
+
+    public async Task<CredentialBackendMigrationResult> MigrateAsync(
+        CredentialBackend targetBackend,
+        long expectedSettingsRevision,
+        Func<CredentialSourceCleanupPrompt, CancellationToken, ValueTask<bool>> confirmSourceCleanup,
+        CancellationToken cancellationToken) => await MigrateAsync(
+            targetBackend,
+            (long?)expectedSettingsRevision,
+            confirmSourceCleanup,
+            cancellationToken).ConfigureAwait(false);
+
+    private async Task<CredentialBackendMigrationResult> MigrateAsync(
+        CredentialBackend targetBackend,
+        long? expectedSettingsRevision,
         Func<CredentialSourceCleanupPrompt, CancellationToken, ValueTask<bool>> confirmSourceCleanup,
         CancellationToken cancellationToken)
     {
@@ -92,30 +120,19 @@ public sealed class CredentialBackendMigrationService
         {
             throw new ArgumentOutOfRangeException(nameof(targetBackend));
         }
+        if (expectedSettingsRevision < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(expectedSettingsRevision));
+        }
 
-        IDisposable mutationLease;
-        try
-        {
-            mutationLease = await _credentialMutationGate.EnterAsync(cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            return Empty(CredentialBackendMigrationCode.Cancelled);
-        }
-        catch
-        {
-            return Empty(CredentialBackendMigrationCode.DatabaseCommitFailed);
-        }
-        using (mutationLease)
-        {
-            return await MigrateUnderGateAsync(
-                targetBackend, confirmSourceCleanup, cancellationToken).ConfigureAwait(false);
-        }
+        return await MigrateCoreAsync(
+            targetBackend, expectedSettingsRevision, confirmSourceCleanup, cancellationToken)
+            .ConfigureAwait(false);
     }
 
-    private async Task<CredentialBackendMigrationResult> MigrateUnderGateAsync(
+    private async Task<CredentialBackendMigrationResult> MigrateCoreAsync(
         CredentialBackend targetBackend,
+        long? expectedSettingsRevision,
         Func<CredentialSourceCleanupPrompt, CancellationToken, ValueTask<bool>> confirmSourceCleanup,
         CancellationToken cancellationToken)
     {
@@ -132,6 +149,23 @@ public sealed class CredentialBackendMigrationService
         catch
         {
             return Empty(CredentialBackendMigrationCode.DatabaseCommitFailed);
+        }
+        SettingsState settingsState;
+        try
+        {
+            settingsState = await ReadSettingsStateAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return Empty(CredentialBackendMigrationCode.Cancelled);
+        }
+        catch
+        {
+            return Empty(CredentialBackendMigrationCode.DatabaseCommitFailed);
+        }
+        if (expectedSettingsRevision is { } expected && settingsState.Revision != expected)
+        {
+            return Empty(CredentialBackendMigrationCode.ConcurrentSettingsChanged);
         }
         var targetStore = StoreName(targetBackend);
         var sources = managed
@@ -156,10 +190,11 @@ public sealed class CredentialBackendMigrationService
         {
             return Empty(CredentialBackendMigrationCode.TargetValidationFailed);
         }
-        SettingsState settingsState;
+        IDisposable mutationLease;
         try
         {
-            settingsState = await ReadSettingsStateAsync(cancellationToken).ConfigureAwait(false);
+            mutationLease = await _credentialMutationGate.EnterAsync(cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -168,6 +203,30 @@ public sealed class CredentialBackendMigrationService
         catch
         {
             return Empty(CredentialBackendMigrationCode.DatabaseCommitFailed);
+        }
+        using var acquiredMutationLease = mutationLease;
+        IReadOnlyList<CredentialReference> lockedManaged;
+        SettingsState lockedSettings;
+        try
+        {
+            lockedManaged = await ReadManagedReferencesAsync(cancellationToken).ConfigureAwait(false);
+            lockedSettings = await ReadSettingsStateAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return Empty(CredentialBackendMigrationCode.Cancelled);
+        }
+        catch
+        {
+            return Empty(CredentialBackendMigrationCode.DatabaseCommitFailed);
+        }
+        if (!managed.SequenceEqual(lockedManaged))
+        {
+            return Empty(CredentialBackendMigrationCode.ConcurrentReferenceChanged);
+        }
+        if (lockedSettings != settingsState)
+        {
+            return Empty(CredentialBackendMigrationCode.ConcurrentSettingsChanged);
         }
         if (targetBackend == CredentialBackend.AskEveryTime)
         {
@@ -230,6 +289,7 @@ public sealed class CredentialBackendMigrationService
                 DisposeCleanupVersions(cleanupVersions);
                 return new(commit, managed.Count, 0, 0, 0);
             }
+            acquiredMutationLease.Dispose();
             var askCleanupFailures = 0;
             for (var index = 0; index < cleanupVersions.Count; index++)
             {
@@ -241,7 +301,8 @@ public sealed class CredentialBackendMigrationService
                     cancellationToken).ConfigureAwait(false);
                 if (approved)
                 {
-                    askCleanupFailures += await CleanupSourcesAsync([cleanup]).ConfigureAwait(false);
+                    askCleanupFailures += await CleanupSourcesUnderGateAsync([cleanup], cancellationToken)
+                        .ConfigureAwait(false);
                 }
                 else
                 {
@@ -252,7 +313,8 @@ public sealed class CredentialBackendMigrationService
                 askCleanupFailures == 0
                     ? CredentialBackendMigrationCode.Succeeded
                     : CredentialBackendMigrationCode.SucceededWithCleanupFailures,
-                managed.Count, sources.Length, 0, askCleanupFailures);
+                managed.Count, sources.Length, 0, askCleanupFailures,
+                checked(settingsState.Revision + 1));
         }
         var copies = new List<CredentialCopy>(sources.Length);
         var failure = CredentialBackendMigrationCode.Succeeded;
@@ -386,6 +448,7 @@ public sealed class CredentialBackendMigrationService
             DisposeCopies(copies);
             return new(commitCode, managed.Count, 0, compensationFailures, 0);
         }
+        acquiredMutationLease.Dispose();
 
         var deleteSources = await ConfirmCleanupAsync(
             confirmSourceCleanup,
@@ -393,8 +456,9 @@ public sealed class CredentialBackendMigrationService
                 sources.Length, sources.Length, RequiresIndividualConfirmation: false),
             cancellationToken).ConfigureAwait(false);
         var cleanupFailures = deleteSources
-            ? await CleanupSourcesAsync(copies.Select(static copy =>
-                new SourceCleanup(copy.Source, copy.SourceVersion.Clone())).ToArray()).ConfigureAwait(false)
+            ? await CleanupSourcesUnderGateAsync(copies.Select(static copy =>
+                new SourceCleanup(copy.Source, copy.SourceVersion.Clone())).ToArray(), cancellationToken)
+                .ConfigureAwait(false)
             : 0;
         DisposeCopies(copies);
         return new(
@@ -404,7 +468,8 @@ public sealed class CredentialBackendMigrationService
             managed.Count,
             copies.Count,
             0,
-            cleanupFailures);
+            cleanupFailures,
+            checked(settingsState.Revision + 1));
     }
 
     private async Task<CredentialBackendMigrationCode> TryCommitAsync(
@@ -444,6 +509,24 @@ public sealed class CredentialBackendMigrationService
                     }
                 }
 
+                foreach (var source in rewrites.Select(static rewrite => rewrite.Source).Distinct())
+                {
+                    var retirement = connection.CreateCommand();
+                    retirement.Transaction = transaction;
+                    retirement.CommandText = """
+                        INSERT OR IGNORE INTO retired_credential_references(
+                            backend, credential_key, retired_utc)
+                        VALUES ($backend, $key, $retired_utc);
+                        """;
+                    retirement.Parameters.AddWithValue("$backend", source.Store);
+                    retirement.Parameters.AddWithValue("$key", source.Key);
+                    retirement.Parameters.AddWithValue(
+                        "$retired_utc",
+                        DateTimeOffset.UtcNow.ToString(
+                            "O", System.Globalization.CultureInfo.InvariantCulture));
+                    await retirement.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+
                 var setting = connection.CreateCommand();
                 setting.Transaction = transaction;
                 setting.CommandText = """
@@ -456,7 +539,7 @@ public sealed class CredentialBackendMigrationService
                 if (await setting.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                 {
                     await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                    return CredentialBackendMigrationCode.ConcurrentReferenceChanged;
+                    return CredentialBackendMigrationCode.ConcurrentSettingsChanged;
                 }
                 var revision = connection.CreateCommand();
                 revision.Transaction = transaction;
@@ -470,7 +553,7 @@ public sealed class CredentialBackendMigrationService
                 if (await revision.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                 {
                     await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                    return CredentialBackendMigrationCode.ConcurrentReferenceChanged;
+                    return CredentialBackendMigrationCode.ConcurrentSettingsChanged;
                 }
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 return CredentialBackendMigrationCode.Succeeded;
@@ -644,21 +727,53 @@ public sealed class CredentialBackendMigrationService
 
     private async Task<int> CleanupSourcesAsync(IEnumerable<SourceCleanup> sources)
     {
-        var candidates = new List<CredentialRetirementCandidate>();
+        var failures = 0;
         foreach (var source in sources)
         {
             try
             {
-                candidates.Add(new CredentialRetirementCandidate(
-                    source.Reference, source.Version.Clone()));
+                using var result = await _store.CompareExchangeWithVersionAsync(
+                    source.Reference,
+                    source.Version,
+                    replacement: null,
+                    CancellationToken.None).ConfigureAwait(false);
+                if (result.Result != CredentialStoreCompareExchangeResult.Succeeded)
+                {
+                    failures++;
+                }
+            }
+            catch
+            {
+                failures++;
             }
             finally
             {
                 source.Dispose();
             }
         }
-        return await _retirementService.RetireUnreferencedAsync(
-            candidates, CancellationToken.None).ConfigureAwait(false);
+        return failures;
+    }
+
+    private async Task<int> CleanupSourcesUnderGateAsync(
+        IEnumerable<SourceCleanup> sources,
+        CancellationToken cancellationToken)
+    {
+        var failures = 0;
+        foreach (var source in sources)
+        {
+            try
+            {
+                using var cleanupLease = await _credentialMutationGate.EnterAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                failures += await CleanupSourcesAsync([source]).ConfigureAwait(false);
+            }
+            catch
+            {
+                source.Dispose();
+                failures++;
+            }
+        }
+        return failures;
     }
 
     private async Task<CredentialBackendMigrationCode> RevalidateSourcesAsync(

@@ -4,6 +4,9 @@ using WinARD.Application.Sessions;
 using WinARD.Application.Quality;
 using WinARD.Desktop.Services;
 using WinARD.Domain.Connections;
+using WinARD.Domain.Security;
+using WinARD.Infrastructure.Database;
+using WinARD.Infrastructure.Devices;
 using WinARD.Transport.Ssh;
 using Xunit;
 
@@ -229,6 +232,48 @@ public sealed class ConnectionSessionControllerTests
         Assert.Same(updated, published);
         Assert.Same(QualityProfile.Smooth, updated.Quality);
         Assert.Equal([updated], repository.Saved);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Connected_runtime_quality_update_preserves_externally_changed_credentials(
+        bool updateWholeQuality)
+    {
+        await using var fixture = await SqliteFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var stale = ProfileWithCredentials();
+        await repository.SaveAsync(stale, CancellationToken.None);
+        await using var sut = Controller(
+            new TrackingTransport(),
+            new Prompt(SshHostKeyPromptDecision.Cancel),
+            repository);
+        await sut.ConnectAsync(stale, CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+        var latest = WithLatestCredentials(stale);
+        await repository.SaveAsync(latest, CancellationToken.None);
+        ConnectionProfile? published = null;
+        sut.ProfileUpdated += profile => published = profile;
+
+        var updated = updateWholeQuality
+            ? await sut.UpdateConnectedQualityProfileAsync(QualityProfile.Smooth, CancellationToken.None)
+            : await sut.UpdateConnectedFrameRefreshPolicyAsync(
+                FrameRefreshPolicy.Fixed(90), CancellationToken.None);
+
+        AssertLatestCredentials(updated);
+        AssertLatestCredentials(ownership.Profile);
+        AssertLatestCredentials(published!);
+        AssertLatestCredentials((await repository.GetAsync(stale.Id, CancellationToken.None))!);
+        Assert.Same(updated, ownership.Profile);
+        Assert.Same(updated, published);
+        if (updateWholeQuality)
+        {
+            Assert.Same(QualityProfile.Smooth, updated.Quality);
+        }
+        else
+        {
+            Assert.Equal(FrameRefreshPolicy.Fixed(90), updated.FrameRefreshPolicy);
+        }
     }
 
     [Fact]
@@ -536,6 +581,37 @@ public sealed class ConnectionSessionControllerTests
     }
 
     [Fact]
+    public async Task Accepted_host_key_preserves_externally_changed_credentials_and_publishes_latest_profile()
+    {
+        await using var fixture = await SqliteFixture.CreateAsync();
+        await using var repository = new SqliteDeviceRepository(fixture.Database);
+        var endpoint = new SshHostKeyEndpoint("jump.local", 22);
+        var stale = ProfileWithCredentials(endpoint);
+        await repository.SaveAsync(stale, CancellationToken.None);
+        var latest = WithLatestCredentials(stale);
+        var candidate = SshHostKeyVerifier.CreateCandidate(endpoint, "ssh-ed25519", "AQIDBA==");
+        var prompt = new CallbackPrompt(async cancellationToken =>
+        {
+            await repository.SaveAsync(latest, cancellationToken);
+            return SshHostKeyPromptDecision.Trust;
+        });
+        await using var sut = Controller(new HostKeyUntilPinnedTransport(candidate), prompt, repository);
+        ConnectionProfile? published = null;
+        sut.ProfileUpdated += profile => published = profile;
+
+        await sut.ConnectAsync(stale, CancellationToken.None);
+        await using var ownership = sut.TransferConnectedSession();
+
+        var persisted = (await repository.GetAsync(stale.Id, CancellationToken.None))!;
+        AssertLatestCredentials(persisted);
+        AssertLatestCredentials(ownership.Profile);
+        AssertLatestCredentials(published!);
+        Assert.Equal(candidate.ToPin(), persisted.SshProfile!.HostKeyPin);
+        Assert.Equal(persisted, ownership.Profile);
+        Assert.Equal(persisted, published);
+    }
+
+    [Fact]
     public async Task Accepted_host_key_profile_publication_is_reentrant_and_isolates_subscriber_failures()
     {
         var endpoint = new SshHostKeyEndpoint("jump.local", 22);
@@ -822,6 +898,41 @@ public sealed class ConnectionSessionControllerTests
     private static ConnectionProfile Profile() => ConnectionProfile.Create(
         Guid.NewGuid(), "Studio", "studio.local", 5900, "operator");
 
+    private static ConnectionProfile ProfileWithCredentials(SshHostKeyEndpoint? endpoint = null) =>
+        ConnectionProfile.Create(Guid.NewGuid(), "Studio", "studio.local", 5900, "operator")
+            .WithCredential(CredentialReference.Create("windows", "stale/mac"))
+            .WithSsh(SshProfile.Create(
+                    endpoint?.Host ?? "jump.local",
+                    endpoint?.Port ?? 22,
+                    "ssh-user",
+                    "C:\\keys\\id_ed25519",
+                    "studio.local",
+                    5900,
+                    null,
+                    null,
+                    null)
+                .WithAuthenticationCredentials(
+                    CredentialReference.Create("vault", "stale/ssh-password"),
+                    CredentialReference.Create("ask", "stale/ssh-passphrase")));
+
+    private static ConnectionProfile WithLatestCredentials(ConnectionProfile profile) =>
+        profile
+            .WithCredential(CredentialReference.Create("ask", "latest/mac"))
+            .WithSsh(profile.SshProfile!.WithAuthenticationCredentials(
+                CredentialReference.Create("windows", "latest/ssh-password"),
+                CredentialReference.Create("vault", "latest/ssh-passphrase")));
+
+    private static void AssertLatestCredentials(ConnectionProfile profile)
+    {
+        Assert.Equal(CredentialReference.Create("ask", "latest/mac"), profile.CredentialReference);
+        Assert.Equal(
+            CredentialReference.Create("windows", "latest/ssh-password"),
+            profile.SshProfile!.PasswordCredentialReference);
+        Assert.Equal(
+            CredentialReference.Create("vault", "latest/ssh-passphrase"),
+            profile.SshProfile.PrivateKeyPassphraseCredentialReference);
+    }
+
     private static ConnectionSessionController Controller(
         IRfbClient client,
         ActiveSessionCoordinator coordinator) =>
@@ -954,6 +1065,19 @@ public sealed class ConnectionSessionControllerTests
             return Task.CompletedTask;
         }
 
+        public Task<ConnectionProfile> UpdateHostKeyPinAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+        public Task<ConnectionProfile> UpdateQualityProfileAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+        public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+
+        private async Task<ConnectionProfile> SaveAndReturnAsync(ConnectionProfile profile, CancellationToken token)
+        {
+            await SaveAsync(profile, token);
+            return profile;
+        }
+
         public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
             Task.FromResult(Saved?.Id == id ? Saved : null);
 
@@ -974,6 +1098,19 @@ public sealed class ConnectionSessionControllerTests
             cancellationToken.ThrowIfCancellationRequested();
             Saved.Add(profile);
             return Task.CompletedTask;
+        }
+
+        public Task<ConnectionProfile> UpdateHostKeyPinAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+        public Task<ConnectionProfile> UpdateQualityProfileAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+        public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+
+        private async Task<ConnectionProfile> SaveAndReturnAsync(ConnectionProfile profile, CancellationToken token)
+        {
+            await SaveAsync(profile, token);
+            return profile;
         }
 
         public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
@@ -1005,6 +1142,19 @@ public sealed class ConnectionSessionControllerTests
                 SaveStarted.TrySetResult();
                 await AllowFirstSave.Task.WaitAsync(cancellationToken);
             }
+        }
+
+        public Task<ConnectionProfile> UpdateHostKeyPinAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+        public Task<ConnectionProfile> UpdateQualityProfileAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+        public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+
+        private async Task<ConnectionProfile> SaveAndReturnAsync(ConnectionProfile profile, CancellationToken token)
+        {
+            await SaveAsync(profile, token);
+            return profile;
         }
 
         public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
@@ -1041,6 +1191,19 @@ public sealed class ConnectionSessionControllerTests
                 SaveCanceled.TrySetResult();
                 throw;
             }
+        }
+
+        public Task<ConnectionProfile> UpdateHostKeyPinAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+        public Task<ConnectionProfile> UpdateQualityProfileAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+        public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(ConnectionProfile profile, CancellationToken token) =>
+            SaveAndReturnAsync(profile, token);
+
+        private async Task<ConnectionProfile> SaveAndReturnAsync(ConnectionProfile profile, CancellationToken token)
+        {
+            await SaveAsync(profile, token);
+            return profile;
         }
 
         public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
@@ -1093,6 +1256,19 @@ public sealed class ConnectionSessionControllerTests
             cancellationToken.ThrowIfCancellationRequested();
             Attempted = profile;
             throw new InvalidOperationException("CAS conflict");
+        }
+
+        public Task<ConnectionProfile> UpdateHostKeyPinAsync(ConnectionProfile profile, CancellationToken token) =>
+            ThrowAsync(profile, token);
+        public Task<ConnectionProfile> UpdateQualityProfileAsync(ConnectionProfile profile, CancellationToken token) =>
+            ThrowAsync(profile, token);
+        public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(ConnectionProfile profile, CancellationToken token) =>
+            ThrowAsync(profile, token);
+
+        private async Task<ConnectionProfile> ThrowAsync(ConnectionProfile profile, CancellationToken token)
+        {
+            await SaveAsync(profile, token);
+            return profile;
         }
 
         public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
@@ -1155,6 +1331,14 @@ public sealed class ConnectionSessionControllerTests
         }
     }
 
+    private sealed class CallbackPrompt(
+        Func<CancellationToken, Task<SshHostKeyPromptDecision>> callback) : ISshHostKeyPrompt
+    {
+        public async ValueTask<SshHostKeyPromptDecision> PromptAsync(
+            SshHostKeyPromptRequest request,
+            CancellationToken cancellationToken) => await callback(cancellationToken);
+    }
+
     private sealed class FailingClient : IRfbClient
     {
         public Task NegotiateAsync(CancellationToken cancellationToken) =>
@@ -1175,5 +1359,34 @@ public sealed class ConnectionSessionControllerTests
         public void CopyTo(Span<byte> destination) => destination[0] = 1;
         public ISecret Clone() => new Secret();
         public void Dispose() { }
+    }
+
+    private sealed class SqliteFixture : IAsyncDisposable
+    {
+        private SqliteFixture(string directory, WinArdDatabase database)
+        {
+            Directory = directory;
+            Database = database;
+        }
+
+        private string Directory { get; }
+        public WinArdDatabase Database { get; }
+
+        public static async Task<SqliteFixture> CreateAsync()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "WinARD.Tests", Guid.NewGuid().ToString("N"));
+            var database = new WinArdDatabase(Path.Combine(directory, "winard.db"));
+            await database.InitializeAsync(CancellationToken.None);
+            return new SqliteFixture(directory, database);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await Database.DisposeAsync();
+            if (System.IO.Directory.Exists(Directory))
+            {
+                System.IO.Directory.Delete(Directory, recursive: true);
+            }
+        }
     }
 }

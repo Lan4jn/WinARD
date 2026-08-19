@@ -399,8 +399,9 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         try
         {
+            var dialogBase = _appSettings;
             var dialog = new SettingsDialog(
-                _appSettings.Settings,
+                dialogBase.Settings,
                 () => _vaultSession.LockAsync())
             {
                 XamlRoot = ShellRoot.XamlRoot,
@@ -411,17 +412,18 @@ public sealed partial class MainWindow : Window, IDisposable
             }
 
             var desired = dialog.SelectedSettings;
+            var expectedRevision = dialogBase.Revision;
             if (desired.DefaultCredentialBackend !=
-                _appSettings.Settings.DefaultCredentialBackend)
+                dialogBase.Settings.DefaultCredentialBackend)
             {
                 var migration = new CredentialBackendMigrationService(
                     _database,
                     _credentialStore,
                     ValidateCredentialTargetAsync,
-                    _credentialMutationGate,
-                    _retirementService);
+                    _credentialMutationGate);
                 var result = await migration.MigrateAsync(
                     desired.DefaultCredentialBackend,
+                    dialogBase.Revision,
                     ConfirmSourceCleanupAsync,
                     _shutdown.Token);
                 _diagnosticSink.TryWrite(new SafeDiagnosticEventInput(
@@ -447,11 +449,12 @@ public sealed partial class MainWindow : Window, IDisposable
                         "迁移未删除源凭据；配置可能已由其他操作更新。请检查后重试。");
                     return;
                 }
-                _appSettings = await _appSettingsRepository.GetAsync(_shutdown.Token);
+                expectedRevision = result.CommittedSettingsRevision ??
+                    throw new InvalidOperationException("迁移未返回已提交的设置版本。");
             }
 
             var saved = await _appSettingsRepository.TryUpdateAsync(
-                _appSettings.Revision, desired, _shutdown.Token);
+                expectedRevision, desired, _shutdown.Token);
             if (!saved)
             {
                 _appSettings = await _appSettingsRepository.GetAsync(_shutdown.Token);

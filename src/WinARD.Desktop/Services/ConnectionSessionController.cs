@@ -103,17 +103,20 @@ public sealed class ConnectionSessionController : IAsyncDisposable
 
             try
             {
+                ConnectionProfile? persistedHostKeyProfile = null;
                 var outcome = await _attemptWorkflow.AttemptAsync(
                     profile,
                     StageChanged,
                     async (updated, token) =>
                     {
-                        await _repository.SaveAsync(updated, token).ConfigureAwait(false);
-                        profilesToPublish.Add(updated);
+                        persistedHostKeyProfile = await _repository
+                            .UpdateHostKeyPinAsync(updated, token)
+                            .ConfigureAwait(false);
+                        profilesToPublish.Add(persistedHostKeyProfile);
                     },
                     hostKeyPrompt,
                     cancellationToken).ConfigureAwait(false);
-                profile = outcome.Profile;
+                profile = persistedHostKeyProfile ?? outcome.Profile;
                 var result = outcome.Result;
                 if (result.Session is null)
                 {
@@ -187,6 +190,7 @@ public sealed class ConnectionSessionController : IAsyncDisposable
         CancellationToken cancellationToken)
         => await UpdateConnectedProfileAsync(
             profile => profile.WithFrameRefreshPolicy(policy),
+            (profile, token) => _repository.UpdateFrameRefreshPolicyAsync(profile, token),
             cancellationToken).ConfigureAwait(false);
 
     public async Task<ConnectionProfile> UpdateConnectedQualityProfileAsync(
@@ -196,14 +200,17 @@ public sealed class ConnectionSessionController : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(quality);
         return await UpdateConnectedProfileAsync(
             profile => profile.WithQualityProfile(quality),
+            (profile, token) => _repository.UpdateQualityProfileAsync(profile, token),
             cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<ConnectionProfile> UpdateConnectedProfileAsync(
         Func<ConnectionProfile, ConnectionProfile> update,
+        Func<ConnectionProfile, CancellationToken, Task<ConnectionProfile>> persist,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(update);
+        ArgumentNullException.ThrowIfNull(persist);
         ConnectionProfile updated;
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -214,8 +221,8 @@ public sealed class ConnectionSessionController : IAsyncDisposable
             await ownership.EnterProfileUpdateAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                updated = update(ownership.Profile);
-                await _repository.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+                var candidate = update(ownership.Profile);
+                updated = await persist(candidate, cancellationToken).ConfigureAwait(false);
                 ownership.UpdateProfile(updated);
             }
             finally

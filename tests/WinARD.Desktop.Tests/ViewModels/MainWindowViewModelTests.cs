@@ -895,6 +895,12 @@ public sealed class MainWindowViewModelTests
         public List<Guid> DeletedIds { get; } = [];
 
         public Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile> UpdateHostKeyPinAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile> UpdateQualityProfileAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
             Task.FromResult(GetSnapshot().SingleOrDefault(profile => profile.Id == id));
         public Task<IReadOnlyList<ConnectionProfile>> GetAllAsync(CancellationToken cancellationToken) =>
@@ -957,6 +963,12 @@ public sealed class MainWindowViewModelTests
         public TaskCompletionSource ReleaseLoad { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task SaveAsync(ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile> UpdateHostKeyPinAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile> UpdateQualityProfileAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ConnectionProfile> UpdateFrameRefreshPolicyAsync(
+            ConnectionProfile profile, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<ConnectionProfile?> GetAsync(Guid id, CancellationToken cancellationToken) =>
             Task.FromResult(_profiles.SingleOrDefault(profile => profile.Id == id));
 

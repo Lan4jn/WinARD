@@ -5,45 +5,87 @@ namespace WinARD.Infrastructure.Settings;
 
 public sealed class CredentialMutationGate : IDisposable
 {
-    private readonly Semaphore _semaphore;
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(25);
+    private readonly CancellationTokenSource _disposeCancellation = new();
+    private readonly Func<CancellationToken, ValueTask>? _afterOpen;
     private int _disposed;
 
-    public CredentialMutationGate(string databasePath)
+    public CredentialMutationGate(string databasePath) : this(databasePath, afterOpen: null)
+    {
+    }
+
+    internal CredentialMutationGate(
+        string databasePath,
+        Func<CancellationToken, ValueTask>? afterOpen)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
-        _semaphore = new Semaphore(1, 1, NameFor(databasePath));
+        LockFilePath = PathFor(databasePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(LockFilePath)!);
+        _afterOpen = afterOpen;
     }
+
+    internal string LockFilePath { get; }
 
     public async ValueTask<IDisposable> EnterAsync(CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        cancellationToken.ThrowIfCancellationRequested();
-        var completion = new TaskCompletionSource(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        RegisteredWaitHandle? wait = null;
-        wait = ThreadPool.RegisterWaitForSingleObject(
-            _semaphore,
-            static (state, _) =>
+        using var waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, _disposeCancellation.Token);
+        while (true)
+        {
+            waitCancellation.Token.ThrowIfCancellationRequested();
+            try
             {
-                var (source, semaphore) = ((TaskCompletionSource, Semaphore))state!;
-                if (!source.TrySetResult())
+                var stream = new FileStream(
+                    LockFilePath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    FileOptions.Asynchronous | FileOptions.WriteThrough);
+                try
                 {
-                    semaphore.Release();
+                    if (_afterOpen is not null)
+                    {
+                        await _afterOpen(cancellationToken).ConfigureAwait(false);
+                    }
+                    ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                    return new Lease(stream);
                 }
-            },
-            (completion, _semaphore),
-            Timeout.Infinite,
-            executeOnlyOnce: true);
-        using var cancellation = cancellationToken.Register(
-            static state => ((TaskCompletionSource)state!).TrySetCanceled(), completion);
-        try
-        {
-            await completion.Task.ConfigureAwait(false);
-            return new Lease(_semaphore);
-        }
-        finally
-        {
-            wait.Unregister(null);
+                catch
+                {
+                    stream.Dispose();
+                    throw;
+                }
+            }
+            catch (IOException exception) when (IsLockContention(exception))
+            {
+                ObjectDisposedException.ThrowIf(
+                    _disposeCancellation.IsCancellationRequested &&
+                    !cancellationToken.IsCancellationRequested,
+                    this);
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    await Task.Delay(RetryDelay, waitCancellation.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (
+                    _disposeCancellation.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    ObjectDisposedException.ThrowIf(
+                        _disposeCancellation.IsCancellationRequested,
+                        this);
+                    throw;
+                }
+            }
+            catch (OperationCanceledException) when (
+                _disposeCancellation.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                ObjectDisposedException.ThrowIf(
+                    _disposeCancellation.IsCancellationRequested,
+                    this);
+                throw;
+            }
         }
     }
 
@@ -51,23 +93,29 @@ public sealed class CredentialMutationGate : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 0)
         {
-            _semaphore.Dispose();
+            _disposeCancellation.Cancel();
+            _disposeCancellation.Dispose();
         }
     }
 
-    private static string NameFor(string databasePath)
+    private static string PathFor(string databasePath)
     {
-        var normalized = Path.GetFullPath(databasePath)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            .ToUpperInvariant();
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
-        return $"Local\\WinARD.CredentialMutation.{hash}";
+        var fullPath = Path.GetFullPath(databasePath)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var normalized = fullPath.ToUpperInvariant();
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))[..16];
+        return Path.Combine(
+            Path.GetDirectoryName(fullPath)!,
+            $".{Path.GetFileName(fullPath).ToLowerInvariant()}.{hash}.credential.lock");
     }
 
-    private sealed class Lease(Semaphore semaphore) : IDisposable
-    {
-        private Semaphore? _semaphore = semaphore;
+    private static bool IsLockContention(IOException exception) =>
+        (exception.HResult & 0xFFFF) is 32 or 33;
 
-        public void Dispose() => Interlocked.Exchange(ref _semaphore, null)?.Release();
+    private sealed class Lease(FileStream stream) : IDisposable
+    {
+        private FileStream? _stream = stream;
+
+        public void Dispose() => Interlocked.Exchange(ref _stream, null)?.Dispose();
     }
 }

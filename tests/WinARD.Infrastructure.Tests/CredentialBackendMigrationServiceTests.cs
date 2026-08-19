@@ -47,8 +47,62 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         var migrated = await ReadMacReferenceAsync();
         Assert.Equal("vault", migrated.Store);
         Assert.Equal("alpha", _store.Text(migrated));
-        Assert.Equal("alpha", _store.Text(CredentialReference.Create("windows", "profile/one/mac")));
+        var source = CredentialReference.Create("windows", "profile/one/mac");
+        Assert.Equal("alpha", _store.Text(source));
+        Assert.True(await IsRetiredAsync(source));
+        await using var repository = new SqliteDeviceRepository(_database);
+        var current = Assert.Single(await repository.GetAllAsync(CancellationToken.None));
+        await Assert.ThrowsAsync<RetiredCredentialReferenceException>(() =>
+            repository.SaveAsync(current.WithCredential(source), CancellationToken.None));
         Assert.Equal(CredentialBackend.EncryptedVault, await ReadDefaultBackendAsync());
+    }
+
+    [Fact]
+    public async Task Stale_dialog_revision_rejects_before_copy_or_database_change()
+    {
+        var targetValidated = false;
+        await ExecuteAsync("""
+            UPDATE app_settings SET setting_value = '1' WHERE setting_key = 'revision';
+            """);
+
+        var result = await CreateService(validator: (_, _, _) =>
+        {
+            targetValidated = true;
+            return ValueTask.CompletedTask;
+        }).MigrateAsync(
+            CredentialBackend.EncryptedVault,
+            expectedSettingsRevision: 0,
+            deleteUnreferencedSources: false,
+            CancellationToken.None);
+
+        Assert.Equal(CredentialBackendMigrationCode.ConcurrentSettingsChanged, result.Code);
+        Assert.False(targetValidated);
+        Assert.DoesNotContain(_store.References,
+            static reference => string.Equals(reference.Store, "vault", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("windows", (await ReadMacReferenceAsync()).Store);
+        Assert.False(await IsRetiredAsync(CredentialReference.Create("windows", "profile/one/mac")));
+    }
+
+    [Fact]
+    public async Task Revision_changed_after_copy_compensates_target_and_rejects_commit()
+    {
+        var result = await CreateService(beforeCommit: async cancellationToken =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await ExecuteAsync("""
+                UPDATE app_settings SET setting_value = '1' WHERE setting_key = 'revision';
+                """);
+        }).MigrateAsync(
+            CredentialBackend.EncryptedVault,
+            expectedSettingsRevision: 0,
+            deleteUnreferencedSources: false,
+            CancellationToken.None);
+
+        Assert.Equal(CredentialBackendMigrationCode.ConcurrentSettingsChanged, result.Code);
+        Assert.DoesNotContain(_store.References,
+            static reference => string.Equals(reference.Store, "vault", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("windows", (await ReadMacReferenceAsync()).Store);
+        Assert.False(await IsRetiredAsync(CredentialReference.Create("windows", "profile/one/mac")));
     }
 
     [Fact]
@@ -81,16 +135,51 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         Assert.True(await IsRetiredAsync(source));
     }
 
-    [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(2)]
-    public async Task Stale_profile_cannot_restore_retired_device_or_ssh_reference(int slot)
+    public static TheoryData<CredentialBackend, bool, int> MigrationTargetsAndCleanupChoices => new()
     {
-        var source = CredentialReference.Create("windows", "profile/one/mac");
+        { CredentialBackend.AskEveryTime, false, 0 },
+        { CredentialBackend.AskEveryTime, false, 1 },
+        { CredentialBackend.AskEveryTime, false, 2 },
+        { CredentialBackend.AskEveryTime, true, 0 },
+        { CredentialBackend.AskEveryTime, true, 1 },
+        { CredentialBackend.AskEveryTime, true, 2 },
+        { CredentialBackend.Windows, false, 0 },
+        { CredentialBackend.Windows, false, 1 },
+        { CredentialBackend.Windows, false, 2 },
+        { CredentialBackend.Windows, true, 0 },
+        { CredentialBackend.Windows, true, 1 },
+        { CredentialBackend.Windows, true, 2 },
+        { CredentialBackend.EncryptedVault, false, 0 },
+        { CredentialBackend.EncryptedVault, false, 1 },
+        { CredentialBackend.EncryptedVault, false, 2 },
+        { CredentialBackend.EncryptedVault, true, 0 },
+        { CredentialBackend.EncryptedVault, true, 1 },
+        { CredentialBackend.EncryptedVault, true, 2 },
+    };
+
+    [Theory]
+    [MemberData(nameof(MigrationTargetsAndCleanupChoices))]
+    public async Task Stale_profile_cannot_restore_retired_reference_after_any_migration(
+        CredentialBackend target,
+        bool deleteSource,
+        int slot)
+    {
+        var sourceStore = target == CredentialBackend.Windows ? "vault" : "windows";
+        var source = CredentialReference.Create(sourceStore, "profile/one/mac");
+        if (sourceStore == "vault")
+        {
+            await ExecuteAsync("""
+                UPDATE devices SET credential_store = 'vault';
+                UPDATE app_settings SET setting_value = '2' WHERE setting_key = 'credential_backend';
+                """);
+            _store = new FakeCredentialStore();
+            _store.Put(source, "alpha");
+        }
         var migration = await CreateService().MigrateAsync(
-            CredentialBackend.EncryptedVault, true, CancellationToken.None);
+            target, deleteSource, CancellationToken.None);
         Assert.Equal(CredentialBackendMigrationCode.Succeeded, migration.Code);
+        Assert.True(await IsRetiredAsync(source));
+        Assert.Equal(deleteSource ? null : "alpha", _store.Text(source));
         await using var repository = new SqliteDeviceRepository(_database);
         var current = Assert.Single(await repository.GetAllAsync(CancellationToken.None));
         var stale = slot switch
@@ -113,12 +202,16 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
     public async Task Cleanup_decision_is_requested_only_after_database_commit()
     {
         var committedBeforePrompt = false;
+        using var migrationGate = new CredentialMutationGate(_database.DatabasePath);
+        using var observerGate = new CredentialMutationGate(_database.DatabasePath);
 
-        var result = await CreateService().MigrateAsync(
+        var result = await CreateService(gate: migrationGate).MigrateAsync(
             CredentialBackend.EncryptedVault,
             async (_, cancellationToken) =>
             {
                 committedBeforePrompt = (await ReadMacReferenceAsync()).Store == "vault";
+                using var acquired = await observerGate.EnterAsync(cancellationToken)
+                    .AsTask().WaitAsync(TimeSpan.FromSeconds(2), cancellationToken);
                 cancellationToken.ThrowIfCancellationRequested();
                 return false;
             },
@@ -331,6 +424,71 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         Assert.Equal("windows", await ReadSshPassphraseStoreAsync());
     }
 
+    [Theory]
+    [InlineData(CredentialBackend.AskEveryTime, false)]
+    [InlineData(CredentialBackend.AskEveryTime, true)]
+    [InlineData(CredentialBackend.Windows, false)]
+    [InlineData(CredentialBackend.Windows, true)]
+    [InlineData(CredentialBackend.EncryptedVault, false)]
+    [InlineData(CredentialBackend.EncryptedVault, true)]
+    public async Task All_three_slots_migrate_with_durable_tombstones_and_explicit_cleanup_choice(
+        CredentialBackend target,
+        bool deleteSources)
+    {
+        var sourceStore = target == CredentialBackend.Windows ? "vault" : "windows";
+        var sources = new[]
+        {
+            CredentialReference.Create(sourceStore, "matrix/mac"),
+            CredentialReference.Create(sourceStore, "matrix/password"),
+            CredentialReference.Create(sourceStore, "matrix/passphrase"),
+        };
+        await ExecuteAsync($"""
+            UPDATE devices
+            SET credential_store = '{sourceStore}', credential_key = 'matrix/mac', transport_mode = 1;
+            UPDATE app_settings
+            SET setting_value = '{(sourceStore == "vault" ? 2 : 1)}'
+            WHERE setting_key = 'credential_backend';
+            INSERT INTO ssh_profiles (
+                device_id, ssh_host, ssh_port, ssh_username, private_key_path, target_host, target_port,
+                password_credential_store, password_credential_key,
+                passphrase_credential_store, passphrase_credential_key)
+            SELECT id, 'jump.local', 22, 'alex', 'C:\keys\id_ed25519', 'target.local', 5900,
+                   '{sourceStore}', 'matrix/password', '{sourceStore}', 'matrix/passphrase'
+            FROM devices LIMIT 1;
+            """);
+        _store = new FakeCredentialStore();
+        _store.Put(sources[0], "alpha");
+        _store.Put(sources[1], "bravo");
+        _store.Put(sources[2], "charlie");
+
+        var result = await CreateService().MigrateAsync(
+            target, deleteSources, CancellationToken.None);
+
+        Assert.Equal(CredentialBackendMigrationCode.Succeeded, result.Code);
+        Assert.Equal(3, result.ManagedReferenceCount);
+        Assert.Equal(3, result.MigratedReferenceCount);
+        var expectedStore = target switch
+        {
+            CredentialBackend.AskEveryTime => "ask",
+            CredentialBackend.Windows => "windows",
+            CredentialBackend.EncryptedVault => "vault",
+            _ => throw new ArgumentOutOfRangeException(nameof(target)),
+        };
+        Assert.Equal(expectedStore, (await ReadMacReferenceAsync()).Store);
+        Assert.Equal(expectedStore, await ReadSshPasswordStoreAsync());
+        Assert.Equal(expectedStore, await ReadSshPassphraseStoreAsync());
+        foreach (var source in sources)
+        {
+            Assert.True(await IsRetiredAsync(source));
+            Assert.Equal(deleteSources ? null : source.Key switch
+            {
+                "matrix/mac" => "alpha",
+                "matrix/password" => "bravo",
+                _ => "charlie",
+            }, _store.Text(source));
+        }
+    }
+
     [Fact]
     public async Task Ask_every_time_confirms_source_cleanup_individually()
     {
@@ -356,6 +514,66 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
         Assert.Equal("bravo", _store.Text(second));
         Assert.Equal("ask", (await ReadMacReferenceAsync()).Store);
         Assert.Equal("ask", await ReadSshPasswordStoreAsync());
+    }
+
+    [Fact]
+    public async Task Writer_can_enter_between_individual_ask_cleanup_items()
+    {
+        var first = CredentialReference.Create("windows", "profile/one/mac");
+        var second = CredentialReference.Create("windows", "profile/one/ssh");
+        await InsertSshReferenceAsync(second.Store, second.Key);
+        _store.Put(second, "bravo");
+        using var migrationGate = new CredentialMutationGate(_database.DatabasePath);
+        using var writerGate = new CredentialMutationGate(_database.DatabasePath);
+
+        var result = await CreateService(gate: migrationGate).MigrateAsync(
+            CredentialBackend.AskEveryTime,
+            async (prompt, cancellationToken) =>
+            {
+                if (prompt.ItemNumber == 2)
+                {
+                    using var writer = await writerGate.EnterAsync(cancellationToken)
+                        .AsTask().WaitAsync(TimeSpan.FromSeconds(2), cancellationToken);
+                }
+                return prompt.ItemNumber == 1;
+            },
+            CancellationToken.None);
+
+        Assert.Equal(CredentialBackendMigrationCode.Succeeded, result.Code);
+        Assert.Null(_store.Text(first));
+        Assert.Equal("bravo", _store.Text(second));
+    }
+
+    [Fact]
+    public async Task Cancellation_while_cleanup_waits_for_gate_returns_committed_result()
+    {
+        using var migrationGate = new CredentialMutationGate(_database.DatabasePath);
+        using var blockingGate = new CredentialMutationGate(_database.DatabasePath);
+        using var cancellation = new CancellationTokenSource();
+        IDisposable? blocker = null;
+        try
+        {
+            var migration = CreateService(gate: migrationGate).MigrateAsync(
+                CredentialBackend.EncryptedVault,
+                async (_, _) =>
+                {
+                    blocker = await blockingGate.EnterAsync(CancellationToken.None);
+                    cancellation.Cancel();
+                    return true;
+                },
+                cancellation.Token);
+
+            var result = await migration.WaitAsync(TimeSpan.FromSeconds(2));
+
+            Assert.Equal(CredentialBackendMigrationCode.SucceededWithCleanupFailures, result.Code);
+            Assert.Equal(1, result.SourceCleanupFailureCount);
+            Assert.Equal("vault", (await ReadMacReferenceAsync()).Store);
+            Assert.Equal("alpha", _store.Text(CredentialReference.Create("windows", "profile/one/mac")));
+        }
+        finally
+        {
+            blocker?.Dispose();
+        }
     }
 
     [Fact]
@@ -588,7 +806,7 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
     [Theory]
     [InlineData(CredentialBackend.EncryptedVault)]
     [InlineData(CredentialBackend.AskEveryTime)]
-    public async Task Cleanup_skips_source_when_new_managed_reference_is_added_after_commit(
+    public async Task Cleanup_only_uses_committed_source_version_after_tombstone(
         CredentialBackend target)
     {
         var source = CredentialReference.Create("windows", "profile/one/mac");
@@ -607,16 +825,17 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
             },
             CancellationToken.None);
 
-        Assert.Equal(CredentialBackendMigrationCode.SucceededWithCleanupFailures, result.Code);
-        Assert.Equal(1, result.SourceCleanupFailureCount);
-        Assert.Equal("alpha", _store.Text(source));
+        Assert.Equal(CredentialBackendMigrationCode.Succeeded, result.Code);
+        Assert.Equal(0, result.SourceCleanupFailureCount);
+        Assert.Null(_store.Text(source));
+        Assert.True(await IsRetiredAsync(source));
     }
 
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(2)]
-    public async Task Cleanup_treats_backend_case_variants_as_the_same_live_reference(int slot)
+    public async Task Committed_tombstone_survives_late_backend_case_variant_reference(int slot)
     {
         var source = CredentialReference.Create("windows", "profile/one/mac");
         var result = await CreateService().MigrateAsync(
@@ -639,13 +858,13 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
             },
             CancellationToken.None);
 
-        Assert.Equal(CredentialBackendMigrationCode.SucceededWithCleanupFailures, result.Code);
-        Assert.Equal("alpha", _store.Text(source));
-        Assert.False(await IsRetiredAsync(source));
+        Assert.Equal(CredentialBackendMigrationCode.Succeeded, result.Code);
+        Assert.Null(_store.Text(source));
+        Assert.True(await IsRetiredAsync(source));
     }
 
     [Fact]
-    public async Task Cleanup_waits_for_uncommitted_writer_then_preserves_new_ssh_passphrase_reference()
+    public async Task Cleanup_does_not_wait_on_database_writer_after_tombstone_commit()
     {
         var source = CredentialReference.Create("windows", "profile/one/mac");
         await using var writer = _database.CreateConnection();
@@ -682,16 +901,14 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
             CancellationToken.None));
 
         await writerReady.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await Assert.ThrowsAsync<TimeoutException>(() =>
-            migration.WaitAsync(TimeSpan.FromMilliseconds(250)));
+        var result = await migration.WaitAsync(TimeSpan.FromSeconds(2));
         await writerTransaction!.CommitAsync();
         await writerTransaction.DisposeAsync();
 
-        var result = await migration;
-
-        Assert.Equal(CredentialBackendMigrationCode.SucceededWithCleanupFailures, result.Code);
-        Assert.Equal(1, result.SourceCleanupFailureCount);
-        Assert.Equal("alpha", _store.Text(source));
+        Assert.Equal(CredentialBackendMigrationCode.Succeeded, result.Code);
+        Assert.Equal(0, result.SourceCleanupFailureCount);
+        Assert.Null(_store.Text(source));
+        Assert.True(await IsRetiredAsync(source));
     }
 
     [Fact]
@@ -731,7 +948,6 @@ public sealed class CredentialBackendMigrationServiceTests : IAsyncLifetime
             _store,
             validator ?? ((_, _, _) => ValueTask.CompletedTask),
             gate ?? new CredentialMutationGate(_database.DatabasePath),
-            new CredentialReferenceRetirementService(_database, _store),
             beforeCommit);
 
     private Task InsertDeviceAsync(string store, string key) =>

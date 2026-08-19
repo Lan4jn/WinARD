@@ -25,6 +25,10 @@
                 <ComboBoxItem Content="Windows 凭据管理器" />
                 <ComboBoxItem Content="加密保险库" />
             </ComboBox>
+            <TextBlock
+                Text="更改默认后端会全局迁移引用；旧源密码默认保留，迁移提交后可按提示确认清理。"
+                TextWrapping="Wrap"
+                Opacity="0.72" />
             <NumberBox
                 x:Name="VaultTimeoutBox"
                 Header="保险库自动锁定（分钟）"

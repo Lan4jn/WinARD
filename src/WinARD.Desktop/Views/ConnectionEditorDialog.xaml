@@ -21,6 +21,10 @@
                 <ComboBoxItem Content="WinARD 加密库" Tag="EncryptedVault" />
                 <ComboBoxItem Content="每次询问" Tag="AskEveryTime" />
             </ComboBox>
+            <TextBlock
+                Text="切换为“每次询问”只会停止引用原凭据；旧密码会保留。可在“设置”中全局迁移凭据并逐项确认清理。"
+                TextWrapping="Wrap"
+                Opacity="0.72" />
             <PasswordBox x:Name="VaultMasterPasswordBox" Header="加密库主密码（仅用于创建或解锁）" AutomationProperties.AutomationId="VaultMasterPassword" />
 
             <ToggleSwitch x:Name="UseSshSwitch" Header="通过 SSH 隧道连接" Toggled="OnUseSshToggled" AutomationProperties.AutomationId="ConnectionUseSsh" />
