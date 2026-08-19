@@ -6,6 +6,7 @@ using WinARD.Application.Sessions;
 using WinARD.Desktop.Services;
 using WinARD.Desktop.ViewModels;
 using WinARD.Domain.Connections;
+using WinARD.Infrastructure.Diagnostics;
 using WinARD.Infrastructure.Settings;
 using WinARD.Security.Secrets;
 using WinARD.Transport.Ssh;
@@ -38,11 +39,14 @@ public sealed class ConnectionEditorServiceTests
         using var store = new VersionedCredentialStore();
         var service = CreateService(repository, store, store);
 
-        var first = await SaveSlotAsync(service, original, slot, CredentialSaveMode.EncryptedVault);
+        var asked = await service.SaveAsync(
+            original, CredentialSaveMode.AskEveryTime, secret: null, CancellationToken.None);
+        var first = await SaveSlotAsync(service, asked, slot, CredentialSaveMode.EncryptedVault);
         var firstReference = SlotReference(first, slot);
         var second = await SaveSlotAsync(service, first, slot, CredentialSaveMode.WindowsCredentialManager);
         var secondReference = SlotReference(second, slot);
 
+        Assert.Equal("ask", SlotReference(asked, slot).Store);
         Assert.Equal("vault", firstReference.Store);
         Assert.Equal("windows", secondReference.Store);
         Assert.NotEqual(slot == 0 ? oldMac : oldSsh, firstReference);
@@ -174,19 +178,31 @@ public sealed class ConnectionEditorServiceTests
         Assert.Null(await store.ReadAsync(saved.CredentialReference, CancellationToken.None));
     }
 
-    [Fact]
-    public async Task ExistingProfileChangedToAskEveryTimeWithoutSecretsPreservesReferences()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExistingProfileChangedToAskEveryTimePromptsAndKeepsPersistentSecrets(bool privateKey)
     {
-        var original = Profile()
-            .WithCredential(WinARD.Domain.Security.CredentialReference.Create("vault", "old/mac"))
+        var macReference = WinARD.Domain.Security.CredentialReference.Create("vault", "old/mac");
+        var sshReference = WinARD.Domain.Security.CredentialReference.Create(
+            "vault", privateKey ? "old/passphrase" : "old/password");
+        var original = Profile().WithCredential(macReference)
             .WithSsh(SshProfile.Create(
-                "jump.local", 22, "ssh-user", null, "studio.local", 5900,
-                WinARD.Domain.Security.CredentialReference.Create("vault", "old/ssh"), null, null));
+                    "jump.local", 22, "ssh-user", privateKey ? "C:\\keys\\id_ed25519" : null,
+                    "studio.local", 5900, null, null, null)
+                .WithAuthenticationCredentials(
+                    privateKey ? null : sshReference,
+                    privateKey ? sshReference : null));
         var repository = new FakeRepository { Existing = original };
         using var store = new VersionedCredentialStore();
+        using var oldMacSecret = Secret("old-mac-secret");
+        using var oldSshSecret = Secret("old-ssh-secret");
+        await store.SaveAsync(macReference, oldMacSecret, CancellationToken.None);
+        await store.SaveAsync(sshReference, oldSshSecret, CancellationToken.None);
         var sut = CreateService(repository, store, store);
         var candidate = ProfileWithId(original.Id).WithSsh(SshProfile.Create(
-            "jump.local", 22, "ssh-user", null, "studio.local", 5900,
+            "jump.local", 22, "ssh-user", privateKey ? "C:\\keys\\id_ed25519" : null,
+            "studio.local", 5900,
             credentialReference: null, null, null));
 
         var saved = await sut.SaveAsync(
@@ -195,11 +211,41 @@ public sealed class ConnectionEditorServiceTests
             secret: null,
             CancellationToken.None);
 
-        Assert.Equal(original.CredentialReference, saved.CredentialReference);
-        Assert.Equal(
-            original.SshProfile!.PasswordCredentialReference,
-            saved.SshProfile!.PasswordCredentialReference);
+        var savedSshReference = privateKey
+            ? saved.SshProfile!.PrivateKeyPassphraseCredentialReference!
+            : saved.SshProfile!.PasswordCredentialReference!;
+        Assert.Equal("ask", saved.CredentialReference!.Store);
+        Assert.Equal("ask", savedSshReference.Store);
+        using var retainedMac = await store.ReadAsync(macReference, CancellationToken.None);
+        using var retainedSsh = await store.ReadAsync(sshReference, CancellationToken.None);
+        Assert.Equal("old-mac-secret", ReadSecret(retainedMac!));
+        Assert.Equal("old-ssh-secret", ReadSecret(retainedSsh!));
+        Assert.Empty(store.DeleteAttempts);
         Assert.Empty(store.CompareExchangeAttempts);
+
+        var prompt = new CredentialPromptService();
+        var prompted = new List<CredentialPromptRequest>();
+        prompt.SetReferenceHandler((request, cancellationToken) =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            prompted.Add(request);
+            return ValueTask.FromResult<ISecret>(Secret("prompted-secret"));
+        });
+        using var redactor = new SecretRedactor();
+        var provider = new CredentialStoreConnectionSecretProvider(store, prompt, redactor);
+        using var macPromptedSecret = await provider.GetSecretAsync(saved, CancellationToken.None);
+        using var transient = new TransientCredentialStore();
+        await using var routed = new RoutedCredentialStore(store, store, transient, prompt);
+        using var sshPromptedSecret = await routed.ReadForPromptAsync(
+            new CredentialPromptRequest(
+                savedSshReference,
+                privateKey
+                    ? CredentialPromptPurpose.PrivateKeyPassphrase
+                    : CredentialPromptPurpose.SshPassword),
+            CancellationToken.None);
+
+        Assert.Equal([saved.CredentialReference, savedSshReference],
+            prompted.Select(static request => request.Reference));
     }
 
     [Fact]

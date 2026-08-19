@@ -59,10 +59,10 @@ public sealed class ConnectionEditorService(
             : secret?.Clone();
         using var sshSecret = package?.HasSshSecret == true ? package.CloneSshSecret() : null;
         var existingReference = profile.CredentialReference ?? oldProfile?.CredentialReference;
-        var reference = macSecret is null && existingReference is not null
-            ? existingReference
-            : mode == CredentialSaveMode.AskEveryTime
-                ? ReferenceFor(profile.Id, mode)
+        var reference = mode == CredentialSaveMode.AskEveryTime
+            ? ReferenceFor(profile.Id, mode)
+            : macSecret is null && existingReference is not null
+                ? existingReference
                 : macSecret is null
                     ? null
                     : GenerationReference(profile.Id, mode, "mac");
@@ -81,7 +81,7 @@ public sealed class ConnectionEditorService(
         if (mode == CredentialSaveMode.AskEveryTime)
         {
             await _repository.SaveAsync(savedProfile, cancellationToken).ConfigureAwait(false);
-            return await CompleteCommittedSaveAsync(oldProfile, savedProfile).ConfigureAwait(false);
+            return new ConnectionProfileSaveResult(savedProfile);
         }
 
         CredentialReference? sshReference = null;
@@ -401,7 +401,7 @@ public sealed class ConnectionEditorService(
             return profile;
         }
 
-        if (!replaceSecret)
+        if (!replaceSecret && mode != CredentialSaveMode.AskEveryTime)
         {
             var oldSsh = oldProfile?.SshProfile;
             var preservedReference = ssh.PrivateKeyPath is null
@@ -419,10 +419,7 @@ public sealed class ConnectionEditorService(
                     ? ssh.WithAuthenticationCredentials(preservedReference, null)
                     : ssh.WithAuthenticationCredentials(null, preservedReference));
             }
-            if (mode != CredentialSaveMode.AskEveryTime)
-            {
-                return profile;
-            }
+            return profile;
         }
 
         var store = mode switch
