@@ -23,6 +23,63 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
         _decoders = decoders;
     }
 
+    /// <summary>
+    /// Explicit research entry point for registering experimental decoders in probe tools without reflection.
+    /// Thread-safe and synchronized with session update processing.
+    /// </summary>
+    public void RegisterResearchDecoder(IRfbEncodingDecoder decoder)
+    {
+        ArgumentNullException.ThrowIfNull(decoder);
+        ThrowIfUnavailable();
+
+        _gate.Wait();
+        try
+        {
+            ThrowIfUnavailable();
+            if (_decoders is IDictionary<int, IRfbEncodingDecoder> mutableDecoders)
+            {
+                mutableDecoders[decoder.EncodingId] = decoder;
+            }
+            else
+            {
+                throw new NotSupportedException("The decoders collection does not support research registration.");
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Asynchronously registers an experimental research decoder under session gate synchronization.
+    /// </summary>
+    public async ValueTask RegisterResearchDecoderAsync(
+        IRfbEncodingDecoder decoder,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(decoder);
+        ThrowIfUnavailable();
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfUnavailable();
+            if (_decoders is IDictionary<int, IRfbEncodingDecoder> mutableDecoders)
+            {
+                mutableDecoders[decoder.EncodingId] = decoder;
+            }
+            else
+            {
+                throw new NotSupportedException("The decoders collection does not support research registration.");
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public async Task<FramebufferUpdateResult> ApplyAsync(
         Stream stream,
         CancellationToken cancellationToken)

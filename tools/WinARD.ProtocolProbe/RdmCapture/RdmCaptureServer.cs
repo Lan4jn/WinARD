@@ -31,7 +31,8 @@ public sealed class RdmCaptureServer
     public async Task<RdmCaptureReport> CaptureOnceAsync(
         int port,
         string profile,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? stageObserver = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(port, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(port, ushort.MaxValue);
@@ -53,11 +54,14 @@ public sealed class RdmCaptureServer
             inactivity.CancelAfter(_inactivityTimeout);
             await using var networkStream = client.GetStream();
             var stream = new ProgressTimeoutStream(networkStream, inactivity, _inactivityTimeout);
-            var handshake = await ArdProbeServerHandshake.AcceptAsync(stream, linkedCancellation.Token)
+            var handshake = await ArdProbeServerHandshake.AcceptAsync(stream, linkedCancellation.Token, stageObserver)
                 .ConfigureAwait(false);
             await WriteSyntheticServerInitAsync(stream, linkedCancellation.Token).ConfigureAwait(false);
-            var declaration = await RfbClientDeclarationReader.ReadAsync(stream, linkedCancellation.Token)
+            stageObserver?.Invoke("ServerInit sent");
+            var declaration = await RfbClientDeclarationReader.ReadAsync(stream, linkedCancellation.Token, stageObserver)
                 .ConfigureAwait(false);
+
+            stageObserver?.Invoke("Declaration read");
 
             return new RdmCaptureReport(
                 1,

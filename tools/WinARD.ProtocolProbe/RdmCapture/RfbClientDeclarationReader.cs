@@ -38,7 +38,8 @@ public static class RfbClientDeclarationReader
 
     public static async Task<RfbClientDeclarationResult> ReadAsync(
         Stream stream,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? stageObserver = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
@@ -56,6 +57,7 @@ public static class RfbClientDeclarationReader
 
             messageCount++;
             var type = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            stageObserver?.Invoke($"Declaration message type 0x{type:X2}");
             switch (type)
             {
                 case 0x00:
@@ -95,6 +97,7 @@ public static class RfbClientDeclarationReader
                         }
 
                         encodings = capturedEncodings;
+                        stageObserver?.Invoke($"Encoding IDs: {string.Join(",", capturedEncodings)}");
                         messages.Add(new CapturedClientMessage(
                             type,
                             "SetEncodings",
@@ -184,6 +187,7 @@ public static class RfbClientDeclarationReader
                 default:
                     return new RfbClientDeclarationResult(pixelFormat, encodings, messages, false, type);
             }
+            stageObserver?.Invoke($"Declaration message 0x{type:X2} complete");
         }
     }
 

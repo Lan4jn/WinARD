@@ -9,6 +9,12 @@ public enum ConnectionQualityLevel
     Disconnected,
 }
 
+/// <summary>
+/// Connection quality snapshot containing latency and qualitative status.
+/// <paramref name="ResponseMilliseconds"/> measures total request-to-frame turnaround
+/// (request transmission, remote capture/encoding turnaround, network RTT, and receive decryption);
+/// it must not be conflated with pure network RTT.
+/// </summary>
 public sealed record ConnectionQualitySnapshot(
     ConnectionQualityLevel Level,
     int? ResponseMilliseconds,

@@ -207,7 +207,8 @@ public static class FramebufferUpdateReader
                 RfbEncodingType.ArdDisplayInfo or
                 RfbEncodingType.ArdSessionEncryption or
                 RfbEncodingType.ArdDisplayInfo2;
-            if (encoding != RfbEncodingType.Cursor && !isArdMetadata && (width == 0 || height == 0))
+            var isAppleMvsControl = encoding == RfbEncodingType.AppleMvs && x == 0 && y == 0 && width == 0 && height == 0;
+            if (encoding != RfbEncodingType.Cursor && !isArdMetadata && !isAppleMvsControl && (width == 0 || height == 0))
             {
                 throw RfbProtocolException.Create(
                     $"RFB encoding {encodingId} requires non-zero rectangle dimensions.",
@@ -229,8 +230,14 @@ public static class FramebufferUpdateReader
                 RfbEncodingType.ArdSessionEncryption or
                 RfbEncodingType.ArdDisplayInfo2 =>
                     FramebufferRect.CreateMetadataRectangle(x, y, width, height),
+                RfbEncodingType.AppleMvs when isAppleMvsControl =>
+                    FramebufferRect.CreateMetadataRectangle(x, y, width, height),
                 _ => new FramebufferRect(x, y, width, height),
             };
+            if (encoding == RfbEncodingType.AppleMvs && !isAppleMvsControl)
+            {
+                rectangle.ValidateWithin(framebuffer.Width, framebuffer.Height);
+            }
             EncodingDecodeResult decodeResult;
             try
             {

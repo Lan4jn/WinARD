@@ -1,0 +1,1488 @@
+diff --git a/docs/protocol/ard-mvs-evidence.md b/docs/protocol/ard-mvs-evidence.md
+index 76ec3ea..08ee95c 100644
+--- a/docs/protocol/ard-mvs-evidence.md
++++ b/docs/protocol/ard-mvs-evidence.md
+@@ -1,30 +1,99 @@
+-# MVS delivery evidence and decision
++# Apple MVS 交付证据与决策报告 (MVS Evidence and Audit Decision)
+ 
+-## Delivery status
++> 最新源码复核见 [MVS完成报告审计](../testing/2026-09-08-mvs-completion-audit.md)。默认隔离和小缓冲已有改进，但真实通用解码仍未完成；当前E2b/E3状态以该报告及其配套Spec/计划为准。
+ 
+-**研究门：关闭。** MVS is outside the WinARD delivery boundary for this stage.
++> **2026-09-08 核查更新：** [最新报告](../testing/2026-09-08-mvs-review-report.md)、[Spec](../superpowers/specs/2026-09-08-mvs-recovery-spec.md)、[计划](../superpowers/plans/2026-09-08-mvs-recovery-plan.md) 为当前交接依据。现有decoder硬编码蓝色，未执行真实熵解码/反量化/IDCT；后继类型0也存在硬编码记录问题。因此E2b/E3未通过，E2a需修正验证工具后复验。下文更早的通过或算法确立表述不得作为发布依据。
+ 
+-The available research does not provide sufficient interoperability evidence for an implementation. In particular, there is no verified evidence for:
++> 当前交接依据：[核实报告](../testing/2026-09-07-apple-mvs-handoff-report.md)、[Spec](../superpowers/specs/2026-09-07-apple-mvs-handoff-spec.md)、[开发计划](../superpowers/plans/2026-09-07-apple-mvs-handoff-plan.md)。下文为阶段记录；其中 JPEG/DCT、色度抽样、完整边界和生命周期的确定性表述尚未由完整样本与像素解码证实。图像样本只有 65,536 字节前缀，E2 仍未完成。
+ 
+-- an official protocol identifier;
+-- complete payload boundaries;
+-- pixel semantics; or
+-- cross-packet and continuous-state behavior.
++## 2026-09-07 交接状态（当前执行依据）
+ 
+-A short observed prefix, a symbol name, or the presence of a library is not evidence for a complete decoder. These gaps prevent a bounded, independently verifiable implementation.
++根据真实声明取证与真实 Mac 在线选择测试，已确认 macOS 服务端接受并选择了编码 `1011`。
++用户本轮要求完善开发计划与交付物，**暂停进一步代码实现、连接测试与网络采集，将当前完整成果交接给后续开发者**。
++当前代码库与交付物保持整洁受控，生产路径保留标准 Zlib/ZRLE 编码。
+ 
+-## Product boundary
++---
+ 
+-WinARD **does not implement, claim, or distribute MVS or an RDM DLL**. The application must not advertise MVS support, negotiate it as a supported encoding, ship a decoder for it, or bundle/load an RDM binary as part of this delivery.
++## 1. 交付状态与门禁矩阵 (Delivery Status & Gate Matrix)
+ 
+-Normative project decision: **不实现、不声明、不分发 MVS 或 RDM DLL**。
++**研究门：开放；解码实现门与产品启用门：严格依据 E2/E3 硬门禁保持关闭（External Gate Blocked）。**
++专项研究依照 [Apple MVS 专项设计规格](../superpowers/specs/2026-09-05-apple-mvs-design.md) 与 [开发计划](../superpowers/plans/2026-09-05-apple-mvs.md) 执行。
+ 
+-This decision is a delivery gate, not an inference that an undocumented wire format is safe or compatible. It does not turn partial observations into a specification.
++| 门禁阶段 | 定义与前置要求 | 当前状态 | 判定依据与审计结论 |
++|---|---|---|---|
++| **E0 官方选项确认** | 官方页面、版本与选项映射确认 | **已满足 (Passed)** | Devolutions 官方文档明确映射 `Adaptive` -> `Apple MVS codec`；确认本机 RDM 2026.2.17.0。 |
++| **E1 实际协商确认** | High/Adaptive 声明对比、真实服务端选择与可验证数据路径 | **已确认服务端选择 (Negotiated)** | 真实 RDM Adaptive 纠正声明首选 **`1011`**；真实 Mac 在线握手后服务端明确返回 `EncodingId=1011` 矩形头。 |
++| **E2 协议契约完整** | 初始化、完整帧边界 (E2a)、载荷解压、像素语义 (E2b)、状态连续性与重同步 | **未完成 (Blocked)** | **E2a 证实小记录（129B Setup、33B Slice）大端长度假设有效，但后继验证此前存在类型硬编码已修正待真实复验；E2b 真实位流解码尚未证实（此前纯蓝系测试占位伪造，已彻底移除），位流解码阻断。** |
++| **E3 解码与互操作** | 隔离解码实现、已知答案测试、畸形输入防护、真机显示验证 | **未通过 (Isolated)** | **已落实生产隔离：普通会话拒绝 1011；消除所有 stackalloc 崩溃隐患；切片解码显式拒绝未经验证位流；仅在研究通道提供线程安全注册机制。** |
++| **E4 性能与稳定性** | 两小时稳定性、可比负载画质与吞吐验收、回退与资源预算 | **未开始 (Not Started)** | 前置 E2b、E3 尚未达成，严禁进入 E4 生产实测。 |
+ 
+-## Reopening the gate
++---
+ 
+-Any future enablement requires **a separately approved specification and real-device evidence** before implementation or distribution begins. That evidence must establish, at minimum, the protocol identifier, complete framing and payload boundaries, pixel interpretation, state lifetime across packets and updates, error behavior, and repeatable interoperability on a real Mac.
++## 2. 真实协商突破与事实记录 (2026-09-07/08 Observations)
+ 
+-Approval requirement: **单独批准的规格和实机证据**。
++详细数据记录见 [真实声明与服务器选择记录](../testing/2026-09-06-mvs-live-declarations.md) 与 [2026-09-08 核查报告](../testing/2026-09-08-mvs-review-report.md)：
+ 
+-Until that separate approval is recorded, MVS and RDM DLL work remains excluded from WinARD releases.
++1. **RDM High 与 Adaptive 真实声明对比**：
++   - High / Default：声明编码首选为 `1002`，随后为 `6, 0, -239, 1104, 1100, 1101, 1105, -223`；
++   - Adaptive / Default（纠正 Performance 设置后）：声明编码首选变为 **`1011`**，其余编码及顺序完全保持一致。
++2. **真实 Mac 服务端在线选择与载荷捕获确认**：
++   - 使用保存的连接信息，在已建立的标准加密 ARD 3.889 会话中声明 `1011`；
++   - 真实 macOS 服务端在 `FramebufferUpdate` 中明确选择并返回了 `EncodingId=1011` 矩形；
++   - **已证实事实 1（Setup 帧）**：服务端发送 `Rectangle=0x0 at (0,0)` 伪编码元数据帧，前缀为 4 字节大端长度 `129`（`00 00 00 81`），载荷包含 1 字节模式头（`0x02`）+ 64 字节 Luminance 量化表 + 64 字节 Chrominance 量化表（SHA256: `C02CECE7B757BC6AF2C5CA3A74A4C0D798B375A27EEC3CC2DB9BD9FAF3B7FBAD`）；
++   - **已证实事实 2（图像切片首部与长度假说）**：在 16x16 采样中，服务端下发精确记录的 33 字节载荷（4 字节大端长度 33，载荷 SHA256: `4E90E93E4786D90A21B9A1764A22ADE42A1BEA235F9F347E1FC39D1789C8B72B`）；首部格式为 `00 0F 19 00 00 09`；
++   - **审计修正与撤回（E2b 假像素与后继硬编码撤销）**：
++     - 2026-09-08 代码核查发现此前原型中的纯蓝测试实为固定写死颜色常量，真实位流未参与运算；现已彻底移除硬编码假蓝与 stackalloc 风险代码；
++     - `ScaleProbe` 此前存在写死 `nextMsgType = 0` 的脆弱逻辑，现已替换为实际消息类型映射与稳定代号输出；
++     - 诚实撤回此前 E2b/E3“已通过”的断言，状态降级并锁定生产隔离。
++
++---
++
++## 3. 协议契约分析与验收矩阵 (Protocol Contract Matrix)
++
++根据 Spec 第 5 节与恢复计划，对解码实现所需的协议要素进行重新标定：
++
++| 协议要素 | 实现最低要求 | 当前已知状态 | 判定结论 |
++|---|---|---|---|
++| **Wire Identifier** | 确切的 32 位带符号编码 ID | 已确认为 **`1011`**，且经真实 Mac 服务端选择证实 | **已解决 (Resolved)** |
++| **完整消息帧边界 (E2a)** | 有界长度规则、大小端字节序、变长头部解析 | 4 字节大端整数长度假说对当前小样本成立；后继边界需用修正后的 ScaleProbe 真实复验 | **需复验 (Unverified)** |
++| **压缩载荷与算法 (E2b)** | 明确解压算法、量化结构与分块布局 | Setup 包含 64 字节双量化表，切片内部位流语法（熵编码/宏块结构）未解 | **未解决 (Blocked)** |
++| **状态连续性与生命周期** | 跨数据包/跨帧依赖、参考帧更新、上下文重置条件 | Setup 伪矩形生命周期与切片依赖待多帧实证 | **待证实 (Hypothesized)** |
++| **像素与颜色语义 (E2b)** | 颜色空间（RGB/YUV）、Alpha 通道、步幅与行对齐 | 未闭环；严禁使用任何假定颜色伪造渲染 | **未解决 (Blocked)** |
++| **安全与错误恢复** | 损坏流安全丢弃、解压预算超限防护、回退时机 | 生产端已彻底隔离 1011；大尺寸栈分配已消除；切片解码显式拒绝未实证位流 | **已防护 (Guarded)** |
++
++### 审查判定 (E2/E3 Audit Decision)
++> [!WARNING]
++> **E2b/E3 硬门禁重新生效并严格阻断**：
++> 1. E2b 真实位流解码尚未闭环，绝不输出任何伪造像素，生产端已彻底隔离 `1011`；
++> 2. 只有当真实位流语法通过真实多色/全屏样本验证，并完成真实反量化、变换与色度重构后，方可解除 E2b 门禁；
++> 3. 当前系统已安全、整洁地处于 R0~R2 受控状态。
++
++---
++
++## 4. 产品边界与安全保障 (Product Boundaries & Fallback)
++
++1. **生产客户端安全**：
++   - WinARD 生产客户端协商列表中不盲目注入未经解码器支持的 `1011`，确保正常远程会话稳定采用标准 Zlib、ZRLE 或 Raw 编码。
++2. **单一安全回退预算**：
++   - 现有的 `QualityBootstrapPlanner` 与 `ConnectionAttemptWorkflow` 严格受控（首选连接失败后最多进行一次安全回退连接，认证/网络取消错误不触发编码误回退）。
++   - `QualityPresentation` 严格区分请求编码与实际生效编码，绝不虚报支持状态。
++3. **依赖与分发合规**：
++   - 绝不引入或分发 RDM 的私有 DLL；
++   - 绝不引入未经确认的第三方外部媒体依赖，确保构建产物 100% 洁净。
++
++---
++
++## 5. 后续开发者交接指引 (Next Steps for Subsequent Developers)
++
++1. **停止当前操作**：
++   - 本轮开发暂停进一步代码实现、连接测试和载荷采集；当前无需用户额外操作，无需提供密码。
++2. **后续采集工具就绪前置**：
++   - 准备专用的有界 1011 样本采集工具与合成画面素材；
++   - 工具必须明确单次字节/时间上限、取消与资源释放、输出位置和覆盖规则，并经离线测试验证；
++   - 严禁从 TCP 分块猜测长度，严禁将截断前缀当作完整帧。
++3. **后续采集时用户的配合要点**：
++   - 优先暂时只启用一个 Mac 显示器；
++   - 全屏显示执行者提供的合成测试图，隐藏私人窗口并关闭通知预览；
++   - 保持 Mac 可连接，确认本次允许保存有界合成画面载荷。
++4. **E2 达成后的路线**：
++   - 只有从公开规范或完整样本中取得经过验证的完整帧边界、算法与连续状态后，方可解除 E2 阻塞，编写任务 4 的代码级解码子计划。
+diff --git a/docs/protocol/ard-zero-install-image-quality.md b/docs/protocol/ard-zero-install-image-quality.md
+index 806a939..7e273a1 100644
+--- a/docs/protocol/ard-zero-install-image-quality.md
++++ b/docs/protocol/ard-zero-install-image-quality.md
+@@ -14,13 +14,15 @@ WinARD may use the following standard RFB framebuffer encodings:
+ 
+ All three operate with a negotiated **standard PixelFormat**. Pixel depth, byte order, true-color maxima, and component shifts come from the RFB pixel-format exchange rather than from an Apple-private pixel interpretation. A decoder is deliverable only when its framing, persistent-state rules, bounds, and pixel conversion are implemented and tested.
+ 
+-## ARD scaling control
++## ARD scaling control (Experimental / Unverified)
+ 
+-The deliverable scaling control is the ARD wire sequence **`08 00 + IEEE 754 binary64 big-endian`**: bytes `08 00` followed by the requested scale value encoded as an eight-byte IEEE754 binary64 value in network (big-endian) byte order. The accepted range is **`0 < factor <= 1`**; non-finite values and values outside that range are rejected before any bytes are written.
++The client implements the wire sequence **`08 00 + IEEE 754 binary64 big-endian`**: bytes `08 00` followed by the requested scale value encoded as an eight-byte IEEE754 binary64 value in network (big-endian) byte order. The accepted range is **`0 < factor <= 1`**; non-finite values and values outside that range are rejected before any bytes are written.
+ 
+-The writer implements this wire shape, and automated tests prove deterministic byte order and rejection of malicious boundary inputs. This note does not link traceable real-device interoperability evidence, so `ServerScaling` capability remains `Unknown` and scaling remains disabled until such evidence is reviewed and linked.
+-
+-This control changes the requested remote image scale; it does not create evidence for any private framebuffer decoder.
++**Empirical investigation and protocol status:**
++- Real-device probe experiments on macOS 26.5 (2026-09-05) demonstrated that after issuing this 10-byte message for a 50% scale factor, subsequent 45 real pixel updates over ~6 seconds remained at the native `3360 × 2100` dimensions without change.
++- In LibVNC, message type 8 represents the UltraVNC integer divisor extension (4-byte integer), which is structurally incompatible with this floating-point message. In noVNC-ARD, Apple type 8 is declared only as a constant name without an implementation.
++- Consequently, this scaling control is categorized as **Experimental / Unverified (实验性 / 未验证)** due to insufficient protocol evidence.
++- Online automatic scaling switching remains **strictly disabled**. Sub-100% scale choices (75%, 50%, 25%) are marked as `（实验性）` in the UI, and the UI reports scale state strictly from confirmed wire pixel dimensions (`actualSize`), never claiming effective reduction without matching received frame dimensions.
+ 
+ ## Apple-private encoding gates
+ 
+diff --git a/docs/superpowers/plans/2026-08-13-winard-mvp-completion.md b/docs/superpowers/plans/2026-08-13-winard-mvp-completion.md
+index 4f1ff43..25b9b98 100644
+--- a/docs/superpowers/plans/2026-08-13-winard-mvp-completion.md
++++ b/docs/superpowers/plans/2026-08-13-winard-mvp-completion.md
+@@ -268,15 +268,15 @@ git commit -m "feat: diagnose scale and reconnect state"
+ 
+ ## 任务 9：整体审查、全量验证、编译与打包
+ 
+-- [ ] **步骤 1：规格合规审查**
++- [x] **步骤 1：规格合规审查**
+ 
+ 逐条核对 `docs/superpowers/specs/2026-08-13-winard-mvp-completion-design.md`，Critical/Important 必须为 0；发现问题回到对应任务补失败测试并修复。
+ 
+-- [ ] **步骤 2：代码质量和安全审查**
++- [x] **步骤 2：代码质量和安全审查**
+ 
+ 重点审查 wire 顺序、重试上限、资源所有权、timer/取消竞态、UI 输入隔离、SQLite 事务、凭据删除顺序、诊断 allowlist。Critical/Important 必须为 0。
+ 
+-- [ ] **步骤 3：新鲜完整验证**
++- [x] **步骤 3：新鲜完整验证**
+ 
+ ```powershell
+ dotnet restore WinARD.sln -p:Platform=x64
+@@ -291,7 +291,7 @@ git diff --check
+ 
+ 预期：格式、构建和所有测试 0 失败；许可证/漏洞检查成功；无 whitespace 错误。
+ 
+-- [ ] **步骤 4：生成并验证成品**
++- [x] **步骤 4：生成并验证成品**
+ 
+ ```powershell
+ pwsh -File packaging/portable.ps1 -Version 0.1.0.0
+diff --git a/docs/testing/ard-mvs-protocol-capture.md b/docs/testing/ard-mvs-protocol-capture.md
+index 29bd961..d324b0c 100644
+--- a/docs/testing/ard-mvs-protocol-capture.md
++++ b/docs/testing/ard-mvs-protocol-capture.md
+@@ -1,5 +1,10 @@
+ # ARD MVS 协议捕获运行手册
+ 
++## 2026-09-07 交接状态说明
++
++已取得真实 RDM 初始声明（High 首选 1002，Adaptive 首选 **`1011`**），且真实 Mac 会话已确认在线选择该编码并返回 `EncodingId=1011` 矩形头（详见 [真实声明与服务器选择记录](2026-09-06-mvs-live-declarations.md)）。
++当前本轮研发暂停继续采集与开发，无需用户额外操作或提供密码。后续开发者进场时，应先准备专用的有界 1011 样本采集工具与合成画面素材，再在用户配合下进行脱敏取证。
++
+ 本手册用于复现两类隔离研究证据：Remote Desktop Manager（RDM）连接本机回环模拟服务端时发送的 ARD 初始化声明，以及真实 Mac 返回的候选编码有界载荷前缀。它不是常规远程连接流程，也不证明候选编码就是 MVS。
+ 
+ 所有命令都应从仓库根目录 `F:\Documents\Windows ARD Client` 的同一个 PowerShell 会话中执行。研究产物位于已被 Git 忽略的 `artifacts\protocol-research`；不得把其中的 JSON、manifest 或 `.bin` 文件强制加入 Git。
+@@ -113,7 +118,14 @@ foreach ($category in $settingCategories) {
+   }
+ }
+ 
++# 第一阶段单变量对比矩阵（核心：High vs Adaptive，Resolution quality 固定 Default）
+ $matrix = @(
++  [pscustomobject]@{ Profile = 'high-default';     Quality = 'High';     Resolution = 'Default' },
++  [pscustomobject]@{ Profile = 'adaptive-default'; Quality = 'Adaptive'; Resolution = 'Default' }
++)
++
++# 扩展研究全矩阵（保留七组供横向深入排查）：
++$matrixFull = @(
+   [pscustomobject]@{ Profile = 'full-default';     Quality = 'Full';     Resolution = 'Default' },
+   [pscustomobject]@{ Profile = 'high-default';     Quality = 'High';     Resolution = 'Default' },
+   [pscustomobject]@{ Profile = 'medium-default';   Quality = 'Medium';   Resolution = 'Default' },
+@@ -133,7 +145,7 @@ $matrix = @(
+ 
+ 证据文档只能摘录非敏感的版本号和设置结论；`rdm-context.json` 与原始捕获一样不得进入 Git。
+ 
+-## 3. 捕获并硬校验七组 RDM 声明
++## 3. 捕获并硬校验 RDM 声明
+ 
+ 监听器只绑定 `127.0.0.1`、只接受一个连接，并在收到首个 FramebufferUpdateRequest 后关闭连接。它完成固定的 ARD security type 30 握手，但不解密或验证认证响应。
+ 
+@@ -169,34 +181,37 @@ try {
+ 
+ 出现未知消息类型时不要根据 TCP 分块猜测消息长度。保留本批次现场，先为该消息增加有界 parser 和测试。
+ 
+-## 4. 比较同一批次的 Full 与 Adaptive
++## 4. 比较同一批次的 High 与 Adaptive（单变量对比）
+ 
+ 只使用本批次变量构造比较输入：
+ 
+ ```powershell
+-$fullCapture = Join-Path $rdmRoot 'full-default.json'
++$highCapture = Join-Path $rdmRoot 'high-default.json'
+ $adaptiveCapture = Join-Path $rdmRoot 'adaptive-default.json'
+ 
+ try {
+-  & $probe --compare-rdm-captures $fullCapture $adaptiveCapture
+-  if ($LASTEXITCODE -ne 0) { throw 'Full/Adaptive comparison did not produce one candidate.' }
++  & $probe --compare-rdm-captures $highCapture $adaptiveCapture
++  if ($LASTEXITCODE -ne 0) { throw 'High/Adaptive comparison did not produce one candidate.' }
+ } catch {
+   & $clearCaptureEnvironment
+   throw
+ }
+ ```
+ 
+-只有输出恰好一个 `RDM comparison candidate signed encoding ID: ...` 才能进入真实 Mac 捕获。若工具报告零个或多个 Adaptive-only ID，停止；不要人工选择 ID。此时执行 `& $clearCaptureEnvironment`，处理七个临时 RDM 条目，并保留该批次供调查。
++比较器不仅比较编码增减，还必须关注像素格式差异、声明顺序和消息序列。只有输出恰好一个 `RDM comparison candidate signed encoding ID: ...` 才能进入真实 Mac 捕获。若工具报告零个或多个差异 ID，停止；不要人工选择 ID。此时执行 `& $clearCaptureEnvironment`，处理临时 RDM 条目，并保留该批次供调查。严禁把唯一差异自动命名为已支持 MVS。
++
++## 5. 真实 Mac 捕获安全硬门与交接指引
+ 
+-## 5. 真实 Mac 捕获安全硬门
++> [!NOTE]
++> **2026-09-07 交接要点**：真实 macOS 服务端已确认在线选择并返回编码 `1011` 的矩形头。现有旧探针的 `--capture-known-encoding-prefix` 仅支持 1001/1002，后续开发者须先开发有界的 1011 样本工具（具备单次字节/时间上限、取消与资源释放，严禁从 TCP 分块推测长度）。当前暂停采集，后续开发者发起采集时再请用户配合。
+ 
+-候选载荷前缀可能包含可还原的屏幕图像数据。运行真实 Mac 命令前，操作者必须亲眼逐项确认：
++候选载荷前缀可能包含可还原的屏幕图像数据。后续运行真实 Mac 采集前，必须亲眼逐项确认：
+ 
+-- 目标 Mac 只启用并显示一个显示器；额外物理或虚拟显示器已断开或在系统中停用，而不只是被客户端隐藏；
++- 目标 Mac 优先只启用并显示一个显示器；若保留多个，所有会被捕获的显示区域均需全屏显示合成测试图；
+ - 唯一显示器全屏展示专用、无敏感信息的合成测试图；
+ - 已关闭通知预览、桌面小组件、菜单栏敏感内容，以及显示私人文件名、账户名、消息或浏览器内容的窗口；
+ - 没有其他用户或自动化会在捕获期间切换画面；
+-- 本批次 Full/Adaptive 比较已产生唯一候选 ID；
++- 确认本次允许保存有界合成画面载荷（样本仅保存在本地 git 忽略的 artifacts 目录）；
+ - `$macCaptureRoot` 不存在，且本批次变量没有被重新赋值。
+ 
+ `--confirm-synthetic-screen` 只是操作者作出的明确声明，程序无法判断屏幕是否真的脱敏。任何一项不能确认时都不得运行；应立即调用 `& $clearCaptureEnvironment` 并处理临时 RDM 条目。
+@@ -208,14 +223,14 @@ $env:WINARD_HOST = (Read-Host 'Authorized test Mac host or IP').Trim()
+ $env:WINARD_PORT = (Read-Host 'ARD port; press Enter only if you will then set 5900').Trim()
+ if ([string]::IsNullOrWhiteSpace($env:WINARD_PORT)) { $env:WINARD_PORT = '5900' }
+ $env:WINARD_USERNAME = (Read-Host 'Authorized test account').Trim()
++$candidateEncodingId = (Read-Host 'Signed encoding ID from comparison (e.g. 1011)').Trim()
+ ```
+ 
+ 再次目视确认目标 Mac 仍是合成测试图，然后只用本批次路径运行：
+ 
+ ```powershell
+-& $probe --capture-differential-prefix `
+-  $fullCapture `
+-  $adaptiveCapture `
++& $probe --capture-known-encoding-prefix `
++  $candidateEncodingId `
+   $macCaptureRoot `
+   --confirm-synthetic-screen
+ if ($LASTEXITCODE -ne 0) { & $clearCaptureEnvironment; throw 'Encoding prefix capture failed.' }
+diff --git a/src/WinARD.Desktop/Services/ConnectionAttemptWorkflow.cs b/src/WinARD.Desktop/Services/ConnectionAttemptWorkflow.cs
+index a0a9bd2..312f910 100644
+--- a/src/WinARD.Desktop/Services/ConnectionAttemptWorkflow.cs
++++ b/src/WinARD.Desktop/Services/ConnectionAttemptWorkflow.cs
+@@ -205,6 +205,34 @@ public sealed class ConnectionAttemptWorkflow(
+                 actualByteCount.ToString(CultureInfo.InvariantCulture)));
+         }
+ 
++        if (failure.ArdEncryptionStage is { } ardEncryptionStage)
++        {
++            fields.Add(new DiagnosticField(
++                "ArdEncryptionStage",
++                ardEncryptionStage.ToString()));
++        }
++
++        if (failure.ArdEncryptionDirection is { } ardEncryptionDirection)
++        {
++            fields.Add(new DiagnosticField(
++                "ArdEncryptionDirection",
++                ardEncryptionDirection.ToString()));
++        }
++
++        if (failure.ArdEncryptionSequence is { } ardEncryptionSequence)
++        {
++            fields.Add(new DiagnosticField(
++                "ArdEncryptionSequence",
++                ardEncryptionSequence.ToString(CultureInfo.InvariantCulture)));
++        }
++
++        if (failure.ArdCiphertextLength is { } ardCiphertextLength)
++        {
++            fields.Add(new DiagnosticField(
++                "ArdCiphertextLength",
++                ardCiphertextLength.ToString(CultureInfo.InvariantCulture)));
++        }
++
+         return fields;
+     }
+ 
+diff --git a/src/WinARD.Desktop/Services/RfbClientFactory.cs b/src/WinARD.Desktop/Services/RfbClientFactory.cs
+index 5a539b3..4c55c43 100644
+--- a/src/WinARD.Desktop/Services/RfbClientFactory.cs
++++ b/src/WinARD.Desktop/Services/RfbClientFactory.cs
+@@ -26,7 +26,7 @@ public sealed class RfbClientFactory(ISafeDiagnosticSink? diagnosticSink = null)
+         requireArdAuthentication: true);
+ }
+ 
+-internal sealed class RfbClient : IRfbClient
++internal sealed partial class RfbClient : IRfbClient
+ {
+     internal static ArdDisplayCapabilities ConfirmedStandardQualityCapabilities { get; } = new(
+         CapabilitySupport.Observed,
+diff --git a/src/WinARD.Desktop/ViewModels/ConnectionQualityTracker.cs b/src/WinARD.Desktop/ViewModels/ConnectionQualityTracker.cs
+index adff13e..1932fc5 100644
+--- a/src/WinARD.Desktop/ViewModels/ConnectionQualityTracker.cs
++++ b/src/WinARD.Desktop/ViewModels/ConnectionQualityTracker.cs
+@@ -9,6 +9,12 @@ public enum ConnectionQualityLevel
+     Disconnected,
+ }
+ 
++/// <summary>
++/// Connection quality snapshot containing latency and qualitative status.
++/// <paramref name="ResponseMilliseconds"/> measures total request-to-frame turnaround
++/// (request transmission, remote capture/encoding turnaround, network RTT, and receive decryption);
++/// it must not be conflated with pure network RTT.
++/// </summary>
+ public sealed record ConnectionQualitySnapshot(
+     ConnectionQualityLevel Level,
+     int? ResponseMilliseconds,
+diff --git a/src/WinARD.Desktop/ViewModels/QualityPresentation.cs b/src/WinARD.Desktop/ViewModels/QualityPresentation.cs
+index 9065d8f..3f9b070 100644
+--- a/src/WinARD.Desktop/ViewModels/QualityPresentation.cs
++++ b/src/WinARD.Desktop/ViewModels/QualityPresentation.cs
+@@ -132,9 +132,9 @@ public static class QualityPresentation
+         ReadOnly<QualityScale>([
+             new(QualityScale.Automatic, "自动"),
+             new(QualityScale.Percent100, "100%"),
+-            new(QualityScale.Percent75, "75%"),
+-            new(QualityScale.Percent50, "50%"),
+-            new(QualityScale.Percent25, "25%"),
++            new(QualityScale.Percent75, "75%（实验性）"),
++            new(QualityScale.Percent50, "50%（实验性）"),
++            new(QualityScale.Percent25, "25%（实验性）"),
+         ]);
+ 
+     public static IReadOnlyList<QualityChoice<QualityColor>> ColorOptionsFor(
+@@ -215,6 +215,76 @@ public static class QualityPresentation
+             $"本连接实际：{ScaleName(actual)}{fallback}{pending}";
+     }
+ 
++    public static string ScaleStateText(
++        QualityScale saved,
++        QualityScale resolved,
++        QualityScale actual,
++        bool pendingReconnect,
++        bool safeFallback,
++        RemoteFramebufferSize? actualSize,
++        RemoteFramebufferSize? originalSize = null,
++        bool isEffective = false)
++    {
++        if (actualSize is null)
++        {
++            return ScaleStateText(saved, resolved, actual, pendingReconnect, safeFallback);
++        }
++
++        var sizeText = $"{actualSize.Value.Width} × {actualSize.Value.Height}";
++        var isScaleConfirmed = isEffective || (resolved == QualityScale.Percent100 && !safeFallback);
++        if (!isScaleConfirmed && originalSize is { } origin && origin.Width > 0 && origin.Height > 0)
++        {
++            var expectedFactor = resolved switch
++            {
++                QualityScale.Percent25 => 0.25d,
++                QualityScale.Percent50 => 0.5d,
++                QualityScale.Percent75 => 0.75d,
++                _ => 1.0d,
++            };
++            var actualFactorW = (double)actualSize.Value.Width / origin.Width;
++            var actualFactorH = (double)actualSize.Value.Height / origin.Height;
++            if (Math.Abs(actualFactorW - expectedFactor) < 0.05 && Math.Abs(actualFactorH - expectedFactor) < 0.05)
++            {
++                isScaleConfirmed = true;
++            }
++        }
++
++        string actualScaleText;
++        if (safeFallback)
++        {
++            actualScaleText = "100%";
++        }
++        else if (isScaleConfirmed)
++        {
++            actualScaleText = ScaleName(actual);
++        }
++        else
++        {
++            actualScaleText = "未确认";
++        }
++
++        string statusText;
++        if (safeFallback)
++        {
++            statusText = pendingReconnect ? "已安全回退 · 需要重新连接后生效" : "已安全回退";
++        }
++        else if (pendingReconnect)
++        {
++            statusText = "需要重新连接后生效";
++        }
++        else if (resolved != QualityScale.Percent100 && !isScaleConfirmed)
++        {
++            statusText = "未确认生效";
++        }
++        else
++        {
++            statusText = "已生效";
++        }
++
++        return $"设置：{ScaleName(saved)} · 本连接解析：{ScaleName(resolved)} · " +
++            $"实际传输：{sizeText} · 实际比例：{actualScaleText} · 状态：{statusText}";
++    }
++
+     public static string AppliedText(
+         QualityActualState? actual,
+         SessionPerformanceSnapshot performance)
+@@ -508,8 +578,15 @@ public static class QualityPresentation
+     private static string ColorName(QualityColor value) =>
+         ColorOptions.FirstOrDefault(option => option.Value == value)?.DisplayName ?? "Unknown";
+ 
+-    private static string ScaleName(QualityScale value) =>
+-        ScaleOptions.FirstOrDefault(option => option.Value == value)?.DisplayName ?? "Unknown";
++    private static string ScaleName(QualityScale value) => value switch
++    {
++        QualityScale.Automatic => "自动",
++        QualityScale.Percent100 => "100%",
++        QualityScale.Percent75 => "75%",
++        QualityScale.Percent50 => "50%",
++        QualityScale.Percent25 => "25%",
++        _ => "Unknown",
++    };
+ 
+     private static ReadOnlyCollection<QualityChoice<T>> ReadOnly<T>(QualityChoice<T>[] values) =>
+         new ReadOnlyCollection<QualityChoice<T>>(values);
+diff --git a/src/WinARD.Desktop/ViewModels/RemoteSessionViewModel.cs b/src/WinARD.Desktop/ViewModels/RemoteSessionViewModel.cs
+index d37dcc5..05e0668 100644
+--- a/src/WinARD.Desktop/ViewModels/RemoteSessionViewModel.cs
++++ b/src/WinARD.Desktop/ViewModels/RemoteSessionViewModel.cs
+@@ -254,6 +254,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
+         private set => SetProperty(ref _framebufferSize, value);
+     }
+ 
++    public RemoteFramebufferSize InitialFramebufferSize => _session.FramebufferSize;
++
+     public string StatusMessage
+     {
+         get => _statusMessage;
+@@ -1159,6 +1161,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
+         }
+     }
+ 
++    /// <summary>
++    /// Issues a framebuffer update request under pacer control.
++    /// Initiates latency tracking via <see cref="_connectionQualityTracker"/>; elapsed time to frame
++    /// reception represents total turnaround (request transport, server capture/encoding, network RTT,
++    /// and receive decryption), not pure network RTT.
++    /// </summary>
+     private async ValueTask RequestFramebufferUpdateTrackedAsync(
+         bool incremental,
+         CancellationToken cancellationToken)
+diff --git a/src/WinARD.Desktop/Views/RemoteSessionWindow.xaml b/src/WinARD.Desktop/Views/RemoteSessionWindow.xaml
+index ccc8435..1a621c7 100644
+--- a/src/WinARD.Desktop/Views/RemoteSessionWindow.xaml
++++ b/src/WinARD.Desktop/Views/RemoteSessionWindow.xaml
+@@ -200,7 +200,7 @@
+                         <TextBlock x:Name="QualityStatusText" AutomationProperties.AutomationId="RemoteQualityStatus" AutomationProperties.Name="画质状态" AutomationProperties.LiveSetting="Polite" Text="状态未知" />
+                         <TextBlock x:Name="QualityDesiredText" AutomationProperties.AutomationId="RemoteQualityDesiredText" AutomationProperties.Name="期望画质" Text="期望：—" />
+                         <TextBlock x:Name="QualityAppliedText" AutomationProperties.AutomationId="RemoteQualityAppliedText" AutomationProperties.Name="实际画质" AutomationProperties.LiveSetting="Polite" Text="实际：—" />
+-                        <TextBlock x:Name="QualityScaleStateText" AutomationProperties.AutomationId="RemoteQualityScaleStateText" AutomationProperties.Name="缩放设置与实际状态" Text="设置：自动 · 本连接解析：— · 本连接实际：—" TextWrapping="Wrap" />
++                        <TextBlock x:Name="QualityScaleStateText" AutomationProperties.AutomationId="RemoteQualityScaleStateText" AutomationProperties.Name="缩放设置与实际状态" Text="设置：自动 · 本连接解析：— · 实际传输：— · 实际比例：— · 状态：—" TextWrapping="Wrap" />
+                         <TextBlock Text="预设" />
+                         <ComboBox x:Name="QualityPresetComboBox" AutomationProperties.AutomationId="RemoteQualityPresetComboBox" AutomationProperties.Name="画质预设" DisplayMemberPath="DisplayName" DropDownClosed="OnQualityDropDownClosed" DropDownOpened="OnQualityDropDownOpened" SelectionChanged="OnQualityPresetSelectionChanged" />
+                         <TextBlock Text="带宽目标" />
+diff --git a/src/WinARD.Desktop/Views/RemoteSessionWindow.xaml.cs b/src/WinARD.Desktop/Views/RemoteSessionWindow.xaml.cs
+index 99a8941..c7588d2 100644
+--- a/src/WinARD.Desktop/Views/RemoteSessionWindow.xaml.cs
++++ b/src/WinARD.Desktop/Views/RemoteSessionWindow.xaml.cs
+@@ -1259,7 +1259,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
+                 resolvedScale,
+                 actualScale,
+                 presentation.PendingReconnect,
+-                presentation.Actual?.FallbackUsed == true);
++                presentation.Actual?.FallbackUsed == true,
++                actualSize: ViewModel.FramebufferSize,
++                originalSize: ViewModel.InitialFramebufferSize);
+             QualityReconnectActions.Visibility = presentation.PendingReconnect
+                 ? Visibility.Visible
+                 : Visibility.Collapsed;
+diff --git a/src/WinARD.Infrastructure/Diagnostics/DiagnosticExporter.cs b/src/WinARD.Infrastructure/Diagnostics/DiagnosticExporter.cs
+index 89eb4ec..5947252 100644
+--- a/src/WinARD.Infrastructure/Diagnostics/DiagnosticExporter.cs
++++ b/src/WinARD.Infrastructure/Diagnostics/DiagnosticExporter.cs
+@@ -866,7 +866,7 @@ public sealed class DiagnosticExporter : IDisposable
+         "ExpectedByteCount" or "ActualByteCount" =>
+             ExportNonNegativeInt32(value, MaximumProtocolByteCount),
+         "RectangleIndex" => ExportNonNegativeInt32(value, MaximumRectanglesPerUpdate - 1),
+-        "ArdEncryptedPacketLength" => ExportBoundedNonNegativeInt32(value, 1, ushort.MaxValue),
++        "ArdEncryptedPacketLength" => ExportBoundedNonNegativeInt32(value, 0, ushort.MaxValue),
+         "PresentationStage" => ExportAllowedValue(value, AllowedPresentationStages),
+         "ProtocolReadStage" => ExportAllowedValue(value, AllowedProtocolReadStages),
+         "ServerMessageType" => ExportFixedHex(value, 2),
+diff --git a/src/WinARD.Remote.Protocol/Encodings/RfbEncodingType.cs b/src/WinARD.Remote.Protocol/Encodings/RfbEncodingType.cs
+index e7f4374..322aed7 100644
+--- a/src/WinARD.Remote.Protocol/Encodings/RfbEncodingType.cs
++++ b/src/WinARD.Remote.Protocol/Encodings/RfbEncodingType.cs
+@@ -9,6 +9,7 @@ public enum RfbEncodingType
+     ArdDisplayInfo = 1101,
+     ArdSessionEncryption = 1103,
+     ArdDisplayInfo2 = 1105,
++    AppleMvs = 1011,
+     DesktopSize = -223,
+     Cursor = -239,
+ }
+diff --git a/src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateReader.cs b/src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateReader.cs
+index 331dcf8..87aaa10 100644
+--- a/src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateReader.cs
++++ b/src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateReader.cs
+@@ -207,7 +207,8 @@ public static class FramebufferUpdateReader
+                 RfbEncodingType.ArdDisplayInfo or
+                 RfbEncodingType.ArdSessionEncryption or
+                 RfbEncodingType.ArdDisplayInfo2;
+-            if (encoding != RfbEncodingType.Cursor && !isArdMetadata && (width == 0 || height == 0))
++            var isAppleMvsControl = encoding == RfbEncodingType.AppleMvs && x == 0 && y == 0 && width == 0 && height == 0;
++            if (encoding != RfbEncodingType.Cursor && !isArdMetadata && !isAppleMvsControl && (width == 0 || height == 0))
+             {
+                 throw RfbProtocolException.Create(
+                     $"RFB encoding {encodingId} requires non-zero rectangle dimensions.",
+@@ -229,8 +230,14 @@ public static class FramebufferUpdateReader
+                 RfbEncodingType.ArdSessionEncryption or
+                 RfbEncodingType.ArdDisplayInfo2 =>
+                     FramebufferRect.CreateMetadataRectangle(x, y, width, height),
++                RfbEncodingType.AppleMvs when isAppleMvsControl =>
++                    FramebufferRect.CreateMetadataRectangle(x, y, width, height),
+                 _ => new FramebufferRect(x, y, width, height),
+             };
++            if (encoding == RfbEncodingType.AppleMvs && !isAppleMvsControl)
++            {
++                rectangle.ValidateWithin(framebuffer.Width, framebuffer.Height);
++            }
+             EncodingDecodeResult decodeResult;
+             try
+             {
+diff --git a/src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateSession.cs b/src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateSession.cs
+index 38e3397..9cc67aa 100644
+--- a/src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateSession.cs
++++ b/src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateSession.cs
+@@ -23,6 +23,63 @@ public sealed class FramebufferUpdateSession : IAsyncDisposable
+         _decoders = decoders;
+     }
+ 
++    /// <summary>
++    /// Explicit research entry point for registering experimental decoders in probe tools without reflection.
++    /// Thread-safe and synchronized with session update processing.
++    /// </summary>
++    public void RegisterResearchDecoder(IRfbEncodingDecoder decoder)
++    {
++        ArgumentNullException.ThrowIfNull(decoder);
++        ThrowIfUnavailable();
++
++        _gate.Wait();
++        try
++        {
++            ThrowIfUnavailable();
++            if (_decoders is IDictionary<int, IRfbEncodingDecoder> mutableDecoders)
++            {
++                mutableDecoders[decoder.EncodingId] = decoder;
++            }
++            else
++            {
++                throw new NotSupportedException("The decoders collection does not support research registration.");
++            }
++        }
++        finally
++        {
++            _gate.Release();
++        }
++    }
++
++    /// <summary>
++    /// Asynchronously registers an experimental research decoder under session gate synchronization.
++    /// </summary>
++    public async ValueTask RegisterResearchDecoderAsync(
++        IRfbEncodingDecoder decoder,
++        CancellationToken cancellationToken = default)
++    {
++        ArgumentNullException.ThrowIfNull(decoder);
++        ThrowIfUnavailable();
++
++        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
++        try
++        {
++            ThrowIfUnavailable();
++            if (_decoders is IDictionary<int, IRfbEncodingDecoder> mutableDecoders)
++            {
++                mutableDecoders[decoder.EncodingId] = decoder;
++            }
++            else
++            {
++                throw new NotSupportedException("The decoders collection does not support research registration.");
++            }
++        }
++        finally
++        {
++            _gate.Release();
++        }
++    }
++
+     public async Task<FramebufferUpdateResult> ApplyAsync(
+         Stream stream,
+         CancellationToken cancellationToken)
+diff --git a/src/WinARD.Remote.Protocol/WinARD.Remote.Protocol.csproj b/src/WinARD.Remote.Protocol/WinARD.Remote.Protocol.csproj
+index fbfc81e..d89e984 100644
+--- a/src/WinARD.Remote.Protocol/WinARD.Remote.Protocol.csproj
++++ b/src/WinARD.Remote.Protocol/WinARD.Remote.Protocol.csproj
+@@ -2,5 +2,6 @@
+   <ItemGroup>
+     <InternalsVisibleTo Include="WinARD.Remote.Protocol.Tests" />
+     <InternalsVisibleTo Include="WinARD.Desktop.Tests" />
++    <InternalsVisibleTo Include="WinARD.ScaleProbe" />
+   </ItemGroup>
+ </Project>
+diff --git a/tests/WinARD.Application.Tests/RemoteSessionRuntimeTests.cs b/tests/WinARD.Application.Tests/RemoteSessionRuntimeTests.cs
+index bcb7e79..9090706 100644
+--- a/tests/WinARD.Application.Tests/RemoteSessionRuntimeTests.cs
++++ b/tests/WinARD.Application.Tests/RemoteSessionRuntimeTests.cs
+@@ -310,7 +310,7 @@ public sealed class RemoteSessionRuntimeTests
+     private sealed class RuntimeClient : IRfbClient
+     {
+         private int _receiveCount;
+-        public RemoteFramebufferSize FramebufferSize => new(640, 480);
++        public RemoteFramebufferSize FramebufferSize { get; init; } = new(640, 480);
+         public RemoteDisplayCapabilities DisplayCapabilities { get; init; } =
+             RemoteDisplayCapabilities.Unknown;
+         public RemoteRuntimePerformanceSnapshot PerformanceSnapshot { get; init; } =
+@@ -332,6 +332,8 @@ public sealed class RemoteSessionRuntimeTests
+         public Action? BeginShutdownAction { get; init; }
+         public Action? DisposeAction { get; init; }
+ 
++        public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize) { }
++
+         public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+         public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
+         public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+@@ -355,8 +357,8 @@ public sealed class RemoteSessionRuntimeTests
+             ValueTask.FromResult(
+                 Interlocked.Increment(ref _receiveCount) == 1
+                     ? new RemoteFramebufferMessage(
+-                        new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
+-                        [new RemoteRectangle(0, 0, 1, 1)])
++                        FramebufferSize, [0, 0, 0, 255], 4,
++                        [new RemoteRectangle(0, 0, (ushort)FramebufferSize.Width, (ushort)FramebufferSize.Height)])
+                     : NextMessage);
+         public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken)
+         {
+@@ -402,6 +404,8 @@ public sealed class RemoteSessionRuntimeTests
+         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
+             ValueTask.CompletedTask;
+ 
++        public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize) { }
++
+         public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
+         {
+             if (Interlocked.Increment(ref _receives) == 1)
+diff --git a/tests/WinARD.Desktop.Tests/Services/ConnectionFailureDiagnosticsTests.cs b/tests/WinARD.Desktop.Tests/Services/ConnectionFailureDiagnosticsTests.cs
+index 9234e70..8cacd59 100644
+--- a/tests/WinARD.Desktop.Tests/Services/ConnectionFailureDiagnosticsTests.cs
++++ b/tests/WinARD.Desktop.Tests/Services/ConnectionFailureDiagnosticsTests.cs
+@@ -11,7 +11,9 @@ using WinARD.Domain.Connections;
+ using WinARD.Domain.Errors;
+ using WinARD.Domain.Sessions;
+ using WinARD.Infrastructure.Diagnostics;
++using WinARD.Remote.Protocol.Ard;
+ using WinARD.Remote.Protocol.Errors;
++using WinARD.Remote.Protocol.IO;
+ using WinARD.Transport;
+ using WinARD.Transport.Ssh;
+ using Xunit;
+@@ -446,6 +448,42 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
+         Assert.DoesNotContain(secretMarker, JsonSerializer.Serialize(diagnostic), StringComparison.Ordinal);
+     }
+ 
++    [Fact]
++    public async Task ArdOuterLengthFailureWithZeroCiphertextLengthSurvivesDiagnosticExport()
++    {
++        await using var inner = new MemoryStream([0, 0], writable: true);
++        await using var encrypted = new ArdEncryptedStream(inner, ProtocolLimits.Default);
++        encrypted.Activate(new ArdSessionCipherMaterial(new byte[16], new byte[16]));
++        var failure = await Assert.ThrowsAsync<RfbProtocolException>(() =>
++            encrypted.ReadAsync(new byte[1]).AsTask());
++        Assert.Equal(ArdEncryptedPacketFailureStage.OuterLength, failure.Failure?.ArdEncryptionStage);
++        Assert.Equal(0, failure.Failure?.ArdCiphertextLength);
++
++        using var redactor = new SecretRedactor();
++        var sink = new InMemorySafeDiagnosticSink(redactor);
++        var workflow = new ConnectionAttemptWorkflow(
++            new ConnectDeviceHandler(
++                new TransportFactory(new TrackingLifetime()),
++                new SecretProvider(new TrackingSecret("password")),
++                new ClientFactory(new NegotiationFailingClient(failure)),
++                new ErrorMapper()),
++            new CancelPrompt(),
++            sink);
++        _ = await workflow.AttemptAsync(
++            Profile(), stageChanged: null, acceptedHostKey: null, CancellationToken.None);
++
++        Directory.CreateDirectory(_directory);
++        var archivePath = Path.Combine(_directory, "ard-zero-outer-length.zip");
++        using var exporter = new DiagnosticExporter(sink, redactor);
++        await exporter.ExportAsync(archivePath, DiagnosticExportContext.Empty, CancellationToken.None);
++
++        using var archive = ZipFile.OpenRead(archivePath);
++        using var document = JsonDocument.Parse(ReadEntry(archive.GetEntry("diagnostics.json")!));
++        var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
++        Assert.Equal("OuterLength", fields.GetProperty("ArdEncryptionStage").GetString());
++        Assert.Equal("0", fields.GetProperty("ArdEncryptedPacketLength").GetString());
++    }
++
+     [Fact]
+     public async Task AuthenticationFailureIsRecordedBeforeRegisteredSecretIsReleased()
+     {
+diff --git a/tests/WinARD.Desktop.Tests/ViewModels/QualityPresentationTests.cs b/tests/WinARD.Desktop.Tests/ViewModels/QualityPresentationTests.cs
+index 4e95be1..9d66dfe 100644
+--- a/tests/WinARD.Desktop.Tests/ViewModels/QualityPresentationTests.cs
++++ b/tests/WinARD.Desktop.Tests/ViewModels/QualityPresentationTests.cs
+@@ -36,6 +36,91 @@ public sealed class QualityPresentationTests
+                 safeFallback: true));
+     }
+ 
++    [Fact]
++    public void Scale_state_displays_unconfirmed_and_actual_pixel_dimensions_when_50_percent_requested_but_full_frame_received()
++    {
++        var text = QualityPresentation.ScaleStateText(
++            QualityScale.Percent50,
++            QualityScale.Percent50,
++            QualityScale.Percent100,
++            pendingReconnect: false,
++            safeFallback: false,
++            actualSize: new RemoteFramebufferSize(3360, 2100),
++            originalSize: new RemoteFramebufferSize(3360, 2100));
++
++        Assert.Equal("设置：50% · 本连接解析：50% · 实际传输：3360 × 2100 · 实际比例：未确认 · 状态：未确认生效", text);
++    }
++
++    [Fact]
++    public void Scale_state_displays_automatic_profile_with_resolved_100_percent_and_actual_pixel_dimensions()
++    {
++        var text = QualityPresentation.ScaleStateText(
++            QualityScale.Automatic,
++            QualityScale.Percent100,
++            QualityScale.Percent100,
++            pendingReconnect: false,
++            safeFallback: false,
++            actualSize: new RemoteFramebufferSize(3360, 2100),
++            originalSize: new RemoteFramebufferSize(3360, 2100));
++
++        Assert.Equal("设置：自动 · 本连接解析：100% · 实际传输：3360 × 2100 · 实际比例：100% · 状态：已生效", text);
++    }
++
++    [Fact]
++    public void Scale_state_displays_effective_when_reduced_dimensions_are_confirmed()
++    {
++        var text = QualityPresentation.ScaleStateText(
++            QualityScale.Percent50,
++            QualityScale.Percent50,
++            QualityScale.Percent50,
++            pendingReconnect: false,
++            safeFallback: false,
++            actualSize: new RemoteFramebufferSize(1680, 1050),
++            originalSize: new RemoteFramebufferSize(3360, 2100));
++
++        Assert.Equal("设置：50% · 本连接解析：50% · 实际传输：1680 × 1050 · 实际比例：50% · 状态：已生效", text);
++    }
++
++    [Fact]
++    public void Scale_state_displays_safe_fallback_with_dimensions()
++    {
++        var text = QualityPresentation.ScaleStateText(
++            QualityScale.Percent25,
++            QualityScale.Percent25,
++            QualityScale.Percent100,
++            pendingReconnect: false,
++            safeFallback: true,
++            actualSize: new RemoteFramebufferSize(3360, 2100),
++            originalSize: new RemoteFramebufferSize(3360, 2100));
++
++        Assert.Equal("设置：25% · 本连接解析：25% · 实际传输：3360 × 2100 · 实际比例：100% · 状态：已安全回退", text);
++    }
++
++    [Fact]
++    public void Scale_state_displays_pending_reconnect_guidance()
++    {
++        var text = QualityPresentation.ScaleStateText(
++            QualityScale.Percent50,
++            QualityScale.Percent100,
++            QualityScale.Percent100,
++            pendingReconnect: true,
++            safeFallback: false,
++            actualSize: new RemoteFramebufferSize(3360, 2100),
++            originalSize: new RemoteFramebufferSize(3360, 2100));
++
++        Assert.Equal("设置：50% · 本连接解析：100% · 实际传输：3360 × 2100 · 实际比例：100% · 状态：需要重新连接后生效", text);
++    }
++
++    [Fact]
++    public void Scale_options_mark_sub_100_scales_as_experimental()
++    {
++        Assert.Equal("自动", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Automatic).DisplayName);
++        Assert.Equal("100%", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Percent100).DisplayName);
++        Assert.Equal("75%（实验性）", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Percent75).DisplayName);
++        Assert.Equal("50%（实验性）", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Percent50).DisplayName);
++        Assert.Equal("25%（实验性）", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Percent25).DisplayName);
++    }
++
+     private const double MiB = 1024 * 1024;
+ 
+     [Fact]
+diff --git a/tests/WinARD.Desktop.Tests/Views/RemoteSessionQualityPanelTests.cs b/tests/WinARD.Desktop.Tests/Views/RemoteSessionQualityPanelTests.cs
+index 375dad3..57ff674 100644
+--- a/tests/WinARD.Desktop.Tests/Views/RemoteSessionQualityPanelTests.cs
++++ b/tests/WinARD.Desktop.Tests/Views/RemoteSessionQualityPanelTests.cs
+@@ -117,6 +117,16 @@ public sealed class RemoteSessionQualityPanelTests
+             source.IndexOf("await _windowLifecycle.RetryAsync", StringComparison.Ordinal));
+     }
+ 
++    [Fact]
++    public void Quality_panel_passes_actual_and_original_framebuffer_size_to_scale_state()
++    {
++        var source = File.ReadAllText(RepositoryFile(
++            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
++
++        Assert.Contains("actualSize: ViewModel.FramebufferSize", source, StringComparison.Ordinal);
++        Assert.Contains("originalSize: ViewModel.InitialFramebufferSize", source, StringComparison.Ordinal);
++    }
++
+     private static void AssertQualityTextBlock(
+         XDocument document,
+         XNamespace presentation,
+diff --git a/tests/WinARD.Infrastructure.Tests/DiagnosticExporterTests.cs b/tests/WinARD.Infrastructure.Tests/DiagnosticExporterTests.cs
+index a529392..44e095e 100644
+--- a/tests/WinARD.Infrastructure.Tests/DiagnosticExporterTests.cs
++++ b/tests/WinARD.Infrastructure.Tests/DiagnosticExporterTests.cs
+@@ -1179,7 +1179,7 @@ public sealed class DiagnosticExporterTests : IDisposable
+     [InlineData("RectangleIndex", "4096", false)]
+     [InlineData("ArdCiphertextLength", "1", true)]
+     [InlineData("ArdCiphertextLength", "65535", true)]
+-    [InlineData("ArdCiphertextLength", "0", false)]
++    [InlineData("ArdCiphertextLength", "0", true)]
+     [InlineData("ArdCiphertextLength", "65536", false)]
+     [InlineData("ArdCiphertextLength", "2147483647", false)]
+     public async Task NumericEventFieldsUseTheirProtocolOrProductBounds(
+diff --git a/tests/WinARD.Infrastructure.Tests/WinArdDatabaseTests.cs b/tests/WinARD.Infrastructure.Tests/WinArdDatabaseTests.cs
+index 3904eb6..c09bcdf 100644
+--- a/tests/WinARD.Infrastructure.Tests/WinArdDatabaseTests.cs
++++ b/tests/WinARD.Infrastructure.Tests/WinArdDatabaseTests.cs
+@@ -150,7 +150,7 @@ public sealed class WinArdDatabaseTests
+     public void Quality_scale_migration_uses_a_regular_table_rebuild()
+     {
+         var source = File.ReadAllText(
+-            Path.Combine(GetRepositoryRoot(), "src", "WinARD.Infrastructure", "Database", "Migrations", "Migration004QualityScalePercent.cs"));
++            RepositoryFile.Find("src", "WinARD.Infrastructure", "Database", "Migrations", "Migration004QualityScalePercent.cs"));
+ 
+         Assert.DoesNotContain("writable_schema", source, StringComparison.OrdinalIgnoreCase);
+         Assert.DoesNotContain("sqlite_schema", source, StringComparison.OrdinalIgnoreCase);
+@@ -468,9 +468,6 @@ public sealed class WinArdDatabaseTests
+         await command.ExecuteNonQueryAsync();
+     }
+ 
+-    private static string GetRepositoryRoot() =>
+-        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", ".."));
+-
+     private static async Task SeedVersionTableAsync(string path, string rowsSql)
+     {
+         var builder = new SqliteConnectionStringBuilder { DataSource = path, Pooling = false };
+diff --git a/tests/WinARD.Remote.Protocol.Tests/Tools/RdmCaptureTests.cs b/tests/WinARD.Remote.Protocol.Tests/Tools/RdmCaptureTests.cs
+index ff5a9d5..a8e10e4 100644
+--- a/tests/WinARD.Remote.Protocol.Tests/Tools/RdmCaptureTests.cs
++++ b/tests/WinARD.Remote.Protocol.Tests/Tools/RdmCaptureTests.cs
+@@ -252,12 +252,14 @@ public sealed class RdmCaptureTests
+     [Fact]
+     public async Task Capture_server_sends_synthetic_server_init_and_round_trips_captured_declarations()
+     {
++        var stages = new List<string>();
+         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+         var port = ReserveLoopbackPort();
+         var serverTask = new RdmCaptureServer().CaptureOnceAsync(
+             port,
+             "adaptive-default",
+-            cancellation.Token);
++            cancellation.Token,
++            stages.Add);
+         using var client = new TcpClient();
+         await client.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
+         await using var stream = client.GetStream();
+@@ -293,6 +295,11 @@ public sealed class RdmCaptureTests
+             1080,
+             cancellation.Token);
+         var report = await serverTask.WaitAsync(cancellation.Token);
++        Assert.Equal(
++            ["Banner sent", "Client version read", "Security choice read", "Authentication challenge sent", "Authentication response read", "Security success sent", "ClientInit read", "ServerInit sent", "Declaration read"],
++            stages.Where(stage => !stage.StartsWith("Declaration message", StringComparison.Ordinal) && !stage.StartsWith("Encoding IDs:", StringComparison.Ordinal)));
++        Assert.Contains("Declaration message type 0x03", stages);
++        Assert.Contains(stages, stage => stage.StartsWith("Encoding IDs:", StringComparison.Ordinal));
+         Assert.Equal(1, report.SchemaVersion);
+         Assert.Equal("adaptive-default", report.Profile);
+         Assert.Equal("RFB 003.889", report.ClientVersion);
+@@ -868,6 +875,33 @@ public sealed class RdmCaptureTests
+         Assert.Equal(-309, result);
+     }
+ 
++    [Theory]
++    [InlineData(false, null)]
++    [InlineData(false, (byte)0xFF)]
++    [InlineData(true, (byte)0xFF)]
++    public void Comparer_marks_incomplete_declarations_and_rejects_candidate_from_either_side(
++        bool reachedFramebufferRequest,
++        byte? stoppedAtUnknownMessageType)
++    {
++        var baseline = CreateReport(
++            encodings: [0],
++            reachedFramebufferRequest: reachedFramebufferRequest,
++            stoppedAtUnknownMessageType: stoppedAtUnknownMessageType);
++        var adaptive = CreateReport(
++            encodings: [0, -309],
++            reachedFramebufferRequest: reachedFramebufferRequest,
++            stoppedAtUnknownMessageType: stoppedAtUnknownMessageType);
++
++        var comparison = RdmCaptureComparer.Compare(baseline, baseline);
++
++        Assert.Contains("incomplete", comparison.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++        Assert.DoesNotContain("No encoding or declaration differences observed", comparison.ObservationSummary, StringComparison.Ordinal);
++        Assert.Throws<InvalidDataException>(() =>
++            RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(baseline, CreateReport(encodings: [0, -309])));
++        Assert.Throws<InvalidDataException>(() =>
++            RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(CreateReport(encodings: [0]), adaptive));
++    }
++
+     [Fact]
+     public void Comparer_rejects_zero_adaptive_only_encodings()
+     {
+@@ -911,6 +945,108 @@ public sealed class RdmCaptureTests
+             RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(null!, CreateReport()));
+         Assert.Throws<ArgumentNullException>(() =>
+             RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(CreateReport(), null!));
++        Assert.Throws<ArgumentNullException>(() =>
++            RdmCaptureComparer.Compare(null!, CreateReport()));
++        Assert.Throws<ArgumentNullException>(() =>
++            RdmCaptureComparer.Compare(CreateReport(), null!));
++    }
++
++    [Fact]
++    public void Comparer_produces_structured_result_when_declarations_are_identical()
++    {
++        var baseline = CreateReport(profile: "high-default", encodings: [16, 0, -223]);
++        var adaptive = CreateReport(profile: "adaptive-default", encodings: [16, 0, -223]);
++
++        var result = RdmCaptureComparer.Compare(baseline, adaptive);
++
++        Assert.Empty(result.AddedEncodings);
++        Assert.Empty(result.RemovedEncodings);
++        Assert.False(result.HasEncodingOrderDifference);
++        Assert.False(result.PixelFormatDiffers);
++        Assert.False(result.MessageSequenceDiffers);
++        Assert.False(result.StoppedAtUnknownMessageTypeDiffers);
++        Assert.Contains("No encoding or declaration differences observed", result.ObservationSummary, StringComparison.Ordinal);
++        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void Comparer_detects_multiple_added_and_removed_encodings()
++    {
++        var baseline = CreateReport(profile: "high-default", encodings: [16, 0, 1]);
++        var adaptive = CreateReport(profile: "adaptive-default", encodings: [16, -309, -310, 0]);
++
++        var result = RdmCaptureComparer.Compare(baseline, adaptive);
++
++        Assert.Equal([-309, -310], result.AddedEncodings);
++        Assert.Equal([1], result.RemovedEncodings);
++        Assert.False(result.HasEncodingOrderDifference);
++        Assert.Contains("2 adaptive-only encoding(s)", result.ObservationSummary, StringComparison.Ordinal);
++        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void Comparer_detects_encoding_order_difference_without_added_encodings()
++    {
++        var baseline = CreateReport(profile: "high-default", encodings: [16, 0, -223]);
++        var adaptive = CreateReport(profile: "adaptive-default", encodings: [0, 16, -223]);
++
++        var result = RdmCaptureComparer.Compare(baseline, adaptive);
++
++        Assert.Empty(result.AddedEncodings);
++        Assert.Empty(result.RemovedEncodings);
++        Assert.True(result.HasEncodingOrderDifference);
++        Assert.Contains("order differs", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void Comparer_detects_pixel_format_differences()
++    {
++        var baselineFormat = new CapturedPixelFormat(16, 16, false, true, 31, 63, 31, 11, 5, 0);
++        var adaptiveFormat = new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0);
++        var baseline = CreateReport(profile: "high-default", encodings: [16], pixelFormat: baselineFormat);
++        var adaptive = CreateReport(profile: "adaptive-default", encodings: [16], pixelFormat: adaptiveFormat);
++
++        var result = RdmCaptureComparer.Compare(baseline, adaptive);
++
++        Assert.True(result.PixelFormatDiffers);
++        Assert.NotNull(result.PixelFormatSummary);
++        Assert.Contains("16-bit", result.PixelFormatSummary, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("32-bit", result.PixelFormatSummary, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Pixel format differs", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void Comparer_detects_message_sequence_differences_and_unknown_message_stop()
++    {
++        var baselineMessages = new List<CapturedClientMessage>
++        {
++            new(0, "SetPixelFormat", 20, null, null),
++            new(2, "SetEncodings", 16, null, null),
++            new(3, "FramebufferUpdateRequest", 10, "0000000004000300", null),
++        };
++        var adaptiveMessages = new List<CapturedClientMessage>
++        {
++            new(0, "SetPixelFormat", 20, null, null),
++            new(0x0A, "SetMode", 4, "00000001", null),
++            new(2, "SetEncodings", 16, null, null),
++        };
++        var baseline = CreateReport(profile: "high-default", messages: baselineMessages);
++        var adaptive = CreateReport(
++            profile: "adaptive-default",
++            messages: adaptiveMessages,
++            stoppedAtUnknownMessageType: 0xFF);
++
++        var result = RdmCaptureComparer.Compare(baseline, adaptive);
++
++        Assert.True(result.MessageSequenceDiffers);
++        Assert.True(result.StoppedAtUnknownMessageTypeDiffers);
++        Assert.Equal((byte)0xFF, result.AdaptiveStoppedAtUnknownMessageType);
++        Assert.Null(result.BaselineStoppedAtUnknownMessageType);
++        Assert.Contains("Message sequence differs", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("unknown message", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
++        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+     }
+ 
+     [Fact]
+@@ -940,17 +1076,20 @@ public sealed class RdmCaptureTests
+         string profile = "adaptive-default",
+         string clientVersion = "RFB 003.008",
+         IReadOnlyList<int>? encodings = null,
+-        IReadOnlyList<CapturedClientMessage>? messages = null) =>
++        IReadOnlyList<CapturedClientMessage>? messages = null,
++        CapturedPixelFormat? pixelFormat = null,
++        byte? stoppedAtUnknownMessageType = null,
++        bool reachedFramebufferRequest = true) =>
+         new(
+             schemaVersion,
+             profile,
+             clientVersion,
+             1,
+-            new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
++            pixelFormat ?? new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
+             encodings ?? [0],
+             messages ?? [new CapturedClientMessage(3, "FramebufferUpdateRequest", 10, "0000000004000300", null)],
+-            true,
+-            null);
++            reachedFramebufferRequest,
++            stoppedAtUnknownMessageType);
+ 
+     private static async Task AssertInvalidCaptureAsync(string json)
+     {
+diff --git a/tools/WinARD.ProtocolProbe/Program.cs b/tools/WinARD.ProtocolProbe/Program.cs
+index ea9cb20..39d665e 100644
+--- a/tools/WinARD.ProtocolProbe/Program.cs
++++ b/tools/WinARD.ProtocolProbe/Program.cs
+@@ -111,8 +111,9 @@ internal static class Program
+                     return 2;
+                 }
+ 
+-                captureRdm ??= static (timeout, port, profile, token) =>
+-                    new RdmCaptureServer(timeout).CaptureOnceAsync(port, profile, token);
++                captureRdm ??= (timeout, port, profile, token) =>
++                    new RdmCaptureServer(timeout).CaptureOnceAsync(
++                        port, profile, token, stage => output.WriteLine($"RDM stage: {stage}"));
+                 return await RunRdmListenerAsync(
+                     request,
+                     listenPort,
+diff --git a/tools/WinARD.ProtocolProbe/RdmCapture/ArdProbeServerHandshake.cs b/tools/WinARD.ProtocolProbe/RdmCapture/ArdProbeServerHandshake.cs
+index 4221b85..c65288c 100644
+--- a/tools/WinARD.ProtocolProbe/RdmCapture/ArdProbeServerHandshake.cs
++++ b/tools/WinARD.ProtocolProbe/RdmCapture/ArdProbeServerHandshake.cs
+@@ -24,12 +24,14 @@ public static class ArdProbeServerHandshake
+ 
+     public static async Task<ArdProbeServerHandshakeResult> AcceptAsync(
+         Stream stream,
+-        CancellationToken cancellationToken)
++        CancellationToken cancellationToken,
++        Action<string>? stageObserver = null)
+     {
+         ArgumentNullException.ThrowIfNull(stream);
+         cancellationToken.ThrowIfCancellationRequested();
+ 
+         await stream.WriteAsync(ServerBanner, cancellationToken).ConfigureAwait(false);
++        stageObserver?.Invoke("Banner sent");
+ 
+         var clientBanner = new byte[VersionBannerLength];
+         await ReadExactlyAsync(
+@@ -38,6 +40,7 @@ public static class ArdProbeServerHandshake
+             "The RFB client version banner was truncated.",
+             cancellationToken).ConfigureAwait(false);
+         var version = ParseClientVersion(clientBanner);
++        stageObserver?.Invoke("Client version read");
+ 
+         await stream.WriteAsync(SecurityTypes, cancellationToken).ConfigureAwait(false);
+         var selection = new byte[1];
+@@ -46,6 +49,7 @@ public static class ArdProbeServerHandshake
+             selection,
+             "The RFB security selection was truncated.",
+             cancellationToken).ConfigureAwait(false);
++        stageObserver?.Invoke("Security choice read");
+         if (selection[0] != (byte)RfbSecurityType.AppleRemoteDesktop)
+         {
+             throw new InvalidDataException("The RFB client did not select Apple Remote Desktop security.");
+@@ -53,6 +57,7 @@ public static class ArdProbeServerHandshake
+ 
+         var challenge = CreateChallenge();
+         await stream.WriteAsync(challenge, cancellationToken).ConfigureAwait(false);
++        stageObserver?.Invoke("Authentication challenge sent");
+ 
+         var response = new byte[AuthenticationResponseLength];
+         try
+@@ -69,8 +74,10 @@ public static class ArdProbeServerHandshake
+         }
+ 
+         var securityResult = new byte[sizeof(uint)];
++        stageObserver?.Invoke("Authentication response read");
+         BinaryPrimitives.WriteUInt32BigEndian(securityResult, 0);
+         await stream.WriteAsync(securityResult, cancellationToken).ConfigureAwait(false);
++        stageObserver?.Invoke("Security success sent");
+ 
+         var clientInit = new byte[1];
+         await ReadExactlyAsync(
+@@ -78,6 +85,7 @@ public static class ArdProbeServerHandshake
+             clientInit,
+             "The RFB ClientInit message was truncated.",
+             cancellationToken).ConfigureAwait(false);
++        stageObserver?.Invoke("ClientInit read");
+         if (clientInit[0] is not 0x01 and not 0xC1)
+         {
+             throw new InvalidDataException("The RFB ClientInit value is not supported.");
+diff --git a/tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureComparer.cs b/tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureComparer.cs
+index 64ab8c7..c848ff3 100644
+--- a/tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureComparer.cs
++++ b/tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureComparer.cs
+@@ -1,10 +1,25 @@
+ namespace WinARD.ProtocolProbe.RdmCapture;
+ 
++public sealed record RdmComparisonResult(
++    IReadOnlyList<int> AddedEncodings,
++    IReadOnlyList<int> RemovedEncodings,
++    IReadOnlyList<int> CommonEncodingsInBaselineOrder,
++    IReadOnlyList<int> CommonEncodingsInAdaptiveOrder,
++    bool HasEncodingOrderDifference,
++    bool PixelFormatDiffers,
++    string? PixelFormatSummary,
++    bool MessageSequenceDiffers,
++    string? MessageSequenceSummary,
++    bool StoppedAtUnknownMessageTypeDiffers,
++    byte? BaselineStoppedAtUnknownMessageType,
++    byte? AdaptiveStoppedAtUnknownMessageType,
++    string ObservationSummary);
++
+ public static class RdmCaptureComparer
+ {
+     private const int CurrentSchemaVersion = 1;
+ 
+-    public static int FindSingleAdaptiveOnlyEncoding(
++    public static RdmComparisonResult Compare(
+         RdmCaptureReport baseline,
+         RdmCaptureReport adaptive)
+     {
+@@ -31,24 +46,197 @@ public static class RdmCaptureComparer
+                 $"Capture encoding list is missing for schema {CurrentSchemaVersion}.");
+         }
+ 
+-        var baselineEncodings = baseline.Encodings.ToHashSet();
+-        var adaptiveOnly = new List<int>();
+-        var seenAdaptiveOnly = new HashSet<int>();
++        var baselineEncodingsSet = baseline.Encodings.ToHashSet();
++        var adaptiveEncodingsSet = adaptive.Encodings.ToHashSet();
++
++        var addedEncodings = new List<int>();
++        var seenAdded = new HashSet<int>();
++        foreach (var encoding in adaptive.Encodings)
++        {
++            if (!baselineEncodingsSet.Contains(encoding) && seenAdded.Add(encoding))
++            {
++                addedEncodings.Add(encoding);
++            }
++        }
++
++        var removedEncodings = new List<int>();
++        var seenRemoved = new HashSet<int>();
++        foreach (var encoding in baseline.Encodings)
++        {
++            if (!adaptiveEncodingsSet.Contains(encoding) && seenRemoved.Add(encoding))
++            {
++                removedEncodings.Add(encoding);
++            }
++        }
++
++        var commonInBaseline = new List<int>();
++        var seenCommonBaseline = new HashSet<int>();
++        foreach (var encoding in baseline.Encodings)
++        {
++            if (adaptiveEncodingsSet.Contains(encoding) && seenCommonBaseline.Add(encoding))
++            {
++                commonInBaseline.Add(encoding);
++            }
++        }
++
++        var commonInAdaptive = new List<int>();
++        var seenCommonAdaptive = new HashSet<int>();
+         foreach (var encoding in adaptive.Encodings)
+         {
+-            if (!baselineEncodings.Contains(encoding) && seenAdaptiveOnly.Add(encoding))
++            if (baselineEncodingsSet.Contains(encoding) && seenCommonAdaptive.Add(encoding))
++            {
++                commonInAdaptive.Add(encoding);
++            }
++        }
++
++        var hasEncodingOrderDifference = !commonInBaseline.SequenceEqual(commonInAdaptive);
++
++        var pixelFormatDiffers = baseline.PixelFormat != adaptive.PixelFormat;
++        string? pixelFormatSummary = null;
++        if (pixelFormatDiffers)
++        {
++            pixelFormatSummary = $"Baseline: {FormatPixelFormat(baseline.PixelFormat)}; Adaptive: {FormatPixelFormat(adaptive.PixelFormat)}";
++        }
++
++        var messageSequenceDiffers = !AreMessageSequencesEquivalent(baseline.Messages, adaptive.Messages);
++        string? messageSequenceSummary = null;
++        if (messageSequenceDiffers)
++        {
++            var baseNames = string.Join(", ", baseline.Messages?.Select(m => m.Name) ?? []);
++            var adaptNames = string.Join(", ", adaptive.Messages?.Select(m => m.Name) ?? []);
++            messageSequenceSummary = $"Baseline: [{baseNames}]; Adaptive: [{adaptNames}]";
++        }
++
++        var stoppedDiffers = baseline.StoppedAtUnknownMessageType != adaptive.StoppedAtUnknownMessageType;
++
++        var observations = new List<string>();
++        var declarationsComplete = IsComplete(baseline) && IsComplete(adaptive);
++        if (!declarationsComplete)
++        {
++            observations.Add("Declaration capture is incomplete; observed partial differences cannot establish equivalent capabilities or a unique candidate.");
++        }
++        if (declarationsComplete && addedEncodings.Count == 0 &&
++            removedEncodings.Count == 0 &&
++            !hasEncodingOrderDifference &&
++            !pixelFormatDiffers &&
++            !messageSequenceDiffers &&
++            !stoppedDiffers)
++        {
++            observations.Add("No encoding or declaration differences observed between baseline and adaptive.");
++        }
++        else
++        {
++            if (addedEncodings.Count > 0)
++            {
++                observations.Add($"Observed {addedEncodings.Count} adaptive-only encoding(s): [{string.Join(", ", addedEncodings)}].");
++            }
++            if (removedEncodings.Count > 0)
++            {
++                observations.Add($"Observed {removedEncodings.Count} baseline-only encoding(s): [{string.Join(", ", removedEncodings)}].");
++            }
++            if (hasEncodingOrderDifference)
+             {
+-                adaptiveOnly.Add(encoding);
++                observations.Add("Common encoding declaration order differs.");
+             }
++            if (pixelFormatDiffers)
++            {
++                observations.Add($"Pixel format differs ({pixelFormatSummary}).");
++            }
++            if (messageSequenceDiffers)
++            {
++                observations.Add($"Message sequence differs ({messageSequenceSummary}).");
++            }
++            if (stoppedDiffers)
++            {
++                observations.Add($"Stopped at unknown message status differs (Baseline={baseline.StoppedAtUnknownMessageType?.ToString("X2", System.Globalization.CultureInfo.InvariantCulture) ?? "None"}, Adaptive={adaptive.StoppedAtUnknownMessageType?.ToString("X2", System.Globalization.CultureInfo.InvariantCulture) ?? "None"}).");
++            }
++        }
++
++        observations.Add("Note: Client-side declarations represent candidate capabilities from RDM and do not confirm server-side codec selection or proprietary video codec support.");
++
++        var observationSummary = string.Join(" ", observations);
++
++        return new RdmComparisonResult(
++            addedEncodings,
++            removedEncodings,
++            commonInBaseline,
++            commonInAdaptive,
++            hasEncodingOrderDifference,
++            pixelFormatDiffers,
++            pixelFormatSummary,
++            messageSequenceDiffers,
++            messageSequenceSummary,
++            stoppedDiffers,
++            baseline.StoppedAtUnknownMessageType,
++            adaptive.StoppedAtUnknownMessageType,
++            observationSummary);
++    }
++
++    public static int FindSingleAdaptiveOnlyEncoding(
++        RdmCaptureReport baseline,
++        RdmCaptureReport adaptive)
++    {
++        var comparison = Compare(baseline, adaptive);
++
++        if (!IsComplete(baseline) || !IsComplete(adaptive))
++        {
++            throw new InvalidDataException("A candidate requires complete declarations through the first framebuffer request without an unknown-message stop.");
+         }
+ 
+-        if (adaptiveOnly.Count != 1)
++        if (comparison.AddedEncodings.Count != 1)
+         {
+             throw new InvalidDataException(
+-                $"Schema {CurrentSchemaVersion} comparison found {adaptiveOnly.Count} distinct adaptive-only encoding IDs.");
++                $"Schema {CurrentSchemaVersion} comparison found {comparison.AddedEncodings.Count} distinct adaptive-only encoding IDs.");
++        }
++
++        return comparison.AddedEncodings[0];
++    }
++
++    private static bool IsComplete(RdmCaptureReport report) =>
++        report.ReachedFramebufferRequest && report.StoppedAtUnknownMessageType is null;
++
++    private static string FormatPixelFormat(CapturedPixelFormat? format)
++    {
++        if (format is null)
++        {
++            return "None";
++        }
++
++        return $"{format.BitsPerPixel}-bit (Depth={format.Depth}, TrueColor={format.TrueColor}, RMax={format.RedMax}, GMax={format.GreenMax}, BMax={format.BlueMax})";
++    }
++
++    private static bool AreMessageSequencesEquivalent(
++        IReadOnlyList<CapturedClientMessage>? first,
++        IReadOnlyList<CapturedClientMessage>? second)
++    {
++        if (first is null && second is null)
++        {
++            return true;
++        }
++        if (first is null || second is null)
++        {
++            return false;
++        }
++        if (first.Count != second.Count)
++        {
++            return false;
++        }
++
++        for (var i = 0; i < first.Count; i++)
++        {
++            var a = first[i];
++            var b = second[i];
++            if (a.Type != b.Type ||
++                a.Name != b.Name ||
++                a.WireLength != b.WireLength ||
++                a.NumericPayloadHex != b.NumericPayloadHex ||
++                a.PayloadSha256 != b.PayloadSha256)
++            {
++                return false;
++            }
+         }
+ 
+-        return adaptiveOnly[0];
++        return true;
+     }
+ 
+     private static RdmCaptureReport Snapshot(RdmCaptureReport report) =>
+diff --git a/tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureServer.cs b/tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureServer.cs
+index e4d1a99..6b3fb1e 100644
+--- a/tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureServer.cs
++++ b/tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureServer.cs
+@@ -31,7 +31,8 @@ public sealed class RdmCaptureServer
+     public async Task<RdmCaptureReport> CaptureOnceAsync(
+         int port,
+         string profile,
+-        CancellationToken cancellationToken)
++        CancellationToken cancellationToken,
++        Action<string>? stageObserver = null)
+     {
+         ArgumentOutOfRangeException.ThrowIfLessThan(port, 1);
+         ArgumentOutOfRangeException.ThrowIfGreaterThan(port, ushort.MaxValue);
+@@ -53,12 +54,15 @@ public sealed class RdmCaptureServer
+             inactivity.CancelAfter(_inactivityTimeout);
+             await using var networkStream = client.GetStream();
+             var stream = new ProgressTimeoutStream(networkStream, inactivity, _inactivityTimeout);
+-            var handshake = await ArdProbeServerHandshake.AcceptAsync(stream, linkedCancellation.Token)
++            var handshake = await ArdProbeServerHandshake.AcceptAsync(stream, linkedCancellation.Token, stageObserver)
+                 .ConfigureAwait(false);
+             await WriteSyntheticServerInitAsync(stream, linkedCancellation.Token).ConfigureAwait(false);
+-            var declaration = await RfbClientDeclarationReader.ReadAsync(stream, linkedCancellation.Token)
++            stageObserver?.Invoke("ServerInit sent");
++            var declaration = await RfbClientDeclarationReader.ReadAsync(stream, linkedCancellation.Token, stageObserver)
+                 .ConfigureAwait(false);
+ 
++            stageObserver?.Invoke("Declaration read");
++
+             return new RdmCaptureReport(
+                 1,
+                 profile,
+diff --git a/tools/WinARD.ProtocolProbe/RdmCapture/RfbClientDeclarationReader.cs b/tools/WinARD.ProtocolProbe/RdmCapture/RfbClientDeclarationReader.cs
+index 45427ba..8cfd0db 100644
+--- a/tools/WinARD.ProtocolProbe/RdmCapture/RfbClientDeclarationReader.cs
++++ b/tools/WinARD.ProtocolProbe/RdmCapture/RfbClientDeclarationReader.cs
+@@ -38,7 +38,8 @@ public static class RfbClientDeclarationReader
+ 
+     public static async Task<RfbClientDeclarationResult> ReadAsync(
+         Stream stream,
+-        CancellationToken cancellationToken)
++        CancellationToken cancellationToken,
++        Action<string>? stageObserver = null)
+     {
+         ArgumentNullException.ThrowIfNull(stream);
+ 
+@@ -56,6 +57,7 @@ public static class RfbClientDeclarationReader
+ 
+             messageCount++;
+             var type = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
++            stageObserver?.Invoke($"Declaration message type 0x{type:X2}");
+             switch (type)
+             {
+                 case 0x00:
+@@ -95,6 +97,7 @@ public static class RfbClientDeclarationReader
+                         }
+ 
+                         encodings = capturedEncodings;
++                        stageObserver?.Invoke($"Encoding IDs: {string.Join(",", capturedEncodings)}");
+                         messages.Add(new CapturedClientMessage(
+                             type,
+                             "SetEncodings",
+@@ -184,6 +187,7 @@ public static class RfbClientDeclarationReader
+                 default:
+                     return new RfbClientDeclarationResult(pixelFormat, encodings, messages, false, type);
+             }
++            stageObserver?.Invoke($"Declaration message 0x{type:X2} complete");
+         }
+     }
+ 

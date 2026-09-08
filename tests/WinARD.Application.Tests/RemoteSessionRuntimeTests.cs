@@ -310,7 +310,7 @@ public sealed class RemoteSessionRuntimeTests
     private sealed class RuntimeClient : IRfbClient
     {
         private int _receiveCount;
-        public RemoteFramebufferSize FramebufferSize => new(640, 480);
+        public RemoteFramebufferSize FramebufferSize { get; init; } = new(640, 480);
         public RemoteDisplayCapabilities DisplayCapabilities { get; init; } =
             RemoteDisplayCapabilities.Unknown;
         public RemoteRuntimePerformanceSnapshot PerformanceSnapshot { get; init; } =
@@ -331,6 +331,8 @@ public sealed class RemoteSessionRuntimeTests
         public int DisposeCount { get; private set; }
         public Action? BeginShutdownAction { get; init; }
         public Action? DisposeAction { get; init; }
+
+        public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize) { }
 
         public Task NegotiateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task AuthenticateAsync(string username, ISecret secret, CancellationToken cancellationToken) => Task.CompletedTask;
@@ -355,8 +357,8 @@ public sealed class RemoteSessionRuntimeTests
             ValueTask.FromResult(
                 Interlocked.Increment(ref _receiveCount) == 1
                     ? new RemoteFramebufferMessage(
-                        new RemoteFramebufferSize(1, 1), [0, 0, 0, 255], 4,
-                        [new RemoteRectangle(0, 0, 1, 1)])
+                        FramebufferSize, [0, 0, 0, 255], 4,
+                        [new RemoteRectangle(0, 0, (ushort)FramebufferSize.Width, (ushort)FramebufferSize.Height)])
                     : NextMessage);
         public ValueTask SendPointerAsync(byte buttons, int x, int y, CancellationToken cancellationToken)
         {
@@ -401,6 +403,8 @@ public sealed class RemoteSessionRuntimeTests
             CancellationToken cancellationToken) => ValueTask.CompletedTask;
         public ValueTask RequestFramebufferUpdateAsync(bool incremental, CancellationToken cancellationToken) =>
             ValueTask.CompletedTask;
+
+        public void ConfirmBootstrap(RemoteFramebufferSize framebufferSize) { }
 
         public async ValueTask<RemoteServerMessage> ReceiveAsync(CancellationToken cancellationToken)
         {

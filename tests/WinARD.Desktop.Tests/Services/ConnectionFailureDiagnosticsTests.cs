@@ -11,7 +11,9 @@ using WinARD.Domain.Connections;
 using WinARD.Domain.Errors;
 using WinARD.Domain.Sessions;
 using WinARD.Infrastructure.Diagnostics;
+using WinARD.Remote.Protocol.Ard;
 using WinARD.Remote.Protocol.Errors;
+using WinARD.Remote.Protocol.IO;
 using WinARD.Transport;
 using WinARD.Transport.Ssh;
 using Xunit;
@@ -444,6 +446,42 @@ public sealed class ConnectionFailureDiagnosticsTests : IDisposable
                 field.Name != "RfbHandshakeStage" ||
                 field.Value.Contains(secretMarker, StringComparison.Ordinal));
         Assert.DoesNotContain(secretMarker, JsonSerializer.Serialize(diagnostic), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ArdOuterLengthFailureWithZeroCiphertextLengthSurvivesDiagnosticExport()
+    {
+        await using var inner = new MemoryStream([0, 0], writable: true);
+        await using var encrypted = new ArdEncryptedStream(inner, ProtocolLimits.Default);
+        encrypted.Activate(new ArdSessionCipherMaterial(new byte[16], new byte[16]));
+        var failure = await Assert.ThrowsAsync<RfbProtocolException>(() =>
+            encrypted.ReadAsync(new byte[1]).AsTask());
+        Assert.Equal(ArdEncryptedPacketFailureStage.OuterLength, failure.Failure?.ArdEncryptionStage);
+        Assert.Equal(0, failure.Failure?.ArdCiphertextLength);
+
+        using var redactor = new SecretRedactor();
+        var sink = new InMemorySafeDiagnosticSink(redactor);
+        var workflow = new ConnectionAttemptWorkflow(
+            new ConnectDeviceHandler(
+                new TransportFactory(new TrackingLifetime()),
+                new SecretProvider(new TrackingSecret("password")),
+                new ClientFactory(new NegotiationFailingClient(failure)),
+                new ErrorMapper()),
+            new CancelPrompt(),
+            sink);
+        _ = await workflow.AttemptAsync(
+            Profile(), stageChanged: null, acceptedHostKey: null, CancellationToken.None);
+
+        Directory.CreateDirectory(_directory);
+        var archivePath = Path.Combine(_directory, "ard-zero-outer-length.zip");
+        using var exporter = new DiagnosticExporter(sink, redactor);
+        await exporter.ExportAsync(archivePath, DiagnosticExportContext.Empty, CancellationToken.None);
+
+        using var archive = ZipFile.OpenRead(archivePath);
+        using var document = JsonDocument.Parse(ReadEntry(archive.GetEntry("diagnostics.json")!));
+        var fields = document.RootElement.GetProperty("events")[0].GetProperty("fields");
+        Assert.Equal("OuterLength", fields.GetProperty("ArdEncryptionStage").GetString());
+        Assert.Equal("0", fields.GetProperty("ArdEncryptedPacketLength").GetString());
     }
 
     [Fact]

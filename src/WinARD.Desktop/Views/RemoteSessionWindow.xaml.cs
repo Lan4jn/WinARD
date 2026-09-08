@@ -1259,7 +1259,9 @@ public sealed partial class RemoteSessionWindow : Window, IAsyncDisposable
                 resolvedScale,
                 actualScale,
                 presentation.PendingReconnect,
-                presentation.Actual?.FallbackUsed == true);
+                presentation.Actual?.FallbackUsed == true,
+                actualSize: ViewModel.FramebufferSize,
+                originalSize: ViewModel.InitialFramebufferSize);
             QualityReconnectActions.Visibility = presentation.PendingReconnect
                 ? Visibility.Visible
                 : Visibility.Collapsed;

@@ -9,6 +9,7 @@ public enum RfbEncodingType
     ArdDisplayInfo = 1101,
     ArdSessionEncryption = 1103,
     ArdDisplayInfo2 = 1105,
+    AppleMvs = 1011,
     DesktopSize = -223,
     Cursor = -239,
 }

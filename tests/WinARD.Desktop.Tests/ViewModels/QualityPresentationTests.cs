@@ -36,6 +36,91 @@ public sealed class QualityPresentationTests
                 safeFallback: true));
     }
 
+    [Fact]
+    public void Scale_state_displays_unconfirmed_and_actual_pixel_dimensions_when_50_percent_requested_but_full_frame_received()
+    {
+        var text = QualityPresentation.ScaleStateText(
+            QualityScale.Percent50,
+            QualityScale.Percent50,
+            QualityScale.Percent100,
+            pendingReconnect: false,
+            safeFallback: false,
+            actualSize: new RemoteFramebufferSize(3360, 2100),
+            originalSize: new RemoteFramebufferSize(3360, 2100));
+
+        Assert.Equal("设置：50% · 本连接解析：50% · 实际传输：3360 × 2100 · 实际比例：未确认 · 状态：未确认生效", text);
+    }
+
+    [Fact]
+    public void Scale_state_displays_automatic_profile_with_resolved_100_percent_and_actual_pixel_dimensions()
+    {
+        var text = QualityPresentation.ScaleStateText(
+            QualityScale.Automatic,
+            QualityScale.Percent100,
+            QualityScale.Percent100,
+            pendingReconnect: false,
+            safeFallback: false,
+            actualSize: new RemoteFramebufferSize(3360, 2100),
+            originalSize: new RemoteFramebufferSize(3360, 2100));
+
+        Assert.Equal("设置：自动 · 本连接解析：100% · 实际传输：3360 × 2100 · 实际比例：100% · 状态：已生效", text);
+    }
+
+    [Fact]
+    public void Scale_state_displays_effective_when_reduced_dimensions_are_confirmed()
+    {
+        var text = QualityPresentation.ScaleStateText(
+            QualityScale.Percent50,
+            QualityScale.Percent50,
+            QualityScale.Percent50,
+            pendingReconnect: false,
+            safeFallback: false,
+            actualSize: new RemoteFramebufferSize(1680, 1050),
+            originalSize: new RemoteFramebufferSize(3360, 2100));
+
+        Assert.Equal("设置：50% · 本连接解析：50% · 实际传输：1680 × 1050 · 实际比例：50% · 状态：已生效", text);
+    }
+
+    [Fact]
+    public void Scale_state_displays_safe_fallback_with_dimensions()
+    {
+        var text = QualityPresentation.ScaleStateText(
+            QualityScale.Percent25,
+            QualityScale.Percent25,
+            QualityScale.Percent100,
+            pendingReconnect: false,
+            safeFallback: true,
+            actualSize: new RemoteFramebufferSize(3360, 2100),
+            originalSize: new RemoteFramebufferSize(3360, 2100));
+
+        Assert.Equal("设置：25% · 本连接解析：25% · 实际传输：3360 × 2100 · 实际比例：100% · 状态：已安全回退", text);
+    }
+
+    [Fact]
+    public void Scale_state_displays_pending_reconnect_guidance()
+    {
+        var text = QualityPresentation.ScaleStateText(
+            QualityScale.Percent50,
+            QualityScale.Percent100,
+            QualityScale.Percent100,
+            pendingReconnect: true,
+            safeFallback: false,
+            actualSize: new RemoteFramebufferSize(3360, 2100),
+            originalSize: new RemoteFramebufferSize(3360, 2100));
+
+        Assert.Equal("设置：50% · 本连接解析：100% · 实际传输：3360 × 2100 · 实际比例：100% · 状态：需要重新连接后生效", text);
+    }
+
+    [Fact]
+    public void Scale_options_mark_sub_100_scales_as_experimental()
+    {
+        Assert.Equal("自动", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Automatic).DisplayName);
+        Assert.Equal("100%", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Percent100).DisplayName);
+        Assert.Equal("75%（实验性）", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Percent75).DisplayName);
+        Assert.Equal("50%（实验性）", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Percent50).DisplayName);
+        Assert.Equal("25%（实验性）", QualityPresentation.ScaleOptions.Single(o => o.Value == QualityScale.Percent25).DisplayName);
+    }
+
     private const double MiB = 1024 * 1024;
 
     [Fact]

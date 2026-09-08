@@ -26,7 +26,7 @@ public sealed class RfbClientFactory(ISafeDiagnosticSink? diagnosticSink = null)
         requireArdAuthentication: true);
 }
 
-internal sealed class RfbClient : IRfbClient
+internal sealed partial class RfbClient : IRfbClient
 {
     internal static ArdDisplayCapabilities ConfirmedStandardQualityCapabilities { get; } = new(
         CapabilitySupport.Observed,

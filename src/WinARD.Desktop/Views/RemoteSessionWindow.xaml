@@ -200,7 +200,7 @@
                         <TextBlock x:Name="QualityStatusText" AutomationProperties.AutomationId="RemoteQualityStatus" AutomationProperties.Name="画质状态" AutomationProperties.LiveSetting="Polite" Text="状态未知" />
                         <TextBlock x:Name="QualityDesiredText" AutomationProperties.AutomationId="RemoteQualityDesiredText" AutomationProperties.Name="期望画质" Text="期望：—" />
                         <TextBlock x:Name="QualityAppliedText" AutomationProperties.AutomationId="RemoteQualityAppliedText" AutomationProperties.Name="实际画质" AutomationProperties.LiveSetting="Polite" Text="实际：—" />
-                        <TextBlock x:Name="QualityScaleStateText" AutomationProperties.AutomationId="RemoteQualityScaleStateText" AutomationProperties.Name="缩放设置与实际状态" Text="设置：自动 · 本连接解析：— · 本连接实际：—" TextWrapping="Wrap" />
+                        <TextBlock x:Name="QualityScaleStateText" AutomationProperties.AutomationId="RemoteQualityScaleStateText" AutomationProperties.Name="缩放设置与实际状态" Text="设置：自动 · 本连接解析：— · 实际传输：— · 实际比例：— · 状态：—" TextWrapping="Wrap" />
                         <TextBlock Text="预设" />
                         <ComboBox x:Name="QualityPresetComboBox" AutomationProperties.AutomationId="RemoteQualityPresetComboBox" AutomationProperties.Name="画质预设" DisplayMemberPath="DisplayName" DropDownClosed="OnQualityDropDownClosed" DropDownOpened="OnQualityDropDownOpened" SelectionChanged="OnQualityPresetSelectionChanged" />
                         <TextBlock Text="带宽目标" />

@@ -254,6 +254,8 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         private set => SetProperty(ref _framebufferSize, value);
     }
 
+    public RemoteFramebufferSize InitialFramebufferSize => _session.FramebufferSize;
+
     public string StatusMessage
     {
         get => _statusMessage;
@@ -1159,6 +1161,12 @@ public sealed class RemoteSessionViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Issues a framebuffer update request under pacer control.
+    /// Initiates latency tracking via <see cref="_connectionQualityTracker"/>; elapsed time to frame
+    /// reception represents total turnaround (request transport, server capture/encoding, network RTT,
+    /// and receive decryption), not pure network RTT.
+    /// </summary>
     private async ValueTask RequestFramebufferUpdateTrackedAsync(
         bool incremental,
         CancellationToken cancellationToken)

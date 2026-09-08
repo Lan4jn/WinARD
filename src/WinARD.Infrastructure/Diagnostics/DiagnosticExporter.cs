@@ -866,7 +866,7 @@ public sealed class DiagnosticExporter : IDisposable
         "ExpectedByteCount" or "ActualByteCount" =>
             ExportNonNegativeInt32(value, MaximumProtocolByteCount),
         "RectangleIndex" => ExportNonNegativeInt32(value, MaximumRectanglesPerUpdate - 1),
-        "ArdEncryptedPacketLength" => ExportBoundedNonNegativeInt32(value, 1, ushort.MaxValue),
+        "ArdEncryptedPacketLength" => ExportBoundedNonNegativeInt32(value, 0, ushort.MaxValue),
         "PresentationStage" => ExportAllowedValue(value, AllowedPresentationStages),
         "ProtocolReadStage" => ExportAllowedValue(value, AllowedProtocolReadStages),
         "ServerMessageType" => ExportFixedHex(value, 2),

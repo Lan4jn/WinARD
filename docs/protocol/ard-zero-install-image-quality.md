@@ -14,13 +14,15 @@ WinARD may use the following standard RFB framebuffer encodings:
 
 All three operate with a negotiated **standard PixelFormat**. Pixel depth, byte order, true-color maxima, and component shifts come from the RFB pixel-format exchange rather than from an Apple-private pixel interpretation. A decoder is deliverable only when its framing, persistent-state rules, bounds, and pixel conversion are implemented and tested.
 
-## ARD scaling control
+## ARD scaling control (Experimental / Unverified)
 
-The deliverable scaling control is the ARD wire sequence **`08 00 + IEEE 754 binary64 big-endian`**: bytes `08 00` followed by the requested scale value encoded as an eight-byte IEEE754 binary64 value in network (big-endian) byte order. The accepted range is **`0 < factor <= 1`**; non-finite values and values outside that range are rejected before any bytes are written.
+The client implements the wire sequence **`08 00 + IEEE 754 binary64 big-endian`**: bytes `08 00` followed by the requested scale value encoded as an eight-byte IEEE754 binary64 value in network (big-endian) byte order. The accepted range is **`0 < factor <= 1`**; non-finite values and values outside that range are rejected before any bytes are written.
 
-The writer implements this wire shape, and automated tests prove deterministic byte order and rejection of malicious boundary inputs. This note does not link traceable real-device interoperability evidence, so `ServerScaling` capability remains `Unknown` and scaling remains disabled until such evidence is reviewed and linked.
-
-This control changes the requested remote image scale; it does not create evidence for any private framebuffer decoder.
+**Empirical investigation and protocol status:**
+- Real-device probe experiments on macOS 26.5 (2026-09-05) demonstrated that after issuing this 10-byte message for a 50% scale factor, subsequent 45 real pixel updates over ~6 seconds remained at the native `3360 × 2100` dimensions without change.
+- In LibVNC, message type 8 represents the UltraVNC integer divisor extension (4-byte integer), which is structurally incompatible with this floating-point message. In noVNC-ARD, Apple type 8 is declared only as a constant name without an implementation.
+- Consequently, this scaling control is categorized as **Experimental / Unverified (实验性 / 未验证)** due to insufficient protocol evidence.
+- Online automatic scaling switching remains **strictly disabled**. Sub-100% scale choices (75%, 50%, 25%) are marked as `（实验性）` in the UI, and the UI reports scale state strictly from confirmed wire pixel dimensions (`actualSize`), never claiming effective reduction without matching received frame dimensions.
 
 ## Apple-private encoding gates
 

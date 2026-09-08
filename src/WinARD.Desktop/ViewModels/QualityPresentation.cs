@@ -132,9 +132,9 @@ public static class QualityPresentation
         ReadOnly<QualityScale>([
             new(QualityScale.Automatic, "自动"),
             new(QualityScale.Percent100, "100%"),
-            new(QualityScale.Percent75, "75%"),
-            new(QualityScale.Percent50, "50%"),
-            new(QualityScale.Percent25, "25%"),
+            new(QualityScale.Percent75, "75%（实验性）"),
+            new(QualityScale.Percent50, "50%（实验性）"),
+            new(QualityScale.Percent25, "25%（实验性）"),
         ]);
 
     public static IReadOnlyList<QualityChoice<QualityColor>> ColorOptionsFor(
@@ -213,6 +213,76 @@ public static class QualityPresentation
         var pending = pendingReconnect ? " · 需要重新连接后生效" : string.Empty;
         return $"设置：{ScaleName(saved)} · 本连接解析：{ScaleName(resolved)} · " +
             $"本连接实际：{ScaleName(actual)}{fallback}{pending}";
+    }
+
+    public static string ScaleStateText(
+        QualityScale saved,
+        QualityScale resolved,
+        QualityScale actual,
+        bool pendingReconnect,
+        bool safeFallback,
+        RemoteFramebufferSize? actualSize,
+        RemoteFramebufferSize? originalSize = null,
+        bool isEffective = false)
+    {
+        if (actualSize is null)
+        {
+            return ScaleStateText(saved, resolved, actual, pendingReconnect, safeFallback);
+        }
+
+        var sizeText = $"{actualSize.Value.Width} × {actualSize.Value.Height}";
+        var isScaleConfirmed = isEffective || (resolved == QualityScale.Percent100 && !safeFallback);
+        if (!isScaleConfirmed && originalSize is { } origin && origin.Width > 0 && origin.Height > 0)
+        {
+            var expectedFactor = resolved switch
+            {
+                QualityScale.Percent25 => 0.25d,
+                QualityScale.Percent50 => 0.5d,
+                QualityScale.Percent75 => 0.75d,
+                _ => 1.0d,
+            };
+            var actualFactorW = (double)actualSize.Value.Width / origin.Width;
+            var actualFactorH = (double)actualSize.Value.Height / origin.Height;
+            if (Math.Abs(actualFactorW - expectedFactor) < 0.05 && Math.Abs(actualFactorH - expectedFactor) < 0.05)
+            {
+                isScaleConfirmed = true;
+            }
+        }
+
+        string actualScaleText;
+        if (safeFallback)
+        {
+            actualScaleText = "100%";
+        }
+        else if (isScaleConfirmed)
+        {
+            actualScaleText = ScaleName(actual);
+        }
+        else
+        {
+            actualScaleText = "未确认";
+        }
+
+        string statusText;
+        if (safeFallback)
+        {
+            statusText = pendingReconnect ? "已安全回退 · 需要重新连接后生效" : "已安全回退";
+        }
+        else if (pendingReconnect)
+        {
+            statusText = "需要重新连接后生效";
+        }
+        else if (resolved != QualityScale.Percent100 && !isScaleConfirmed)
+        {
+            statusText = "未确认生效";
+        }
+        else
+        {
+            statusText = "已生效";
+        }
+
+        return $"设置：{ScaleName(saved)} · 本连接解析：{ScaleName(resolved)} · " +
+            $"实际传输：{sizeText} · 实际比例：{actualScaleText} · 状态：{statusText}";
     }
 
     public static string AppliedText(
@@ -508,8 +578,15 @@ public static class QualityPresentation
     private static string ColorName(QualityColor value) =>
         ColorOptions.FirstOrDefault(option => option.Value == value)?.DisplayName ?? "Unknown";
 
-    private static string ScaleName(QualityScale value) =>
-        ScaleOptions.FirstOrDefault(option => option.Value == value)?.DisplayName ?? "Unknown";
+    private static string ScaleName(QualityScale value) => value switch
+    {
+        QualityScale.Automatic => "自动",
+        QualityScale.Percent100 => "100%",
+        QualityScale.Percent75 => "75%",
+        QualityScale.Percent50 => "50%",
+        QualityScale.Percent25 => "25%",
+        _ => "Unknown",
+    };
 
     private static ReadOnlyCollection<QualityChoice<T>> ReadOnly<T>(QualityChoice<T>[] values) =>
         new ReadOnlyCollection<QualityChoice<T>>(values);

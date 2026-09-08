@@ -111,8 +111,9 @@ internal static class Program
                     return 2;
                 }
 
-                captureRdm ??= static (timeout, port, profile, token) =>
-                    new RdmCaptureServer(timeout).CaptureOnceAsync(port, profile, token);
+                captureRdm ??= (timeout, port, profile, token) =>
+                    new RdmCaptureServer(timeout).CaptureOnceAsync(
+                        port, profile, token, stage => output.WriteLine($"RDM stage: {stage}"));
                 return await RunRdmListenerAsync(
                     request,
                     listenPort,

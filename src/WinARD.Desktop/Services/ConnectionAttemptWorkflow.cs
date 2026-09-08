@@ -205,6 +205,34 @@ public sealed class ConnectionAttemptWorkflow(
                 actualByteCount.ToString(CultureInfo.InvariantCulture)));
         }
 
+        if (failure.ArdEncryptionStage is { } ardEncryptionStage)
+        {
+            fields.Add(new DiagnosticField(
+                "ArdEncryptionStage",
+                ardEncryptionStage.ToString()));
+        }
+
+        if (failure.ArdEncryptionDirection is { } ardEncryptionDirection)
+        {
+            fields.Add(new DiagnosticField(
+                "ArdEncryptionDirection",
+                ardEncryptionDirection.ToString()));
+        }
+
+        if (failure.ArdEncryptionSequence is { } ardEncryptionSequence)
+        {
+            fields.Add(new DiagnosticField(
+                "ArdEncryptionSequence",
+                ardEncryptionSequence.ToString(CultureInfo.InvariantCulture)));
+        }
+
+        if (failure.ArdCiphertextLength is { } ardCiphertextLength)
+        {
+            fields.Add(new DiagnosticField(
+                "ArdCiphertextLength",
+                ardCiphertextLength.ToString(CultureInfo.InvariantCulture)));
+        }
+
         return fields;
     }
 

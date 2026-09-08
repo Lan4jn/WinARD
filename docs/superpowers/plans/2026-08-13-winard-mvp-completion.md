@@ -268,15 +268,15 @@ git commit -m "feat: diagnose scale and reconnect state"
 
 ## 任务 9：整体审查、全量验证、编译与打包
 
-- [ ] **步骤 1：规格合规审查**
+- [x] **步骤 1：规格合规审查**
 
 逐条核对 `docs/superpowers/specs/2026-08-13-winard-mvp-completion-design.md`，Critical/Important 必须为 0；发现问题回到对应任务补失败测试并修复。
 
-- [ ] **步骤 2：代码质量和安全审查**
+- [x] **步骤 2：代码质量和安全审查**
 
 重点审查 wire 顺序、重试上限、资源所有权、timer/取消竞态、UI 输入隔离、SQLite 事务、凭据删除顺序、诊断 allowlist。Critical/Important 必须为 0。
 
-- [ ] **步骤 3：新鲜完整验证**
+- [x] **步骤 3：新鲜完整验证**
 
 ```powershell
 dotnet restore WinARD.sln -p:Platform=x64
@@ -291,7 +291,7 @@ git diff --check
 
 预期：格式、构建和所有测试 0 失败；许可证/漏洞检查成功；无 whitespace 错误。
 
-- [ ] **步骤 4：生成并验证成品**
+- [x] **步骤 4：生成并验证成品**
 
 ```powershell
 pwsh -File packaging/portable.ps1 -Version 0.1.0.0

@@ -252,12 +252,14 @@ public sealed class RdmCaptureTests
     [Fact]
     public async Task Capture_server_sends_synthetic_server_init_and_round_trips_captured_declarations()
     {
+        var stages = new List<string>();
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         var port = ReserveLoopbackPort();
         var serverTask = new RdmCaptureServer().CaptureOnceAsync(
             port,
             "adaptive-default",
-            cancellation.Token);
+            cancellation.Token,
+            stages.Add);
         using var client = new TcpClient();
         await client.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
         await using var stream = client.GetStream();
@@ -293,6 +295,11 @@ public sealed class RdmCaptureTests
             1080,
             cancellation.Token);
         var report = await serverTask.WaitAsync(cancellation.Token);
+        Assert.Equal(
+            ["Banner sent", "Client version read", "Security choice read", "Authentication challenge sent", "Authentication response read", "Security success sent", "ClientInit read", "ServerInit sent", "Declaration read"],
+            stages.Where(stage => !stage.StartsWith("Declaration message", StringComparison.Ordinal) && !stage.StartsWith("Encoding IDs:", StringComparison.Ordinal)));
+        Assert.Contains("Declaration message type 0x03", stages);
+        Assert.Contains(stages, stage => stage.StartsWith("Encoding IDs:", StringComparison.Ordinal));
         Assert.Equal(1, report.SchemaVersion);
         Assert.Equal("adaptive-default", report.Profile);
         Assert.Equal("RFB 003.889", report.ClientVersion);
@@ -868,6 +875,33 @@ public sealed class RdmCaptureTests
         Assert.Equal(-309, result);
     }
 
+    [Theory]
+    [InlineData(false, null)]
+    [InlineData(false, (byte)0xFF)]
+    [InlineData(true, (byte)0xFF)]
+    public void Comparer_marks_incomplete_declarations_and_rejects_candidate_from_either_side(
+        bool reachedFramebufferRequest,
+        byte? stoppedAtUnknownMessageType)
+    {
+        var baseline = CreateReport(
+            encodings: [0],
+            reachedFramebufferRequest: reachedFramebufferRequest,
+            stoppedAtUnknownMessageType: stoppedAtUnknownMessageType);
+        var adaptive = CreateReport(
+            encodings: [0, -309],
+            reachedFramebufferRequest: reachedFramebufferRequest,
+            stoppedAtUnknownMessageType: stoppedAtUnknownMessageType);
+
+        var comparison = RdmCaptureComparer.Compare(baseline, baseline);
+
+        Assert.Contains("incomplete", comparison.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("No encoding or declaration differences observed", comparison.ObservationSummary, StringComparison.Ordinal);
+        Assert.Throws<InvalidDataException>(() =>
+            RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(baseline, CreateReport(encodings: [0, -309])));
+        Assert.Throws<InvalidDataException>(() =>
+            RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(CreateReport(encodings: [0]), adaptive));
+    }
+
     [Fact]
     public void Comparer_rejects_zero_adaptive_only_encodings()
     {
@@ -911,6 +945,108 @@ public sealed class RdmCaptureTests
             RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(null!, CreateReport()));
         Assert.Throws<ArgumentNullException>(() =>
             RdmCaptureComparer.FindSingleAdaptiveOnlyEncoding(CreateReport(), null!));
+        Assert.Throws<ArgumentNullException>(() =>
+            RdmCaptureComparer.Compare(null!, CreateReport()));
+        Assert.Throws<ArgumentNullException>(() =>
+            RdmCaptureComparer.Compare(CreateReport(), null!));
+    }
+
+    [Fact]
+    public void Comparer_produces_structured_result_when_declarations_are_identical()
+    {
+        var baseline = CreateReport(profile: "high-default", encodings: [16, 0, -223]);
+        var adaptive = CreateReport(profile: "adaptive-default", encodings: [16, 0, -223]);
+
+        var result = RdmCaptureComparer.Compare(baseline, adaptive);
+
+        Assert.Empty(result.AddedEncodings);
+        Assert.Empty(result.RemovedEncodings);
+        Assert.False(result.HasEncodingOrderDifference);
+        Assert.False(result.PixelFormatDiffers);
+        Assert.False(result.MessageSequenceDiffers);
+        Assert.False(result.StoppedAtUnknownMessageTypeDiffers);
+        Assert.Contains("No encoding or declaration differences observed", result.ObservationSummary, StringComparison.Ordinal);
+        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Comparer_detects_multiple_added_and_removed_encodings()
+    {
+        var baseline = CreateReport(profile: "high-default", encodings: [16, 0, 1]);
+        var adaptive = CreateReport(profile: "adaptive-default", encodings: [16, -309, -310, 0]);
+
+        var result = RdmCaptureComparer.Compare(baseline, adaptive);
+
+        Assert.Equal([-309, -310], result.AddedEncodings);
+        Assert.Equal([1], result.RemovedEncodings);
+        Assert.False(result.HasEncodingOrderDifference);
+        Assert.Contains("2 adaptive-only encoding(s)", result.ObservationSummary, StringComparison.Ordinal);
+        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Comparer_detects_encoding_order_difference_without_added_encodings()
+    {
+        var baseline = CreateReport(profile: "high-default", encodings: [16, 0, -223]);
+        var adaptive = CreateReport(profile: "adaptive-default", encodings: [0, 16, -223]);
+
+        var result = RdmCaptureComparer.Compare(baseline, adaptive);
+
+        Assert.Empty(result.AddedEncodings);
+        Assert.Empty(result.RemovedEncodings);
+        Assert.True(result.HasEncodingOrderDifference);
+        Assert.Contains("order differs", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Comparer_detects_pixel_format_differences()
+    {
+        var baselineFormat = new CapturedPixelFormat(16, 16, false, true, 31, 63, 31, 11, 5, 0);
+        var adaptiveFormat = new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0);
+        var baseline = CreateReport(profile: "high-default", encodings: [16], pixelFormat: baselineFormat);
+        var adaptive = CreateReport(profile: "adaptive-default", encodings: [16], pixelFormat: adaptiveFormat);
+
+        var result = RdmCaptureComparer.Compare(baseline, adaptive);
+
+        Assert.True(result.PixelFormatDiffers);
+        Assert.NotNull(result.PixelFormatSummary);
+        Assert.Contains("16-bit", result.PixelFormatSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("32-bit", result.PixelFormatSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Pixel format differs", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Comparer_detects_message_sequence_differences_and_unknown_message_stop()
+    {
+        var baselineMessages = new List<CapturedClientMessage>
+        {
+            new(0, "SetPixelFormat", 20, null, null),
+            new(2, "SetEncodings", 16, null, null),
+            new(3, "FramebufferUpdateRequest", 10, "0000000004000300", null),
+        };
+        var adaptiveMessages = new List<CapturedClientMessage>
+        {
+            new(0, "SetPixelFormat", 20, null, null),
+            new(0x0A, "SetMode", 4, "00000001", null),
+            new(2, "SetEncodings", 16, null, null),
+        };
+        var baseline = CreateReport(profile: "high-default", messages: baselineMessages);
+        var adaptive = CreateReport(
+            profile: "adaptive-default",
+            messages: adaptiveMessages,
+            stoppedAtUnknownMessageType: 0xFF);
+
+        var result = RdmCaptureComparer.Compare(baseline, adaptive);
+
+        Assert.True(result.MessageSequenceDiffers);
+        Assert.True(result.StoppedAtUnknownMessageTypeDiffers);
+        Assert.Equal((byte)0xFF, result.AdaptiveStoppedAtUnknownMessageType);
+        Assert.Null(result.BaselineStoppedAtUnknownMessageType);
+        Assert.Contains("Message sequence differs", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("unknown message", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("MVS", result.ObservationSummary, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -940,17 +1076,20 @@ public sealed class RdmCaptureTests
         string profile = "adaptive-default",
         string clientVersion = "RFB 003.008",
         IReadOnlyList<int>? encodings = null,
-        IReadOnlyList<CapturedClientMessage>? messages = null) =>
+        IReadOnlyList<CapturedClientMessage>? messages = null,
+        CapturedPixelFormat? pixelFormat = null,
+        byte? stoppedAtUnknownMessageType = null,
+        bool reachedFramebufferRequest = true) =>
         new(
             schemaVersion,
             profile,
             clientVersion,
             1,
-            new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
+            pixelFormat ?? new CapturedPixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
             encodings ?? [0],
             messages ?? [new CapturedClientMessage(3, "FramebufferUpdateRequest", 10, "0000000004000300", null)],
-            true,
-            null);
+            reachedFramebufferRequest,
+            stoppedAtUnknownMessageType);
 
     private static async Task AssertInvalidCaptureAsync(string json)
     {

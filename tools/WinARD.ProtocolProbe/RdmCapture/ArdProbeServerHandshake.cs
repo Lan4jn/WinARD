@@ -24,12 +24,14 @@ public static class ArdProbeServerHandshake
 
     public static async Task<ArdProbeServerHandshakeResult> AcceptAsync(
         Stream stream,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? stageObserver = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
         cancellationToken.ThrowIfCancellationRequested();
 
         await stream.WriteAsync(ServerBanner, cancellationToken).ConfigureAwait(false);
+        stageObserver?.Invoke("Banner sent");
 
         var clientBanner = new byte[VersionBannerLength];
         await ReadExactlyAsync(
@@ -38,6 +40,7 @@ public static class ArdProbeServerHandshake
             "The RFB client version banner was truncated.",
             cancellationToken).ConfigureAwait(false);
         var version = ParseClientVersion(clientBanner);
+        stageObserver?.Invoke("Client version read");
 
         await stream.WriteAsync(SecurityTypes, cancellationToken).ConfigureAwait(false);
         var selection = new byte[1];
@@ -46,6 +49,7 @@ public static class ArdProbeServerHandshake
             selection,
             "The RFB security selection was truncated.",
             cancellationToken).ConfigureAwait(false);
+        stageObserver?.Invoke("Security choice read");
         if (selection[0] != (byte)RfbSecurityType.AppleRemoteDesktop)
         {
             throw new InvalidDataException("The RFB client did not select Apple Remote Desktop security.");
@@ -53,6 +57,7 @@ public static class ArdProbeServerHandshake
 
         var challenge = CreateChallenge();
         await stream.WriteAsync(challenge, cancellationToken).ConfigureAwait(false);
+        stageObserver?.Invoke("Authentication challenge sent");
 
         var response = new byte[AuthenticationResponseLength];
         try
@@ -69,8 +74,10 @@ public static class ArdProbeServerHandshake
         }
 
         var securityResult = new byte[sizeof(uint)];
+        stageObserver?.Invoke("Authentication response read");
         BinaryPrimitives.WriteUInt32BigEndian(securityResult, 0);
         await stream.WriteAsync(securityResult, cancellationToken).ConfigureAwait(false);
+        stageObserver?.Invoke("Security success sent");
 
         var clientInit = new byte[1];
         await ReadExactlyAsync(
@@ -78,6 +85,7 @@ public static class ArdProbeServerHandshake
             clientInit,
             "The RFB ClientInit message was truncated.",
             cancellationToken).ConfigureAwait(false);
+        stageObserver?.Invoke("ClientInit read");
         if (clientInit[0] is not 0x01 and not 0xC1)
         {
             throw new InvalidDataException("The RFB ClientInit value is not supported.");

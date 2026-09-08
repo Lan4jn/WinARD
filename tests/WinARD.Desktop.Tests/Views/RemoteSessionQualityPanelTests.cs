@@ -117,6 +117,16 @@ public sealed class RemoteSessionQualityPanelTests
             source.IndexOf("await _windowLifecycle.RetryAsync", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void Quality_panel_passes_actual_and_original_framebuffer_size_to_scale_state()
+    {
+        var source = File.ReadAllText(RepositoryFile(
+            "src", "WinARD.Desktop", "Views", "RemoteSessionWindow.xaml.cs"));
+
+        Assert.Contains("actualSize: ViewModel.FramebufferSize", source, StringComparison.Ordinal);
+        Assert.Contains("originalSize: ViewModel.InitialFramebufferSize", source, StringComparison.Ordinal);
+    }
+
     private static void AssertQualityTextBlock(
         XDocument document,
         XNamespace presentation,

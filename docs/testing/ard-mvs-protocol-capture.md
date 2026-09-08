@@ -1,5 +1,10 @@
 # ARD MVS 协议捕获运行手册
 
+## 2026-09-07 交接状态说明
+
+已取得真实 RDM 初始声明（High 首选 1002，Adaptive 首选 **`1011`**），且真实 Mac 会话已确认在线选择该编码并返回 `EncodingId=1011` 矩形头（详见 [真实声明与服务器选择记录](2026-09-06-mvs-live-declarations.md)）。
+当前本轮研发暂停继续采集与开发，无需用户额外操作或提供密码。后续开发者进场时，应先准备专用的有界 1011 样本采集工具与合成画面素材，再在用户配合下进行脱敏取证。
+
 本手册用于复现两类隔离研究证据：Remote Desktop Manager（RDM）连接本机回环模拟服务端时发送的 ARD 初始化声明，以及真实 Mac 返回的候选编码有界载荷前缀。它不是常规远程连接流程，也不证明候选编码就是 MVS。
 
 所有命令都应从仓库根目录 `F:\Documents\Windows ARD Client` 的同一个 PowerShell 会话中执行。研究产物位于已被 Git 忽略的 `artifacts\protocol-research`；不得把其中的 JSON、manifest 或 `.bin` 文件强制加入 Git。
@@ -113,7 +118,14 @@ foreach ($category in $settingCategories) {
   }
 }
 
+# 第一阶段单变量对比矩阵（核心：High vs Adaptive，Resolution quality 固定 Default）
 $matrix = @(
+  [pscustomobject]@{ Profile = 'high-default';     Quality = 'High';     Resolution = 'Default' },
+  [pscustomobject]@{ Profile = 'adaptive-default'; Quality = 'Adaptive'; Resolution = 'Default' }
+)
+
+# 扩展研究全矩阵（保留七组供横向深入排查）：
+$matrixFull = @(
   [pscustomobject]@{ Profile = 'full-default';     Quality = 'Full';     Resolution = 'Default' },
   [pscustomobject]@{ Profile = 'high-default';     Quality = 'High';     Resolution = 'Default' },
   [pscustomobject]@{ Profile = 'medium-default';   Quality = 'Medium';   Resolution = 'Default' },
@@ -133,7 +145,7 @@ $matrix = @(
 
 证据文档只能摘录非敏感的版本号和设置结论；`rdm-context.json` 与原始捕获一样不得进入 Git。
 
-## 3. 捕获并硬校验七组 RDM 声明
+## 3. 捕获并硬校验 RDM 声明
 
 监听器只绑定 `127.0.0.1`、只接受一个连接，并在收到首个 FramebufferUpdateRequest 后关闭连接。它完成固定的 ARD security type 30 握手，但不解密或验证认证响应。
 
@@ -169,34 +181,37 @@ try {
 
 出现未知消息类型时不要根据 TCP 分块猜测消息长度。保留本批次现场，先为该消息增加有界 parser 和测试。
 
-## 4. 比较同一批次的 Full 与 Adaptive
+## 4. 比较同一批次的 High 与 Adaptive（单变量对比）
 
 只使用本批次变量构造比较输入：
 
 ```powershell
-$fullCapture = Join-Path $rdmRoot 'full-default.json'
+$highCapture = Join-Path $rdmRoot 'high-default.json'
 $adaptiveCapture = Join-Path $rdmRoot 'adaptive-default.json'
 
 try {
-  & $probe --compare-rdm-captures $fullCapture $adaptiveCapture
-  if ($LASTEXITCODE -ne 0) { throw 'Full/Adaptive comparison did not produce one candidate.' }
+  & $probe --compare-rdm-captures $highCapture $adaptiveCapture
+  if ($LASTEXITCODE -ne 0) { throw 'High/Adaptive comparison did not produce one candidate.' }
 } catch {
   & $clearCaptureEnvironment
   throw
 }
 ```
 
-只有输出恰好一个 `RDM comparison candidate signed encoding ID: ...` 才能进入真实 Mac 捕获。若工具报告零个或多个 Adaptive-only ID，停止；不要人工选择 ID。此时执行 `& $clearCaptureEnvironment`，处理七个临时 RDM 条目，并保留该批次供调查。
+比较器不仅比较编码增减，还必须关注像素格式差异、声明顺序和消息序列。只有输出恰好一个 `RDM comparison candidate signed encoding ID: ...` 才能进入真实 Mac 捕获。若工具报告零个或多个差异 ID，停止；不要人工选择 ID。此时执行 `& $clearCaptureEnvironment`，处理临时 RDM 条目，并保留该批次供调查。严禁把唯一差异自动命名为已支持 MVS。
 
-## 5. 真实 Mac 捕获安全硬门
+## 5. 真实 Mac 捕获安全硬门与交接指引
 
-候选载荷前缀可能包含可还原的屏幕图像数据。运行真实 Mac 命令前，操作者必须亲眼逐项确认：
+> [!NOTE]
+> **2026-09-07 交接要点**：真实 macOS 服务端已确认在线选择并返回编码 `1011` 的矩形头。现有旧探针的 `--capture-known-encoding-prefix` 仅支持 1001/1002，后续开发者须先开发有界的 1011 样本工具（具备单次字节/时间上限、取消与资源释放，严禁从 TCP 分块推测长度）。当前暂停采集，后续开发者发起采集时再请用户配合。
 
-- 目标 Mac 只启用并显示一个显示器；额外物理或虚拟显示器已断开或在系统中停用，而不只是被客户端隐藏；
+候选载荷前缀可能包含可还原的屏幕图像数据。后续运行真实 Mac 采集前，必须亲眼逐项确认：
+
+- 目标 Mac 优先只启用并显示一个显示器；若保留多个，所有会被捕获的显示区域均需全屏显示合成测试图；
 - 唯一显示器全屏展示专用、无敏感信息的合成测试图；
 - 已关闭通知预览、桌面小组件、菜单栏敏感内容，以及显示私人文件名、账户名、消息或浏览器内容的窗口；
 - 没有其他用户或自动化会在捕获期间切换画面；
-- 本批次 Full/Adaptive 比较已产生唯一候选 ID；
+- 确认本次允许保存有界合成画面载荷（样本仅保存在本地 git 忽略的 artifacts 目录）；
 - `$macCaptureRoot` 不存在，且本批次变量没有被重新赋值。
 
 `--confirm-synthetic-screen` 只是操作者作出的明确声明，程序无法判断屏幕是否真的脱敏。任何一项不能确认时都不得运行；应立即调用 `& $clearCaptureEnvironment` 并处理临时 RDM 条目。
@@ -208,14 +223,14 @@ $env:WINARD_HOST = (Read-Host 'Authorized test Mac host or IP').Trim()
 $env:WINARD_PORT = (Read-Host 'ARD port; press Enter only if you will then set 5900').Trim()
 if ([string]::IsNullOrWhiteSpace($env:WINARD_PORT)) { $env:WINARD_PORT = '5900' }
 $env:WINARD_USERNAME = (Read-Host 'Authorized test account').Trim()
+$candidateEncodingId = (Read-Host 'Signed encoding ID from comparison (e.g. 1011)').Trim()
 ```
 
 再次目视确认目标 Mac 仍是合成测试图，然后只用本批次路径运行：
 
 ```powershell
-& $probe --capture-differential-prefix `
-  $fullCapture `
-  $adaptiveCapture `
+& $probe --capture-known-encoding-prefix `
+  $candidateEncodingId `
   $macCaptureRoot `
   --confirm-synthetic-screen
 if ($LASTEXITCODE -ne 0) { & $clearCaptureEnvironment; throw 'Encoding prefix capture failed.' }

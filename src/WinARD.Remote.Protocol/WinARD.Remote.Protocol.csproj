@@ -2,5 +2,6 @@
   <ItemGroup>
     <InternalsVisibleTo Include="WinARD.Remote.Protocol.Tests" />
     <InternalsVisibleTo Include="WinARD.Desktop.Tests" />
+    <InternalsVisibleTo Include="WinARD.ScaleProbe" />
   </ItemGroup>
 </Project>

@@ -150,7 +150,7 @@ public sealed class WinArdDatabaseTests
     public void Quality_scale_migration_uses_a_regular_table_rebuild()
     {
         var source = File.ReadAllText(
-            Path.Combine(GetRepositoryRoot(), "src", "WinARD.Infrastructure", "Database", "Migrations", "Migration004QualityScalePercent.cs"));
+            RepositoryFile.Find("src", "WinARD.Infrastructure", "Database", "Migrations", "Migration004QualityScalePercent.cs"));
 
         Assert.DoesNotContain("writable_schema", source, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("sqlite_schema", source, StringComparison.OrdinalIgnoreCase);
@@ -467,9 +467,6 @@ public sealed class WinArdDatabaseTests
         command.Parameters.AddWithValue("$now", "2026-08-13T00:00:00.0000000+00:00");
         await command.ExecuteNonQueryAsync();
     }
-
-    private static string GetRepositoryRoot() =>
-        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", ".."));
 
     private static async Task SeedVersionTableAsync(string path, string rowsSql)
     {

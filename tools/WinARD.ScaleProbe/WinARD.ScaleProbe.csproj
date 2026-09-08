@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/WinARD.Application/WinARD.Application.csproj" />
+    <ProjectReference Include="../../src/WinARD.Infrastructure/WinARD.Infrastructure.csproj" />
+    <ProjectReference Include="../../src/WinARD.Security/WinARD.Security.csproj" />
+    <ProjectReference Include="../../src/WinARD.Remote.Protocol/WinARD.Remote.Protocol.csproj" />
+    <ProjectReference Include="../../tools/WinARD.ProtocolProbe/WinARD.ProtocolProbe.csproj" />
+    <Compile Include="../../src/WinARD.Desktop/Services/RfbClientFactory.cs" Link="Production/RfbClientFactory.cs" />
+    <Compile Include="../../src/WinARD.Desktop/Services/ClientMessageScheduler.cs" Link="Production/ClientMessageScheduler.cs" />
+    <Compile Include="../../src/WinARD.Desktop/Services/SessionTrafficCountingStream.cs" Link="Production/SessionTrafficCountingStream.cs" />
+    <Compile Include="../../src/WinARD.Desktop/Input/RemoteInputDiagnosticTracker.cs" Link="Production/RemoteInputDiagnosticTracker.cs" />
+  </ItemGroup>
+</Project>

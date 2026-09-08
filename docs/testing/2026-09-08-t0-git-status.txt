@@ -1,0 +1,81 @@
+On branch master
+Your branch is ahead of 'origin/master' by 41 commits.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   docs/protocol/ard-mvs-evidence.md
+	modified:   docs/protocol/ard-zero-install-image-quality.md
+	modified:   docs/superpowers/plans/2026-08-13-winard-mvp-completion.md
+	modified:   docs/testing/ard-mvs-protocol-capture.md
+	modified:   src/WinARD.Desktop/Services/ConnectionAttemptWorkflow.cs
+	modified:   src/WinARD.Desktop/Services/RfbClientFactory.cs
+	modified:   src/WinARD.Desktop/ViewModels/ConnectionQualityTracker.cs
+	modified:   src/WinARD.Desktop/ViewModels/QualityPresentation.cs
+	modified:   src/WinARD.Desktop/ViewModels/RemoteSessionViewModel.cs
+	modified:   src/WinARD.Desktop/Views/RemoteSessionWindow.xaml
+	modified:   src/WinARD.Desktop/Views/RemoteSessionWindow.xaml.cs
+	modified:   src/WinARD.Infrastructure/Diagnostics/DiagnosticExporter.cs
+	modified:   src/WinARD.Remote.Protocol/Encodings/RfbEncodingType.cs
+	modified:   src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateReader.cs
+	modified:   src/WinARD.Remote.Protocol/Framebuffer/FramebufferUpdateSession.cs
+	modified:   src/WinARD.Remote.Protocol/WinARD.Remote.Protocol.csproj
+	modified:   tests/WinARD.Application.Tests/RemoteSessionRuntimeTests.cs
+	modified:   tests/WinARD.Desktop.Tests/Services/ConnectionFailureDiagnosticsTests.cs
+	modified:   tests/WinARD.Desktop.Tests/ViewModels/QualityPresentationTests.cs
+	modified:   tests/WinARD.Desktop.Tests/Views/RemoteSessionQualityPanelTests.cs
+	modified:   tests/WinARD.Infrastructure.Tests/DiagnosticExporterTests.cs
+	modified:   tests/WinARD.Infrastructure.Tests/WinArdDatabaseTests.cs
+	modified:   tests/WinARD.Remote.Protocol.Tests/Tools/RdmCaptureTests.cs
+	modified:   tools/WinARD.ProtocolProbe/Program.cs
+	modified:   tools/WinARD.ProtocolProbe/RdmCapture/ArdProbeServerHandshake.cs
+	modified:   tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureComparer.cs
+	modified:   tools/WinARD.ProtocolProbe/RdmCapture/RdmCaptureServer.cs
+	modified:   tools/WinARD.ProtocolProbe/RdmCapture/RfbClientDeclarationReader.cs
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	docs/superpowers/plans/2026-09-05-apple-mvs.md
+	docs/superpowers/plans/2026-09-05-server-scale-repair.md
+	docs/superpowers/plans/2026-09-07-apple-mvs-handoff-plan.md
+	docs/superpowers/plans/2026-09-08-mvs-general-decoding-plan.md
+	docs/superpowers/plans/2026-09-08-mvs-recovery-plan.md
+	docs/superpowers/plans/2026-09-08-winard-project-plan.md
+	docs/superpowers/specs/2026-09-05-apple-mvs-design.md
+	docs/superpowers/specs/2026-09-05-server-scale-repair-design.md
+	docs/superpowers/specs/2026-09-07-apple-mvs-handoff-spec.md
+	docs/superpowers/specs/2026-09-08-mvs-general-decoding-spec.md
+	docs/superpowers/specs/2026-09-08-mvs-recovery-spec.md
+	docs/superpowers/specs/2026-09-08-winard-project-spec.md
+	docs/testing/2026-09-05-online-scale-investigation.md
+	docs/testing/2026-09-06-mvs-live-declarations.md
+	docs/testing/2026-09-07-apple-mvs-handoff-report.md
+	docs/testing/2026-09-08-apple-mvs-e2a-validation-report.md
+	docs/testing/2026-09-08-mvs-completion-audit.md
+	docs/testing/2026-09-08-mvs-recovery-completion-report.md
+	docs/testing/2026-09-08-mvs-review-report.md
+	docs/testing/2026-09-08-mvs-sample-analysis-report.md
+	docs/testing/2026-09-08-t0-git-diff.patch
+	docs/testing/2026-09-08-t0-git-status.txt
+	docs/testing/2026-09-08-winard-project-handoff-report.md
+	src/WinARD.Remote.Protocol/Encodings/AppleMvsDecoder.cs
+	src/WinARD.Remote.Protocol/Encodings/Mvs/
+	tests/WinARD.Remote.Protocol.Tests/EncodingResearch/
+	tests/WinARD.Remote.Protocol.Tests/Encodings/AppleMvsDecoderTests.cs
+	tests/WinARD.Remote.Protocol.Tests/Encodings/AppleMvsFullFrameTests.cs
+	tests/WinARD.Remote.Protocol.Tests/Framebuffer/AppleMvsRectangleValidationTests.cs
+	tests/WinARD.Remote.Protocol.Tests/Tools/MvsSampleCaptureTests.cs
+	tools/Analyze-MvsSamples.ps1
+	tools/Capture-MvsSample.ps1
+	tools/Generate-SyntheticPatterns.ps1
+	tools/WinARD.ProtocolProbe/EncodingResearch/MvsPrototypeDecoder.cs
+	tools/WinARD.ProtocolProbe/EncodingResearch/MvsSampleCapture.cs
+	tools/WinARD.ProtocolProbe/EncodingResearch/MvsSampleCaptureReader.cs
+	tools/WinARD.ProtocolProbe/EncodingResearch/MvsSyntaxAnalyzer.cs
+	tools/WinARD.ScaleProbe/
+	tools/analyze_grammar.ps1
+	tools/diagnostic_bits.ps1
+	tools/find_color_offsets.ps1
+
+no changes added to commit (use "git add" and/or "git commit -a")

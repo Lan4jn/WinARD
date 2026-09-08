@@ -1,30 +1,99 @@
-# MVS delivery evidence and decision
+# Apple MVS 交付证据与决策报告 (MVS Evidence and Audit Decision)
 
-## Delivery status
+> 最新源码复核见 [MVS完成报告审计](../testing/2026-09-08-mvs-completion-audit.md)。默认隔离和小缓冲已有改进，但真实通用解码仍未完成；当前E2b/E3状态以该报告及其配套Spec/计划为准。
 
-**研究门：关闭。** MVS is outside the WinARD delivery boundary for this stage.
+> **2026-09-08 核查更新：** [最新报告](../testing/2026-09-08-mvs-review-report.md)、[Spec](../superpowers/specs/2026-09-08-mvs-recovery-spec.md)、[计划](../superpowers/plans/2026-09-08-mvs-recovery-plan.md) 为当前交接依据。现有decoder硬编码蓝色，未执行真实熵解码/反量化/IDCT；后继类型0也存在硬编码记录问题。因此E2b/E3未通过，E2a需修正验证工具后复验。下文更早的通过或算法确立表述不得作为发布依据。
 
-The available research does not provide sufficient interoperability evidence for an implementation. In particular, there is no verified evidence for:
+> 当前交接依据：[核实报告](../testing/2026-09-07-apple-mvs-handoff-report.md)、[Spec](../superpowers/specs/2026-09-07-apple-mvs-handoff-spec.md)、[开发计划](../superpowers/plans/2026-09-07-apple-mvs-handoff-plan.md)。下文为阶段记录；其中 JPEG/DCT、色度抽样、完整边界和生命周期的确定性表述尚未由完整样本与像素解码证实。图像样本只有 65,536 字节前缀，E2 仍未完成。
 
-- an official protocol identifier;
-- complete payload boundaries;
-- pixel semantics; or
-- cross-packet and continuous-state behavior.
+## 2026-09-07 交接状态（当前执行依据）
 
-A short observed prefix, a symbol name, or the presence of a library is not evidence for a complete decoder. These gaps prevent a bounded, independently verifiable implementation.
+根据真实声明取证与真实 Mac 在线选择测试，已确认 macOS 服务端接受并选择了编码 `1011`。
+用户本轮要求完善开发计划与交付物，**暂停进一步代码实现、连接测试与网络采集，将当前完整成果交接给后续开发者**。
+当前代码库与交付物保持整洁受控，生产路径保留标准 Zlib/ZRLE 编码。
 
-## Product boundary
+---
 
-WinARD **does not implement, claim, or distribute MVS or an RDM DLL**. The application must not advertise MVS support, negotiate it as a supported encoding, ship a decoder for it, or bundle/load an RDM binary as part of this delivery.
+## 1. 交付状态与门禁矩阵 (Delivery Status & Gate Matrix)
 
-Normative project decision: **不实现、不声明、不分发 MVS 或 RDM DLL**。
+**研究门：开放；解码实现门与产品启用门：严格依据 E2/E3 硬门禁保持关闭（External Gate Blocked）。**
+专项研究依照 [Apple MVS 专项设计规格](../superpowers/specs/2026-09-05-apple-mvs-design.md) 与 [开发计划](../superpowers/plans/2026-09-05-apple-mvs.md) 执行。
 
-This decision is a delivery gate, not an inference that an undocumented wire format is safe or compatible. It does not turn partial observations into a specification.
+| 门禁阶段 | 定义与前置要求 | 当前状态 | 判定依据与审计结论 |
+|---|---|---|---|
+| **E0 官方选项确认** | 官方页面、版本与选项映射确认 | **已满足 (Passed)** | Devolutions 官方文档明确映射 `Adaptive` -> `Apple MVS codec`；确认本机 RDM 2026.2.17.0。 |
+| **E1 实际协商确认** | High/Adaptive 声明对比、真实服务端选择与可验证数据路径 | **已确认服务端选择 (Negotiated)** | 真实 RDM Adaptive 纠正声明首选 **`1011`**；真实 Mac 在线握手后服务端明确返回 `EncodingId=1011` 矩形头。 |
+| **E2 协议契约完整** | 初始化、完整帧边界 (E2a)、载荷解压、像素语义 (E2b)、状态连续性与重同步 | **未完成 (Blocked)** | **E2a 证实小记录（129B Setup、33B Slice）大端长度假设有效，但后继验证此前存在类型硬编码已修正待真实复验；E2b 真实位流解码尚未证实（此前纯蓝系测试占位伪造，已彻底移除），位流解码阻断。** |
+| **E3 解码与互操作** | 隔离解码实现、已知答案测试、畸形输入防护、真机显示验证 | **未通过 (Isolated)** | **已落实生产隔离：普通会话拒绝 1011；消除所有 stackalloc 崩溃隐患；切片解码显式拒绝未经验证位流；仅在研究通道提供线程安全注册机制。** |
+| **E4 性能与稳定性** | 两小时稳定性、可比负载画质与吞吐验收、回退与资源预算 | **未开始 (Not Started)** | 前置 E2b、E3 尚未达成，严禁进入 E4 生产实测。 |
 
-## Reopening the gate
+---
 
-Any future enablement requires **a separately approved specification and real-device evidence** before implementation or distribution begins. That evidence must establish, at minimum, the protocol identifier, complete framing and payload boundaries, pixel interpretation, state lifetime across packets and updates, error behavior, and repeatable interoperability on a real Mac.
+## 2. 真实协商突破与事实记录 (2026-09-07/08 Observations)
 
-Approval requirement: **单独批准的规格和实机证据**。
+详细数据记录见 [真实声明与服务器选择记录](../testing/2026-09-06-mvs-live-declarations.md) 与 [2026-09-08 核查报告](../testing/2026-09-08-mvs-review-report.md)：
 
-Until that separate approval is recorded, MVS and RDM DLL work remains excluded from WinARD releases.
+1. **RDM High 与 Adaptive 真实声明对比**：
+   - High / Default：声明编码首选为 `1002`，随后为 `6, 0, -239, 1104, 1100, 1101, 1105, -223`；
+   - Adaptive / Default（纠正 Performance 设置后）：声明编码首选变为 **`1011`**，其余编码及顺序完全保持一致。
+2. **真实 Mac 服务端在线选择与载荷捕获确认**：
+   - 使用保存的连接信息，在已建立的标准加密 ARD 3.889 会话中声明 `1011`；
+   - 真实 macOS 服务端在 `FramebufferUpdate` 中明确选择并返回了 `EncodingId=1011` 矩形；
+   - **已证实事实 1（Setup 帧）**：服务端发送 `Rectangle=0x0 at (0,0)` 伪编码元数据帧，前缀为 4 字节大端长度 `129`（`00 00 00 81`），载荷包含 1 字节模式头（`0x02`）+ 64 字节 Luminance 量化表 + 64 字节 Chrominance 量化表（SHA256: `C02CECE7B757BC6AF2C5CA3A74A4C0D798B375A27EEC3CC2DB9BD9FAF3B7FBAD`）；
+   - **已证实事实 2（图像切片首部与长度假说）**：在 16x16 采样中，服务端下发精确记录的 33 字节载荷（4 字节大端长度 33，载荷 SHA256: `4E90E93E4786D90A21B9A1764A22ADE42A1BEA235F9F347E1FC39D1789C8B72B`）；首部格式为 `00 0F 19 00 00 09`；
+   - **审计修正与撤回（E2b 假像素与后继硬编码撤销）**：
+     - 2026-09-08 代码核查发现此前原型中的纯蓝测试实为固定写死颜色常量，真实位流未参与运算；现已彻底移除硬编码假蓝与 stackalloc 风险代码；
+     - `ScaleProbe` 此前存在写死 `nextMsgType = 0` 的脆弱逻辑，现已替换为实际消息类型映射与稳定代号输出；
+     - 诚实撤回此前 E2b/E3“已通过”的断言，状态降级并锁定生产隔离。
+
+---
+
+## 3. 协议契约分析与验收矩阵 (Protocol Contract Matrix)
+
+根据 Spec 第 5 节与恢复计划，对解码实现所需的协议要素进行重新标定：
+
+| 协议要素 | 实现最低要求 | 当前已知状态 | 判定结论 |
+|---|---|---|---|
+| **Wire Identifier** | 确切的 32 位带符号编码 ID | 已确认为 **`1011`**，且经真实 Mac 服务端选择证实 | **已解决 (Resolved)** |
+| **完整消息帧边界 (E2a)** | 有界长度规则、大小端字节序、变长头部解析 | 4 字节大端整数长度假说对当前小样本成立；后继边界需用修正后的 ScaleProbe 真实复验 | **需复验 (Unverified)** |
+| **压缩载荷与算法 (E2b)** | 明确解压算法、量化结构与分块布局 | Setup 包含 64 字节双量化表，切片内部位流语法（熵编码/宏块结构）未解 | **未解决 (Blocked)** |
+| **状态连续性与生命周期** | 跨数据包/跨帧依赖、参考帧更新、上下文重置条件 | Setup 伪矩形生命周期与切片依赖待多帧实证 | **待证实 (Hypothesized)** |
+| **像素与颜色语义 (E2b)** | 颜色空间（RGB/YUV）、Alpha 通道、步幅与行对齐 | 未闭环；严禁使用任何假定颜色伪造渲染 | **未解决 (Blocked)** |
+| **安全与错误恢复** | 损坏流安全丢弃、解压预算超限防护、回退时机 | 生产端已彻底隔离 1011；大尺寸栈分配已消除；切片解码显式拒绝未实证位流 | **已防护 (Guarded)** |
+
+### 审查判定 (E2/E3 Audit Decision)
+> [!WARNING]
+> **E2b/E3 硬门禁重新生效并严格阻断**：
+> 1. E2b 真实位流解码尚未闭环，绝不输出任何伪造像素，生产端已彻底隔离 `1011`；
+> 2. 只有当真实位流语法通过真实多色/全屏样本验证，并完成真实反量化、变换与色度重构后，方可解除 E2b 门禁；
+> 3. 当前系统已安全、整洁地处于 R0~R2 受控状态。
+
+---
+
+## 4. 产品边界与安全保障 (Product Boundaries & Fallback)
+
+1. **生产客户端安全**：
+   - WinARD 生产客户端协商列表中不盲目注入未经解码器支持的 `1011`，确保正常远程会话稳定采用标准 Zlib、ZRLE 或 Raw 编码。
+2. **单一安全回退预算**：
+   - 现有的 `QualityBootstrapPlanner` 与 `ConnectionAttemptWorkflow` 严格受控（首选连接失败后最多进行一次安全回退连接，认证/网络取消错误不触发编码误回退）。
+   - `QualityPresentation` 严格区分请求编码与实际生效编码，绝不虚报支持状态。
+3. **依赖与分发合规**：
+   - 绝不引入或分发 RDM 的私有 DLL；
+   - 绝不引入未经确认的第三方外部媒体依赖，确保构建产物 100% 洁净。
+
+---
+
+## 5. 后续开发者交接指引 (Next Steps for Subsequent Developers)
+
+1. **停止当前操作**：
+   - 本轮开发暂停进一步代码实现、连接测试和载荷采集；当前无需用户额外操作，无需提供密码。
+2. **后续采集工具就绪前置**：
+   - 准备专用的有界 1011 样本采集工具与合成画面素材；
+   - 工具必须明确单次字节/时间上限、取消与资源释放、输出位置和覆盖规则，并经离线测试验证；
+   - 严禁从 TCP 分块猜测长度，严禁将截断前缀当作完整帧。
+3. **后续采集时用户的配合要点**：
+   - 优先暂时只启用一个 Mac 显示器；
+   - 全屏显示执行者提供的合成测试图，隐藏私人窗口并关闭通知预览；
+   - 保持 Mac 可连接，确认本次允许保存有界合成画面载荷。
+4. **E2 达成后的路线**：
+   - 只有从公开规范或完整样本中取得经过验证的完整帧边界、算法与连续状态后，方可解除 E2 阻塞，编写任务 4 的代码级解码子计划。

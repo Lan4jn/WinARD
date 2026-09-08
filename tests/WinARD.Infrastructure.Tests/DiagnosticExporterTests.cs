@@ -1179,7 +1179,7 @@ public sealed class DiagnosticExporterTests : IDisposable
     [InlineData("RectangleIndex", "4096", false)]
     [InlineData("ArdCiphertextLength", "1", true)]
     [InlineData("ArdCiphertextLength", "65535", true)]
-    [InlineData("ArdCiphertextLength", "0", false)]
+    [InlineData("ArdCiphertextLength", "0", true)]
     [InlineData("ArdCiphertextLength", "65536", false)]
     [InlineData("ArdCiphertextLength", "2147483647", false)]
     public async Task NumericEventFieldsUseTheirProtocolOrProductBounds(
