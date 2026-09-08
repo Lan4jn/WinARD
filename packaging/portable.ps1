@@ -19,8 +19,8 @@ if ($ValidateVersionOnly) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $artifactsDirectory = Join-Path $repoRoot 'artifacts'
-$portableDirectory = Join-Path $artifactsDirectory 'portable-win-x64'
-$msixStagingDirectory = Join-Path $artifactsDirectory 'msix-staging'
+$portableDirectory = Join-Path $artifactsDirectory 'portable-win-x64-new'
+$msixStagingDirectory = Join-Path $artifactsDirectory 'msix-staging-new'
 $msixOutput = Join-Path $artifactsDirectory 'WinARD.msix'
 $portableZip = Join-Path $artifactsDirectory 'WinARD-portable-win-x64.zip'
 $checksumsPath = Join-Path $artifactsDirectory 'SHA256SUMS.txt'
